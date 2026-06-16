@@ -34,7 +34,7 @@ def main() -> None:
         )
 
         # Create two threads
-        thread_values = [
+        thread_templates = [
             {
                 "id": str(uuid.uuid4()),
                 "user_id": user_id,
@@ -52,24 +52,28 @@ def main() -> None:
                 "last_message_at": now - timedelta(days=1, hours=2),
             },
         ]
-        for tv in thread_values:
-            conn.execute(
+        thread_records = []
+        for tv in thread_templates:
+            thread_id = conn.scalar(
                 text(
                     """
                     INSERT INTO mail_thread (id, user_id, provider, provider_thread_id, subject, last_message_at)
                     VALUES (:id, :user_id, :provider, :provider_thread_id, :subject, :last_message_at)
                     ON CONFLICT (user_id, provider, provider_thread_id) DO UPDATE
                     SET subject = EXCLUDED.subject, last_message_at = EXCLUDED.last_message_at
+                    RETURNING id
                     """
                 ),
                 tv,
             )
+            tv_with_id = {**tv, "id": str(thread_id)}
+            thread_records.append(tv_with_id)
 
         # Messages per thread
-        messages = [
+        message_templates = [
             {
                 "id": str(uuid.uuid4()),
-                "thread_id": thread_values[0]["id"],
+                "thread_id": thread_records[0]["id"],
                 "provider_message_id": "m_demo_1",
                 "sender": "teammate@example.com",
                 "recipient": ["demo@example.com"],
@@ -83,7 +87,7 @@ def main() -> None:
             },
             {
                 "id": str(uuid.uuid4()),
-                "thread_id": thread_values[1]["id"],
+                "thread_id": thread_records[1]["id"],
                 "provider_message_id": "m_demo_2",
                 "sender": "billing@example.com",
                 "recipient": ["demo@example.com"],
@@ -96,10 +100,10 @@ def main() -> None:
                 "headers": json.dumps({}),
             },
         ]
-        for m in messages:
-            # Ensure JSONB-safe string for headers to avoid psycopg adaptation errors
-            m = {**m, "headers": json.dumps({})}
-            conn.execute(
+        message_records = []
+        for template in message_templates:
+            payload = {**template, "headers": json.dumps({})}
+            message_id = conn.scalar(
                 text(
                     """
                     INSERT INTO mail_message (
@@ -115,16 +119,18 @@ def main() -> None:
                         snippet = EXCLUDED.snippet,
                         body_text = EXCLUDED.body_text,
                         sent_at = EXCLUDED.sent_at
+                    RETURNING id
                     """
                 ),
-                m,
+                payload,
             )
+            message_records.append({**template, "id": str(message_id)})
 
         # Classification labels for the latest messages
         classifications = [
             {
                 "id": str(uuid.uuid4()),
-                "message_id": messages[0]["id"],
+                "message_id": message_records[0]["id"],
                 "label": "needs_reply",
                 "confidence": 0.83,
                 "rationale": "Action requested for agenda confirmation",
@@ -132,7 +138,7 @@ def main() -> None:
             },
             {
                 "id": str(uuid.uuid4()),
-                "message_id": messages[1]["id"],
+                "message_id": message_records[1]["id"],
                 "label": "transactional",
                 "confidence": 0.92,
                 "rationale": "Contains invoice/payment request",

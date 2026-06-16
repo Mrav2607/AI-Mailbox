@@ -15,12 +15,12 @@ class DemoLoginRequest(BaseModel):
     display_name: str | None = None
 
 
-@router.get("/auth/providers")
+@router.get("/providers")
 async def list_providers() -> dict:
     return {"providers": ["gmail", "outlook"]}
 
 
-@router.post("/auth/demo-login")
+@router.post("/demo-login")
 def demo_login(payload: DemoLoginRequest, db: Session = Depends(get_db)) -> dict:
     """
     Minimal user bootstrap for local dev. Creates the user record if missing.
@@ -41,7 +41,7 @@ def demo_login(payload: DemoLoginRequest, db: Session = Depends(get_db)) -> dict
     }
 
 
-@router.get("/auth/{user_id}/connections")
+@router.get("/{user_id}/connections")
 def list_connections(user_id: UUID, db: Session = Depends(get_db)) -> dict:
     connections = (
         db.query(ProviderAccount)

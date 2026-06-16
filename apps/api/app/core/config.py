@@ -1,8 +1,17 @@
-from pydantic_settings import BaseSettings
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=(
+            Path(__file__).resolve().parents[4] / ".env",
+            Path(__file__).resolve().parents[2] / ".env",
+        )
+    )
+
     # Blueprint-aligned settings
     app_env: str = Field(default="dev", alias="APP_ENV")
     api_secret: str = Field(default="change_me", alias="API_SECRET")
@@ -10,6 +19,11 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
+    gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
+    gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
+    google_client_id: str | None = Field(default=None, alias="GOOGLE_CLIENT_ID")
+    google_client_secret: str | None = Field(default=None, alias="GOOGLE_CLIENT_SECRET")
+    google_redirect_uri: str | None = Field(default=None, alias="GOOGLE_REDIRECT_URI")
 
     # Back-compat aliases for earlier scaffold usages
     @property
@@ -31,9 +45,5 @@ class Settings(BaseSettings):
     @property
     def SECRET_KEY(self) -> str:  # pragma: no cover
         return self.api_secret
-
-    class Config:
-        env_file = ".env"
-
 
 settings = Settings()

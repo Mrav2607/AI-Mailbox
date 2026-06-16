@@ -12,11 +12,18 @@ router = APIRouter()
 
 @router.get("/analytics/overview")
 async def analytics_overview(user_id: UUID, db: Session = Depends(get_db)) -> dict:
-    threads_count = db.scalar(select(func.count()).where(MailThread.user_id == user_id)) or 0
+    threads_count = db.scalar(select(func.count(MailThread.id)).where(MailThread.user_id == user_id)) or 0
     messages_count = db.scalar(
-        select(func.count()).join(MailThread, MailMessage.thread_id == MailThread.id).where(MailThread.user_id == user_id)
+        select(func.count(MailMessage.id))
+        .select_from(MailMessage)
+        .join(MailThread, MailMessage.thread_id == MailThread.id)
+        .where(MailThread.user_id == user_id)
     ) or 0
     classified_count = db.scalar(
-        select(func.count()).join(MailMessage, Classification.message_id == MailMessage.id).join(MailThread, MailMessage.thread_id == MailThread.id).where(MailThread.user_id == user_id)
+        select(func.count(Classification.id))
+        .select_from(Classification)
+        .join(MailMessage, Classification.message_id == MailMessage.id)
+        .join(MailThread, MailMessage.thread_id == MailThread.id)
+        .where(MailThread.user_id == user_id)
     ) or 0
     return {"summary": {"threads": threads_count, "messages": messages_count, "classified": classified_count}}

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Text, TIMESTAMP, ForeignKey, UniqueConstraint
+from sqlalchemy import DateTime, Text, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -31,11 +32,11 @@ class MailMessage(Base):
     recipient: Mapped[list[str] | None] = mapped_column(ARRAY(Text()))
     cc: Mapped[list[str] | None] = mapped_column(ARRAY(Text()))
     bcc: Mapped[list[str] | None] = mapped_column(ARRAY(Text()))
-    sent_at: Mapped[TIMESTAMP | None] = mapped_column(TIMESTAMP(timezone=True))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     snippet: Mapped[str | None] = mapped_column(Text)
     body_text: Mapped[str | None] = mapped_column(Text)
     body_html: Mapped[str | None] = mapped_column(Text)
     headers: Mapped[dict | None] = mapped_column(JSONB)
-    created_at: Mapped[TIMESTAMP] = mapped_column(
-        TIMESTAMP(timezone=True), server_default="now()"
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default="now()"
     )
