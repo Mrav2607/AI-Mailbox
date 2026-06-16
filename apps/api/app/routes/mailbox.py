@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+import time
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -6,17 +8,15 @@ from sqlalchemy.orm import Session
 
 from app.deps import get_db
 from app.db.models import MailThread, MailMessage, Classification
+from app.services.ingest.gmail_ingest import ingest_gmail_messages
+from app.workers.tasks_nlp import classify_latest_threads
+from app.services.nlp.classifier import classify
 
 router = APIRouter(prefix="/mail")
 
 
 @router.get("/triage")
-def get_triage(
-    user_id: UUID,
-    bucket: str = "needs_reply",
-    limit: int = 50,
-    db: Session = Depends(get_db),
-) -> dict:
+def get_triage(user_id: UUID, bucket: str = "needs_reply", limit: int = 50, db: Session = Depends(get_db)) -> dict:
     """
     Fetch recent threads for a user with latest classification label.
     """
@@ -24,7 +24,10 @@ def get_triage(
         db.execute(
             select(MailThread)
             .where(MailThread.user_id == user_id)
-            .order_by(desc(MailThread.last_message_at.nullslast()), desc(MailThread.created_at))
+            .order_by(
+                MailThread.last_message_at.desc().nullslast(),
+                MailThread.created_at.desc(),
+            )
             .limit(limit)
         )
         .scalars()
@@ -36,13 +39,30 @@ def get_triage(
         db.execute(
             select(MailMessage)
             .where(MailMessage.thread_id.in_(thread_ids))
-            .order_by(desc(MailMessage.sent_at.nullslast()), desc(MailMessage.created_at))
+            .order_by(
+                MailMessage.sent_at.desc().nullslast(),
+                MailMessage.created_at.desc(),
+            )
         )
         .scalars()
         .all()
         if thread_ids
         else []
     )
+    latest_message_by_thread: dict[UUID, MailMessage] = {}
+    for message in messages:
+        message_time = message.sent_at or message.created_at
+        if not message_time:
+            message_time = datetime.min.replace(tzinfo=timezone.utc)
+        current = latest_message_by_thread.get(message.thread_id)
+        if not current:
+            latest_message_by_thread[message.thread_id] = message
+            continue
+        current_time = current.sent_at or current.created_at
+        if not current_time:
+            current_time = datetime.min.replace(tzinfo=timezone.utc)
+        if message_time > current_time:
+            latest_message_by_thread[message.thread_id] = message
     latest_classifications = (
         db.execute(
             select(Classification)
@@ -59,15 +79,16 @@ def get_triage(
         if cls.message_id not in classifications_by_msg:
             classifications_by_msg[cls.message_id] = cls
 
-    messages_by_thread: dict[UUID, list[MailMessage]] = {}
-    for message in messages:
-        messages_by_thread.setdefault(message.thread_id, []).append(message)
-
     items = []
     for thread in threads:
-        msg_list = messages_by_thread.get(thread.id, [])
-        latest_message = msg_list[0] if msg_list else None
+        latest_message = latest_message_by_thread.get(thread.id)
         classification = classifications_by_msg.get(latest_message.id) if latest_message else None
+        if bucket != "all":
+            if bucket == "unclassified" and classification is not None:
+                continue
+            if bucket not in ("all", "unclassified"):
+                if not classification or classification.label != bucket:
+                    continue
         items.append(
             {
                 "thread_id": str(thread.id),
@@ -77,6 +98,7 @@ def get_triage(
                 "classification": {
                     "label": classification.label if classification else None,
                     "confidence": float(classification.confidence) if classification and classification.confidence is not None else None,
+                    "model_version": classification.model_version if classification else None,
                 },
             }
         )
@@ -92,7 +114,10 @@ def get_thread(thread_id: UUID, db: Session = Depends(get_db)) -> dict:
         db.execute(
             select(MailMessage)
             .where(MailMessage.thread_id == thread_id)
-            .order_by(desc(MailMessage.sent_at.nullslast()), desc(MailMessage.created_at))
+            .order_by(
+                MailMessage.sent_at.desc().nullslast(),
+                MailMessage.created_at.desc(),
+            )
         )
         .scalars()
         .all()
@@ -115,3 +140,126 @@ def get_thread(thread_id: UUID, db: Session = Depends(get_db)) -> dict:
             for m in messages
         ],
     }
+
+
+@router.post("/ingest/gmail")
+def ingest_gmail(user_id: UUID, max_results: int = 25, db: Session = Depends(get_db)) -> dict:
+    try:
+        result = ingest_gmail_messages(db=db, user_id=str(user_id), max_results=max_results)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "ok", **result}
+
+
+@router.post("/classify/backfill")
+def backfill_classifications(
+    user_id: UUID,
+    limit: int = 100,
+    force: bool = False,
+    delay_ms: int = 300,
+    db: Session = Depends(get_db),
+) -> dict:
+    threads = (
+        db.execute(
+            select(MailThread)
+            .where(MailThread.user_id == user_id)
+            .order_by(
+                MailThread.last_message_at.desc().nullslast(),
+                MailThread.created_at.desc(),
+            )
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+    thread_ids = [t.id for t in threads]
+    messages = (
+        db.execute(
+            select(MailMessage)
+            .where(MailMessage.thread_id.in_(thread_ids))
+            .order_by(
+                MailMessage.sent_at.desc().nullslast(),
+                MailMessage.created_at.desc(),
+            )
+        )
+        .scalars()
+        .all()
+        if thread_ids
+        else []
+    )
+    latest_message_by_thread: dict[UUID, MailMessage] = {}
+    for message in messages:
+        message_time = message.sent_at or message.created_at
+        if not message_time:
+            message_time = datetime.min.replace(tzinfo=timezone.utc)
+        current = latest_message_by_thread.get(message.thread_id)
+        if not current:
+            latest_message_by_thread[message.thread_id] = message
+            continue
+        current_time = current.sent_at or current.created_at
+        if not current_time:
+            current_time = datetime.min.replace(tzinfo=timezone.utc)
+        if message_time > current_time:
+            latest_message_by_thread[message.thread_id] = message
+
+    message_ids = [m.id for m in latest_message_by_thread.values()]
+    existing = (
+        db.execute(select(Classification).where(Classification.message_id.in_(message_ids)))
+        .scalars()
+        .all()
+        if message_ids
+        else []
+    )
+    classified_by_id = {c.message_id: c for c in existing}
+
+    created = 0
+    for message in latest_message_by_thread.values():
+        existing_cls = classified_by_id.get(message.id)
+        if existing_cls and not force:
+            continue
+        text_for_classification = " ".join(
+            [
+                message.snippet or "",
+                message.body_text or "",
+            ]
+        ).strip()
+        label, confidence, rationale, model_version = classify(text_for_classification)
+        if existing_cls:
+            existing_cls.label = label
+            existing_cls.confidence = confidence
+            existing_cls.rationale = rationale
+            existing_cls.model_version = model_version
+        else:
+            db.add(
+                Classification(
+                    message_id=message.id,
+                    label=label,
+                    confidence=confidence,
+                    rationale=rationale,
+                    model_version=model_version,
+                )
+            )
+        created += 1
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000)
+
+    db.commit()
+    return {
+        "status": "ok",
+        "created": created,
+        "scanned": len(latest_message_by_thread),
+        "delay_ms": delay_ms,
+    }
+
+
+@router.post("/classify/queue")
+def queue_classification(
+    user_id: UUID, limit: int = 25, delay_seconds: int = 12, force: bool = False
+) -> dict:
+    task = classify_latest_threads.delay(
+        user_id=str(user_id),
+        limit=limit,
+        delay_seconds=delay_seconds,
+        force=force,
+    )
+    return {"status": "queued", "task_id": task.id}

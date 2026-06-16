@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Text, Numeric, TIMESTAMP, ForeignKey, Index
+from sqlalchemy import DateTime, Float, Text, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -27,9 +28,9 @@ class Classification(Base):
         UUID(as_uuid=True), ForeignKey("mail_message.id", ondelete="CASCADE")
     )
     label: Mapped[str | None] = mapped_column(Text)
-    confidence: Mapped[Numeric | None] = mapped_column(Numeric)
+    confidence: Mapped[float | None] = mapped_column(Float)
     rationale: Mapped[str | None] = mapped_column(Text)
     model_version: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[TIMESTAMP] = mapped_column(
-        TIMESTAMP(timezone=True), server_default="now()"
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default="now()"
     )

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Text, TIMESTAMP, ForeignKey, UniqueConstraint
+from sqlalchemy import DateTime, Text, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -33,7 +34,7 @@ class MailThread(Base):
     provider: Mapped[str] = mapped_column(Text, nullable=False)
     provider_thread_id: Mapped[str] = mapped_column(Text, nullable=False)
     subject: Mapped[str | None] = mapped_column(Text)
-    last_message_at: Mapped[TIMESTAMP | None] = mapped_column(TIMESTAMP(timezone=True))
-    created_at: Mapped[TIMESTAMP] = mapped_column(
-        TIMESTAMP(timezone=True), server_default="now()"
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default="now()"
     )

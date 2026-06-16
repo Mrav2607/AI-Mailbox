@@ -25,6 +25,12 @@ dependencies = [
   "markdown-it-py",
   "tiktoken",
   "pgvector>=0.2.5",
+  "google-genai>=1.9.0",
+  "pydantic[email]>=2.0.0",
+  # Pulled in transitively by google-genai -> google-auth. Pin to a range that
+  # ships prebuilt wheels so pip never falls back to compiling the sdist, which
+  # requires a Rust toolchain (maturin) that isn't available locally.
+  "cryptography>=42.0,<50",
 ]
 
 [project.optional-dependencies]

@@ -1,7 +1,36 @@
+from __future__ import annotations
+
+from typing import Any
+
+import httpx
+
+
 class GmailClient:
-    def __init__(self, token: str | None = None):
+    def __init__(self, token: str):
         self.token = token
 
-    def list_messages(self, user_id: str) -> list[dict]:
-        # Placeholder
-        return []
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}"}
+
+    def list_messages(self, max_results: int = 50, page_token: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"maxResults": max_results}
+        if page_token:
+            params["pageToken"] = page_token
+        resp = httpx.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            headers=self._headers(),
+            params=params,
+            timeout=20.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_message(self, message_id: str) -> dict[str, Any]:
+        resp = httpx.get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+            headers=self._headers(),
+            params={"format": "full"},
+            timeout=20.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
