@@ -17,6 +17,7 @@ dependencies = [
   "alembic>=1.13",
   "python-dotenv",
   "httpx>=0.27",
+  "pyjwt>=2.8",
   "redis>=5.0",
   "celery>=5.3",
   "tenacity>=8.2",

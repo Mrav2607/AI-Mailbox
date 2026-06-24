@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     # Blueprint-aligned settings
     app_env: str = Field(default="dev", alias="APP_ENV")
     api_secret: str = Field(default="change_me", alias="API_SECRET")
+    # Session tokens (HS256 JWT) are signed with api_secret. Set a strong
+    # API_SECRET in production -- anyone with it can mint valid tokens.
+    jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
+    access_token_expires_minutes: int = Field(
+        default=60 * 24 * 7, alias="ACCESS_TOKEN_EXPIRES_MINUTES"  # 7 days
+    )
     database_url: str = Field(default="postgresql+psycopg://user:pass@localhost:5432/ai_mailbox", alias="DATABASE_URL")
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")

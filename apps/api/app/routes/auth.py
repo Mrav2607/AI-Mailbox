@@ -1,10 +1,9 @@
-from uuid import UUID
-
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
-from app.deps import get_db
+from app.core.security import create_access_token
+from app.deps import get_db, get_current_user
 from app.db.models import AppUser, ProviderAccount
 
 router = APIRouter()
@@ -23,7 +22,11 @@ async def list_providers() -> dict:
 @router.post("/demo-login")
 def demo_login(payload: DemoLoginRequest, db: Session = Depends(get_db)) -> dict:
     """
-    Minimal user bootstrap for local dev. Creates the user record if missing.
+    Minimal user bootstrap for local dev. Creates the user record if missing
+    and returns a session token for subsequent authenticated requests.
+
+    DEV convenience only -- it verifies no credential, so it must not be
+    exposed in production. Real sign-in goes through Google OAuth.
     """
     email = payload.email.lower()
     user = db.query(AppUser).filter(AppUser.email == email).first()
@@ -33,19 +36,23 @@ def demo_login(payload: DemoLoginRequest, db: Session = Depends(get_db)) -> dict
         db.commit()
         db.refresh(user)
     return {
+        "access_token": create_access_token(str(user.id)),
+        "token_type": "bearer",
         "user": {
             "id": str(user.id),
             "email": user.email,
             "display_name": user.display_name,
-        }
+        },
     }
 
 
-@router.get("/{user_id}/connections")
-def list_connections(user_id: UUID, db: Session = Depends(get_db)) -> dict:
+@router.get("/connections")
+def list_connections(
+    current_user: AppUser = Depends(get_current_user), db: Session = Depends(get_db)
+) -> dict:
     connections = (
         db.query(ProviderAccount)
-        .filter(ProviderAccount.user_id == user_id)
+        .filter(ProviderAccount.user_id == current_user.id)
         .order_by(ProviderAccount.created_at.desc())
         .all()
     )

@@ -1,6 +1,14 @@
 from collections.abc import Generator
+from uuid import UUID
 
+import jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
+
+from .core.security import decode_access_token
 from .db.base import SessionLocal
+from .db.models import AppUser
 
 
 def get_db() -> Generator:
@@ -12,3 +20,36 @@ def get_db() -> Generator:
         yield db
     finally:
         db.close()
+
+
+# auto_error=False so we can raise our own 401 (HTTPBearer defaults to 403).
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+_UNAUTHENTICATED = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Not authenticated",
+    headers={"WWW-Authenticate": "Bearer"},
+)
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+    db: Session = Depends(get_db),
+) -> AppUser:
+    """Resolve the authenticated AppUser from a ``Bearer`` session token.
+
+    Raises 401 if the token is missing, invalid, expired, or no longer maps to
+    a real user. Routes depend on this instead of trusting a ``user_id`` param.
+    """
+    if credentials is None or not credentials.credentials:
+        raise _UNAUTHENTICATED
+    try:
+        payload = decode_access_token(credentials.credentials)
+        user_id = UUID(payload["sub"])
+    except (jwt.PyJWTError, KeyError, ValueError, TypeError) as exc:
+        raise _UNAUTHENTICATED from exc
+
+    user = db.get(AppUser, user_id)
+    if user is None:
+        raise _UNAUTHENTICATED
+    return user
