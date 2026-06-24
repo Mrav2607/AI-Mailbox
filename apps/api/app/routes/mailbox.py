@@ -5,8 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, desc
 from sqlalchemy.orm import Session
 
-from app.deps import get_db
-from app.db.models import MailThread, MailMessage, Classification
+from app.deps import get_db, get_current_user
+from app.db.models import MailThread, MailMessage, Classification, AppUser
 from app.services.ingest.gmail_ingest import ingest_gmail_messages
 from app.workers.tasks_nlp import classify_latest_threads
 from app.services.nlp.classifier import classify, build_classification_text
@@ -15,14 +15,19 @@ router = APIRouter(prefix="/mail")
 
 
 @router.get("/triage")
-def get_triage(user_id: UUID, bucket: str = "needs_reply", limit: int = 50, db: Session = Depends(get_db)) -> dict:
+def get_triage(
+    bucket: str = "needs_reply",
+    limit: int = 50,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
     """
-    Fetch recent threads for a user with latest classification label.
+    Fetch recent threads for the authenticated user with latest classification label.
     """
     threads = (
         db.execute(
             select(MailThread)
-            .where(MailThread.user_id == user_id)
+            .where(MailThread.user_id == current_user.id)
             .order_by(
                 MailThread.last_message_at.desc().nullslast(),
                 MailThread.created_at.desc(),
@@ -105,9 +110,14 @@ def get_triage(user_id: UUID, bucket: str = "needs_reply", limit: int = 50, db: 
 
 
 @router.get("/thread/{thread_id}")
-def get_thread(thread_id: UUID, db: Session = Depends(get_db)) -> dict:
+def get_thread(
+    thread_id: UUID,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
     thread = db.get(MailThread, thread_id)
-    if not thread:
+    # 404 (not 403) for another user's thread so we don't leak that it exists.
+    if not thread or thread.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Thread not found")
     messages = (
         db.execute(
@@ -143,16 +153,16 @@ def get_thread(thread_id: UUID, db: Session = Depends(get_db)) -> dict:
 
 @router.post("/ingest/gmail")
 def ingest_gmail(
-    user_id: UUID,
     max_results: int = 25,
     skip_existing: bool = True,
     classify: bool = True,
+    current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
         result = ingest_gmail_messages(
             db=db,
-            user_id=str(user_id),
+            user_id=str(current_user.id),
             max_results=max_results,
             skip_existing=skip_existing,
             classify_messages=classify,
@@ -164,15 +174,15 @@ def ingest_gmail(
 
 @router.post("/classify/backfill")
 def backfill_classifications(
-    user_id: UUID,
     limit: int = 100,
     force: bool = False,
+    current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
     threads = (
         db.execute(
             select(MailThread)
-            .where(MailThread.user_id == user_id)
+            .where(MailThread.user_id == current_user.id)
             .order_by(
                 MailThread.last_message_at.desc().nullslast(),
                 MailThread.created_at.desc(),
@@ -261,10 +271,12 @@ def backfill_classifications(
 
 @router.post("/classify/queue")
 def queue_classification(
-    user_id: UUID, limit: int = 25, force: bool = False
+    limit: int = 25,
+    force: bool = False,
+    current_user: AppUser = Depends(get_current_user),
 ) -> dict:
     task = getattr(classify_latest_threads, "delay")(
-        user_id=str(user_id),
+        user_id=str(current_user.id),
         limit=limit,
         force=force,
     )

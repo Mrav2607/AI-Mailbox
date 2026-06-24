@@ -1,17 +1,18 @@
-from uuid import UUID
-
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.deps import get_db
-from app.db.models import MailThread, MailMessage, Classification
+from app.deps import get_db, get_current_user
+from app.db.models import MailThread, MailMessage, Classification, AppUser
 
 router = APIRouter()
 
 
 @router.get("/analytics/overview")
-async def analytics_overview(user_id: UUID, db: Session = Depends(get_db)) -> dict:
+async def analytics_overview(
+    current_user: AppUser = Depends(get_current_user), db: Session = Depends(get_db)
+) -> dict:
+    user_id = current_user.id
     threads_count = db.scalar(select(func.count(MailThread.id)).where(MailThread.user_id == user_id)) or 0
     messages_count = db.scalar(
         select(func.count(MailMessage.id))

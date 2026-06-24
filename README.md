@@ -78,26 +78,42 @@ Interactive API docs: http://localhost:8000/docs
 
 > Alternative to step 3: from `apps/api/app` you can run `python -m app.main`.
 
+### Authentication
+All data endpoints require a session token. Sign in to get one, then send it as
+an `Authorization: Bearer <token>` header on every request. Unauthenticated or
+expired requests get `401`.
+
+- **Dev login:** `POST /api/v1/auth/demo-login` with `{"email": "you@example.com"}`
+  returns `{ access_token, token_type, user }`. It verifies no password, so it is
+  dev-only.
+- **Real login (Gmail):** `GET /api/v1/auth/google/start` returns an `auth_url`;
+  complete consent and the callback returns an `access_token` for that Google
+  account (the user is created on first sign-in).
+
+Tokens are HS256 JWTs signed with `API_SECRET` and expire after
+`ACCESS_TOKEN_EXPIRES_MINUTES` (default 7 days).
+
 ### Triage demo data (optional, local only)
 - The demo-data seed scripts live under `scripts/` (git-ignored) and are **not**
   required to run the app — the primary data path is Gmail ingest (below).
 - If you have a seed script locally, run it to create a demo user and messages,
-  then use the demo email `demo@example.com` with `/api/v1/auth/demo-login` to
-  get the `user_id`.
-- Call `/api/v1/mail/triage?user_id=<uuid>` to see the seeded threads and classifications.
+  then `POST /api/v1/auth/demo-login` with that user's email to get a token.
+- Call `GET /api/v1/mail/triage` (with the bearer token) to see the seeded
+  threads and classifications.
 
 ### Gmail OAuth (dev)
 1. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URI` in `.env`.
-2. Create a demo user via `POST /api/v1/auth/demo-login` and copy the `user_id`.
-3. Visit `/api/v1/auth/google/start?user_id=<uuid>` to get an `auth_url` and complete consent.
-4. After redirect, the callback will store a Gmail provider account and tokens in `provider_account`.
+2. `GET /api/v1/auth/google/start` to get an `auth_url`, then complete consent.
+3. The callback creates/links the Gmail account, stores tokens in
+   `provider_account`, and returns an `access_token` to use for the calls below.
 
 ### Gmail ingest (dev)
-1. Ensure Gmail OAuth is connected and you have a `provider_account` for the user.
-2. Trigger ingest: `POST /api/v1/mail/ingest/gmail?user_id=<uuid>&max_results=25`.
-3. Fetch triage: `GET /api/v1/mail/triage?user_id=<uuid>`.
+All calls below require the `Authorization: Bearer <token>` header.
+1. Ensure Gmail OAuth is connected for the signed-in user.
+2. Trigger ingest: `POST /api/v1/mail/ingest/gmail?max_results=25`.
+3. Fetch triage: `GET /api/v1/mail/triage`.
 4. If some threads are missing classifications, run backfill:
-   `POST /api/v1/mail/classify/backfill?user_id=<uuid>&limit=100`.
+   `POST /api/v1/mail/classify/backfill?limit=100`.
 
 ### Triage buckets
 - `bucket=needs_reply` filters to items classified as needs_reply.
@@ -125,5 +141,8 @@ and point `CLASSIFIER_MODEL_PATH` at the output directory. Until then, run with
 
 ## Notes for local API usage
 
-- Use `/api/v1/auth/demo-login` to create a dev user record (stores only email + display name).
-- Pass `user_id` (UUID from the demo login response) to `/api/v1/mail/triage`, `/api/v1/mail/thread/{id}`, and `/api/v1/analytics/overview` to query data.
+- Use `/api/v1/auth/demo-login` to create a dev user and get an `access_token`.
+- Send `Authorization: Bearer <access_token>` on data endpoints
+  (`/api/v1/mail/*`, `/api/v1/analytics/overview`, `/api/v1/auth/connections`);
+  the user is derived from the token, so no `user_id` is passed. In the
+  interactive docs (`/docs`), click **Authorize** and paste the token.
