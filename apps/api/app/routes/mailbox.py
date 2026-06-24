@@ -1,5 +1,4 @@
 from datetime import datetime, timezone
-import time
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -10,7 +9,7 @@ from app.deps import get_db
 from app.db.models import MailThread, MailMessage, Classification
 from app.services.ingest.gmail_ingest import ingest_gmail_messages
 from app.workers.tasks_nlp import classify_latest_threads
-from app.services.nlp.classifier import classify
+from app.services.nlp.classifier import classify, build_classification_text
 
 router = APIRouter(prefix="/mail")
 
@@ -143,9 +142,21 @@ def get_thread(thread_id: UUID, db: Session = Depends(get_db)) -> dict:
 
 
 @router.post("/ingest/gmail")
-def ingest_gmail(user_id: UUID, max_results: int = 25, db: Session = Depends(get_db)) -> dict:
+def ingest_gmail(
+    user_id: UUID,
+    max_results: int = 25,
+    skip_existing: bool = True,
+    classify: bool = True,
+    db: Session = Depends(get_db),
+) -> dict:
     try:
-        result = ingest_gmail_messages(db=db, user_id=str(user_id), max_results=max_results)
+        result = ingest_gmail_messages(
+            db=db,
+            user_id=str(user_id),
+            max_results=max_results,
+            skip_existing=skip_existing,
+            classify_messages=classify,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "ok", **result}
@@ -156,7 +167,6 @@ def backfill_classifications(
     user_id: UUID,
     limit: int = 100,
     force: bool = False,
-    delay_ms: int = 300,
     db: Session = Depends(get_db),
 ) -> dict:
     threads = (
@@ -202,6 +212,7 @@ def backfill_classifications(
         if message_time > current_time:
             latest_message_by_thread[message.thread_id] = message
 
+    subject_by_thread = {t.id: t.subject for t in threads}
     message_ids = [m.id for m in latest_message_by_thread.values()]
     existing = (
         db.execute(select(Classification).where(Classification.message_id.in_(message_ids)))
@@ -217,12 +228,11 @@ def backfill_classifications(
         existing_cls = classified_by_id.get(message.id)
         if existing_cls and not force:
             continue
-        text_for_classification = " ".join(
-            [
-                message.snippet or "",
-                message.body_text or "",
-            ]
-        ).strip()
+        text_for_classification = build_classification_text(
+            subject_by_thread.get(message.thread_id),
+            message.snippet,
+            message.body_text,
+        )
         label, confidence, rationale, model_version = classify(text_for_classification)
         if existing_cls:
             existing_cls.label = label
@@ -240,26 +250,22 @@ def backfill_classifications(
                 )
             )
         created += 1
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000)
 
     db.commit()
     return {
         "status": "ok",
         "created": created,
         "scanned": len(latest_message_by_thread),
-        "delay_ms": delay_ms,
     }
 
 
 @router.post("/classify/queue")
 def queue_classification(
-    user_id: UUID, limit: int = 25, delay_seconds: int = 12, force: bool = False
+    user_id: UUID, limit: int = 25, force: bool = False
 ) -> dict:
-    task = classify_latest_threads.delay(
+    task = getattr(classify_latest_threads, "delay")(
         user_id=str(user_id),
         limit=limit,
-        delay_seconds=delay_seconds,
         force=force,
     )
     return {"status": "queued", "task_id": task.id}

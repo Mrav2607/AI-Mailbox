@@ -1,0 +1,18 @@
+# ML training/serving dependencies (heavy -- install into the apps/api venv).
+#
+# STEP 1 -- install PyTorch with CUDA FIRST, from PyTorch's own index.
+# Pick the build matching your GPU/driver (cu124 works for most recent NVIDIA
+# setups). See https://pytorch.org/get-started/locally/ if unsure.
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+#
+# Verify the GPU is visible before training:
+#   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+#
+# STEP 2 -- then install the rest from regular PyPI:
+#   pip install -r ml/requirements.txt
+
+transformers>=4.48
+accelerate>=0.30
+scikit-learn>=1.3
+numpy>=1.26

@@ -35,6 +35,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff", "mypy"]
+# Required only for CLASSIFIER_BACKEND=local (in-process fine-tuned encoder).
+# Omit to run with the gemini/heuristic backends and a lean image.
+local-classifier = ["torch>=2.2", "transformers>=4.40"]
 
 [tool.uvicorn]
 factory = false

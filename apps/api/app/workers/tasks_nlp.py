@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -9,7 +8,7 @@ from sqlalchemy import select, desc
 from .celery_app import celery_app
 from app.db.base import SessionLocal
 from app.db.models import MailThread, MailMessage, Classification
-from app.services.nlp.classifier import classify
+from app.services.nlp.classifier import classify, build_classification_text
 
 
 @celery_app.task
@@ -18,12 +17,12 @@ def classify_message(message_id: str) -> dict:
         message = db.get(MailMessage, UUID(message_id))
         if not message:
             return {"message_id": message_id, "status": "missing"}
-        text_for_classification = " ".join(
-            [
-                message.snippet or "",
-                message.body_text or "",
-            ]
-        ).strip()
+        thread = db.get(MailThread, message.thread_id)
+        text_for_classification = build_classification_text(
+            thread.subject if thread else None,
+            message.snippet,
+            message.body_text,
+        )
         label, confidence, rationale, model_version = classify(text_for_classification)
         db.add(
             Classification(
@@ -40,10 +39,10 @@ def classify_message(message_id: str) -> dict:
 
 @celery_app.task
 def classify_latest_threads(
-    user_id: str, limit: int = 25, delay_seconds: int = 12, force: bool = False
+    user_id: str, limit: int = 25, force: bool = False
 ) -> dict:
     """
-    Rate-limited classification: 5 RPM default (12s delay).
+    Classify the latest message in each of the user's most recent threads.
     """
     with SessionLocal() as db:
         threads = (
@@ -89,6 +88,7 @@ def classify_latest_threads(
             if message_time > current_time:
                 latest_message_by_thread[message.thread_id] = message
 
+        subject_by_thread = {t.id: t.subject for t in threads}
         message_ids = [m.id for m in latest_message_by_thread.values()]
         existing = (
             db.execute(select(Classification).where(Classification.message_id.in_(message_ids)))
@@ -105,12 +105,11 @@ def classify_latest_threads(
             existing_cls = classified_by_id.get(message.id)
             if existing_cls and not force:
                 continue
-            text_for_classification = " ".join(
-                [
-                    message.snippet or "",
-                    message.body_text or "",
-                ]
-            ).strip()
+            text_for_classification = build_classification_text(
+                subject_by_thread.get(message.thread_id),
+                message.snippet,
+                message.body_text,
+            )
             label, confidence, rationale, model_version = classify(text_for_classification)
             if existing_cls:
                 existing_cls.label = label
@@ -130,7 +129,5 @@ def classify_latest_threads(
                 created += 1
             db.commit()
             processed += 1
-            if delay_seconds > 0 and processed < len(latest_message_by_thread):
-                time.sleep(delay_seconds)
 
         return {"status": "ok", "created": created, "processed": processed}

@@ -10,15 +10,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
+from app.core.config import settings  # noqa: E402
 from app.db.base import Base  # noqa: E402
 # Import models so metadata is populated for autogenerate
 import app.db.models  # noqa: F401,E402
 
 config = context.config
 section = config.get_section(config.config_ini_section) or {}
-section["sqlalchemy.url"] = os.getenv(
-    "DATABASE_URL", "postgresql+psycopg://user:pass@localhost:5432/ai_mailbox"
-)
+# Prefer an explicit shell DATABASE_URL; otherwise fall back to the value in
+# .env (loaded by Settings). Run locally with a host of "localhost" -- the
+# "db" hostname only resolves inside the Docker Compose network.
+section["sqlalchemy.url"] = os.getenv("DATABASE_URL", settings.database_url)
 
 # Use ORM metadata for autogenerate (kept in sync with alembic revision 0001)
 target_metadata = Base.metadata
