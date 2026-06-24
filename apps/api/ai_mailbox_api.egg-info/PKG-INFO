@@ -21,6 +21,7 @@ Requires-Dist: markdown-it-py
 Requires-Dist: tiktoken
 Requires-Dist: pgvector>=0.2.5
 Requires-Dist: google-genai>=1.9.0
+Requires-Dist: pydantic[email]>=2.0.0
 Requires-Dist: cryptography<50,>=42.0
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"

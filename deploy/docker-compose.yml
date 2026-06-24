@@ -1,11 +1,10 @@
-version: "3.9"
 services:
   db:
     image: postgres:15
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: pass
-      POSTGRES_DB: ai_mailbox
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
@@ -16,11 +15,10 @@ services:
       - "6379:6379"
   api:
     build:
-      context: ../apps/api
-      dockerfile: ../../deploy/Dockerfile.api
-    environment:
-      DATABASE_URL: postgresql+psycopg://user:pass@db:5432/ai_mailbox
-      REDIS_URL: redis://redis:6379/0
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    env_file:
+      - .env
     ports:
       - "8000:8000"
     depends_on:

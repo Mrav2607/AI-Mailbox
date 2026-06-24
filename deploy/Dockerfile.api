@@ -1,7 +1,23 @@
+# Build context is the repo ROOT (see deploy/docker-compose.yml) so we can copy
+# both the API package (apps/api) and the trained model (models/) into the image.
 FROM python:3.11-slim
 WORKDIR /app
-COPY ./pyproject.toml ./
-RUN pip install --upgrade pip && pip install -e .
-COPY ./app ./app
-ENV PORT=8000
+
+COPY apps/api/pyproject.toml ./pyproject.toml
+COPY apps/api/app ./app
+
+# Install CPU-only torch first (the default PyPI wheel bundles CUDA and is
+# multi-GB), then the API plus the "local-classifier" extra (transformers) on
+# top of the already-satisfied torch.
+RUN pip install --upgrade pip \
+ && pip install torch --index-url https://download.pytorch.org/whl/cpu \
+ && pip install -e ".[local-classifier]"
+
+# Bake the fine-tuned classifier in so CLASSIFIER_BACKEND=local serves in-process.
+# Last so model retrains don't bust the dependency layer cache.
+COPY models/email-classifier ./models/email-classifier
+
+ENV PORT=8000 \
+    CLASSIFIER_BACKEND=local \
+    CLASSIFIER_MODEL_PATH=/app/models/email-classifier
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

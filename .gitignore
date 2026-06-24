@@ -36,3 +36,8 @@ coverage.xml
 # Project specific
 ai-mailbox/apps/api/dev.db
 ai-mailbox/apps/api/receipts_export.csv
+
+# ML artifacts & datasets & data scripts
+models/
+data/
+scripts/

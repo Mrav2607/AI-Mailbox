@@ -1,0 +1,30 @@
+# Build context is the repo root (deploy/docker-compose.yml). The API image only
+# needs apps/api/pyproject.toml, apps/api/app, and models/email-classifier.
+
+# Virtualenvs / Python caches
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.egg-info/
+
+# VCS & local secrets (never bake .env into the image)
+.git/
+.gitignore
+**/.env
+.env
+
+# Data, training, and tooling not used at serve time
+data/
+ml/
+scripts/
+logs/
+notebooks/
+apps/api/tests/
+
+# Training checkpoints are a full duplicate of the model + optimizer state;
+# serving only reads models/email-classifier/{config,tokenizer,model.safetensors,labels.json}
+models/*/checkpoints/

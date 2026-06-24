@@ -12,7 +12,7 @@ from app.db.models import MailThread, MailMessage, ProviderAccount, Classificati
 from app.core.config import settings
 from app.services.ingest.gmail_client import GmailClient
 from app.services.ingest.normalizer import normalize_message
-from app.services.nlp.classifier import classify
+from app.services.nlp.classifier import classify, build_classification_text
 
 
 def _refresh_access_token(provider: ProviderAccount) -> tuple[str | None, datetime | None]:
@@ -41,7 +41,15 @@ def _refresh_access_token(provider: ProviderAccount) -> tuple[str | None, dateti
     return access_token, token_expiry
 
 
-def ingest_gmail_messages(db: Session, user_id: str, max_results: int = 50) -> dict[str, Any]:
+def ingest_gmail_messages(
+    db: Session,
+    user_id: str,
+    max_results: int = 50,
+    skip_existing: bool = True,
+    max_pages: int = 20,
+    classify_messages: bool = True,
+    commit_every: int = 50,
+) -> dict[str, Any]:
     provider = (
         db.execute(
             select(ProviderAccount).where(
@@ -64,27 +72,73 @@ def ingest_gmail_messages(db: Session, user_id: str, max_results: int = 50) -> d
             access_token = refreshed_token
 
     client = GmailClient(access_token)
+
+    # Messages already ingested for this user, so repeat ingests resume at the
+    # next NEW message instead of re-fetching the same newest page every time.
+    existing_ids: set[str] = set()
+    if skip_existing:
+        existing_ids = set(
+            db.execute(
+                select(MailMessage.provider_message_id)
+                .join(MailThread, MailThread.id == MailMessage.thread_id)
+                .where(MailThread.user_id == user_id)
+            )
+            .scalars()
+            .all()
+        )
+
+    def collect_new_ids() -> list[str]:
+        new_ids: list[str] = []
+        page_token: str | None = None
+        pages = 0
+        while len(new_ids) < max_results and pages < max_pages:
+            batch = client.list_messages(max_results=500, page_token=page_token)
+            for msg in batch.get("messages", []):
+                mid = msg["id"]
+                if skip_existing and mid in existing_ids:
+                    continue
+                new_ids.append(mid)
+                if len(new_ids) >= max_results:
+                    break
+            pages += 1
+            page_token = batch.get("nextPageToken")
+            if not page_token:
+                break
+        return new_ids[:max_results]
+
+    def refresh_client() -> bool:
+        """Refresh the access token and rebuild the client. Returns success."""
+        nonlocal client
+        refreshed_token, token_expiry = _refresh_access_token(provider)
+        if not refreshed_token:
+            return False
+        provider.access_token = refreshed_token
+        provider.token_expiry = token_expiry
+        db.commit()
+        client = GmailClient(refreshed_token)
+        return True
+
     try:
-        batch = client.list_messages(max_results=max_results)
+        message_ids = collect_new_ids()
     except httpx.HTTPStatusError as exc:
-        if exc.response is not None and exc.response.status_code == 401:
-            refreshed_token, token_expiry = _refresh_access_token(provider)
-            if not refreshed_token:
-                raise
-            provider.access_token = refreshed_token
-            provider.token_expiry = token_expiry
-            db.commit()
-            client = GmailClient(refreshed_token)
-            batch = client.list_messages(max_results=max_results)
+        if exc.response is not None and exc.response.status_code == 401 and refresh_client():
+            message_ids = collect_new_ids()
         else:
             raise
-    message_ids = [msg["id"] for msg in batch.get("messages", [])]
 
     threads_upserted = 0
     messages_upserted = 0
 
-    for message_id in message_ids:
-        raw = client.get_message(message_id)
+    for index, msg_id in enumerate(message_ids):
+        # The access token expires ~1h in; a large pull outlives it. Refresh on
+        # a mid-loop 401 and retry once instead of crashing (and losing work).
+        try:
+            raw = client.get_message(msg_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 401 and refresh_client():
+                raw = client.get_message(msg_id)
+            else:
+                raise
         normalized = normalize_message(raw)
         if not normalized.get("provider_message_id") or not normalized.get("provider_thread_id"):
             continue
@@ -141,38 +195,47 @@ def ingest_gmail_messages(db: Session, user_id: str, max_results: int = 50) -> d
             )
             .returning(MailMessage.id)
         )
-        message_id = db.execute(message_stmt).scalar_one()
+        new_message_id = db.execute(message_stmt).scalar_one()
         messages_upserted += 1
 
-        existing = (
-            db.execute(
-                select(Classification).where(Classification.message_id == message_id)
-            )
-            .scalars()
-            .first()
-        )
-        if not existing:
-            text_for_classification = " ".join(
-                [
-                    normalized.get("subject") or "",
-                    normalized.get("snippet") or "",
-                    normalized.get("body_text") or "",
-                ]
-            ).strip()
-            label, confidence, rationale, model_version = classify(text_for_classification)
-            db.execute(
-                insert(Classification).values(
-                    message_id=message_id,
-                    label=label,
-                    confidence=confidence,
-                    rationale=rationale,
-                    model_version=model_version,
+        # Inline classification runs the local encoder once PER message -- fine
+        # for small interactive pulls, but it dominates the runtime of a large
+        # backfill (and the data-gathering path re-labels separately). Skip it
+        # when classify_messages is False.
+        if classify_messages:
+            existing = (
+                db.execute(
+                    select(Classification).where(Classification.message_id == new_message_id)
                 )
+                .scalars()
+                .first()
             )
+            if not existing:
+                text_for_classification = build_classification_text(
+                    normalized.get("subject"),
+                    normalized.get("snippet"),
+                    normalized.get("body_text"),
+                )
+                label, confidence, rationale, model_version = classify(text_for_classification)
+                db.execute(
+                    insert(Classification).values(
+                        message_id=new_message_id,
+                        label=label,
+                        confidence=confidence,
+                        rationale=rationale,
+                        model_version=model_version,
+                    )
+                )
+
+        # Commit periodically so a late failure (e.g. token death on a multi-
+        # thousand pull) keeps everything fetched so far instead of rolling back.
+        if commit_every and (index + 1) % commit_every == 0:
+            db.commit()
 
     db.commit()
     return {
         "threads_upserted": threads_upserted,
         "messages_upserted": messages_upserted,
         "fetched": len(message_ids),
+        "skipped_existing": len(existing_ids),
     }
