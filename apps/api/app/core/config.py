@@ -1,7 +1,15 @@
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, model_validator
+
+
+# api_secret signs HS256 JWTs; HMAC-SHA256 wants a key of at least this many
+# bytes (RFC 7518 3.2), and "change_me" is the insecure scaffold default.
+_MIN_SECRET_BYTES = 32
+_PLACEHOLDER_SECRET = "change_me"
+# Environments treated as non-production, where the insecure defaults are fine.
+_DEV_ENVS = {"dev", "development", "local", "test", "testing", "ci"}
 
 
 _CONFIG_PATH = Path(__file__).resolve()
@@ -54,6 +62,47 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         """Parse CORS_ORIGINS into a clean list, dropping blanks."""
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def is_production(self) -> bool:
+        """True unless APP_ENV names a known dev/test environment."""
+        return self.app_env.strip().lower() not in _DEV_ENVS
+
+    @model_validator(mode="after")
+    def _require_secure_production_config(self) -> "Settings":
+        """Refuse to start with insecure defaults in production.
+
+        Dev keeps the convenient scaffold defaults; anything that isn't a known
+        dev env must supply real secrets. Collect every problem so the operator
+        sees them all at once instead of fixing one and hitting the next.
+        """
+        if not self.is_production:
+            return self
+
+        problems: list[str] = []
+        if self.api_secret == _PLACEHOLDER_SECRET:
+            problems.append("API_SECRET is still the insecure default 'change_me'")
+        elif len(self.api_secret.encode()) < _MIN_SECRET_BYTES:
+            problems.append(
+                f"API_SECRET must be at least {_MIN_SECRET_BYTES} bytes "
+                f"(got {len(self.api_secret.encode())})"
+            )
+
+        # Google OAuth is the real sign-in path, so its credentials are required.
+        for name, value in (
+            ("GOOGLE_CLIENT_ID", self.google_client_id),
+            ("GOOGLE_CLIENT_SECRET", self.google_client_secret),
+            ("GOOGLE_REDIRECT_URI", self.google_redirect_uri),
+        ):
+            if not value:
+                problems.append(f"{name} is required in production")
+
+        if problems:
+            raise ValueError(
+                "Insecure or incomplete production configuration (APP_ENV="
+                f"{self.app_env!r}):\n  - " + "\n  - ".join(problems)
+            )
+        return self
 
     # Back-compat aliases for earlier scaffold usages
     @property
