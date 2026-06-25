@@ -2,11 +2,15 @@ from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 
 from .core.config import settings
+from .core.errors import register_exception_handlers
 from .routes import health, auth, mailbox, analytics, auth_google_dev
 import uvicorn
 
 
 app = FastAPI(title="AI Mailbox API")
+
+# Safety-net handlers for DB and uncaught errors (consistent JSON, no leaks).
+register_exception_handlers(app)
 
 # Allow the browser frontend(s) to call the API. Origins are configurable via
 # CORS_ORIGINS; credentials are enabled so the frontend can send the bearer
