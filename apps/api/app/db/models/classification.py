@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, Text, ForeignKey, Index
+from sqlalchemy import DateTime, Float, Text, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -16,7 +16,11 @@ class Classification(Base):
     """
 
     __tablename__ = "classification"
-    __table_args__ = (Index("classification_message_idx", "message_id"),)
+    # One classification per message: the unique constraint makes that an
+    # invariant the DB enforces (so concurrent writers can't double-insert) and
+    # serves as the conflict target for upserts. It also backs message_id
+    # lookups, replacing the old non-unique index.
+    __table_args__ = (UniqueConstraint("message_id", name="uq_classification_message"),)
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

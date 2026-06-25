@@ -10,6 +10,7 @@ from app.db.models import MailThread, MailMessage, Classification, AppUser
 from app.services.ingest.gmail_ingest import ingest_gmail_messages
 from app.workers.tasks_nlp import classify_latest_threads
 from app.services.nlp.classifier import classify, build_classification_text
+from app.services.nlp.persistence import upsert_classification
 
 router = APIRouter(prefix="/mail")
 
@@ -224,19 +225,24 @@ def backfill_classifications(
 
     subject_by_thread = {t.id: t.subject for t in threads}
     message_ids = [m.id for m in latest_message_by_thread.values()]
-    existing = (
-        db.execute(select(Classification).where(Classification.message_id.in_(message_ids)))
-        .scalars()
-        .all()
+    already_classified = (
+        set(
+            db.execute(
+                select(Classification.message_id).where(
+                    Classification.message_id.in_(message_ids)
+                )
+            ).scalars()
+        )
         if message_ids
-        else []
+        else set()
     )
-    classified_by_id = {c.message_id: c for c in existing}
 
     created = 0
     for message in latest_message_by_thread.values():
-        existing_cls = classified_by_id.get(message.id)
-        if existing_cls and not force:
+        is_new = message.id not in already_classified
+        # Skip the (expensive) classify call when a label already exists and
+        # we're not forcing a refresh.
+        if not is_new and not force:
             continue
         text_for_classification = build_classification_text(
             subject_by_thread.get(message.thread_id),
@@ -244,21 +250,14 @@ def backfill_classifications(
             message.body_text,
         )
         label, confidence, rationale, model_version = classify(text_for_classification)
-        if existing_cls:
-            existing_cls.label = label
-            existing_cls.confidence = confidence
-            existing_cls.rationale = rationale
-            existing_cls.model_version = model_version
-        else:
-            db.add(
-                Classification(
-                    message_id=message.id,
-                    label=label,
-                    confidence=confidence,
-                    rationale=rationale,
-                    model_version=model_version,
-                )
-            )
+        upsert_classification(
+            db,
+            message_id=message.id,
+            label=label,
+            confidence=confidence,
+            rationale=rationale,
+            model_version=model_version,
+        )
         created += 1
 
     db.commit()
