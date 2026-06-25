@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, desc
 from sqlalchemy.orm import Session
 
@@ -9,22 +9,34 @@ from app.deps import get_db, get_current_user
 from app.db.models import MailThread, MailMessage, Classification, AppUser
 from app.services.ingest.gmail_ingest import ingest_gmail_messages
 from app.workers.tasks_nlp import classify_latest_threads
-from app.services.nlp.classifier import classify, build_classification_text
+from app.services.nlp.classifier import classify, build_classification_text, LABELS
 from app.services.nlp.persistence import upsert_classification
 
 router = APIRouter(prefix="/mail")
+
+# Upper bounds on caller-supplied counts so a single request can't ask the DB
+# (or a Gmail pull) for an unbounded amount of work.
+_MAX_PAGE_LIMIT = 200
+_MAX_INGEST_RESULTS = 500
+# Valid triage filters: every classifier label plus the two synthetic buckets.
+_TRIAGE_BUCKETS = frozenset(LABELS) | {"all", "unclassified"}
 
 
 @router.get("/triage")
 def get_triage(
     bucket: str = "needs_reply",
-    limit: int = 50,
+    limit: int = Query(default=50, ge=1, le=_MAX_PAGE_LIMIT),
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
     """
     Fetch recent threads for the authenticated user with latest classification label.
     """
+    if bucket not in _TRIAGE_BUCKETS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid bucket '{bucket}'. Valid: {sorted(_TRIAGE_BUCKETS)}",
+        )
     threads = (
         db.execute(
             select(MailThread)
@@ -154,7 +166,7 @@ def get_thread(
 
 @router.post("/ingest/gmail")
 def ingest_gmail(
-    max_results: int = 25,
+    max_results: int = Query(default=25, ge=1, le=_MAX_INGEST_RESULTS),
     skip_existing: bool = True,
     classify: bool = True,
     current_user: AppUser = Depends(get_current_user),
@@ -175,7 +187,7 @@ def ingest_gmail(
 
 @router.post("/classify/backfill")
 def backfill_classifications(
-    limit: int = 100,
+    limit: int = Query(default=100, ge=1, le=_MAX_INGEST_RESULTS),
     force: bool = False,
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -270,7 +282,7 @@ def backfill_classifications(
 
 @router.post("/classify/queue")
 def queue_classification(
-    limit: int = 25,
+    limit: int = Query(default=25, ge=1, le=_MAX_INGEST_RESULTS),
     force: bool = False,
     current_user: AppUser = Depends(get_current_user),
 ) -> dict:
