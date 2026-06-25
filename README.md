@@ -93,6 +93,10 @@ expired requests get `401`.
 Tokens are HS256 JWTs signed with `API_SECRET` and expire after
 `ACCESS_TOKEN_EXPIRES_MINUTES` (default 7 days).
 
+A browser frontend must be served from an origin listed in `CORS_ORIGINS`
+(comma-separated; defaults cover `http://localhost:3000` and
+`http://localhost:5173`). Other origins are blocked by the browser.
+
 ### Triage demo data (optional, local only)
 - The demo-data seed scripts live under `scripts/` (git-ignored) and are **not**
   required to run the app — the primary data path is Gmail ingest (below).

@@ -1,9 +1,23 @@
 from fastapi import FastAPI, APIRouter
+from fastapi.middleware.cors import CORSMiddleware
+
+from .core.config import settings
 from .routes import health, auth, mailbox, analytics, auth_google_dev
 import uvicorn
 
 
 app = FastAPI(title="AI Mailbox API")
+
+# Allow the browser frontend(s) to call the API. Origins are configurable via
+# CORS_ORIGINS; credentials are enabled so the frontend can send the bearer
+# token (and so a future cookie-based flow keeps working).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(health.router, prefix="/api/v1")
 app.include_router(auth.router, prefix="/api/v1/auth")
