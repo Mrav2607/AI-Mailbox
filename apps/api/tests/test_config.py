@@ -5,6 +5,7 @@ can't bleed real values into the assertions.
 """
 
 import pytest
+from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
 from app.core.config import Settings
@@ -17,6 +18,7 @@ PROD_OK = dict(
     GOOGLE_CLIENT_ID="cid",
     GOOGLE_CLIENT_SECRET="sec",
     GOOGLE_REDIRECT_URI="https://app.example.com/callback",
+    TOKEN_ENCRYPTION_KEY=Fernet.generate_key().decode(),
 )
 
 
@@ -49,6 +51,18 @@ def test_production_requires_google_credentials():
         Settings(**cfg)
 
 
+def test_production_requires_token_encryption_key():
+    cfg = PROD_OK | {"TOKEN_ENCRYPTION_KEY": None}
+    with pytest.raises(ValidationError, match="TOKEN_ENCRYPTION_KEY"):
+        Settings(**cfg)
+
+
+def test_malformed_token_encryption_key_rejected_in_any_env():
+    # A non-Fernet key must fail at boot, in dev too -- not at first use.
+    with pytest.raises(ValidationError, match="TOKEN_ENCRYPTION_KEY"):
+        Settings(_env_file=None, TOKEN_ENCRYPTION_KEY="not-a-valid-fernet-key")
+
+
 def test_production_reports_all_problems_at_once():
     with pytest.raises(ValidationError) as exc_info:
         Settings(_env_file=None, APP_ENV="production")
@@ -56,3 +70,4 @@ def test_production_reports_all_problems_at_once():
     assert "API_SECRET" in message
     assert "GOOGLE_CLIENT_ID" in message
     assert "GOOGLE_REDIRECT_URI" in message
+    assert "TOKEN_ENCRYPTION_KEY" in message
