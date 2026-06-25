@@ -41,6 +41,19 @@ class Settings(BaseSettings):
     google_client_id: str | None = Field(default=None, alias="GOOGLE_CLIENT_ID")
     google_client_secret: str | None = Field(default=None, alias="GOOGLE_CLIENT_SECRET")
     google_redirect_uri: str | None = Field(default=None, alias="GOOGLE_REDIRECT_URI")
+    # Comma-separated list of browser origins allowed to call the API (CORS).
+    # Defaults cover the common local frontend dev servers (Next.js, Vite).
+    # Set the real frontend origin(s) in production -- never use "*" here while
+    # credentialed bearer requests are in play.
+    cors_origins: str = Field(
+        default="http://localhost:3000,http://localhost:5173",
+        alias="CORS_ORIGINS",
+    )
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """Parse CORS_ORIGINS into a clean list, dropping blanks."""
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
     # Back-compat aliases for earlier scaffold usages
     @property
