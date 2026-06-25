@@ -73,7 +73,9 @@ cd apps\api
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Health check: http://localhost:8000/api/v1/health
+Liveness check: http://localhost:8000/api/v1/health (process is up)
+Readiness check: http://localhost:8000/api/v1/ready (pings Postgres + Redis;
+returns 503 if either is unreachable)
 Interactive API docs: http://localhost:8000/docs
 
 > Alternative to step 3: from `apps/api/app` you can run `python -m app.main`.
