@@ -37,7 +37,8 @@ coverage.xml
 ai-mailbox/apps/api/dev.db
 ai-mailbox/apps/api/receipts_export.csv
 
-# ML artifacts & datasets & data scripts
-models/
-data/
-scripts/
+# ML artifacts & datasets & data scripts (repo-root only -- leading slash so
+# these don't shadow nested dirs like apps/api/app/db/models)
+/models/
+/data/
+/scripts/

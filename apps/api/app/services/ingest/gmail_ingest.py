@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.services.ingest.gmail_client import GmailClient
 from app.services.ingest.normalizer import normalize_message
 from app.services.nlp.classifier import classify, build_classification_text
+from app.services.nlp.persistence import upsert_classification
 
 
 def _refresh_access_token(provider: ProviderAccount) -> tuple[str | None, datetime | None]:
@@ -217,14 +218,13 @@ def ingest_gmail_messages(
                     normalized.get("body_text"),
                 )
                 label, confidence, rationale, model_version = classify(text_for_classification)
-                db.execute(
-                    insert(Classification).values(
-                        message_id=new_message_id,
-                        label=label,
-                        confidence=confidence,
-                        rationale=rationale,
-                        model_version=model_version,
-                    )
+                upsert_classification(
+                    db,
+                    message_id=new_message_id,
+                    label=label,
+                    confidence=confidence,
+                    rationale=rationale,
+                    model_version=model_version,
                 )
 
         # Commit periodically so a late failure (e.g. token death on a multi-
