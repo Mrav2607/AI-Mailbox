@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from cryptography.fernet import Fernet
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, model_validator
 
@@ -35,6 +36,11 @@ class Settings(BaseSettings):
     access_token_expires_minutes: int = Field(
         default=60 * 24 * 7, alias="ACCESS_TOKEN_EXPIRES_MINUTES"  # 7 days
     )
+    # Fernet key (urlsafe base64, 32 bytes) for encrypting provider OAuth tokens
+    # at rest. Generate with: Fernet.generate_key(). Required in production (see
+    # the startup validator); dev falls back to a key derived from api_secret so
+    # it can run with zero extra config.
+    token_encryption_key: str | None = Field(default=None, alias="TOKEN_ENCRYPTION_KEY")
     database_url: str = Field(default="postgresql+psycopg://user:pass@localhost:5432/ai_mailbox", alias="DATABASE_URL")
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
@@ -76,6 +82,20 @@ class Settings(BaseSettings):
         dev env must supply real secrets. Collect every problem so the operator
         sees them all at once instead of fixing one and hitting the next.
         """
+        # A non-empty encryption key must be a usable Fernet key in any
+        # environment, so a typo fails loudly at boot instead of at first use.
+        # Blank is deliberately allowed here: in dev it means "derive from
+        # API_SECRET", and in production the required-keys check below rejects
+        # it -- so there's no insecure silent fallback in prod.
+        if self.token_encryption_key:
+            try:
+                Fernet(self.token_encryption_key.encode())
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    "TOKEN_ENCRYPTION_KEY is not a valid Fernet key (urlsafe "
+                    "base64, 32 bytes); generate one with Fernet.generate_key()"
+                ) from exc
+
         if not self.is_production:
             return self
 
@@ -96,6 +116,12 @@ class Settings(BaseSettings):
         ):
             if not value:
                 problems.append(f"{name} is required in production")
+
+        # A dedicated token-encryption key is required in production: deriving it
+        # from api_secret would tie rotating the JWT secret to re-encrypting
+        # every stored provider token. Dev may fall back to the derived key.
+        if not self.token_encryption_key:
+            problems.append("TOKEN_ENCRYPTION_KEY is required in production")
 
         if problems:
             raise ValueError(

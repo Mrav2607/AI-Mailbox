@@ -112,6 +112,7 @@ A browser frontend must be served from an origin listed in `CORS_ORIGINS`
 2. `GET /api/v1/auth/google/start` to get an `auth_url`, then complete consent.
 3. The callback creates/links the Gmail account, stores tokens in
    `provider_account`, and returns an `access_token` to use for the calls below.
+   The provider OAuth tokens are encrypted at rest (see `TOKEN_ENCRYPTION_KEY`).
 
 ### Gmail ingest (dev)
 All calls below require the `Authorization: Bearer <token>` header.
