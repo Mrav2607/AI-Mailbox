@@ -16,7 +16,7 @@ from app.core.crypto import decrypt, encrypt, _looks_like_fernet
 
 
 revision = "0003_encrypt_provider_tokens"
-down_revision = "0002_classification_message_unique"
+down_revision = "0002_classification_msg_unique"
 branch_labels = None
 depends_on = None
 
