@@ -51,6 +51,16 @@ def test_invalid_bucket_is_rejected(client):
     assert "Invalid bucket" in resp.json()["detail"]
 
 
+def test_invalid_reclassify_label_is_rejected(client):
+    # The label is validated before any DB access, so the stub DB is untouched.
+    resp = client.post(
+        f"/api/v1/mail/thread/{uuid4()}/classification",
+        json={"label": "not_a_label"},
+    )
+    assert resp.status_code == 422
+    assert "Invalid label" in resp.json()["detail"]
+
+
 def test_valid_bucket_passes_validation(client):
     # A known bucket clears validation and, against the empty-result DB stub,
     # returns an empty triage page.
