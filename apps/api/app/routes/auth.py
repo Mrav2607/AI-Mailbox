@@ -19,6 +19,17 @@ async def list_providers() -> dict:
     return {"providers": ["gmail", "outlook"]}
 
 
+@router.get("/me")
+def get_me(current_user: AppUser = Depends(get_current_user)) -> dict:
+    """Return the authenticated user. Lets a client validate its stored token
+    and restore the session on reload (401 if the token is missing/invalid)."""
+    return {
+        "id": str(current_user.id),
+        "email": current_user.email,
+        "display_name": current_user.display_name,
+    }
+
+
 @router.post("/demo-login")
 def demo_login(payload: DemoLoginRequest, db: Session = Depends(get_db)) -> dict:
     """

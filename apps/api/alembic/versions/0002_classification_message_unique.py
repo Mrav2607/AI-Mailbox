@@ -10,7 +10,7 @@ can't be created.
 from alembic import op
 
 
-revision = "0002_classification_message_unique"
+revision = "0002_classification_msg_unique"
 down_revision = "0001_init_schema"
 branch_labels = None
 depends_on = None

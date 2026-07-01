@@ -20,6 +20,7 @@ PROTECTED_GETS = [
     "/api/v1/mail/triage",
     "/api/v1/analytics/overview",
     "/api/v1/auth/connections",
+    "/api/v1/auth/me",
 ]
 
 

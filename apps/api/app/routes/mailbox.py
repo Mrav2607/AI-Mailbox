@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import select, desc
 from sqlalchemy.orm import Session
 
@@ -20,6 +21,14 @@ _MAX_PAGE_LIMIT = 200
 _MAX_INGEST_RESULTS = 500
 # Valid triage filters: every classifier label plus the two synthetic buckets.
 _TRIAGE_BUCKETS = frozenset(LABELS) | {"all", "unclassified"}
+# Marks a label set by a human in the console rather than a model, so it's
+# distinguishable from a real prediction and never overwritten by a backfill
+# (which only touches unclassified messages unless forced).
+_OPERATOR_MODEL_VERSION = "operator-override"
+
+
+class ReclassifyRequest(BaseModel):
+    label: str
 
 
 @router.get("/triage")
@@ -161,6 +170,67 @@ def get_thread(
             }
             for m in messages
         ],
+    }
+
+
+@router.post("/thread/{thread_id}/classification")
+def reclassify_thread(
+    thread_id: UUID,
+    payload: ReclassifyRequest,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Apply an operator's manual label to a thread.
+
+    The console lets the user override the model when QA-ing predictions. The
+    label is stored against the thread's latest message (the same message whose
+    classification drives the triage view), with full confidence and an
+    ``user-override`` model_version. 
+    """
+    if payload.label not in LABELS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid label '{payload.label}'. Valid: {sorted(LABELS)}",
+        )
+
+    thread = db.get(MailThread, thread_id)
+    # 404 (not 403) for another user's thread so we don't leak that it exists.
+    if not thread or thread.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    latest_message = (
+        db.execute(
+            select(MailMessage)
+            .where(MailMessage.thread_id == thread_id)
+            .order_by(
+                MailMessage.sent_at.desc().nullslast(),
+                MailMessage.created_at.desc(),
+            )
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+    if latest_message is None:
+        raise HTTPException(status_code=409, detail="Thread has no messages to label")
+
+    upsert_classification(
+        db,
+        message_id=latest_message.id,
+        label=payload.label,
+        confidence=1.0,
+        rationale="Operator override from the console.",
+        model_version=_OPERATOR_MODEL_VERSION,
+    )
+    db.commit()
+
+    return {
+        "thread_id": str(thread_id),
+        "classification": {
+            "label": payload.label,
+            "confidence": 1.0,
+            "model_version": _OPERATOR_MODEL_VERSION,
+        },
     }
 
 
