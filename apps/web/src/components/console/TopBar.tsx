@@ -14,9 +14,7 @@ interface Props {
 function Stat({ label, value }: { label: string; value: number | string }) {
   return (
     <div className="px-2.5 py-1 rounded border border-border bg-[var(--color-panel)] flex items-baseline gap-1.5 font-mono">
-      <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
-        {label}
-      </span>
+      <span className="text-[10.5px] text-muted-foreground">{label}</span>
       <span className="text-[12.5px] tabular-nums">{value}</span>
     </div>
   );
@@ -35,13 +33,13 @@ export function TopBar({
   return (
     <header className="h-11 shrink-0 border-b border-border bg-[var(--color-panel)] flex items-center gap-3 px-3">
       <div className="flex items-center gap-2 mr-1">
-        <div className="h-5 w-5 rounded bg-primary/20 border border-primary/40 flex items-center justify-center">
+        <div className="h-5 w-5 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor">
           <Sparkles className="h-3 w-3 text-primary" />
         </div>
         <span className="font-mono text-[13px] font-semibold tracking-tight">
           AI&nbsp;Mailbox
         </span>
-        <span className="text-[10px] uppercase font-mono text-muted-foreground border border-border rounded px-1 py-0.5">
+        <span className="text-[10px] font-mono text-muted-foreground border border-border rounded px-1 py-0.5">
           console
         </span>
       </div>

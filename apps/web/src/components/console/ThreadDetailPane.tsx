@@ -51,30 +51,31 @@ export function ThreadDetailPane({
   return (
     <div className="h-full flex flex-col">
       <header className="px-4 py-3 border-b border-border bg-[var(--color-panel)]">
-        <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-mono">
+        <div className="text-[11px] text-muted-foreground font-mono lowercase">
           {data.thread.provider} · {absTime(data.thread.last_message_at)}
         </div>
-        <h2 className="mt-1 text-base font-semibold truncate">
+        <h2 className="mt-1 text-base font-semibold tracking-tight truncate">
           {data.thread.subject ?? "(no subject)"}
         </h2>
       </header>
 
       {/* Prediction */}
       <section className="px-4 py-3 border-b border-border bg-[var(--color-panel)]/40">
-        <div className="text-[11px] uppercase tracking-wider text-muted-foreground font-mono mb-2">
+        <div className="text-[11px] text-muted-foreground font-mono mb-2">
           prediction
         </div>
         <div className="flex items-center gap-3 flex-wrap">
           <span
             className={[
-              "px-2 py-0.5 rounded text-[11px] uppercase tracking-wide font-mono",
-              meta ? meta.chip : "bg-muted text-muted-foreground",
+              "inline-flex items-center gap-1.5 px-2 py-1 rounded border font-mono text-[11px]",
+              meta ? `${meta.soft} ${meta.text} ${meta.border}` : "bg-muted text-muted-foreground border-border",
             ].join(" ")}
           >
+            <span className={["h-1.5 w-1.5 rounded-full", meta ? meta.dot : "bg-muted-foreground/40"].join(" ")} />
             {classification?.label ?? "unclassified"}
           </span>
           <div className="flex items-center gap-1.5">
-            <div className="h-1.5 w-24 rounded-full bg-muted overflow-hidden">
+            <div className="h-[3px] w-24 rounded-full bg-muted overflow-hidden">
               <div
                 className={`h-full ${confidenceColor(conf)}`}
                 style={{ width: `${confPct ?? 0}%` }}
@@ -100,12 +101,13 @@ export function ThreadDetailPane({
                 key={l}
                 onClick={() => onReclassify(l)}
                 className={[
-                  "px-1.5 py-0.5 rounded text-[10.5px] uppercase tracking-wide font-mono border transition-colors",
+                  "inline-flex items-center gap-1.5 px-2 py-1 rounded text-[10.5px] font-mono border transition-colors duration-100",
                   active
-                    ? `${lm.chip} border-transparent`
-                    : `border-border text-muted-foreground hover:${lm.text} hover:border-foreground/30`,
+                    ? `${lm.soft} ${lm.text} ${lm.border}`
+                    : "border-border text-muted-foreground hover:text-foreground hover:border-foreground/30",
                 ].join(" ")}
               >
+                <span className={`h-1.5 w-1.5 rounded-full ${lm.dot}`} />
                 {lm.name}
               </button>
             );

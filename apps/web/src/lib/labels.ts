@@ -1,55 +1,68 @@
 import type { BucketKey, Label } from "./types";
 
+/*
+  Phosphor Terminal label system. Color lives in a single dot and a tinted
+  label word — never a filled pill — so the list scans by hue without any one
+  label shouting. The six hues are tuned to roughly equal lightness/chroma so
+  weight reads evenly; spam is drained toward gray and fyi runs low-chroma
+  because they're the ones you can safely ignore. Amber (hue 80) is deliberately
+  absent here — it's reserved for the UI's selection/primary accent.
+
+  - dot:    solid swatch color (the dot, sidebar chip, confidence fill)
+  - text:   tinted label word, still ~4.5:1 on the panel
+  - soft:   low-alpha background for the one chip that earns a fill (prediction)
+  - border: tinted hairline for that same chip
+*/
 export const LABEL_META: Record<
   Label,
-  { name: string; chip: string; bar: string; border: string; text: string; key: string }
+  { name: string; dot: string; text: string; soft: string; border: string; key: string }
 > = {
   needs_reply: {
     name: "needs reply",
-    chip: "bg-[oklch(0.55_0.22_25)] text-white",
-    bar: "bg-[oklch(0.65_0.22_25)]",
-    border: "border-[oklch(0.65_0.22_25)]",
-    text: "text-[oklch(0.75_0.18_25)]",
+    dot: "bg-[oklch(0.66_0.18_22)]",
+    text: "text-[oklch(0.78_0.14_22)]",
+    soft: "bg-[oklch(0.66_0.18_22_/_0.12)]",
+    border: "border-[oklch(0.66_0.18_22_/_0.45)]",
     key: "1",
   },
   action_required: {
     name: "action req",
-    chip: "bg-[oklch(0.6_0.2_50)] text-white",
-    bar: "bg-[oklch(0.7_0.2_50)]",
-    border: "border-[oklch(0.7_0.2_50)]",
-    text: "text-[oklch(0.8_0.18_50)]",
+    dot: "bg-[oklch(0.74_0.15_52)]",
+    text: "text-[oklch(0.82_0.12_54)]",
+    soft: "bg-[oklch(0.74_0.15_52_/_0.12)]",
+    border: "border-[oklch(0.74_0.15_52_/_0.45)]",
     key: "2",
   },
   fyi: {
     name: "fyi",
-    chip: "bg-[oklch(0.55_0.15_240)] text-white",
-    bar: "bg-[oklch(0.65_0.18_240)]",
-    border: "border-[oklch(0.65_0.18_240)]",
-    text: "text-[oklch(0.75_0.16_240)]",
+    dot: "bg-[oklch(0.68_0.09_235)]",
+    text: "text-[oklch(0.78_0.08_235)]",
+    soft: "bg-[oklch(0.68_0.09_235_/_0.12)]",
+    border: "border-[oklch(0.68_0.09_235_/_0.45)]",
     key: "3",
   },
   promotional: {
     name: "promo",
-    chip: "bg-[oklch(0.55_0.18_300)] text-white",
-    bar: "bg-[oklch(0.65_0.2_300)]",
-    border: "border-[oklch(0.65_0.2_300)]",
-    text: "text-[oklch(0.75_0.18_300)]",
+    dot: "bg-[oklch(0.66_0.13_322)]",
+    text: "text-[oklch(0.77_0.11_322)]",
+    soft: "bg-[oklch(0.66_0.13_322_/_0.12)]",
+    border: "border-[oklch(0.66_0.13_322_/_0.45)]",
     key: "4",
   },
   security_alert: {
     name: "security",
-    chip: "bg-[oklch(0.55_0.22_15)] text-white",
-    bar: "bg-[oklch(0.65_0.22_15)]",
-    border: "border-[oklch(0.65_0.22_15)]",
-    text: "text-[oklch(0.78_0.2_15)]",
+    dot: "bg-[oklch(0.64_0.21_12)]",
+    text: "text-[oklch(0.76_0.17_14)]",
+    soft: "bg-[oklch(0.64_0.21_12_/_0.12)]",
+    border: "border-[oklch(0.64_0.21_12_/_0.45)]",
     key: "5",
   },
   spam: {
     name: "spam",
-    chip: "bg-[oklch(0.45_0.05_260)] text-white",
-    bar: "bg-[oklch(0.55_0.05_260)]",
-    border: "border-[oklch(0.55_0.05_260)]",
-    text: "text-[oklch(0.7_0.04_260)]",
+    dot: "bg-[oklch(0.55_0.015_260)]",
+    text: "text-[oklch(0.66_0.012_260)]",
+    soft: "bg-[oklch(0.55_0.015_260_/_0.14)]",
+    border: "border-[oklch(0.55_0.015_260_/_0.5)]",
     key: "6",
   },
 };
@@ -71,15 +84,17 @@ export function bucketLabel(b: BucketKey): string {
   return LABEL_META[b].name;
 }
 
+// Confidence keeps a universal green/amber/red read, muted to sit inside the
+// terminal palette rather than glow like a status LED.
 export function confidenceColor(c: number | null): string {
   if (c == null) return "bg-muted";
-  if (c >= 0.8) return "bg-[oklch(0.7_0.18_145)]";
-  if (c >= 0.5) return "bg-[oklch(0.75_0.17_75)]";
-  return "bg-[oklch(0.65_0.22_25)]";
+  if (c >= 0.8) return "bg-[oklch(0.72_0.15_150)]";
+  if (c >= 0.5) return "bg-[oklch(0.78_0.13_82)]";
+  return "bg-[oklch(0.66_0.19_25)]";
 }
 export function confidenceText(c: number | null): string {
   if (c == null) return "text-muted-foreground";
-  if (c >= 0.8) return "text-[oklch(0.8_0.18_145)]";
-  if (c >= 0.5) return "text-[oklch(0.82_0.17_75)]";
-  return "text-[oklch(0.78_0.2_25)]";
+  if (c >= 0.8) return "text-[oklch(0.78_0.13_150)]";
+  if (c >= 0.5) return "text-[oklch(0.82_0.12_82)]";
+  return "text-[oklch(0.74_0.17_25)]";
 }

@@ -47,54 +47,67 @@ export function ThreadList({ items, selectedId, onSelect, loading, error }: Prop
               data-thread-row={it.thread_id}
               onClick={() => onSelect(it.thread_id)}
               className={[
-                "w-full text-left px-3 py-1.5 flex items-center gap-2.5 text-[12.5px] border-l-2",
+                "group relative w-full text-left pl-3 pr-3 py-[7px] flex items-center gap-2.5 text-[12.5px]",
+                "border-l-2 transition-colors duration-100",
                 isSel
-                  ? `${meta ? meta.border : "border-primary"} bg-[var(--color-panel-hi)]`
-                  : "border-transparent hover:bg-[var(--color-panel-hi)]/50",
+                  ? "border-primary bg-[var(--color-panel-hi)]"
+                  : "border-transparent hover:bg-[var(--color-panel-hi)]/45",
               ].join(" ")}
             >
-              {/* label chip */}
+              {/* label: colored dot + quiet mono word */}
               <span
-                className={[
-                  "shrink-0 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide font-mono w-[78px] text-center truncate",
-                  meta ? meta.chip : "bg-muted text-muted-foreground",
-                ].join(" ")}
+                className="shrink-0 w-[92px] flex items-center gap-1.5 font-mono"
                 title={it.classification.label ?? "unclassified"}
               >
-                {meta ? meta.name : "unclass"}
+                <span
+                  className={[
+                    "h-1.5 w-1.5 rounded-full shrink-0",
+                    meta ? meta.dot : "bg-muted-foreground/40",
+                  ].join(" ")}
+                />
+                <span
+                  className={[
+                    "truncate text-[11px]",
+                    meta ? meta.text : "text-muted-foreground",
+                  ].join(" ")}
+                >
+                  {meta ? meta.name : "unclass"}
+                </span>
               </span>
 
-              {/* confidence */}
-              <div className="shrink-0 flex items-center gap-1.5 w-[78px]">
-                <div className="h-1 w-12 rounded-full bg-muted overflow-hidden">
+              {/* confidence: hairline track + mono percent */}
+              <div className="shrink-0 flex items-center gap-1.5 w-[70px]">
+                <div className="h-px w-11 bg-border overflow-hidden">
                   <div
                     className={`h-full ${confidenceColor(conf)}`}
                     style={{ width: `${confPct ?? 0}%` }}
                   />
                 </div>
                 <span
-                  className={`text-[10.5px] font-mono tabular-nums w-7 text-right ${confidenceText(conf)}`}
+                  className={`text-[10.5px] font-mono tabular-nums w-8 text-right ${confidenceText(conf)}`}
                 >
                   {confPct == null ? "—" : `${confPct}%`}
                 </span>
               </div>
 
-              {/* subject + snippet + sender */}
+              {/* subject + snippet */}
               <div className="min-w-0 flex-1 flex items-baseline gap-2 overflow-hidden">
                 <span
                   className={[
-                    "truncate font-semibold",
-                    isSel ? "text-foreground" : "text-foreground/90",
+                    "truncate",
+                    isSel
+                      ? "text-foreground font-semibold"
+                      : "text-foreground/90 font-medium",
                   ].join(" ")}
                 >
                   {it.subject ?? "(no subject)"}
                 </span>
-                <span className="truncate text-muted-foreground text-[12px]">
+                <span className="truncate text-muted-foreground/80 text-[12px]">
                   {it.latest_message_snippet ?? ""}
                 </span>
               </div>
 
-              <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground font-mono w-10 text-right">
+              <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground/70 font-mono w-9 text-right">
                 {relTime(it.last_message_at)}
               </span>
             </button>

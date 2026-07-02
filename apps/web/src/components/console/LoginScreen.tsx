@@ -49,7 +49,7 @@ export function LoginScreen({ onAuthed }: Props) {
         className="w-full max-w-sm rounded-lg border border-border bg-[var(--color-panel)] p-6 shadow-xl"
       >
         <div className="flex items-center gap-2 mb-1">
-          <div className="h-6 w-6 rounded bg-primary/20 border border-primary/40 flex items-center justify-center">
+          <div className="h-6 w-6 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor">
             <Sparkles className="h-3.5 w-3.5 text-primary" />
           </div>
           <h1 className="font-mono text-base font-semibold tracking-tight">
@@ -76,7 +76,7 @@ export function LoginScreen({ onAuthed }: Props) {
               {googleBusy ? "redirecting…" : "Continue with Google"}
             </button>
 
-            <div className="my-4 flex items-center gap-2 text-[10px] uppercase tracking-wider text-muted-foreground font-mono">
+            <div className="my-4 flex items-center gap-2 text-[10.5px] tracking-wide text-muted-foreground font-mono">
               <div className="h-px flex-1 bg-border" />
               or dev login
               <div className="h-px flex-1 bg-border" />
@@ -84,7 +84,7 @@ export function LoginScreen({ onAuthed }: Props) {
           </>
         )}
 
-        <label className="block text-[11px] uppercase tracking-wider text-muted-foreground font-mono mb-1.5">
+        <label className="block text-[11px] tracking-wide text-muted-foreground font-mono mb-1.5">
           email
         </label>
         <input

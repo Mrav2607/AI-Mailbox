@@ -25,7 +25,7 @@ export function Shortcuts({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md bg-[var(--color-panel)] border-border">
-        <div className="font-mono text-[11px] uppercase tracking-wider text-muted-foreground mb-2">
+        <div className="font-mono text-[11px] tracking-wide text-muted-foreground mb-2">
           keyboard shortcuts
         </div>
         <ul className="divide-y divide-border">

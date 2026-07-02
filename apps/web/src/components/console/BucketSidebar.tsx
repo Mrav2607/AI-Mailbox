@@ -12,7 +12,7 @@ interface Props {
 export function BucketSidebar({ active, counts, onSelect }: Props) {
   return (
     <aside className="w-52 shrink-0 border-r border-border bg-[var(--color-panel)] flex flex-col">
-      <div className="px-3 py-2 border-b border-border flex items-center gap-2 text-xs uppercase tracking-wider text-muted-foreground">
+      <div className="px-3 py-2.5 border-b border-border flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
         <Inbox className="h-3.5 w-3.5" /> buckets
       </div>
       <nav className="flex-1 overflow-y-auto scrollbar-thin py-1">
@@ -24,17 +24,17 @@ export function BucketSidebar({ active, counts, onSelect }: Props) {
               key={b}
               onClick={() => onSelect(b)}
               className={[
-                "w-full text-left px-3 py-1.5 flex items-center gap-2 font-mono text-[12.5px] transition-colors",
+                "relative w-full text-left pl-3 pr-3 py-1.5 flex items-center gap-2 font-mono text-[12.5px] transition-colors duration-100 border-l-2",
                 isActive
-                  ? "bg-[var(--color-panel-hi)] text-foreground"
-                  : "text-muted-foreground hover:bg-[var(--color-panel-hi)]/60 hover:text-foreground",
+                  ? "border-primary bg-[var(--color-panel-hi)] text-foreground"
+                  : "border-transparent text-muted-foreground hover:bg-[var(--color-panel-hi)]/60 hover:text-foreground",
               ].join(" ")}
             >
               <span className="kbd">{i + 1}</span>
               <span
                 className={[
-                  "h-2 w-2 rounded-sm shrink-0",
-                  meta ? meta.bar : b === "unclassified" ? "bg-muted-foreground/40" : "bg-foreground/40",
+                  "h-2 w-2 rounded-full shrink-0",
+                  meta ? meta.dot : b === "unclassified" ? "bg-muted-foreground/40" : "bg-foreground/40",
                 ].join(" ")}
               />
               <span className="flex-1 truncate">{bucketLabel(b)}</span>

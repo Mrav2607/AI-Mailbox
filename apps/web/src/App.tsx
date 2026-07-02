@@ -482,10 +482,10 @@ export default function Console() {
 
         <section className="flex-1 min-w-0 flex flex-col border-r border-border">
           <div className="h-9 shrink-0 border-b border-border bg-[var(--color-panel)] flex items-center px-3 gap-3 font-mono text-[11.5px]">
-            <span className="text-muted-foreground uppercase tracking-wider">
+            <span className="text-primary font-semibold tracking-tight">
               {bucket.replace("_", " ")}
             </span>
-            <span className="text-foreground/80 tabular-nums">
+            <span className="text-muted-foreground tabular-nums">
               {sortedItems.length} thread{sortedItems.length === 1 ? "" : "s"}
             </span>
             <div className="flex-1" />
