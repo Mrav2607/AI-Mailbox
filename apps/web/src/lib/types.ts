@@ -47,6 +47,37 @@ export interface TriageResponse {
   items: TriageItem[];
 }
 
+export interface SearchResponse {
+  query: string;
+  items: TriageItem[];
+}
+
+export interface CountsResponse {
+  counts: Record<BucketKey, number>;
+}
+
+// Classifier backends an operator can pick per run. "local" = fine-tuned
+// encoder, "gemini" = hosted LLM, "heuristic" = keyword rules.
+export type ClassifierBackend = "local" | "gemini" | "heuristic";
+
+export interface IngestOptions {
+  maxResults: number;
+  classify: boolean;
+}
+
+export interface BackfillOptions {
+  limit: number;
+  bucket: BucketKey;
+  backend: ClassifierBackend;
+  force: boolean;
+}
+
+// Small backfills run inline and report counts; over the API's inline cap the
+// server queues a worker task and answers 202 with its id.
+export type BackfillResult =
+  | { status: "ok"; created: number; scanned: number }
+  | { status: "queued"; task_id: string };
+
 export interface ThreadMessage {
   id: string;
   sent_at: string | null;

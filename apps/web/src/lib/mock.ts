@@ -1,4 +1,6 @@
 import type {
+  BackfillOptions,
+  BackfillResult,
   BucketKey,
   Label,
   Overview,
@@ -8,6 +10,7 @@ import type {
   User,
 } from "./types";
 import { ALL_LABELS } from "./types";
+import { ApiError } from "./api";
 
 
 const SENDERS = [
@@ -105,9 +108,28 @@ export function mockTriage(bucket: BucketKey, limit: number): TriageResponse {
   return { bucket, items: items.slice(0, limit) };
 }
 
+export function mockCounts(): Record<BucketKey, number> {
+  const counts: Record<BucketKey, number> = {
+    needs_reply: 0,
+    action_required: 0,
+    fyi: 0,
+    promotional: 0,
+    security_alert: 0,
+    spam: 0,
+    all: ALL.length,
+    unclassified: 0,
+  };
+  for (const item of ALL) {
+    const label = item.classification.label;
+    if (label) counts[label] += 1;
+    else counts.unclassified += 1;
+  }
+  return counts;
+}
+
 export function mockThread(id: string): ThreadDetail {
-  const item =
-    ALL.find((i) => i.thread_id === id) ?? ALL[0];
+  const item = ALL.find((i) => i.thread_id === id);
+  if (!item) throw new ApiError(404, `Thread not found: ${id}`);
   const messages = Array.from({ length: 3 }).map((_, k) => ({
     id: `${id}-m${k}`,
     sent_at: new Date(
@@ -139,7 +161,69 @@ export function mockApplyLabel(threadId: string, label: Label) {
     t.classification = {
       label,
       confidence: 1,
-      model_version: "operator-override",
+      model_version: "user-override",
     };
   }
+}
+
+// Substring match on subject + snippet across the whole mock store, mirroring
+// the server's cross-bucket search.
+export function mockSearch(
+  q: string,
+  limit: number,
+): { query: string; items: TriageItem[] } {
+  const needle = q.toLowerCase();
+  const items = ALL.filter(
+    (i) =>
+      (i.subject ?? "").toLowerCase().includes(needle) ||
+      (i.latest_message_snippet ?? "").toLowerCase().includes(needle),
+  ).slice(0, limit);
+  return { query: q, items };
+}
+
+export function mockDeleteThread(id: string) {
+  const idx = ALL.findIndex((i) => i.thread_id === id);
+  if (idx >= 0) ALL.splice(idx, 1);
+}
+
+// Rough keyword guess so backfilled items land in believable buckets.
+function guessLabel(item: TriageItem): Label {
+  const s = `${item.subject ?? ""} ${item.latest_message_snippet ?? ""}`.toLowerCase();
+  if (/(security|sign-in|alert|unusual|verify your)/.test(s)) return "security_alert";
+  if (/(invoice|action required|due|receipt|billing)/.test(s)) return "action_required";
+  if (/(% off|sale|deal|weekend|digest|newsletter)/.test(s)) return "promotional";
+  if (/(\?|can you|could you|^re:|dinner)/.test(s)) return "needs_reply";
+  return "fyi";
+}
+
+// Mutate the mock store the way the real backfill would: classify matching
+// unclassified items (and, with force, re-label a whole bucket) so the sidebar
+// counts and list actually move in preview.
+export function mockBackfill(opts: BackfillOptions): BackfillResult {
+  const { bucket, limit, force, backend } = opts;
+  let pool: TriageItem[];
+  if (bucket === "unclassified") pool = ALL.filter((i) => !i.classification.label);
+  else if (bucket === "all") pool = ALL;
+  else pool = ALL.filter((i) => i.classification.label === bucket);
+
+  const scanned = pool.slice(0, limit);
+  const version =
+    backend === "local"
+      ? "local:email-classifier"
+      : backend === "gemini"
+        ? "gemini-2.5-flash"
+        : "heuristic-v1";
+
+  let created = 0;
+  for (const item of scanned) {
+    const isNew = !item.classification.label;
+    if (!isNew && !force) continue;
+    item.classification = {
+      label: guessLabel(item),
+      confidence: 0.6,
+      model_version: version,
+    };
+    created += 1;
+  }
+  return { status: "ok", created, scanned: scanned.length };
 }

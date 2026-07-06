@@ -3,6 +3,8 @@ import {
   ApiError,
   classifyBackfill,
   classifyQueue,
+  deleteThread,
+  getCounts,
   getMe,
   googleAuthCallback,
   getOverview,
@@ -10,13 +12,16 @@ import {
   getTriage,
   ingestGmail,
   reclassify,
+  searchThreads,
   setToken,
   USE_MOCK,
 } from "@/lib/api";
 import { mockApplyLabel } from "@/lib/mock";
 import { BUCKET_KEYS } from "@/lib/labels";
 import type {
+  BackfillOptions,
   BucketKey,
+  IngestOptions,
   Label,
   Overview,
   ThreadDetail,
@@ -34,8 +39,30 @@ import { Shortcuts } from "@/components/console/Shortcuts";
 import { LoginScreen } from "@/components/console/LoginScreen";
 import { useHotkeys } from "@/lib/use-hotkeys";
 import { Toaster } from "@/components/ui/sonner";
+import { PanelLeftOpen, PanelRightOpen, Search, X } from "lucide-react";
 
 type SortMode = "recent" | "confidence_asc" | "confidence_desc";
+
+// Which chrome panels are visible. Persisted so the operator's layout sticks.
+// The shortcuts hint lives inside the sidebar, so it tracks `sidebar`.
+type Panels = { sidebar: boolean; detail: boolean };
+const UI_KEY = "ai_mailbox_ui";
+const DEFAULT_PANELS: Panels = { sidebar: true, detail: true };
+
+function loadPanels(): Panels {
+  if (typeof window === "undefined") return DEFAULT_PANELS;
+  try {
+    const raw = window.localStorage.getItem(UI_KEY);
+    if (raw) return { ...DEFAULT_PANELS, ...JSON.parse(raw) };
+  } catch {
+    /* fall through to defaults */
+  }
+  return DEFAULT_PANELS;
+}
+
+// How long the "thread deleted · undo" window stays open before the delete is
+// actually sent to the server.
+const UNDO_MS = 5000;
 
 // Guards the one-time OAuth code exchange. The authorization code is single-use,
 // but React StrictMode invokes effects twice in dev — without this module-level
@@ -70,12 +97,41 @@ export default function Console() {
 
   const [ingesting, setIngesting] = useState(false);
   const [backfilling, setBackfilling] = useState(false);
+  const [ingestOpen, setIngestOpen] = useState(false);
+  const [backfillOpen, setBackfillOpen] = useState(false);
 
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [sortMode, setSortMode] = useState<SortMode>("recent");
 
+  const [panels, setPanels] = useState<Panels>(loadPanels);
+
+  // Search: `query` drives the instant client-side filter of the loaded bucket;
+  // running a search (Enter) flips `searchMode` on and shows whole-mailbox
+  // results from the server instead.
+  const [query, setQuery] = useState("");
+  const [searchMode, setSearchMode] = useState(false);
+  const [searchResults, setSearchResults] = useState<TriageItem[]>([]);
+  const [searching, setSearching] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
   const gPressedAt = useRef<number>(0);
+  // thread_id -> timer for deletes still inside their undo window.
+  const pendingDeletes = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map(),
+  );
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(UI_KEY, JSON.stringify(panels));
+    } catch {
+      /* storage unavailable; layout just won't persist */
+    }
+  }, [panels]);
+
+  const togglePanel = useCallback((key: keyof Panels) => {
+    setPanels((p) => ({ ...p, [key]: !p[key] }));
+  }, []);
 
   // ---- auth ----------------------------------------------------------------
   useEffect(() => {
@@ -135,26 +191,10 @@ export default function Console() {
   }, [handleSessionExpired]);
 
   const refreshCounts = useCallback(async () => {
-    // Fetch counts for each bucket using bucket=all and grouping client-side,
-    // which keeps wire calls down to a single request.
+    // Server aggregates counts across the whole mailbox, so the sidebar totals
+    // don't cap at a single triage page.
     try {
-      const all = await getTriage("all", 200);
-      const counts: Record<BucketKey, number> = {
-        needs_reply: 0,
-        action_required: 0,
-        fyi: 0,
-        promotional: 0,
-        security_alert: 0,
-        spam: 0,
-        all: all.items.length,
-        unclassified: 0,
-      };
-      for (const it of all.items) {
-        const l = it.classification.label;
-        if (l) counts[l] += 1;
-        else counts.unclassified += 1;
-      }
-      setAllCounts(counts);
+      setAllCounts(await getCounts());
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) handleSessionExpired();
     }
@@ -185,9 +225,12 @@ export default function Console() {
     [handleSessionExpired],
   );
 
-  // initial + bucket changes
+  // initial + bucket changes. Switching buckets also exits any active search.
   useEffect(() => {
     if (!user) return;
+    setSearchMode(false);
+    setSearchResults([]);
+    setQuery("");
     refreshList(bucket);
   }, [user, bucket, refreshList]);
 
@@ -238,20 +281,34 @@ export default function Console() {
     return arr;
   }, [items, sortMode]);
 
+  // What the list actually shows: whole-mailbox search results when a search is
+  // running, otherwise the bucket list with the instant client-side filter
+  // applied on top.
+  const visibleItems = useMemo(() => {
+    if (searchMode) return searchResults;
+    const q = query.trim().toLowerCase();
+    if (!q) return sortedItems;
+    return sortedItems.filter(
+      (it) =>
+        (it.subject ?? "").toLowerCase().includes(q) ||
+        (it.latest_message_snippet ?? "").toLowerCase().includes(q),
+    );
+  }, [searchMode, searchResults, query, sortedItems]);
+
   const selectedIndex = useMemo(
-    () => sortedItems.findIndex((i) => i.thread_id === selectedId),
-    [sortedItems, selectedId],
+    () => visibleItems.findIndex((i) => i.thread_id === selectedId),
+    [visibleItems, selectedId],
   );
 
-  const focusedItem = selectedIndex >= 0 ? sortedItems[selectedIndex] : null;
+  const focusedItem = selectedIndex >= 0 ? visibleItems[selectedIndex] : null;
 
   // ---- actions -------------------------------------------------------------
   const moveSelection = useCallback(
     (delta: number) => {
-      if (sortedItems.length === 0) return;
+      if (visibleItems.length === 0) return;
       const cur = selectedIndex < 0 ? 0 : selectedIndex;
-      const next = Math.max(0, Math.min(sortedItems.length - 1, cur + delta));
-      const target = sortedItems[next];
+      const next = Math.max(0, Math.min(visibleItems.length - 1, cur + delta));
+      const target = visibleItems[next];
       setSelectedId(target.thread_id);
       // scroll into view
       requestAnimationFrame(() => {
@@ -263,28 +320,133 @@ export default function Console() {
         }
       });
     },
-    [sortedItems, selectedIndex],
+    [visibleItems, selectedIndex],
   );
 
-  const doIngest = useCallback(async () => {
-    setIngesting(true);
+  // ---- search --------------------------------------------------------------
+  const runSearch = useCallback(async () => {
+    const q = query.trim();
+    if (!q) return;
+    setSearching(true);
     try {
-      await ingestGmail(100);
-      toast.success("ingest complete");
-      await Promise.all([refreshList(bucket), refreshOverview(), refreshCounts()]);
+      const res = await searchThreads(q, 100);
+      setSearchResults(res.items);
+      setSearchMode(true);
+      setSelectedId(res.items[0]?.thread_id ?? null);
     } catch (e) {
-      toast.error((e as Error).message ?? "ingest failed");
+      if (e instanceof ApiError && e.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      toast.error((e as Error).message ?? "search failed");
     } finally {
-      setIngesting(false);
+      setSearching(false);
     }
-  }, [bucket, refreshList, refreshOverview, refreshCounts]);
+  }, [query, handleSessionExpired]);
+
+  const clearSearch = useCallback(() => {
+    setQuery("");
+    setSearchMode(false);
+    setSearchResults([]);
+    searchInputRef.current?.blur();
+  }, []);
+
+  // ---- delete (optimistic, with a deferred server call for undo) -----------
+  const doDelete = useCallback(
+    (idArg?: string) => {
+      const id = idArg ?? selectedId;
+      if (!id || pendingDeletes.current.has(id)) return;
+
+      // Snapshot position in each list so undo can put the row back exactly.
+      const bucketIdx = items.findIndex((i) => i.thread_id === id);
+      const removedFromBucket = bucketIdx >= 0 ? items[bucketIdx] : null;
+      const resultIdx = searchResults.findIndex((i) => i.thread_id === id);
+      const removedFromResults = resultIdx >= 0 ? searchResults[resultIdx] : null;
+
+      // Advance selection to a neighbour in the visible list before removing.
+      if (selectedId === id) {
+        const vi = visibleItems.findIndex((i) => i.thread_id === id);
+        const next = visibleItems[vi + 1] ?? visibleItems[vi - 1] ?? null;
+        setSelectedId(next?.thread_id ?? null);
+      }
+      setItems((prev) => prev.filter((i) => i.thread_id !== id));
+      setSearchResults((prev) => prev.filter((i) => i.thread_id !== id));
+
+      const undo = () => {
+        const timer = pendingDeletes.current.get(id);
+        if (timer) clearTimeout(timer);
+        pendingDeletes.current.delete(id);
+        if (removedFromBucket) {
+          setItems((prev) => {
+            const copy = [...prev];
+            copy.splice(Math.min(bucketIdx, copy.length), 0, removedFromBucket);
+            return copy;
+          });
+        }
+        if (removedFromResults) {
+          setSearchResults((prev) => {
+            const copy = [...prev];
+            copy.splice(Math.min(resultIdx, copy.length), 0, removedFromResults);
+            return copy;
+          });
+        }
+        setSelectedId(id);
+      };
+
+      const timer = setTimeout(async () => {
+        pendingDeletes.current.delete(id);
+        try {
+          await deleteThread(id);
+          refreshCounts();
+          refreshOverview();
+        } catch (e) {
+          toast.error((e as Error).message ?? "delete failed");
+          undo(); // put it back if the server rejected it
+        }
+      }, UNDO_MS);
+      pendingDeletes.current.set(id, timer);
+
+      toast("thread deleted", {
+        description: "removing in a few seconds",
+        action: { label: "undo", onClick: undo },
+        duration: UNDO_MS,
+      });
+    },
+    [selectedId, items, searchResults, visibleItems, refreshCounts, refreshOverview],
+  );
+
+  const doIngest = useCallback(
+    async (opts: IngestOptions) => {
+      setIngesting(true);
+      try {
+        const r = await ingestGmail(opts.maxResults, opts.classify);
+        toast.success(`ingest complete · ${r.ingested ?? opts.maxResults} pulled`);
+        await Promise.all([
+          refreshList(bucket),
+          refreshOverview(),
+          refreshCounts(),
+        ]);
+      } catch (e) {
+        toast.error((e as Error).message ?? "ingest failed");
+      } finally {
+        setIngesting(false);
+      }
+    },
+    [bucket, refreshList, refreshOverview, refreshCounts],
+  );
 
   const doBackfill = useCallback(
-    async (force = false) => {
+    async (opts: BackfillOptions) => {
       setBackfilling(true);
       try {
-        await classifyBackfill(200, force);
-        toast.success(force ? "re-classified all" : "backfill complete");
+        const r = await classifyBackfill(opts);
+        if (r.status === "queued") {
+          // Big batch went to the worker; results land later, so there's
+          // nothing to refresh yet.
+          toast.success(`backfill queued · ${r.task_id}`);
+          return;
+        }
+        toast.success(`classified ${r.created} · scanned ${r.scanned}`);
         await Promise.all([
           refreshList(bucket),
           refreshOverview(),
@@ -312,20 +474,23 @@ export default function Console() {
     async (label: Label) => {
       const id = selectedId;
       if (!id) return;
+      // Snapshot the row (captured from the updater's live state, so we don't
+      // depend on `items` here) to roll back if the server rejects the change.
+      let prevItem: TriageItem | undefined;
       // optimistic update
       setItems((prev) =>
-        prev.map((it) =>
-          it.thread_id === id
-            ? {
-                ...it,
-                classification: {
-                  label,
-                  confidence: 1,
-                  model_version: "operator-override",
-                },
-              }
-            : it,
-        ),
+        prev.map((it) => {
+          if (it.thread_id !== id) return it;
+          prevItem = it;
+          return {
+            ...it,
+            classification: {
+              label,
+              confidence: 1,
+              model_version: "user-override",
+            },
+          };
+        }),
       );
       if (USE_MOCK) mockApplyLabel(id, label);
       try {
@@ -333,6 +498,14 @@ export default function Console() {
         toast.success(`label → ${label}`);
         refreshCounts();
       } catch (e) {
+        // Restore the pre-optimistic label so the row doesn't keep a change the
+        // server never accepted.
+        if (prevItem) {
+          const restored = prevItem;
+          setItems((prev) =>
+            prev.map((it) => (it.thread_id === id ? restored : it)),
+          );
+        }
         toast.error((e as Error).message ?? "reclassify failed");
       }
     },
@@ -351,6 +524,16 @@ export default function Console() {
         return;
       }
 
+      // Escape clears an active search (works even while the search box has
+      // focus, since useHotkeys lets Escape through).
+      if (e.key === "Escape") {
+        if (searchMode || query) {
+          e.preventDefault();
+          clearSearch();
+        }
+        return;
+      }
+
       // palette
       if ((e.key === "k" || e.key === "K") && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
@@ -360,6 +543,27 @@ export default function Console() {
       if (e.key === "?") {
         e.preventDefault();
         setShortcutsOpen(true);
+        return;
+      }
+      // panels + search + delete
+      if (e.key === "/") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+        return;
+      }
+      if (e.key === "[") {
+        e.preventDefault();
+        togglePanel("sidebar");
+        return;
+      }
+      if (e.key === "]") {
+        e.preventDefault();
+        togglePanel("detail");
+        return;
+      }
+      if (e.key === "#") {
+        e.preventDefault();
+        doDelete();
         return;
       }
       // bucket switching 1-8
@@ -378,12 +582,12 @@ export default function Console() {
         moveSelection(-1);
       } else if (e.key === "G") {
         e.preventDefault();
-        if (sortedItems.length)
-          setSelectedId(sortedItems[sortedItems.length - 1].thread_id);
+        if (visibleItems.length)
+          setSelectedId(visibleItems[visibleItems.length - 1].thread_id);
       } else if (e.key === "g") {
         const now = Date.now();
         if (now - gPressedAt.current < 400) {
-          if (sortedItems.length) setSelectedId(sortedItems[0].thread_id);
+          if (visibleItems.length) setSelectedId(visibleItems[0].thread_id);
           gPressedAt.current = 0;
         } else {
           gPressedAt.current = now;
@@ -407,9 +611,9 @@ export default function Console() {
         refreshOverview();
         refreshCounts();
       } else if (e.key === "i") {
-        doIngest();
+        doIngest({ maxResults: 100, classify: true });
       } else if (e.key === "b") {
-        doBackfill();
+        doBackfill({ limit: 200, bucket, backend: "local", force: false });
       } else if (e.key === "q") {
         doQueue();
       }
@@ -417,10 +621,15 @@ export default function Console() {
     [
       paletteOpen,
       shortcutsOpen,
-      sortedItems,
+      searchMode,
+      query,
+      visibleItems,
       focusedItem,
       bucket,
       moveSelection,
+      clearSearch,
+      togglePanel,
+      doDelete,
       refreshList,
       refreshOverview,
       refreshCounts,
@@ -465,8 +674,13 @@ export default function Console() {
         overview={overview}
         ingesting={ingesting}
         backfilling={backfilling}
+        currentBucket={bucket}
         onIngest={doIngest}
-        onBackfill={() => doBackfill(false)}
+        onBackfill={doBackfill}
+        ingestOpen={ingestOpen}
+        onIngestOpenChange={setIngestOpen}
+        backfillOpen={backfillOpen}
+        onBackfillOpenChange={setBackfillOpen}
         onLogout={() => {
           setToken(null);
           setUser(null);
@@ -474,21 +688,70 @@ export default function Console() {
       />
 
       <div className="flex-1 min-h-0 flex">
-        <BucketSidebar
-          active={bucket}
-          counts={allCounts}
-          onSelect={(b) => setBucket(b)}
-        />
+        {panels.sidebar ? (
+          <BucketSidebar
+            active={bucket}
+            counts={allCounts}
+            onSelect={(b) => setBucket(b)}
+            onCollapse={() => togglePanel("sidebar")}
+          />
+        ) : (
+          <button
+            onClick={() => togglePanel("sidebar")}
+            aria-label="Show buckets"
+            title="Show buckets ( [ )"
+            className="w-8 shrink-0 border-r border-border bg-[var(--color-panel)] flex items-start justify-center pt-2.5 text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+          >
+            <PanelLeftOpen className="h-4 w-4" />
+          </button>
+        )}
 
         <section className="flex-1 min-w-0 flex flex-col border-r border-border">
-          <div className="h-9 shrink-0 border-b border-border bg-[var(--color-panel)] flex items-center px-3 gap-3 font-mono text-[11.5px]">
-            <span className="text-primary font-semibold tracking-tight">
-              {bucket.replace("_", " ")}
+          <div className="h-10 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center px-3 gap-2.5 font-mono text-[11.5px]">
+            <span className="text-primary font-semibold tracking-tight shrink-0">
+              {searchMode ? "search" : bucket.replace("_", " ")}
             </span>
-            <span className="text-muted-foreground tabular-nums">
-              {sortedItems.length} thread{sortedItems.length === 1 ? "" : "s"}
+            <span className="text-muted-foreground tabular-nums shrink-0">
+              {visibleItems.length}
+              {searchMode ? " match" : " thread"}
+              {visibleItems.length === 1 ? "" : "s"}
+              {searchMode ? " · all buckets" : ""}
             </span>
-            <div className="flex-1" />
+
+            <div className="flex-1 flex items-center min-w-0 max-w-[380px] ml-1">
+              <div className="flex items-center gap-1.5 w-full rounded border border-border bg-background px-2 h-6 focus-within:border-primary transition-colors">
+                <Search className="h-3 w-3 text-muted-foreground shrink-0" />
+                <input
+                  ref={searchInputRef}
+                  value={query}
+                  onChange={(e) => {
+                    setQuery(e.target.value);
+                    if (searchMode) {
+                      setSearchMode(false);
+                      setSearchResults([]);
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      runSearch();
+                    }
+                  }}
+                  placeholder="filter…  ↵ to search all buckets"
+                  className="flex-1 min-w-0 bg-transparent outline-none text-[12px] placeholder:text-muted-foreground/60"
+                />
+                {(query || searchMode) && (
+                  <button
+                    onClick={clearSearch}
+                    aria-label="Clear search"
+                    className="shrink-0 text-muted-foreground hover:text-foreground cursor-pointer"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                )}
+              </div>
+            </div>
+
             <button
               onClick={() =>
                 setSortMode((m) =>
@@ -500,42 +763,68 @@ export default function Console() {
                 )
               }
               title="press c"
-              className="px-2 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground"
+              aria-label={`Sort order: ${sortBadge}. Press c to cycle.`}
+              className="shrink-0 px-2 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
             >
               sort: {sortBadge}
             </button>
+
+            {!panels.detail && (
+              <button
+                onClick={() => togglePanel("detail")}
+                aria-label="Show thread detail"
+                title="Show detail ( ] )"
+                className="shrink-0 h-6 px-1.5 rounded border border-border text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer transition-colors flex items-center"
+              >
+                <PanelRightOpen className="h-3.5 w-3.5" />
+              </button>
+            )}
           </div>
           <div className="flex-1 overflow-y-auto scrollbar-thin">
             <ThreadList
-              items={sortedItems}
+              items={visibleItems}
               selectedId={selectedId}
               onSelect={(id) => setSelectedId(id)}
-              loading={listLoading}
+              loading={listLoading || searching}
               error={listError}
             />
           </div>
         </section>
 
-        <section className="w-[42%] min-w-[380px] max-w-[640px] flex flex-col bg-[var(--color-panel)]/30">
-          <ThreadDetailPane
-            data={thread}
-            classification={focusedItem?.classification ?? null}
-            loading={threadLoading}
-            error={threadError}
-            onReclassify={doReclassify}
-          />
-        </section>
+        {panels.detail && (
+          <section className="w-[42%] min-w-[380px] max-w-[640px] flex flex-col bg-[var(--color-panel)]/30">
+            <ThreadDetailPane
+              data={thread}
+              classification={focusedItem?.classification ?? null}
+              loading={threadLoading}
+              error={threadError}
+              onReclassify={doReclassify}
+              onCollapse={() => togglePanel("detail")}
+              onDelete={
+                focusedItem
+                  ? () => doDelete(focusedItem.thread_id)
+                  : undefined
+              }
+            />
+          </section>
+        )}
       </div>
 
       <CommandPalette
         open={paletteOpen}
         onOpenChange={setPaletteOpen}
         onBucket={(b) => setBucket(b)}
-        onIngest={doIngest}
-        onBackfill={() => doBackfill(false)}
+        onIngest={() => setIngestOpen(true)}
+        onBackfill={() => setBackfillOpen(true)}
         onQueue={doQueue}
         onReclassify={doReclassify}
         hasFocusedThread={!!focusedItem}
+        onToggleSidebar={() => togglePanel("sidebar")}
+        onToggleDetail={() => togglePanel("detail")}
+        onFocusSearch={() =>
+          setTimeout(() => searchInputRef.current?.focus(), 60)
+        }
+        onDelete={() => doDelete()}
       />
       <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
       <Toaster />

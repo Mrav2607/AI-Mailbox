@@ -5,14 +5,17 @@ const ROWS: [string, string][] = [
   ["j / k", "next / previous thread"],
   ["↵", "open focused thread"],
   ["g g / G", "jump to top / bottom"],
+  ["/", "search threads (↵ = all buckets)"],
   ["c", "sort by confidence (asc ↔ desc)"],
+  ["[ / ]", "toggle sidebar / detail pane"],
+  ["#", "delete focused thread"],
   ["r", "re-fetch list + overview"],
-  ["i", "ingest gmail"],
-  ["b", "backfill classification"],
+  ["i", "ingest gmail (quick; click for options)"],
+  ["b", "backfill (quick; click for model/bucket)"],
   ["q", "queue classification"],
   ["⌘ K / Ctrl K", "command palette"],
-  ["?", "this cheatsheet"],
-  ["Esc", "close overlay"],
+  ["Shift ?", "this cheatsheet"],
+  ["Esc", "clear search · close overlay"],
 ];
 
 export function Shortcuts({

@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { Sparkles, Loader2 } from "lucide-react";
+import { Loader2 } from "lucide-react";
+import { Mark } from "./Mark";
 import { demoLogin, googleAuthStart, setToken, USE_MOCK } from "@/lib/api";
 import type { User } from "@/lib/types";
 
@@ -49,8 +50,8 @@ export function LoginScreen({ onAuthed }: Props) {
         className="w-full max-w-sm rounded-lg border border-border bg-[var(--color-panel)] p-6 shadow-xl"
       >
         <div className="flex items-center gap-2 mb-1">
-          <div className="h-6 w-6 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor">
-            <Sparkles className="h-3.5 w-3.5 text-primary" />
+          <div className="h-6 w-6 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor text-primary">
+            <Mark className="h-4 w-4" />
           </div>
           <h1 className="font-mono text-base font-semibold tracking-tight">
             AI Mailbox
@@ -66,7 +67,7 @@ export function LoginScreen({ onAuthed }: Props) {
               type="button"
               onClick={google}
               disabled={googleBusy || busy}
-              className="w-full h-9 rounded border border-border bg-background font-mono text-[13px] font-semibold flex items-center justify-center gap-2 hover:bg-accent disabled:opacity-50"
+              className="w-full h-9 rounded border border-border bg-background font-mono text-[13px] font-semibold flex items-center justify-center gap-2 hover:bg-accent cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
               {googleBusy ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -84,10 +85,14 @@ export function LoginScreen({ onAuthed }: Props) {
           </>
         )}
 
-        <label className="block text-[11px] tracking-wide text-muted-foreground font-mono mb-1.5">
+        <label
+          htmlFor="login-email"
+          className="block text-[11px] tracking-wide text-muted-foreground font-mono mb-1.5"
+        >
           email
         </label>
         <input
+          id="login-email"
           autoFocus
           type="email"
           required
@@ -102,10 +107,12 @@ export function LoginScreen({ onAuthed }: Props) {
           </div>
         )}
 
+        {/* Also locked while the Google redirect is in flight, mirroring the
+            Google button, so the two sign-in paths can't race each other. */}
         <button
           type="submit"
-          disabled={busy}
-          className="mt-4 w-full h-9 rounded bg-primary text-primary-foreground font-mono text-[13px] font-semibold flex items-center justify-center gap-2 disabled:opacity-50"
+          disabled={busy || googleBusy}
+          className="mt-4 w-full h-9 rounded bg-primary text-primary-foreground font-mono text-[13px] font-semibold flex items-center justify-center gap-2 cursor-pointer transition-[filter] hover:brightness-110 disabled:opacity-50 disabled:cursor-default"
         >
           {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
           {busy ? "signing in…" : "demo login"}

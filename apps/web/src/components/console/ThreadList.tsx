@@ -1,3 +1,4 @@
+import { Inbox } from "lucide-react";
 import { LABEL_META, confidenceColor, confidenceText } from "@/lib/labels";
 import type { TriageItem } from "@/lib/types";
 import { relTime } from "@/lib/time";
@@ -20,15 +21,32 @@ export function ThreadList({ items, selectedId, onSelect, loading, error }: Prop
   }
   if (loading && items.length === 0) {
     return (
-      <div className="p-6 text-sm text-muted-foreground font-mono">
-        loading…
-      </div>
+      <ul className="divide-y divide-border" aria-hidden="true">
+        {Array.from({ length: 12 }).map((_, i) => (
+          <li
+            key={i}
+            className="px-3 py-[7px] flex items-center gap-2.5 border-l-2 border-transparent"
+          >
+            <span className="shrink-0 w-[92px] flex items-center gap-1.5">
+              <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/25 animate-pulse" />
+              <span className="h-2.5 w-14 rounded bg-muted animate-pulse" />
+            </span>
+            <span className="shrink-0 w-[70px] h-2.5 rounded bg-muted animate-pulse" />
+            <span
+              className="flex-1 h-2.5 rounded bg-muted animate-pulse"
+              style={{ maxWidth: `${45 + ((i * 7) % 40)}%` }}
+            />
+          </li>
+        ))}
+      </ul>
     );
   }
   if (items.length === 0) {
     return (
-      <div className="p-6 text-sm text-muted-foreground font-mono">
-        empty bucket
+      <div className="h-full flex flex-col items-center justify-center gap-2 text-muted-foreground font-mono">
+        <Inbox className="h-6 w-6 opacity-40" />
+        <div className="text-[12.5px]">nothing in this bucket</div>
+        <div className="text-[11px] opacity-70">ingest or backfill to populate it</div>
       </div>
     );
   }
@@ -47,8 +65,8 @@ export function ThreadList({ items, selectedId, onSelect, loading, error }: Prop
               data-thread-row={it.thread_id}
               onClick={() => onSelect(it.thread_id)}
               className={[
-                "group relative w-full text-left pl-3 pr-3 py-[7px] flex items-center gap-2.5 text-[12.5px]",
-                "border-l-2 transition-colors duration-100",
+                "group relative w-full text-left pl-3 pr-3 py-[7px] flex items-center gap-2.5 text-[12.5px] cursor-pointer",
+                "border-l-2 transition-colors duration-100 focus-visible:outline-none focus-visible:bg-[var(--color-panel-hi)]",
                 isSel
                   ? "border-primary bg-[var(--color-panel-hi)]"
                   : "border-transparent hover:bg-[var(--color-panel-hi)]/45",

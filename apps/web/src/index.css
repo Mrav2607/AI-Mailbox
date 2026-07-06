@@ -86,6 +86,30 @@
     background: oklch(0.82 0.145 80 / 0.28);
     color: var(--color-foreground);
   }
+  /* Keyboard focus is first-class in an operator console: a crisp amber ring,
+     never the browser default, and only for keyboard nav (not mouse clicks). */
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  [role="button"]:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 1px;
+  }
+}
+
+/* Subtle "lit from above" highlight that gives flat panels a touch of depth. */
+@utility panel-lift {
+  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.04);
+}
+
+/* Overlay elevation: a defined ring + deep shadow so modals read as floating,
+   not painted on. One purposeful shadow, not decoration. */
+@utility elevated {
+  box-shadow:
+    0 0 0 1px oklch(0 0 0 / 0.55),
+    0 28px 64px -20px oklch(0 0 0 / 0.75),
+    inset 0 1px 0 oklch(1 0 0 / 0.05);
 }
 
 /* A key on the amber accent — for the primary CTA and the selected row rail. */

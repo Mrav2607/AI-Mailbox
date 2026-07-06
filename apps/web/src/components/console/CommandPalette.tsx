@@ -20,6 +20,10 @@ interface Props {
   onQueue: () => void;
   onReclassify: (l: Label) => void;
   hasFocusedThread: boolean;
+  onToggleSidebar: () => void;
+  onToggleDetail: () => void;
+  onFocusSearch: () => void;
+  onDelete: () => void;
 }
 
 export function CommandPalette({
@@ -31,6 +35,10 @@ export function CommandPalette({
   onQueue,
   onReclassify,
   hasFocusedThread,
+  onToggleSidebar,
+  onToggleDetail,
+  onFocusSearch,
+  onDelete,
 }: Props) {
   const run = (fn: () => void) => {
     onOpenChange(false);
@@ -56,15 +64,35 @@ export function CommandPalette({
                 </CommandItem>
               ))}
             </CommandGroup>
+            <CommandGroup heading="view">
+              <CommandItem
+                onSelect={() => run(onFocusSearch)}
+                value="search threads find"
+              >
+                search threads
+              </CommandItem>
+              <CommandItem
+                onSelect={() => run(onToggleSidebar)}
+                value="toggle buckets sidebar"
+              >
+                toggle bucket sidebar
+              </CommandItem>
+              <CommandItem
+                onSelect={() => run(onToggleDetail)}
+                value="toggle thread detail pane"
+              >
+                toggle thread detail pane
+              </CommandItem>
+            </CommandGroup>
             <CommandGroup heading="actions">
               <CommandItem onSelect={() => run(onIngest)} value="ingest gmail">
-                ingest gmail
+                ingest gmail…
               </CommandItem>
               <CommandItem
                 onSelect={() => run(onBackfill)}
                 value="backfill classification"
               >
-                backfill classification
+                backfill classification…
               </CommandItem>
               <CommandItem
                 onSelect={() => run(onQueue)}
@@ -74,7 +102,7 @@ export function CommandPalette({
               </CommandItem>
             </CommandGroup>
             {hasFocusedThread && (
-              <CommandGroup heading="reclassify focused">
+              <CommandGroup heading="focused thread">
                 {ALL_LABELS.map((l) => (
                   <CommandItem
                     key={l}
@@ -84,6 +112,13 @@ export function CommandPalette({
                     set label → {LABEL_META[l].name}
                   </CommandItem>
                 ))}
+                <CommandItem
+                  onSelect={() => run(onDelete)}
+                  value="delete thread"
+                  className="text-[oklch(0.74_0.17_25)]"
+                >
+                  delete thread
+                </CommandItem>
               </CommandGroup>
             )}
           </CommandList>

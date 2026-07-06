@@ -1,13 +1,26 @@
 import type {
+  BackfillOptions,
+  BackfillResult,
   BucketKey,
   Classification,
+  CountsResponse,
   Label,
   Overview,
+  SearchResponse,
   ThreadDetail,
   TriageResponse,
   User,
 } from "./types";
-import { mockOverview, mockThread, mockTriage, mockUser } from "./mock";
+import {
+  mockBackfill,
+  mockCounts,
+  mockDeleteThread,
+  mockOverview,
+  mockSearch,
+  mockThread,
+  mockTriage,
+  mockUser,
+} from "./mock";
 
 const TOKEN_KEY = "ai_mailbox_token";
 const BASE = (import.meta.env.VITE_API_BASE_URL as string) ?? "";
@@ -48,6 +61,8 @@ async function request<T>(
   if (!res.ok) {
     throw new ApiError(res.status, `${res.status} ${res.statusText}`);
   }
+  // 204 No Content (e.g. DELETE) has no body to parse.
+  if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
 
@@ -76,6 +91,11 @@ export async function googleAuthCallback(
   code: string,
   state?: string | null,
 ): Promise<{ access_token: string; token_type: string; user: User }> {
+  if (USE_MOCK) {
+    // Same story as googleAuthStart: nobody should land here in preview mode,
+    // but if they paste the callback URL, fail with the friendly error.
+    throw new ApiError(0, "Google sign-in needs a live API (set VITE_API_BASE_URL)");
+  }
   const qs = new URLSearchParams({ code });
   if (state) qs.set("state", state);
   return request<{ access_token: string; token_type: string; user: User }>(
@@ -109,9 +129,41 @@ export async function getTriage(
   );
 }
 
+// Whole-mailbox thread counts per bucket for the sidebar. Computed server-side
+// so the totals aren't capped by a single triage page.
+export async function getCounts(): Promise<Record<BucketKey, number>> {
+  if (USE_MOCK) return mockCounts();
+  const res = await request<CountsResponse>("/mail/counts");
+  return res.counts;
+}
+
 export async function getThread(id: string): Promise<ThreadDetail> {
   if (USE_MOCK) return mockThread(id);
   return request<ThreadDetail>(`/mail/thread/${id}`);
+}
+
+// Cross-bucket search over the whole mailbox (subject / sender / snippet).
+export async function searchThreads(
+  q: string,
+  limit = 50,
+): Promise<SearchResponse> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 120));
+    return mockSearch(q, limit);
+  }
+  return request<SearchResponse>(
+    `/mail/search?q=${encodeURIComponent(q)}&limit=${limit}`,
+  );
+}
+
+// Permanently delete a thread (and its messages/classifications via cascade).
+export async function deleteThread(threadId: string): Promise<void> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 120));
+    mockDeleteThread(threadId);
+    return;
+  }
+  await request<void>(`/mail/thread/${threadId}`, { method: "DELETE" });
 }
 
 export async function getOverview(): Promise<Overview> {
@@ -119,25 +171,36 @@ export async function getOverview(): Promise<Overview> {
   return request<Overview>("/analytics/overview");
 }
 
-export async function ingestGmail(max_results = 50) {
+export async function ingestGmail(
+  max_results = 50,
+  classify = true,
+): Promise<{ status: string; ingested?: number }> {
   if (USE_MOCK) {
     await new Promise((r) => setTimeout(r, 700));
     return { status: "ok", ingested: max_results };
   }
-  return request(`/mail/ingest/gmail?max_results=${max_results}`, {
-    method: "POST",
-  });
-}
-
-export async function classifyBackfill(limit = 100, force = false) {
-  if (USE_MOCK) {
-    await new Promise((r) => setTimeout(r, 700));
-    return { status: "ok", classified: limit };
-  }
-  return request(
-    `/mail/classify/backfill?limit=${limit}&force=${force}`,
+  return request<{ status: string; ingested?: number }>(
+    `/mail/ingest/gmail?max_results=${max_results}&classify=${classify}`,
     { method: "POST" },
   );
+}
+
+export async function classifyBackfill(
+  opts: BackfillOptions,
+): Promise<BackfillResult> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 700));
+    return mockBackfill(opts);
+  }
+  const qs = new URLSearchParams({
+    limit: String(opts.limit),
+    force: String(opts.force),
+    bucket: opts.bucket,
+    backend: opts.backend,
+  });
+  return request<BackfillResult>(`/mail/classify/backfill?${qs.toString()}`, {
+    method: "POST",
+  });
 }
 
 export async function classifyQueue(limit = 100, force = false) {
