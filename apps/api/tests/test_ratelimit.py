@@ -1,7 +1,8 @@
 """Rate limiter tests: fixed-window behavior and fail-open.
 
 Everything runs offline. Redis is replaced by a tiny in-memory fake (or one
-that always raises) via the module's lazy client helper.
+that always raises) via the module's lazy client helper, and the demo-login
+endpoint test stubs the DB so results are deterministic without Postgres.
 """
 
 import logging
@@ -10,8 +11,11 @@ import pytest
 import redis
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core import ratelimit
+from app.deps import get_db
+from app.main import app as main_app
 
 
 class FakeRedis:
@@ -94,3 +98,24 @@ def test_redis_failure_fails_open_and_logs(monkeypatch, caplog):
         for _ in range(5):
             assert client.get("/ping").status_code == 200
     assert any("Rate limiter unavailable" in record.message for record in caplog.records)
+
+
+def test_demo_login_is_limited_per_ip(fake_redis):
+    """The 11th demo-login from one IP is rejected before any DB access."""
+
+    def _db_down():
+        raise SQLAlchemyError("no database in offline tests")
+
+    main_app.dependency_overrides[get_db] = _db_down
+    try:
+        client = TestClient(main_app, raise_server_exceptions=False)
+        payload = {"email": "abuse@example.com"}
+        # Under the limit the limiter waves requests through and they die at the
+        # stubbed DB instead -- 503, never 429.
+        for _ in range(10):
+            assert client.post("/api/v1/auth/demo-login", json=payload).status_code == 503
+        resp = client.post("/api/v1/auth/demo-login", json=payload)
+        assert resp.status_code == 429
+        assert "Retry-After" in resp.headers
+    finally:
+        main_app.dependency_overrides.clear()

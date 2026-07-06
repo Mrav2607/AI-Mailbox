@@ -1,8 +1,11 @@
 """Session-token helpers: issue and verify HS256 JWTs for authenticated users.
 
-A token's ``sub`` claim holds the AppUser id. Tokens are signed with
-``settings.api_secret`` -- keep it secret in production, since anyone holding it
-can mint valid tokens.
+A token's ``sub`` claim holds the AppUser id, and every token carries our
+``iss``/``aud`` claims so a token minted by (or for) some other service can't
+be replayed against this API. Verification requires ``sub``/``exp``/``iat`` to
+be present, so a stripped-down token can't dodge expiry checks. Tokens are
+signed with ``settings.api_secret`` -- keep it secret in production, since
+anyone holding it can mint valid tokens.
 """
 
 from __future__ import annotations
@@ -12,6 +15,11 @@ from datetime import datetime, timedelta, timezone
 import jwt
 
 from app.core.config import settings
+
+# Who mints the token and who it's for. Both are checked on decode, so tokens
+# from another deployment (or another app sharing the secret) get rejected.
+JWT_ISSUER = "ai-mailbox-api"
+JWT_AUDIENCE = "ai-mailbox"
 
 
 def create_access_token(subject: str, expires_minutes: int | None = None) -> str:
@@ -24,6 +32,8 @@ def create_access_token(subject: str, expires_minutes: int | None = None) -> str
     )
     payload = {
         "sub": subject,
+        "iss": JWT_ISSUER,
+        "aud": JWT_AUDIENCE,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=minutes)).timestamp()),
     }
@@ -32,5 +42,13 @@ def create_access_token(subject: str, expires_minutes: int | None = None) -> str
 
 def decode_access_token(token: str) -> dict:
     """Verify a token and return its claims. Raises ``jwt.PyJWTError`` on an
-    invalid signature or an expired/malformed token."""
-    return jwt.decode(token, settings.api_secret, algorithms=[settings.jwt_algorithm])
+    invalid signature, a wrong issuer/audience, missing required claims, or an
+    expired/malformed token."""
+    return jwt.decode(
+        token,
+        settings.api_secret,
+        algorithms=[settings.jwt_algorithm],
+        audience=JWT_AUDIENCE,
+        issuer=JWT_ISSUER,
+        options={"require": ["sub", "exp", "iat"]},
+    )
