@@ -1,4 +1,4 @@
-"""Rate limiter tests: fixed-window behavior and fail-open.
+"""Rate limiter tests: fixed-window behavior, fail-open, and LIKE escaping.
 
 Everything runs offline. Redis is replaced by a tiny in-memory fake (or one
 that always raises) via the module's lazy client helper, and the demo-login
@@ -16,6 +16,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.core import ratelimit
 from app.deps import get_db
 from app.main import app as main_app
+from app.routes.mailbox import _escape_like
 
 
 class FakeRedis:
@@ -119,3 +120,13 @@ def test_demo_login_is_limited_per_ip(fake_redis):
         assert "Retry-After" in resp.headers
     finally:
         main_app.dependency_overrides.clear()
+
+
+def test_escape_like_neutralizes_metacharacters():
+    assert _escape_like("100%") == "100\\%"
+    assert _escape_like("a_b") == "a\\_b"
+    assert _escape_like("back\\slash") == "back\\\\slash"
+    # Backslash is escaped first, so a caller-supplied "\\%" can't sneak an
+    # unescaped wildcard through.
+    assert _escape_like("\\%") == "\\\\\\%"
+    assert _escape_like("plain query") == "plain query"

@@ -81,19 +81,20 @@ def _parse_llm_response(content: str) -> tuple[str, float, str]:
     return label, float(confidence), str(rationale)
 
 
-def classify(text: str) -> tuple[str, float, str, str]:
+def classify(text: str, backend: str | None = None) -> tuple[str, float, str, str]:
     """
     Classify an email into the 6-label taxonomy.
     Returns (label, confidence, rationale, model_version).
 
-    Routed by settings.classifier_backend:
+    Routed by `backend` (falling back to settings.classifier_backend when not
+    given, so callers can override the global default per request):
       - "local":     fine-tuned encoder in models/, falling back to the LLM /
                      heuristic path if the model or its deps are unavailable.
       - "gemini":    LLM with heuristic fallback (the original behavior).
       - "heuristic": keyword rules only.
       - "auto":      try local, then LLM, then heuristic.
     """
-    backend = (settings.classifier_backend or "auto").lower()
+    backend = (backend or settings.classifier_backend or "auto").lower()
 
     if backend == "heuristic":
         return _heuristic_classify(text)

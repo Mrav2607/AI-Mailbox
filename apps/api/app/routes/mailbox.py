@@ -1,16 +1,19 @@
 from datetime import datetime, timezone
 from uuid import UUID
+from typing import Any, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, or_, func
 from sqlalchemy.orm import Session
 
+from app.core.ratelimit import user_rate_limit
 from app.deps import get_db, get_current_user
 from app.db.models import MailThread, MailMessage, Classification, AppUser
-from app.services.ingest.gmail_ingest import ingest_gmail_messages
-from app.workers.tasks_nlp import classify_latest_threads
-from app.services.nlp.classifier import classify, build_classification_text, LABELS
+from app.workers.tasks_ingest import ingest_gmail_for_user
+from app.workers.tasks_nlp import backfill_threads_for_user, classify_latest_threads
+from app.services.nlp.backfill import latest_label_subquery, run_backfill
+from app.services.nlp.classifier import LABELS
 from app.services.nlp.persistence import upsert_classification
 
 router = APIRouter(prefix="/mail")
@@ -19,47 +22,28 @@ router = APIRouter(prefix="/mail")
 # (or a Gmail pull) for an unbounded amount of work.
 _MAX_PAGE_LIMIT = 200
 _MAX_INGEST_RESULTS = 500
+# Backfills up to this many threads run inline and return counts immediately;
+# anything bigger goes to the Celery worker (a 500-thread Gemini run can hold
+# a request open for minutes).
+_MAX_INLINE_BACKFILL = 50
 # Valid triage filters: every classifier label plus the two synthetic buckets.
 _TRIAGE_BUCKETS = frozenset(LABELS) | {"all", "unclassified"}
+# Classifier backends a caller may request per run (see services.nlp.classify).
+_CLASSIFIER_BACKENDS = frozenset({"local", "gemini", "heuristic", "auto"})
 # Marks a label set by a human in the console rather than a model, so it's
 # distinguishable from a real prediction and never overwritten by a backfill
 # (which only touches unclassified messages unless forced).
-_OPERATOR_MODEL_VERSION = "operator-override"
+_OPERATOR_MODEL_VERSION = "user-override"
 
 
 class ReclassifyRequest(BaseModel):
     label: str
 
 
-@router.get("/triage")
-def get_triage(
-    bucket: str = "needs_reply",
-    limit: int = Query(default=50, ge=1, le=_MAX_PAGE_LIMIT),
-    current_user: AppUser = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict:
-    """
-    Fetch recent threads for the authenticated user with latest classification label.
-    """
-    if bucket not in _TRIAGE_BUCKETS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Invalid bucket '{bucket}'. Valid: {sorted(_TRIAGE_BUCKETS)}",
-        )
-    threads = (
-        db.execute(
-            select(MailThread)
-            .where(MailThread.user_id == current_user.id)
-            .order_by(
-                MailThread.last_message_at.desc().nullslast(),
-                MailThread.created_at.desc(),
-            )
-            .limit(limit)
-        )
-        .scalars()
-        .all()
-    )
-
+def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]:
+    """Build triage item dicts for an ordered list of threads: each thread's
+    latest message plus that message's latest classification. Shared by the
+    triage and search endpoints so both return the same shape."""
     thread_ids = [t.id for t in threads]
     messages = (
         db.execute(
@@ -109,12 +93,6 @@ def get_triage(
     for thread in threads:
         latest_message = latest_message_by_thread.get(thread.id)
         classification = classifications_by_msg.get(latest_message.id) if latest_message else None
-        if bucket != "all":
-            if bucket == "unclassified" and classification is not None:
-                continue
-            if bucket not in ("all", "unclassified"):
-                if not classification or classification.label != bucket:
-                    continue
         items.append(
             {
                 "thread_id": str(thread.id),
@@ -128,7 +106,80 @@ def get_triage(
                 },
             }
         )
-    return {"bucket": bucket, "items": items}
+    return items
+
+
+@router.get("/triage")
+def get_triage(
+    bucket: str = "needs_reply",
+    limit: int = Query(default=50, ge=1, le=_MAX_PAGE_LIMIT),
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Fetch recent threads for the authenticated user with latest classification label.
+    """
+    if bucket not in _TRIAGE_BUCKETS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid bucket '{bucket}'. Valid: {sorted(_TRIAGE_BUCKETS)}",
+        )
+    query = select(MailThread).where(MailThread.user_id == current_user.id)
+    # Filter by bucket in SQL, before the limit, so a specific-label view returns
+    # up to `limit` matching threads instead of whatever matches happen to fall
+    # inside the `limit` most-recent threads overall.
+    if bucket == "unclassified":
+        query = query.where(latest_label_subquery().is_(None))
+    elif bucket != "all":
+        query = query.where(latest_label_subquery() == bucket)
+
+    threads = list(
+        db.execute(
+            query.order_by(
+                MailThread.last_message_at.desc().nullslast(),
+                MailThread.created_at.desc(),
+            )
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+    return {"bucket": bucket, "items": _assemble_triage_items(db, threads)}
+
+
+@router.get("/counts")
+def get_counts(
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Total thread count per bucket for the sidebar.
+
+    Grouped in SQL so the counts reflect the whole mailbox rather than a single
+    truncated page. Keys cover every triage bucket, including `all` (the total)
+    and `unclassified`.
+    """
+    bucket_label = latest_label_subquery().label("bucket_label")
+    grouped = (
+        select(bucket_label)
+        .select_from(MailThread)
+        .where(MailThread.user_id == current_user.id)
+        .subquery()
+    )
+    rows = db.execute(
+        select(grouped.c.bucket_label, func.count())
+        .group_by(grouped.c.bucket_label)
+    ).all()
+
+    counts = {bucket: 0 for bucket in _TRIAGE_BUCKETS}
+    total = 0
+    for label, count in rows:
+        total += count
+        if label is None:
+            counts["unclassified"] += count
+        elif label in counts:
+            counts[label] += count
+    counts["all"] = total
+    return {"counts": counts}
 
 
 @router.get("/thread/{thread_id}")
@@ -234,38 +285,48 @@ def reclassify_thread(
     }
 
 
-@router.post("/ingest/gmail")
-def ingest_gmail(
-    max_results: int = Query(default=25, ge=1, le=_MAX_INGEST_RESULTS),
-    skip_existing: bool = True,
-    classify: bool = True,
+def _escape_like(q: str) -> str:
+    """Escape LIKE metacharacters so user input matches literally -- searching
+    for "100%" should find "100%", not "100" followed by anything. Backslash
+    goes first so we don't double-escape our own escapes."""
+    return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# Generous per-user limit -- the console fires a search per keystroke, but each
+# one is an unanchored ILIKE over body_text, so cap runaway callers.
+@router.get("/search", dependencies=[Depends(user_rate_limit("search", 60, 60))])
+def search_threads(
+    q: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(default=50, ge=1, le=_MAX_PAGE_LIMIT),
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    try:
-        result = ingest_gmail_messages(
-            db=db,
-            user_id=str(current_user.id),
-            max_results=max_results,
-            skip_existing=skip_existing,
-            classify_messages=classify,
+    """Search the user's threads across every bucket.
+
+    Case-insensitive substring match on the thread subject and on any of its
+    messages' sender / snippet / body. Returns the same item shape as triage so
+    the console can render results in the same list.
+    """
+    pattern = f"%{_escape_like(q)}%"
+    message_match = (
+        select(MailMessage.id)
+        .where(
+            MailMessage.thread_id == MailThread.id,
+            or_(
+                MailMessage.sender.ilike(pattern, escape="\\"),
+                MailMessage.snippet.ilike(pattern, escape="\\"),
+                MailMessage.body_text.ilike(pattern, escape="\\"),
+            ),
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"status": "ok", **result}
-
-
-@router.post("/classify/backfill")
-def backfill_classifications(
-    limit: int = Query(default=100, ge=1, le=_MAX_INGEST_RESULTS),
-    force: bool = False,
-    current_user: AppUser = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict:
-    threads = (
+        .exists()
+    )
+    threads = list(
         db.execute(
             select(MailThread)
-            .where(MailThread.user_id == current_user.id)
+            .where(
+                MailThread.user_id == current_user.id,
+                or_(MailThread.subject.ilike(pattern, escape="\\"), message_match),
+            )
             .order_by(
                 MailThread.last_message_at.desc().nullslast(),
                 MailThread.created_at.desc(),
@@ -275,82 +336,128 @@ def backfill_classifications(
         .scalars()
         .all()
     )
-    thread_ids = [t.id for t in threads]
-    messages = (
-        db.execute(
-            select(MailMessage)
-            .where(MailMessage.thread_id.in_(thread_ids))
-            .order_by(
-                MailMessage.sent_at.desc().nullslast(),
-                MailMessage.created_at.desc(),
-            )
-        )
-        .scalars()
-        .all()
-        if thread_ids
-        else []
-    )
-    latest_message_by_thread: dict[UUID, MailMessage] = {}
-    for message in messages:
-        message_time = message.sent_at or message.created_at
-        if not message_time:
-            message_time = datetime.min.replace(tzinfo=timezone.utc)
-        current = latest_message_by_thread.get(message.thread_id)
-        if not current:
-            latest_message_by_thread[message.thread_id] = message
-            continue
-        current_time = current.sent_at or current.created_at
-        if not current_time:
-            current_time = datetime.min.replace(tzinfo=timezone.utc)
-        if message_time > current_time:
-            latest_message_by_thread[message.thread_id] = message
+    return {"query": q, "items": _assemble_triage_items(db, threads)}
 
-    subject_by_thread = {t.id: t.subject for t in threads}
-    message_ids = [m.id for m in latest_message_by_thread.values()]
-    already_classified = (
-        set(
-            db.execute(
-                select(Classification.message_id).where(
-                    Classification.message_id.in_(message_ids)
-                )
-            ).scalars()
-        )
-        if message_ids
-        else set()
-    )
 
-    created = 0
-    for message in latest_message_by_thread.values():
-        is_new = message.id not in already_classified
-        # Skip the (expensive) classify call when a label already exists and
-        # we're not forcing a refresh.
-        if not is_new and not force:
-            continue
-        text_for_classification = build_classification_text(
-            subject_by_thread.get(message.thread_id),
-            message.snippet,
-            message.body_text,
-        )
-        label, confidence, rationale, model_version = classify(text_for_classification)
-        upsert_classification(
-            db,
-            message_id=message.id,
-            label=label,
-            confidence=confidence,
-            rationale=rationale,
-            model_version=model_version,
-        )
-        created += 1
+@router.delete("/thread/{thread_id}", status_code=204)
+def delete_thread(
+    thread_id: UUID,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Permanently delete a thread and everything hanging off it.
 
+    The mail_message -> mail_thread and classification -> mail_message foreign
+    keys are ON DELETE CASCADE, so dropping the thread row takes its messages
+    and their classifications with it.
+    """
+    thread = db.get(MailThread, thread_id)
+    # 404 (not 403) for another user's thread so we don't leak that it exists.
+    if not thread or thread.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    db.delete(thread)
     db.commit()
-    return {
-        "status": "ok",
-        "created": created,
-        "scanned": len(latest_message_by_thread),
-    }
+    return Response(status_code=204)
 
 
-@router.post("/classify/queue")
+@router.post(
+    "/ingest/gmail",
+    status_code=202,
+    # Each call queues up to 500 Gmail fetches of Celery work; keep it rare.
+    dependencies=[Depends(user_rate_limit("ingest-gmail", 5, 60))],
+)
+def ingest_gmail(
+    max_results: int = Query(default=25, ge=1, le=_MAX_INGEST_RESULTS),
+    skip_existing: bool = True,
+    classify: bool = True,
+    current_user: AppUser = Depends(get_current_user),
+) -> dict:
+    """Queue a Gmail pull for the worker instead of running it inline.
+
+    A full ingest is up to 500 serial Gmail fetches plus classification --
+    way too slow to hold a request open for, so we hand it to Celery and
+    return 202 with the task id.
+    """
+    task = cast(Any, ingest_gmail_for_user).delay(
+        user_id=str(current_user.id),
+        max_results=max_results,
+        skip_existing=skip_existing,
+        classify_messages=classify,
+    )
+    return {"status": "queued", "task_id": task.id}
+
+
+@router.post(
+    "/classify/backfill",
+    # Small backfills run the classifier inline; big ones enqueue worker jobs.
+    # Either way each call is expensive, so keep the per-user cadence low.
+    dependencies=[Depends(user_rate_limit("classify-backfill", 5, 60))],
+)
+def backfill_classifications(
+    response: Response,
+    limit: int = Query(default=100, ge=1, le=_MAX_INGEST_RESULTS),
+    force: bool = False,
+    bucket: str = "unclassified",
+    backend: str | None = None,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Classify (or, with ``force``, re-classify) a batch of threads.
+
+    ``bucket`` scopes which threads are eligible, filtered in SQL *before* the
+    limit so the batch targets the intended threads instead of whatever falls in
+    the most-recent ``limit`` rows:
+      - "unclassified" (default): threads whose latest message has no label.
+      - a specific label: threads currently in that bucket (needs ``force`` to
+        actually re-run, since they're already classified).
+      - "all": every thread; unlabeled ones get classified, and with ``force``
+        everything is re-classified.
+    ``backend`` overrides the configured classifier for this run.
+
+    Up to ``_MAX_INLINE_BACKFILL`` threads this runs inline and returns counts;
+    anything bigger is handed to the worker and answered with 202 + task id,
+    since a large Gemini batch can hold the request open for minutes.
+    """
+    if bucket not in _TRIAGE_BUCKETS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid bucket '{bucket}'. Valid: {sorted(_TRIAGE_BUCKETS)}",
+        )
+    # classify() lowercases its backend anyway, but normalize here so one
+    # canonical value flows into task kwargs and logs.
+    normalized_backend = backend.lower() if backend is not None else None
+    if normalized_backend is not None and normalized_backend not in _CLASSIFIER_BACKENDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid backend '{backend}'. Valid: {sorted(_CLASSIFIER_BACKENDS)}",
+        )
+
+    if limit > _MAX_INLINE_BACKFILL:
+        task = cast(Any, backfill_threads_for_user).delay(
+            user_id=str(current_user.id),
+            limit=limit,
+            force=force,
+            bucket=bucket,
+            backend=normalized_backend,
+        )
+        response.status_code = 202
+        return {"status": "queued", "task_id": task.id}
+
+    return run_backfill(
+        db,
+        current_user.id,
+        limit=limit,
+        force=force,
+        bucket=bucket,
+        backend=normalized_backend,
+    )
+
+
+@router.post(
+    "/classify/queue",
+    # Same story as ingest: each call piles classification work on the worker.
+    dependencies=[Depends(user_rate_limit("classify-queue", 5, 60))],
+)
 def queue_classification(
     limit: int = Query(default=25, ge=1, le=_MAX_INGEST_RESULTS),
     force: bool = False,
