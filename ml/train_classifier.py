@@ -8,7 +8,7 @@ doesn't swamp the rare ones), selects the best epoch by macro-F1, prints a
 per-class report, and saves the model + tokenizer + label map for in-process
 serving (loaded at runtime by ``app/services/nlp/local_model.py``).
 
-The --data inputs come from the data-prep scripts (all git-ignored, local-only):
+The --data inputs come from the data-prep scripts (local-only):
 ``pseudo_label_inbox.py`` -> ``data/real_train.jsonl`` (Gemini-labeled real
 inbox), ``generate_synthetic.py`` -> ``data/synthetic.jsonl`` (grounded
 synthetic for scarce classes), and ``import_manual_emails.py`` ->
