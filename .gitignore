@@ -42,3 +42,8 @@ ai-mailbox/apps/api/receipts_export.csv
 /models/
 /data/
 /scripts/
+
+# AI-agent working files (local only)
+/audit-report.md
+/.mcp.json
+apps/web/_shot*.mjs
