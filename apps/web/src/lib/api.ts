@@ -54,7 +54,10 @@ async function request<T>(
   const res = await fetch(`${BASE}${path}`, {
     ...opts,
     headers: {
-      "Content-Type": "application/json",
+      // Only declare a Content-Type when there's a body: it's not a
+      // CORS-safelisted header, so putting it on GETs forces a preflight
+      // round-trip on every cross-origin read.
+      ...(opts.body != null ? { "Content-Type": "application/json" } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(opts.headers ?? {}),
     },
