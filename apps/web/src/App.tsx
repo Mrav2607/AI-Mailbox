@@ -14,9 +14,7 @@ import {
   reclassify,
   searchThreads,
   setToken,
-  USE_MOCK,
 } from "@/lib/api";
-import { mockApplyLabel } from "@/lib/mock";
 import { BUCKET_KEYS } from "@/lib/labels";
 import type {
   BackfillOptions,
@@ -474,25 +472,25 @@ export default function Console() {
     async (label: Label) => {
       const id = selectedId;
       if (!id) return;
-      // Snapshot the row (captured from the updater's live state, so we don't
+      // Snapshot the row (captured from the updaters' live state, so we don't
       // depend on `items` here) to roll back if the server rejects the change.
+      // Search results are a separate list rendered while searchMode is on, so
+      // the optimistic write (and any rollback) has to hit both.
       let prevItem: TriageItem | undefined;
-      // optimistic update
-      setItems((prev) =>
-        prev.map((it) => {
-          if (it.thread_id !== id) return it;
-          prevItem = it;
-          return {
-            ...it,
-            classification: {
-              label,
-              confidence: 1,
-              model_version: "user-override",
-            },
-          };
-        }),
-      );
-      if (USE_MOCK) mockApplyLabel(id, label);
+      const applyOverride = (it: TriageItem): TriageItem => {
+        if (it.thread_id !== id) return it;
+        prevItem = it;
+        return {
+          ...it,
+          classification: {
+            label,
+            confidence: 1,
+            model_version: "user-override",
+          },
+        };
+      };
+      setItems((prev) => prev.map(applyOverride));
+      setSearchResults((prev) => prev.map(applyOverride));
       try {
         await reclassify(id, label);
         toast.success(`label → ${label}`);
@@ -503,6 +501,9 @@ export default function Console() {
         if (prevItem) {
           const restored = prevItem;
           setItems((prev) =>
+            prev.map((it) => (it.thread_id === id ? restored : it)),
+          );
+          setSearchResults((prev) =>
             prev.map((it) => (it.thread_id === id ? restored : it)),
           );
         }

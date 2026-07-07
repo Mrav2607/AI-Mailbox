@@ -12,6 +12,7 @@ import type {
   User,
 } from "./types";
 import {
+  mockApplyLabel,
   mockBackfill,
   mockCounts,
   mockDeleteThread,
@@ -222,6 +223,9 @@ export async function reclassify(
 ): Promise<{ thread_id: string; classification: Classification } | void> {
   if (USE_MOCK) {
     await new Promise((r) => setTimeout(r, 150));
+    // Mutate the mock store so the label survives re-fetches, same as the
+    // other mock write paths (delete/backfill) do.
+    mockApplyLabel(threadId, label);
     return;
   }
   return request<{ thread_id: string; classification: Classification }>(
