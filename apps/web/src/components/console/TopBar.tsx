@@ -1,0 +1,311 @@
+import { useState } from "react";
+import { Loader2, Download, Sparkles, LogOut } from "lucide-react";
+import { Mark } from "./Mark";
+import { Popover } from "./Popover";
+import { bucketLabel } from "@/lib/labels";
+import { BUCKETS } from "@/lib/types";
+import type {
+  BackfillOptions,
+  BucketKey,
+  ClassifierBackend,
+  IngestOptions,
+  Overview,
+  User,
+} from "@/lib/types";
+
+interface Props {
+  user: User | null;
+  overview: Overview | null;
+  ingesting: boolean;
+  backfilling: boolean;
+  currentBucket: BucketKey;
+  onIngest: (opts: IngestOptions) => void;
+  onBackfill: (opts: BackfillOptions) => void;
+  onLogout: () => void;
+  ingestOpen: boolean;
+  onIngestOpenChange: (v: boolean) => void;
+  backfillOpen: boolean;
+  onBackfillOpenChange: (v: boolean) => void;
+}
+
+const BACKENDS: { value: ClassifierBackend; label: string }[] = [
+  { value: "local", label: "local encoder" },
+  { value: "gemini", label: "gemini (LLM)" },
+  { value: "heuristic", label: "heuristic" },
+];
+
+function clamp(n: number, lo: number, hi: number): number {
+  if (Number.isNaN(n)) return lo;
+  return Math.max(lo, Math.min(hi, n));
+}
+
+function Stat({ label, value }: { label: string; value: number | string }) {
+  return (
+    <div className="px-2.5 py-1 rounded border border-border bg-[var(--color-panel)] flex items-baseline gap-1.5 font-mono">
+      <span className="text-[10.5px] text-muted-foreground">{label}</span>
+      <span className="text-[12.5px] tabular-nums">{value}</span>
+    </div>
+  );
+}
+
+const fieldLabel = "font-mono text-[11px] text-muted-foreground";
+const control =
+  "w-full bg-[var(--color-panel)] border border-border rounded px-2 py-1 text-[12px] font-mono text-foreground focus-visible:outline-none focus-visible:border-primary/60";
+
+function IngestForm({
+  busy,
+  onSubmit,
+}: {
+  busy: boolean;
+  onSubmit: (o: IngestOptions) => void;
+}) {
+  // String state so a mid-edit (cleared) field never becomes NaN; we parse
+  // and clamp on submit instead.
+  const [count, setCount] = useState("100");
+  const [classify, setClassify] = useState(true);
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        const n = parseInt(count, 10);
+        onSubmit({ maxResults: clamp(Number.isNaN(n) ? 100 : n, 1, 500), classify });
+      }}
+      className="space-y-2.5"
+    >
+      <div className={fieldLabel}>ingest gmail</div>
+      <label className="block space-y-1">
+        <span className={fieldLabel}>how many (1–500)</span>
+        <input
+          type="number"
+          min={1}
+          max={500}
+          value={count}
+          onChange={(e) => setCount(e.target.value)}
+          className={control}
+        />
+      </label>
+      <label className="flex items-center gap-2 cursor-pointer text-[12px] font-mono text-foreground/85">
+        <input
+          type="checkbox"
+          checked={classify}
+          onChange={(e) => setClassify(e.target.checked)}
+          className="accent-primary"
+        />
+        classify on ingest
+      </label>
+      <button
+        type="submit"
+        disabled={busy}
+        className="w-full h-7 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+      >
+        run ingest
+      </button>
+    </form>
+  );
+}
+
+function BackfillForm({
+  busy,
+  currentBucket,
+  onSubmit,
+}: {
+  busy: boolean;
+  currentBucket: BucketKey;
+  onSubmit: (o: BackfillOptions) => void;
+}) {
+  // Same string-state trick as IngestForm: parse/clamp on submit so a cleared
+  // field never submits NaN.
+  const [limit, setLimit] = useState("200");
+  const [bucket, setBucket] = useState<BucketKey>(currentBucket);
+  const [backend, setBackend] = useState<ClassifierBackend>("local");
+  const labeled = bucket !== "unclassified" && bucket !== "all";
+  // A labeled bucket is already classified, so re-running it needs force.
+  const [force, setForce] = useState(labeled);
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        const n = parseInt(limit, 10);
+        onSubmit({ limit: clamp(Number.isNaN(n) ? 200 : n, 1, 500), bucket, backend, force });
+      }}
+      className="space-y-2.5"
+    >
+      <div className={fieldLabel}>classify / backfill</div>
+      <label className="block space-y-1">
+        <span className={fieldLabel}>bucket</span>
+        <select
+          value={bucket}
+          onChange={(e) => {
+            const b = e.target.value as BucketKey;
+            setBucket(b);
+            if (b !== "unclassified" && b !== "all") setForce(true);
+          }}
+          className={control}
+        >
+          {BUCKETS.map((b) => (
+            <option key={b} value={b}>
+              {bucketLabel(b)}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="block space-y-1">
+        <span className={fieldLabel}>model</span>
+        <select
+          value={backend}
+          onChange={(e) => setBackend(e.target.value as ClassifierBackend)}
+          className={control}
+        >
+          {BACKENDS.map((b) => (
+            <option key={b.value} value={b.value}>
+              {b.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="block space-y-1">
+        <span className={fieldLabel}>how many (1–500)</span>
+        <input
+          type="number"
+          min={1}
+          max={500}
+          value={limit}
+          onChange={(e) => setLimit(e.target.value)}
+          className={control}
+        />
+      </label>
+      <label className="flex items-center gap-2 cursor-pointer text-[12px] font-mono text-foreground/85">
+        <input
+          type="checkbox"
+          checked={force}
+          onChange={(e) => setForce(e.target.checked)}
+          className="accent-primary"
+        />
+        force re-classify
+      </label>
+      {labeled && !force && (
+        <p className="text-[10.5px] text-muted-foreground font-mono leading-snug">
+          this bucket is already classified — enable force to re-run it.
+        </p>
+      )}
+      <button
+        type="submit"
+        disabled={busy}
+        className="w-full h-7 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+      >
+        run backfill
+      </button>
+    </form>
+  );
+}
+
+export function TopBar({
+  user,
+  overview,
+  ingesting,
+  backfilling,
+  currentBucket,
+  onIngest,
+  onBackfill,
+  onLogout,
+  ingestOpen,
+  onIngestOpenChange,
+  backfillOpen,
+  onBackfillOpenChange,
+}: Props) {
+  const s = overview?.summary;
+  return (
+    <header className="h-11 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center gap-3 px-3">
+      <div className="flex items-center gap-2 mr-1">
+        <div className="h-5 w-5 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor text-primary">
+          <Mark className="h-3.5 w-3.5" />
+        </div>
+        <span className="font-mono text-[13px] font-semibold tracking-tight">
+          AI&nbsp;Mailbox
+        </span>
+        <span className="text-[10px] font-mono text-muted-foreground border border-border rounded px-1 py-0.5">
+          console
+        </span>
+      </div>
+
+      <div className="flex items-center gap-1.5">
+        <Stat label="threads" value={s?.threads ?? "—"} />
+        <Stat label="msgs" value={s?.messages ?? "—"} />
+        <Stat label="classified" value={s?.classified ?? "—"} />
+      </div>
+
+      <div className="flex-1" />
+
+      <Popover
+        open={ingestOpen}
+        onOpenChange={onIngestOpenChange}
+        trigger={
+          <button
+            onClick={() => onIngestOpenChange(!ingestOpen)}
+            disabled={ingesting}
+            aria-expanded={ingestOpen}
+            className="h-7 px-2.5 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+          >
+            {ingesting ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Download className="h-3 w-3" />
+            )}
+            ingest
+          </button>
+        }
+      >
+        <IngestForm
+          busy={ingesting}
+          onSubmit={(o) => {
+            onIngestOpenChange(false);
+            onIngest(o);
+          }}
+        />
+      </Popover>
+
+      <Popover
+        open={backfillOpen}
+        onOpenChange={onBackfillOpenChange}
+        trigger={
+          <button
+            onClick={() => onBackfillOpenChange(!backfillOpen)}
+            disabled={backfilling}
+            aria-expanded={backfillOpen}
+            className="h-7 px-2.5 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+          >
+            {backfilling ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Sparkles className="h-3 w-3" />
+            )}
+            backfill
+          </button>
+        }
+      >
+        <BackfillForm
+          busy={backfilling}
+          currentBucket={currentBucket}
+          onSubmit={(o) => {
+            onBackfillOpenChange(false);
+            onBackfill(o);
+          }}
+        />
+      </Popover>
+
+      <div className="mx-1 h-5 w-px bg-border" />
+
+      <span className="text-[11.5px] font-mono text-muted-foreground truncate max-w-[180px]">
+        {user?.email ?? "—"}
+      </span>
+      <button
+        onClick={onLogout}
+        title="sign out"
+        aria-label="Sign out"
+        className="h-7 w-7 rounded border border-border hover:bg-accent hover:text-foreground flex items-center justify-center text-muted-foreground cursor-pointer transition-colors"
+      >
+        <LogOut className="h-3 w-3" />
+      </button>
+    </header>
+  );
+}

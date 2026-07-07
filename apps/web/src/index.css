@@ -1,0 +1,148 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap");
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 3px);
+  --radius-md: calc(var(--radius) - 1px);
+  --radius-lg: var(--radius);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-panel: var(--panel);
+  --color-panel-hi: var(--panel-hi);
+  --color-amber: var(--primary);
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    sans-serif;
+}
+
+/*
+  Phosphor Terminal — a true-neutral near-black console lit by a single amber
+  phosphor accent. Neutrals sit at chroma 0 so the only color in the chrome is
+  the amber (selection, primary) and the six label hues; nothing else competes.
+*/
+:root {
+  --radius: 0.3125rem;
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.925 0 0);
+  --panel: oklch(0.185 0 0);
+  --panel-hi: oklch(0.235 0 0);
+  --card: oklch(0.185 0 0);
+  --card-foreground: oklch(0.925 0 0);
+  --popover: oklch(0.17 0 0);
+  --popover-foreground: oklch(0.925 0 0);
+  --primary: oklch(0.82 0.145 80);
+  --primary-foreground: oklch(0.18 0.03 80);
+  --secondary: oklch(0.26 0 0);
+  --secondary-foreground: oklch(0.92 0 0);
+  --muted: oklch(0.235 0 0);
+  --muted-foreground: oklch(0.63 0 0);
+  --accent: oklch(0.26 0 0);
+  --accent-foreground: oklch(0.95 0 0);
+  --destructive: oklch(0.62 0.2 25);
+  --destructive-foreground: oklch(0.98 0 0);
+  --border: oklch(0.275 0 0);
+  --input: oklch(0.275 0 0);
+  --ring: oklch(0.82 0.145 80);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  ::selection {
+    background: oklch(0.82 0.145 80 / 0.28);
+    color: var(--color-foreground);
+  }
+  /* Keyboard focus is first-class in an operator console: a crisp amber ring,
+     never the browser default, and only for keyboard nav (not mouse clicks). */
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  [role="button"]:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 1px;
+  }
+}
+
+/* Subtle "lit from above" highlight that gives flat panels a touch of depth. */
+@utility panel-lift {
+  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.04);
+}
+
+/* Overlay elevation: a defined ring + deep shadow so modals read as floating,
+   not painted on. One purposeful shadow, not decoration. */
+@utility elevated {
+  box-shadow:
+    0 0 0 1px oklch(0 0 0 / 0.55),
+    0 28px 64px -20px oklch(0 0 0 / 0.75),
+    inset 0 1px 0 oklch(1 0 0 / 0.05);
+}
+
+/* A key on the amber accent — for the primary CTA and the selected row rail. */
+@utility phosphor {
+  box-shadow: 0 0 0 1px oklch(0.82 0.145 80 / 0.35),
+    0 0 16px -6px oklch(0.82 0.145 80 / 0.5);
+}
+
+@utility kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  padding: 0 0.35rem;
+  border-radius: 0.25rem;
+  background: var(--color-panel-hi);
+  border: 1px solid var(--color-border);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+}
+
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
