@@ -33,6 +33,10 @@ _unavailable = False  # set once a load attempt has definitively failed
 # in flight is plenty for a single-box deployment; the rest queue briefly here
 # instead of thrashing.
 _infer_slots = Semaphore(4)
+# How long to wait for a slot before giving up. Waiting forever would pin
+# request threads behind a stuck forward pass; returning None instead lets the
+# caller fall back to the LLM/heuristic path like every other failure here.
+_SLOT_TIMEOUT_S = 5.0
 
 
 def reset() -> None:
@@ -139,12 +143,17 @@ def try_predict(text: str) -> tuple[str, float, str, str] | None:
         import torch
 
         # Bound how many forward passes run at once -- see _infer_slots above.
-        with _infer_slots:
+        if not _infer_slots.acquire(timeout=_SLOT_TIMEOUT_S):
+            logger.warning("Local classifier busy (no slot in %.0fs); falling back", _SLOT_TIMEOUT_S)
+            return None
+        try:
             enc = tokenizer(text or "", truncation=True, max_length=256, return_tensors="pt").to(device)
             with torch.no_grad():
                 logits = model(**enc).logits[0]
                 probs = torch.softmax(logits, dim=-1)
                 conf, idx = torch.max(probs, dim=-1)
+        finally:
+            _infer_slots.release()
         confidence = round(float(conf), 4)
         label = labels[int(idx)]
         return (label, confidence, f"local encoder (p={confidence:.2f})", f"local:{version}")

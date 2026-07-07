@@ -148,6 +148,25 @@ def test_try_predict_fast_path_skips_the_load_lock(monkeypatch):
     assert model_version == "local:test"
 
 
+def test_try_predict_falls_back_when_all_infer_slots_are_busy(monkeypatch):
+    # With every inference slot held, try_predict must give up after the
+    # bounded wait and return None (LLM/heuristic fallback) instead of
+    # queueing the request thread forever.
+    pytest.importorskip("torch")
+    from threading import Semaphore
+
+    from app.services.nlp import local_model
+
+    local_model.reset()
+    monkeypatch.setattr(
+        local_model, "_state", ("tok", "model", ["a"], "cpu", "test")
+    )
+    monkeypatch.setattr(local_model, "_infer_slots", Semaphore(0))
+    monkeypatch.setattr(local_model, "_SLOT_TIMEOUT_S", 0.01)
+
+    assert local_model.try_predict("hello") is None
+
+
 def test_genai_client_is_cached_across_calls(monkeypatch):
     pytest.importorskip("google.genai")
     from app.services.nlp import classifier
