@@ -8,6 +8,7 @@ from sqlalchemy import select, desc
 from .celery_app import celery_app
 from app.db.base import SessionLocal
 from app.db.models import MailThread, MailMessage, Classification
+from app.services.nlp.backfill import run_backfill
 from app.services.nlp.classifier import classify, build_classification_text
 from app.services.nlp.persistence import upsert_classification
 
@@ -35,6 +36,40 @@ def classify_message(message_id: str) -> dict:
         )
         db.commit()
         return {"message_id": message_id, "label": label, "confidence": confidence}
+
+
+# Same shape as the ingest task's safeguards: a 500-thread Gemini backfill can
+# run a long while, so the time limit is a hung-call backstop, and retries with
+# backoff cover transient classifier/DB failures. Already-labeled messages are
+# skipped on re-run (unless force), so a retry resumes rather than redoing the
+# whole batch.
+@celery_app.task(
+    autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,
+    time_limit=1800,
+    soft_time_limit=1740,
+)
+def backfill_threads_for_user(
+    user_id: str,
+    limit: int = 100,
+    force: bool = False,
+    bucket: str = "unclassified",
+    backend: str | None = None,
+) -> dict:
+    """Run a classification backfill off the request path. The backfill route
+    enqueues us for anything over its inline cap and returns 202; bucket and
+    backend were already validated there."""
+    with SessionLocal() as db:
+        result = run_backfill(
+            db,
+            UUID(user_id),
+            limit=limit,
+            force=force,
+            bucket=bucket,
+            backend=backend,
+        )
+    return {"user_id": user_id, **result}
 
 
 @celery_app.task

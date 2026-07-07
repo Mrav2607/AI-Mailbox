@@ -16,8 +16,9 @@ once per process.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Semaphore
 
 from app.core.config import settings
 from app.core.logging import logger
@@ -25,6 +26,17 @@ from app.core.logging import logger
 _lock = Lock()
 _state: tuple | None = None  # (tokenizer, model, labels, device, version)
 _unavailable = False  # set once a load attempt has definitively failed
+
+# Caps concurrent forward passes. Each API threadpool thread that reaches
+# inference drives its own torch call, and torch fans out intra-op threads per
+# call -- unbounded, that oversubscribes the CPU and slows everyone down. Four
+# in flight is plenty for a single-box deployment; the rest queue briefly here
+# instead of thrashing.
+_infer_slots = Semaphore(4)
+# How long to wait for a slot before giving up. Waiting forever would pin
+# request threads behind a stuck forward pass; returning None instead lets the
+# caller fall back to the LLM/heuristic path like every other failure here.
+_SLOT_TIMEOUT_S = 5.0
 
 
 def reset() -> None:
@@ -54,6 +66,10 @@ def _load() -> tuple:
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+    # Keep torch's intra-op pool to half the cores so concurrent inference
+    # calls (gated by _infer_slots) don't oversubscribe the CPU between them.
+    torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2))
+
     model_dir = _resolve_model_dir()
     if not (model_dir / "config.json").exists():
         raise FileNotFoundError(f"no local classifier model at {model_dir}")
@@ -75,6 +91,25 @@ def _load() -> tuple:
     return tokenizer, model, labels, device, model_dir.name
 
 
+def warmup() -> None:
+    """Load the model eagerly (e.g. from a startup hook) so the first real
+    request doesn't pay for the load. Cheap no-op when already loaded or when
+    a prior attempt marked us unavailable; failures degrade exactly like the
+    lazy path -- flag it and let callers fall back."""
+    global _state, _unavailable
+
+    if _state is not None or _unavailable:
+        return
+    with _lock:
+        if _state is not None or _unavailable:
+            return
+        try:
+            _state = _load()
+        except Exception as exc:  # missing deps, missing model, corrupt files
+            _unavailable = True
+            logger.warning("Local classifier unavailable; falling back (%s)", exc)
+
+
 def try_predict(text: str) -> tuple[str, float, str, str] | None:
     """Classify ``text`` with the local encoder.
 
@@ -87,26 +122,38 @@ def try_predict(text: str) -> tuple[str, float, str, str] | None:
     if _unavailable:
         return None
 
-    with _lock:
-        if _unavailable:
-            return None
-        if _state is None:
-            try:
-                _state = _load()
-            except Exception as exc:  # missing deps, missing model, corrupt files
-                _unavailable = True
-                logger.warning("Local classifier unavailable; falling back (%s)", exc)
+    # Fast path: once the model's loaded we can read it without the lock.
+    # Grab a local ref first so a concurrent reset() can't yank it mid-use.
+    state = _state
+    if state is None:
+        with _lock:
+            if _unavailable:
                 return None
-        tokenizer, model, labels, device, version = _state
+            if _state is None:
+                try:
+                    _state = _load()
+                except Exception as exc:  # missing deps, missing model, corrupt files
+                    _unavailable = True
+                    logger.warning("Local classifier unavailable; falling back (%s)", exc)
+                    return None
+            state = _state
+    tokenizer, model, labels, device, version = state
 
     try:
         import torch
 
-        enc = tokenizer(text or "", truncation=True, max_length=256, return_tensors="pt").to(device)
-        with torch.no_grad():
-            logits = model(**enc).logits[0]
-            probs = torch.softmax(logits, dim=-1)
-            conf, idx = torch.max(probs, dim=-1)
+        # Bound how many forward passes run at once -- see _infer_slots above.
+        if not _infer_slots.acquire(timeout=_SLOT_TIMEOUT_S):
+            logger.warning("Local classifier busy (no slot in %.0fs); falling back", _SLOT_TIMEOUT_S)
+            return None
+        try:
+            enc = tokenizer(text or "", truncation=True, max_length=256, return_tensors="pt").to(device)
+            with torch.no_grad():
+                logits = model(**enc).logits[0]
+                probs = torch.softmax(logits, dim=-1)
+                conf, idx = torch.max(probs, dim=-1)
+        finally:
+            _infer_slots.release()
         confidence = round(float(conf), 4)
         label = labels[int(idx)]
         return (label, confidence, f"local encoder (p={confidence:.2f})", f"local:{version}")

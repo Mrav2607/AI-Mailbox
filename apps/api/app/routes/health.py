@@ -1,10 +1,8 @@
 """Liveness and readiness probes.
 
-``/health`` is a cheap liveness check: it only says the process is up, so a
-transient dependency outage doesn't get the container killed and restarted.
-``/ready`` is the readiness check: it pings Postgres and Redis and returns 503
-if either is unreachable, so a load balancer / orchestrator routes traffic only
-when the service can actually serve it.
+``/health`` only says whether the process is up, so a transient dependency
+outage doesn't get the container killed and restarted. ``/ready`` pings
+Postgres and Redis and returns 503 if either is unreachable.
 """
 
 import redis
@@ -18,13 +16,13 @@ from app.db.base import engine
 
 router = APIRouter()
 
-# Bound the probe so a hung dependency can't make readiness hang with it.
+# Bound the probe
 _REDIS_TIMEOUT_SECONDS = 2
 
 
 @router.get("/health")
 async def health_check():
-    """Liveness: the process is up and serving."""
+    """Verifies liveness."""
     return {"status": "ok"}
 
 
@@ -62,11 +60,11 @@ def _check_redis() -> str | None:
 
 @router.get("/ready")
 def readiness_check():
-    """Readiness: every backing service the API needs is reachable.
+    """Verifies readiness, checks whether backing services are reachable.
 
     Plain ``def`` (not ``async``) so FastAPI runs it in a threadpool -- the DB
     and Redis checks are blocking I/O and would otherwise stall the event loop
-    during an outage, exactly when other requests need it most.
+    during an outage.
     """
     db_error = _check_database()
     redis_error = _check_redis()

@@ -1,8 +1,8 @@
 """Health/readiness tests.
 
-Liveness is static. Readiness is exercised by stubbing the per-dependency
-checks, so the suite needs no live Postgres or Redis -- the actual SELECT 1 /
-PING calls are thin wrappers validated against real services in deployment.
+Readiness is exercised by stubbing the per-dependency checks, so the suite
+needs no live Postgres or Redis -- the actual SELECT 1 / PING calls are thin
+wrappers validated against real services in deployment.
 """
 
 from fastapi.testclient import TestClient

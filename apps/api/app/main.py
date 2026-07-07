@@ -1,3 +1,6 @@
+import threading
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -7,7 +10,20 @@ from .routes import health, auth, mailbox, analytics, auth_google_dev
 import uvicorn
 
 
-app = FastAPI(title="AI Mailbox API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Warm the local classifier off the request path: the ~1 GB encoder used
+    # to load lazily on the first classify call, stalling every early request
+    # behind it. A daemon thread keeps startup and readiness unblocked, and a
+    # missing model degrades exactly as before (try_predict just returns None).
+    if (settings.classifier_backend or "auto").lower() in ("local", "auto"):
+        from .services.nlp import local_model
+
+        threading.Thread(target=local_model.warmup, name="classifier-warmup", daemon=True).start()
+    yield
+
+
+app = FastAPI(title="AI Mailbox API", lifespan=lifespan)
 
 # Safety-net handlers for DB and uncaught errors (consistent JSON, no leaks).
 register_exception_handlers(app)

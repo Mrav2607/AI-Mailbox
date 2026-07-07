@@ -63,6 +63,20 @@ def test_malformed_token_encryption_key_rejected_in_any_env():
         Settings(_env_file=None, TOKEN_ENCRYPTION_KEY="not-a-valid-fernet-key")
 
 
+@pytest.mark.parametrize("alg", ["none", "RS256"])
+def test_unsupported_jwt_algorithm_rejected_in_any_env(alg):
+    # "none" would skip signature checks and RS* needs asymmetric keys we
+    # don't have -- both must fail at boot, even in dev.
+    with pytest.raises(ValidationError, match="JWT_ALGORITHM"):
+        Settings(_env_file=None, JWT_ALGORITHM=alg)
+
+
+@pytest.mark.parametrize("alg", ["HS256", "HS512"])
+def test_supported_jwt_algorithms_accepted(alg):
+    s = Settings(_env_file=None, JWT_ALGORITHM=alg)
+    assert s.jwt_algorithm == alg
+
+
 def test_production_reports_all_problems_at_once():
     with pytest.raises(ValidationError) as exc_info:
         Settings(_env_file=None, APP_ENV="production")

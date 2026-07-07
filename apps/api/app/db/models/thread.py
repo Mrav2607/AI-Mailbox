@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Text, ForeignKey, UniqueConstraint
+from sqlalchemy import DateTime, Index, Text, ForeignKey, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -19,6 +19,13 @@ class MailThread(Base):
     __table_args__ = (
         UniqueConstraint(
             "user_id", "provider", "provider_thread_id", name="uq_thread_provider"
+        ),
+        # Serves the triage list: WHERE user_id = ? ORDER BY recency.
+        Index(
+            "ix_mail_thread_user_recency",
+            "user_id",
+            text("last_message_at DESC NULLS LAST"),
+            text("created_at DESC"),
         ),
     )
 

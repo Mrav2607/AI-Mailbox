@@ -77,3 +77,105 @@ def test_classify_local_backend_falls_back_when_model_missing(monkeypatch, tmp_p
     assert label in LABELS
     assert model_version == "heuristic-v1"
     local_model.reset()
+
+
+def test_warmup_caches_failure_and_is_a_noop_after(monkeypatch):
+    # A failed warmup must flag the model unavailable once and never re-attempt
+    # the load -- not from warmup() again, not from try_predict.
+    from app.services.nlp import local_model
+
+    local_model.reset()
+    load_attempts = []
+
+    def failing_load():
+        load_attempts.append(1)
+        raise FileNotFoundError("no model on disk")
+
+    monkeypatch.setattr(local_model, "_load", failing_load)
+
+    local_model.warmup()
+    assert local_model._unavailable is True
+    assert local_model.try_predict("hello") is None
+    local_model.warmup()  # cheap no-op now
+    assert load_attempts == [1]
+    local_model.reset()
+
+
+def test_warmup_is_a_noop_when_already_loaded(monkeypatch):
+    from app.services.nlp import local_model
+
+    local_model.reset()
+    monkeypatch.setattr(local_model, "_state", ("tok", "model", ["a"], "cpu", "v1"))
+    monkeypatch.setattr(local_model, "_load", lambda: pytest.fail("must not reload"))
+    local_model.warmup()
+    assert local_model._unavailable is False
+
+
+def test_try_predict_fast_path_skips_the_load_lock(monkeypatch):
+    # Once _state is populated, try_predict must serve without touching the
+    # load lock -- we plant a lock that blows up if anyone enters it.
+    torch = pytest.importorskip("torch")
+    from app.services.nlp import local_model
+
+    local_model.reset()
+
+    class Encoding(dict):
+        def to(self, device):
+            return self
+
+    class FakeOutput:
+        logits = torch.tensor([[0.1, 5.0, 0.2]])
+
+    def fake_tokenizer(text, **kwargs):
+        return Encoding(input_ids=torch.tensor([[1, 2]]))
+
+    class ExplodingLock:
+        def __enter__(self):
+            raise AssertionError("fast path acquired the load lock")
+
+        def __exit__(self, *args):
+            return False
+
+    state = (fake_tokenizer, lambda **enc: FakeOutput(), ["a", "b", "c"], "cpu", "test")
+    monkeypatch.setattr(local_model, "_state", state)
+    monkeypatch.setattr(local_model, "_lock", ExplodingLock())
+
+    result = local_model.try_predict("hello")
+    assert result is not None
+    label, confidence, _rationale, model_version = result
+    assert label == "b"
+    assert 0.0 < confidence <= 1.0
+    assert model_version == "local:test"
+
+
+def test_try_predict_falls_back_when_all_infer_slots_are_busy(monkeypatch):
+    # With every inference slot held, try_predict must give up after the
+    # bounded wait and return None (LLM/heuristic fallback) instead of
+    # queueing the request thread forever.
+    pytest.importorskip("torch")
+    from threading import Semaphore
+
+    from app.services.nlp import local_model
+
+    local_model.reset()
+    monkeypatch.setattr(
+        local_model, "_state", ("tok", "model", ["a"], "cpu", "test")
+    )
+    monkeypatch.setattr(local_model, "_infer_slots", Semaphore(0))
+    monkeypatch.setattr(local_model, "_SLOT_TIMEOUT_S", 0.01)
+
+    assert local_model.try_predict("hello") is None
+
+
+def test_genai_client_is_cached_across_calls(monkeypatch):
+    pytest.importorskip("google.genai")
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", "test-key")
+    classifier._genai_client.cache_clear()
+    try:
+        first = classifier._genai_client()
+        assert classifier._genai_client() is first
+    finally:
+        # Don't leave a client built from the test key cached for other tests.
+        classifier._genai_client.cache_clear()

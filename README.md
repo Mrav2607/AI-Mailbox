@@ -20,8 +20,8 @@ triage buckets over a FastAPI service.
 1. Create your `.env` at the repo root by copying the example, then fill in real values
    (Postgres credentials, and `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` for Gmail OAuth):
 
-```powershell
-Copy-Item deploy\.env.example .env
+```bash
+cp deploy/.env.example .env
 ```
 
    The app reads this `.env` automatically. For local runs, make sure `DATABASE_URL`
@@ -30,46 +30,46 @@ Copy-Item deploy\.env.example .env
 
 2. Create the virtual environment and install the API:
 
-```powershell
-cd apps\api
+```bash
+cd apps/api
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/bin/activate
 pip install -e .
-cd ..\..
+cd ../..
 ```
 
    To use the local encoder classifier (`CLASSIFIER_BACKEND=local`), also install
    the optional ML dependencies (torch + transformers):
 
-```powershell
-cd apps\api; pip install -e ".[local-classifier]"; cd ..\..
+```bash
+cd apps/api; pip install -e ".[local-classifier]"; cd ../..
 ```
 
 3. Apply database migrations (needs Postgres running — see step 1 of the daily startup):
 
-```powershell
-$env:DATABASE_URL = "postgresql+psycopg://user:pass@localhost:5432/ai_mailbox"
-cd apps\api; alembic upgrade head; cd ..\..
+```bash
+export DATABASE_URL="postgresql+psycopg://user:pass@localhost:5432/ai_mailbox"
+cd apps/api; alembic upgrade head; cd ../..
 ```
 
 ## Daily startup
 
 1. Start Postgres and Redis (Docker Desktop must be running):
 
-```powershell
-docker compose -f deploy\docker-compose.yml up -d db redis
+```bash
+docker compose -f deploy/docker-compose.yml up -d db redis
 ```
 
 2. Open a terminal and activate the venv:
 
-```powershell
-.\apps\api\.venv\Scripts\Activate.ps1
+```bash
+source apps/api/.venv/bin/activate
 ```
 
 3. Run the API:
 
-```powershell
-cd apps\api
+```bash
+cd apps/api
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 

@@ -12,6 +12,11 @@ _PLACEHOLDER_SECRET = "change_me"
 # Environments treated as non-production, where the insecure defaults are fine.
 _DEV_ENVS = {"dev", "development", "local", "test", "testing", "ci"}
 
+# The only signing algorithms we support. api_secret is a shared HMAC secret,
+# so asymmetric algorithms (RS*/ES*) can't work here, and "none" would disable
+# signature checks entirely -- reject anything outside this set at boot.
+_ALLOWED_JWT_ALGORITHMS = {"HS256", "HS384", "HS512"}
+
 
 _CONFIG_PATH = Path(__file__).resolve()
 # Look for a .env at the repo root (dev layout) and at the api package root.
@@ -95,6 +100,16 @@ class Settings(BaseSettings):
                     "TOKEN_ENCRYPTION_KEY is not a valid Fernet key (urlsafe "
                     "base64, 32 bytes); generate one with Fernet.generate_key()"
                 ) from exc
+
+        # Same idea for the JWT algorithm: an unsupported value (or "none",
+        # which would skip signature checks) should fail at boot in every
+        # environment, not as a confusing PyJWT error on first login.
+        if self.jwt_algorithm not in _ALLOWED_JWT_ALGORITHMS:
+            allowed = ", ".join(sorted(_ALLOWED_JWT_ALGORITHMS))
+            raise ValueError(
+                f"JWT_ALGORITHM {self.jwt_algorithm!r} is not supported; "
+                f"choose one of: {allowed}"
+            )
 
         if not self.is_production:
             return self

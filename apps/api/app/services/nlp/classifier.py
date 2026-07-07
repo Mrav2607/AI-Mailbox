@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from typing import Any
 
 from app.core.config import settings
@@ -80,19 +81,20 @@ def _parse_llm_response(content: str) -> tuple[str, float, str]:
     return label, float(confidence), str(rationale)
 
 
-def classify(text: str) -> tuple[str, float, str, str]:
+def classify(text: str, backend: str | None = None) -> tuple[str, float, str, str]:
     """
     Classify an email into the 6-label taxonomy.
     Returns (label, confidence, rationale, model_version).
 
-    Routed by settings.classifier_backend:
+    Routed by `backend` (falling back to settings.classifier_backend when not
+    given, so callers can override the global default per request):
       - "local":     fine-tuned encoder in models/, falling back to the LLM /
                      heuristic path if the model or its deps are unavailable.
       - "gemini":    LLM with heuristic fallback (the original behavior).
       - "heuristic": keyword rules only.
       - "auto":      try local, then LLM, then heuristic.
     """
-    backend = (settings.classifier_backend or "auto").lower()
+    backend = (backend or settings.classifier_backend or "auto").lower()
 
     if backend == "heuristic":
         return _heuristic_classify(text)
@@ -106,6 +108,21 @@ def classify(text: str) -> tuple[str, float, str, str]:
         # local unavailable -> fall through to the LLM / heuristic path
 
     return _classify_llm(text)
+
+
+@lru_cache(maxsize=1)
+def _genai_client():
+    """Build the Gemini client once per process (settings don't change at
+    runtime, so there's nothing to key on). The explicit timeout keeps a hung
+    call from pinning a threadpool thread forever -- the SDK measures it in
+    milliseconds."""
+    from google import genai
+    from google.genai import types
+
+    return genai.Client(
+        api_key=settings.gemini_api_key,
+        http_options=types.HttpOptions(timeout=30_000),
+    )
 
 
 def _classify_llm(text: str) -> tuple[str, float, str, str]:
@@ -153,11 +170,9 @@ def _classify_llm(text: str) -> tuple[str, float, str, str]:
         "Return JSON only with keys: label, confidence (0-1), rationale."
     )
     try:
-        from google import genai
         from google.genai import types
 
-        client = genai.Client(api_key=settings.gemini_api_key)
-        response = client.models.generate_content(
+        response = _genai_client().models.generate_content(
             model=settings.gemini_model,
             contents=f"{prompt}\n\nEmail:\n{text[:6000]}",
             config=types.GenerateContentConfig(response_mime_type="application/json"),

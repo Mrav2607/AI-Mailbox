@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Text, ForeignKey, UniqueConstraint
+from sqlalchemy import DateTime, Index, Text, ForeignKey, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID, ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -16,7 +16,16 @@ class MailMessage(Base):
     """
 
     __tablename__ = "mail_message"
-    __table_args__ = (UniqueConstraint("thread_id", "provider_message_id", name="uq_msg_provider"),)
+    __table_args__ = (
+        UniqueConstraint("thread_id", "provider_message_id", name="uq_msg_provider"),
+        # Serves the latest-message-per-thread lookup used by triage.
+        Index(
+            "ix_mail_message_thread_recency",
+            "thread_id",
+            text("sent_at DESC NULLS LAST"),
+            text("created_at DESC"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
