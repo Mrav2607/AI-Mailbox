@@ -1,7 +1,7 @@
 """Liveness and readiness probes.
 
-``/health`` only says whether the process is up, so a transient dependency 
-outage doesn't get the container killed and restarted. ``/ready`` pings 
+``/health`` only says whether the process is up, so a transient dependency
+outage doesn't get the container killed and restarted. ``/ready`` pings
 Postgres and Redis and returns 503 if either is unreachable.
 """
 

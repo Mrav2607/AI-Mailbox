@@ -1,7 +1,7 @@
 """Health/readiness tests.
 
-Readiness is exercised by stubbing the per-dependency checks, so the suite 
-needs no live Postgres or Redis -- the actual SELECT 1 / PING calls are thin 
+Readiness is exercised by stubbing the per-dependency checks, so the suite
+needs no live Postgres or Redis -- the actual SELECT 1 / PING calls are thin
 wrappers validated against real services in deployment.
 """
 

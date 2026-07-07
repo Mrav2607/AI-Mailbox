@@ -142,7 +142,7 @@ def test_try_predict_fast_path_skips_the_load_lock(monkeypatch):
 
     result = local_model.try_predict("hello")
     assert result is not None
-    label, confidence, rationale, model_version = result
+    label, confidence, _rationale, model_version = result
     assert label == "b"
     assert 0.0 < confidence <= 1.0
     assert model_version == "local:test"
