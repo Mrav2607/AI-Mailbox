@@ -37,8 +37,10 @@ export function Popover({ open, onOpenChange, trigger, align = "end", children }
     <div ref={ref} className="relative">
       {trigger}
       {open && (
+        // No ARIA role on purpose: this is a disclosure (trigger sets
+        // aria-expanded, panel sits right after it in the DOM), and
+        // role="dialog" would promise modal focus behavior we don't have.
         <div
-          role="dialog"
           className={[
             "absolute top-full mt-1.5 z-50 w-64 rounded-md border border-border bg-[var(--color-panel-hi)] elevated p-3",
             align === "end" ? "right-0" : "left-0",

@@ -1,4 +1,4 @@
-import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
   Command,
   CommandEmpty,
@@ -49,6 +49,8 @@ export function CommandPalette({
       <DialogContent
         className="p-0 overflow-hidden max-w-xl border-border bg-[var(--color-panel)]"
       >
+        {/* Screen-reader-only name for the dialog; Radix warns without one. */}
+        <DialogTitle className="sr-only">command palette</DialogTitle>
         <Command className="bg-transparent">
           <CommandInput placeholder="type a command…" />
           <CommandList className="max-h-[420px]">
