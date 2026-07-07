@@ -49,8 +49,14 @@ def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]
         db.execute(
             select(MailMessage)
             .where(MailMessage.thread_id.in_(thread_ids))
+            # Same coalesced ordering as latest_label_subquery: the loop below
+            # compares `sent_at or created_at` itself, but on exact ties it
+            # keeps the first row it sees -- so the DB order has to break ties
+            # the same way the bucket filter does.
             .order_by(
-                MailMessage.sent_at.desc().nullslast(),
+                func.coalesce(MailMessage.sent_at, MailMessage.created_at)
+                .desc()
+                .nullslast(),
                 MailMessage.created_at.desc(),
             )
         )
@@ -197,7 +203,9 @@ def get_thread(
             select(MailMessage)
             .where(MailMessage.thread_id == thread_id)
             .order_by(
-                MailMessage.sent_at.desc().nullslast(),
+                func.coalesce(MailMessage.sent_at, MailMessage.created_at)
+                .desc()
+                .nullslast(),
                 MailMessage.created_at.desc(),
             )
         )
@@ -236,7 +244,7 @@ def reclassify_thread(
     The console lets the user override the model when QA-ing predictions. The
     label is stored against the thread's latest message (the same message whose
     classification drives the triage view), with full confidence and an
-    ``user-override`` model_version. 
+    ``user-override`` model_version.
     """
     if payload.label not in LABELS:
         raise HTTPException(
@@ -253,8 +261,12 @@ def reclassify_thread(
         db.execute(
             select(MailMessage)
             .where(MailMessage.thread_id == thread_id)
+            # Coalesced like latest_label_subquery, so the override lands on
+            # the exact message whose classification drives the triage bucket.
             .order_by(
-                MailMessage.sent_at.desc().nullslast(),
+                func.coalesce(MailMessage.sent_at, MailMessage.created_at)
+                .desc()
+                .nullslast(),
                 MailMessage.created_at.desc(),
             )
             .limit(1)
