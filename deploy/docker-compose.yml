@@ -17,10 +17,25 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.api
+    image: ai-mailbox-api
     env_file:
       - .env
     ports:
       - "8000:8000"
+    depends_on:
+      - db
+      - redis
+  # Runs the queued work: Gmail ingest and >50-thread backfills return 202
+  # from the API and land here. Same image as the api (it needs the app code
+  # and the baked-in classifier model), just a different entrypoint.
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    image: ai-mailbox-api
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+    env_file:
+      - .env
     depends_on:
       - db
       - redis
