@@ -74,31 +74,35 @@ def ingest_gmail_messages(
 
     client = GmailClient(access_token)
 
-    # Messages already ingested for this user, so repeat ingests resume at the
-    # next NEW message instead of re-fetching the same newest page every time.
-    existing_ids: set[str] = set()
+    # Threads already ingested for this user, so repeat pulls resume at the next
+    # NEW thread instead of re-fetching the same newest page every time. Keying
+    # on threads (not messages) is what makes `max_results` mean "threads": the
+    # unit a triage operator actually thinks in.
+    existing_thread_ids: set[str] = set()
     if skip_existing:
-        existing_ids = set(
+        existing_thread_ids = set(
             db.execute(
-                select(MailMessage.provider_message_id)
-                .join(MailThread, MailThread.id == MailMessage.thread_id)
-                .where(MailThread.user_id == user_id)
+                select(MailThread.provider_thread_id).where(MailThread.user_id == user_id)
             )
             .scalars()
             .all()
         )
 
-    def collect_new_ids() -> list[str]:
+    def collect_new_thread_ids() -> list[str]:
         new_ids: list[str] = []
+        seen: set[str] = set()
         page_token: str | None = None
         pages = 0
         while len(new_ids) < max_results and pages < max_pages:
-            batch = client.list_messages(max_results=500, page_token=page_token)
-            for msg in batch.get("messages", []):
-                mid = msg["id"]
-                if skip_existing and mid in existing_ids:
+            batch = client.list_threads(max_results=500, page_token=page_token)
+            for thread in batch.get("threads", []):
+                tid = thread["id"]
+                if tid in seen:
                     continue
-                new_ids.append(mid)
+                seen.add(tid)
+                if skip_existing and tid in existing_thread_ids:
+                    continue
+                new_ids.append(tid)
                 if len(new_ids) >= max_results:
                     break
             pages += 1
@@ -119,45 +123,52 @@ def ingest_gmail_messages(
         client = GmailClient(refreshed_token)
         return True
 
-    try:
-        message_ids = collect_new_ids()
-    except httpx.HTTPStatusError as exc:
-        if exc.response is not None and exc.response.status_code == 401 and refresh_client():
-            message_ids = collect_new_ids()
-        else:
+    def with_token_retry(call):
+        """Run a Gmail call, refreshing the token once on a 401 and retrying.
+        The access token expires ~1h in, so a large pull can outlive it."""
+        try:
+            return call()
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 401 and refresh_client():
+                return call()
             raise
+
+    thread_ids = with_token_retry(collect_new_thread_ids)
 
     threads_upserted = 0
     messages_upserted = 0
+    classified = 0
 
-    for index, msg_id in enumerate(message_ids):
-        # The access token expires ~1h in; a large pull outlives it. Refresh on
-        # a mid-loop 401 and retry once instead of crashing (and losing work).
-        try:
-            raw = client.get_message(msg_id)
-        except httpx.HTTPStatusError as exc:
-            if exc.response is not None and exc.response.status_code == 401 and refresh_client():
-                raw = client.get_message(msg_id)
-            else:
-                raise
-        normalized = normalize_message(raw)
-        if not normalized.get("provider_message_id") or not normalized.get("provider_thread_id"):
+    for index, tid in enumerate(thread_ids):
+        raw_thread = with_token_retry(lambda: client.get_thread(tid))
+
+        normalized_msgs = [normalize_message(m) for m in raw_thread.get("messages", [])]
+        normalized_msgs = [
+            n
+            for n in normalized_msgs
+            if n.get("provider_message_id") and n.get("provider_thread_id")
+        ]
+        if not normalized_msgs:
             continue
+
+        # Thread-level fields come from the newest message in the thread.
+        _epoch = datetime.min.replace(tzinfo=timezone.utc)
+        latest = max(normalized_msgs, key=lambda n: n.get("sent_at") or _epoch)
 
         thread_stmt = (
             insert(MailThread)
             .values(
                 user_id=user_id,
                 provider="gmail",
-                provider_thread_id=normalized["provider_thread_id"],
-                subject=normalized.get("subject"),
-                last_message_at=normalized.get("sent_at") or datetime.now(timezone.utc),
+                provider_thread_id=tid,
+                subject=latest.get("subject"),
+                last_message_at=latest.get("sent_at") or datetime.now(timezone.utc),
             )
             .on_conflict_do_update(
                 index_elements=["user_id", "provider", "provider_thread_id"],
                 set_={
-                    "subject": normalized.get("subject"),
-                    "last_message_at": normalized.get("sent_at") or datetime.now(timezone.utc),
+                    "subject": latest.get("subject"),
+                    "last_message_at": latest.get("sent_at") or datetime.now(timezone.utc),
                 },
             )
             .returning(MailThread.id)
@@ -165,70 +176,71 @@ def ingest_gmail_messages(
         thread_id = db.execute(thread_stmt).scalar_one()
         threads_upserted += 1
 
-        message_stmt = (
-            insert(MailMessage)
-            .values(
-                thread_id=thread_id,
-                provider_message_id=normalized["provider_message_id"],
-                sender=normalized.get("sender"),
-                recipient=normalized.get("recipient"),
-                cc=normalized.get("cc"),
-                bcc=normalized.get("bcc"),
-                sent_at=normalized.get("sent_at"),
-                snippet=normalized.get("snippet"),
-                body_text=normalized.get("body_text"),
-                body_html=normalized.get("body_html"),
-                headers=normalized.get("headers"),
+        for normalized in normalized_msgs:
+            message_stmt = (
+                insert(MailMessage)
+                .values(
+                    thread_id=thread_id,
+                    provider_message_id=normalized["provider_message_id"],
+                    sender=normalized.get("sender"),
+                    recipient=normalized.get("recipient"),
+                    cc=normalized.get("cc"),
+                    bcc=normalized.get("bcc"),
+                    sent_at=normalized.get("sent_at"),
+                    snippet=normalized.get("snippet"),
+                    body_text=normalized.get("body_text"),
+                    body_html=normalized.get("body_html"),
+                    headers=normalized.get("headers"),
+                )
+                .on_conflict_do_update(
+                    index_elements=["thread_id", "provider_message_id"],
+                    set_={
+                        "sender": normalized.get("sender"),
+                        "recipient": normalized.get("recipient"),
+                        "cc": normalized.get("cc"),
+                        "bcc": normalized.get("bcc"),
+                        "sent_at": normalized.get("sent_at"),
+                        "snippet": normalized.get("snippet"),
+                        "body_text": normalized.get("body_text"),
+                        "body_html": normalized.get("body_html"),
+                        "headers": normalized.get("headers"),
+                    },
+                )
+                .returning(MailMessage.id)
             )
-            .on_conflict_do_update(
-                index_elements=["thread_id", "provider_message_id"],
-                set_={
-                    "sender": normalized.get("sender"),
-                    "recipient": normalized.get("recipient"),
-                    "cc": normalized.get("cc"),
-                    "bcc": normalized.get("bcc"),
-                    "sent_at": normalized.get("sent_at"),
-                    "snippet": normalized.get("snippet"),
-                    "body_text": normalized.get("body_text"),
-                    "body_html": normalized.get("body_html"),
-                    "headers": normalized.get("headers"),
-                },
-            )
-            .returning(MailMessage.id)
-        )
-        new_message_id = db.execute(message_stmt).scalar_one()
-        messages_upserted += 1
+            new_message_id = db.execute(message_stmt).scalar_one()
+            messages_upserted += 1
 
-        # Inline classification runs the local encoder once PER message -- fine
-        # for small interactive pulls, but it dominates the runtime of a large
-        # backfill (and the data-gathering path re-labels separately). Skip it
-        # when classify_messages is False.
-        if classify_messages:
-            existing = (
-                db.execute(
-                    select(Classification).where(Classification.message_id == new_message_id)
+            # Inline classification runs the classifier once PER message -- fine
+            # for interactive pulls, but skipped when classify_messages is False
+            # (the data-gathering path re-labels separately).
+            if classify_messages:
+                existing = (
+                    db.execute(
+                        select(Classification).where(Classification.message_id == new_message_id)
+                    )
+                    .scalars()
+                    .first()
                 )
-                .scalars()
-                .first()
-            )
-            if not existing:
-                text_for_classification = build_classification_text(
-                    normalized.get("subject"),
-                    normalized.get("snippet"),
-                    normalized.get("body_text"),
-                )
-                label, confidence, rationale, model_version = classify(text_for_classification)
-                upsert_classification(
-                    db,
-                    message_id=new_message_id,
-                    label=label,
-                    confidence=confidence,
-                    rationale=rationale,
-                    model_version=model_version,
-                )
+                if not existing:
+                    text_for_classification = build_classification_text(
+                        normalized.get("subject"),
+                        normalized.get("snippet"),
+                        normalized.get("body_text"),
+                    )
+                    label, confidence, rationale, model_version = classify(text_for_classification)
+                    upsert_classification(
+                        db,
+                        message_id=new_message_id,
+                        label=label,
+                        confidence=confidence,
+                        rationale=rationale,
+                        model_version=model_version,
+                    )
+                    classified += 1
 
-        # Commit periodically so a late failure (e.g. token death on a multi-
-        # thousand pull) keeps everything fetched so far instead of rolling back.
+        # Commit per thread so a late failure (e.g. token death mid-pull) keeps
+        # every thread fetched so far instead of rolling the whole run back.
         if commit_every and (index + 1) % commit_every == 0:
             db.commit()
 
@@ -236,6 +248,7 @@ def ingest_gmail_messages(
     return {
         "threads_upserted": threads_upserted,
         "messages_upserted": messages_upserted,
-        "fetched": len(message_ids),
-        "skipped_existing": len(existing_ids),
+        "classified": classified,
+        "fetched": len(thread_ids),
+        "skipped_existing": len(existing_thread_ids),
     }

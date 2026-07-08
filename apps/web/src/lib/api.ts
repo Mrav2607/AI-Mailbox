@@ -175,18 +175,63 @@ export async function getOverview(): Promise<Overview> {
   return request<Overview>("/analytics/overview");
 }
 
+// Queues a Gmail pull on the worker. `max_results` is a THREAD count now, so N
+// gives you N threads (and all their messages), not N messages. The real API
+// returns a task_id to poll; the mock resolves as if already done.
 export async function ingestGmail(
   max_results = 50,
   classify = true,
-): Promise<{ status: string; ingested?: number }> {
+): Promise<{ status: string; task_id?: string }> {
   if (USE_MOCK) {
     await new Promise((r) => setTimeout(r, 700));
-    return { status: "ok", ingested: max_results };
+    return { status: "ok" };
   }
-  return request<{ status: string; ingested?: number }>(
+  return request<{ status: string; task_id?: string }>(
     `/mail/ingest/gmail?max_results=${max_results}&classify=${classify}`,
     { method: "POST" },
   );
+}
+
+// Result payload a worker task reports back through the status endpoint. For
+// ingest that's the upsert counts; `status: "error"` is a user-facing problem
+// (e.g. Gmail not connected) that still comes back as a *completed* task.
+export interface TaskResult {
+  status?: string;
+  detail?: string;
+  threads_upserted?: number;
+  messages_upserted?: number;
+  classified?: number;
+  fetched?: number;
+  skipped_existing?: number;
+}
+
+export interface TaskStatus {
+  task_id: string;
+  state: string;
+  ready: boolean;
+  result?: TaskResult | null;
+  error?: string;
+}
+
+export async function getTaskStatus(taskId: string): Promise<TaskStatus> {
+  return request<TaskStatus>(`/mail/tasks/${encodeURIComponent(taskId)}`);
+}
+
+// Poll a queued task until it finishes. Returns the final status; if it's still
+// running when the timeout hits, returns the last (not-ready) status so the
+// caller can decide what to do rather than hanging forever.
+export async function waitForTask(
+  taskId: string,
+  { intervalMs = 1500, timeoutMs = 120_000 }: { intervalMs?: number; timeoutMs?: number } = {},
+): Promise<TaskStatus> {
+  const start = Date.now();
+  // eslint-disable-next-line no-constant-condition
+  for (;;) {
+    const status = await getTaskStatus(taskId);
+    if (status.ready) return status;
+    if (Date.now() - start >= timeoutMs) return status;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
 }
 
 export async function classifyBackfill(

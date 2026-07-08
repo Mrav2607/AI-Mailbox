@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.core.ratelimit import user_rate_limit
 from app.deps import get_db, get_current_user
 from app.db.models import MailThread, MailMessage, Classification, AppUser
+from app.workers.celery_app import celery_app
 from app.workers.tasks_ingest import ingest_gmail_for_user
 from app.workers.tasks_nlp import backfill_threads_for_user, classify_latest_threads
 from app.services.nlp.backfill import latest_label_subquery, run_backfill
@@ -397,6 +398,32 @@ def ingest_gmail(
         classify_messages=classify,
     )
     return {"status": "queued", "task_id": task.id}
+
+
+@router.get("/tasks/{task_id}")
+def get_task_status(
+    task_id: str,
+    current_user: AppUser = Depends(get_current_user),
+) -> dict:
+    """Report a queued job's state so the UI can wait for it to finish before
+    refreshing -- otherwise it refetches against a DB the worker hasn't written
+    to yet, and nothing appears until the operator navigates or reloads.
+    """
+    result = celery_app.AsyncResult(task_id)
+    ready = result.ready()
+    payload: dict[str, Any] = {"task_id": task_id, "state": result.state, "ready": ready}
+    if ready:
+        if result.successful():
+            data = result.result
+            # Worker tasks return a dict carrying user_id; don't hand one user
+            # another user's job outcome (task ids are opaque, but cheap to check).
+            if isinstance(data, dict) and data.get("user_id") not in (None, str(current_user.id)):
+                raise HTTPException(status_code=404, detail="Not Found")
+            payload["result"] = data
+        else:
+            # A failed task stores the exception; surface a string, not a 500.
+            payload["error"] = str(result.result) if result.result else "task failed"
+    return payload
 
 
 @router.post(

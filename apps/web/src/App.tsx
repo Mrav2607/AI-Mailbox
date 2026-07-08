@@ -14,6 +14,7 @@ import {
   reclassify,
   searchThreads,
   setToken,
+  waitForTask,
 } from "@/lib/api";
 import { BUCKET_KEYS } from "@/lib/labels";
 import type {
@@ -416,14 +417,39 @@ export default function Console() {
   const doIngest = useCallback(
     async (opts: IngestOptions) => {
       setIngesting(true);
+      const refreshAll = () =>
+        Promise.all([refreshList(bucket), refreshOverview(), refreshCounts()]);
       try {
         const r = await ingestGmail(opts.maxResults, opts.classify);
-        toast.success(`ingest complete · ${r.ingested ?? opts.maxResults} pulled`);
-        await Promise.all([
-          refreshList(bucket),
-          refreshOverview(),
-          refreshCounts(),
-        ]);
+        // Mock / synchronous path: no task to wait on, data is already there.
+        if (!r.task_id) {
+          toast.success(`ingest complete · ${opts.maxResults} threads`);
+          await refreshAll();
+          return;
+        }
+        // The API returns as soon as the job is QUEUED; wait for the worker to
+        // actually finish before refreshing, or the UI shows a stale mailbox.
+        const t = toast.loading("ingest running…");
+        const final = await waitForTask(r.task_id);
+        const res = final.result;
+        if (res?.status === "error") {
+          toast.error(res.detail ?? "ingest failed", { id: t });
+          return;
+        }
+        if (final.error) {
+          toast.error(final.error, { id: t });
+          return;
+        }
+        if (!final.ready) {
+          toast.message("ingest still running — showing what's landed so far", { id: t });
+        } else {
+          toast.success(
+            `ingest complete · ${res?.threads_upserted ?? 0} threads · ` +
+              `${res?.messages_upserted ?? 0} msgs`,
+            { id: t },
+          );
+        }
+        await refreshAll();
       } catch (e) {
         toast.error((e as Error).message ?? "ingest failed");
       } finally {

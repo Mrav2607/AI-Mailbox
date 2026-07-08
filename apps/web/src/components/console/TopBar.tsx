@@ -74,7 +74,7 @@ function IngestForm({
     >
       <div className={fieldLabel}>ingest gmail</div>
       <label className="block space-y-1">
-        <span className={fieldLabel}>how many (1–500)</span>
+        <span className={fieldLabel}>how many threads (1–500)</span>
         <input
           type="number"
           min={1}
