@@ -1,0 +1,116 @@
+# One-command local stack for AI-Mailbox. From the repo root:
+#
+#   cp deploy/.env.example deploy/.env    # once — fill in secrets if you want Gmail
+#   docker compose up --build
+#   open http://localhost:8080            # click "demo login" — no Google creds needed
+#
+# Brings up Postgres (with pgvector), Redis, runs DB migrations to head, then the
+# API, the Celery worker, and the SPA behind nginx (which also proxies /api to the
+# API, so the whole app is one origin — no CORS to configure).
+#
+# The in-process torch classifier is OFF by default so the image stays small and
+# the build stays fast; the app falls back to the keyword heuristic. To serve the
+# fine-tuned model instead: drop it in ./models/email-classifier, set
+# CLASSIFIER_BACKEND=local in deploy/.env, and build with
+# INSTALL_LOCAL_CLASSIFIER=true docker compose up --build
+name: ai-mailbox
+
+services:
+  db:
+    image: pgvector/pgvector:pg15 # stock postgres:15 has no `vector` extension
+    env_file: ./deploy/.env
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: migrate the schema to head, then exit. api and worker wait for this
+  # to finish so they never come up against an unmigrated database.
+  migrate:
+    build: &api-build
+      context: .
+      dockerfile: deploy/Dockerfile.api
+      args:
+        INSTALL_LOCAL_CLASSIFIER: ${INSTALL_LOCAL_CLASSIFIER:-false}
+    image: ai-mailbox-api:local
+    command: alembic upgrade head
+    env_file: ./deploy/.env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: *api-build
+    image: ai-mailbox-api:local
+    env_file: ./deploy/.env
+    # Mount a fine-tuned classifier (if you have one) so CLASSIFIER_BACKEND=local
+    # can serve it without rebuilding. Harmless when the dir is absent/empty.
+    volumes:
+      - ./models:/app/models:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/v1/health').status==200 else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  worker:
+    build: *api-build
+    image: ai-mailbox-api:local
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+    env_file: ./deploy/.env
+    volumes:
+      - ./models:/app/models:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.web
+      args:
+        # Relative base → same-origin calls that nginx proxies to the API.
+        VITE_API_BASE_URL: /api/v1
+    image: ai-mailbox-web:local
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:

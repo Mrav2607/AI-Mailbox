@@ -9,6 +9,57 @@ triage buckets over a FastAPI service.
 - Web path: `apps/web` (placeholder)
 - Model training: `ml/` (see [Email classification](#email-classification))
 
+## Quick start (Docker)
+
+The fastest way to run the whole app — API, Celery worker, Postgres (pgvector),
+Redis, and the web UI — is Docker Compose. From the repo root:
+
+```bash
+cp deploy/.env.example deploy/.env    # once; defaults are enough to boot
+docker compose up --build
+```
+
+Then open **http://localhost:8080** and click **demo login** (email only, no
+Google account needed). Everything is served from one origin — nginx serves the
+SPA and proxies `/api` to the API, so there's no CORS to configure.
+
+What comes up:
+
+| Service   | Purpose                              | URL / port |
+|-----------|--------------------------------------|------------|
+| `web`     | React SPA + `/api` reverse proxy     | http://localhost:8080 |
+| `api`     | FastAPI service                      | http://localhost:8000 |
+| `worker`  | Celery worker (Gmail ingest, backfill) | — |
+| `migrate` | one-shot `alembic upgrade head`, then exits | — |
+| `db`      | Postgres 15 + pgvector               | localhost:5432 |
+| `redis`   | Celery broker + OAuth state          | localhost:6379 |
+
+The `migrate` service runs first and the app waits on health checks, so a single
+`docker compose up` comes up clean with no ordering races.
+
+**Classifier:** the default build is lean and uses the keyword `heuristic`
+backend — no model or API keys required, which is enough to test the app end to
+end. To serve the actual fine-tuned encoder, you need the model artifact. It's
+git-ignored (~1GB, trained on private data), so it ships as chunked assets on
+the `model-v1` GitHub Release. Fetch it (needs the [GitHub CLI](https://cli.github.com),
+`gh auth login`), then build with the torch deps:
+
+```bash
+./fetch-model.sh    # downloads + unpacks into ./models/email-classifier
+INSTALL_LOCAL_CLASSIFIER=true CLASSIFIER_BACKEND=local docker compose up --build
+```
+
+No repo access to the release? Set `GEMINI_API_KEY` and `CLASSIFIER_BACKEND=gemini`
+for real LLM classification without any download.
+
+**Gmail (optional):** to ingest real mail, fill `GOOGLE_CLIENT_ID` /
+`GOOGLE_CLIENT_SECRET` in `deploy/.env` and register
+`http://localhost:8080/auth/google/callback` in your Google Cloud OAuth client.
+
+> The sections below cover running the API **directly on the host** (venv +
+> `uvicorn --reload`) for API development. For just trying the app, the Docker
+> quick start above is all you need.
+
 > **Local-only paths:** `models/`, `data/`, and `scripts/` are git-ignored. The
 > trained model (~1 GB), the training/eval datasets (real email content), and the
 > one-off data-prep scripts live on your machine, not in the repo. None of them
@@ -57,7 +108,7 @@ cd apps/api; alembic upgrade head; cd ../..
 1. Start Postgres and Redis (Docker Desktop must be running):
 
 ```bash
-docker compose -f deploy/docker-compose.yml up -d db redis
+docker compose up -d db redis
 ```
 
 2. Open a terminal and activate the venv:

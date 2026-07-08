@@ -1,23 +1,32 @@
-# Build context is the repo ROOT (see deploy/docker-compose.yml) so we can copy
-# both the API package (apps/api) and the trained model (models/) into the image.
+# Build context is the repo ROOT (see docker-compose.yml) so we can copy the API
+# package and, when enabled, install the local classifier.
 FROM python:3.11-slim
 WORKDIR /app
 
 COPY apps/api/pyproject.toml ./pyproject.toml
 COPY apps/api/app ./app
 
-# Install CPU-only torch first (the default PyPI wheel bundles CUDA and is
-# multi-GB), then the API plus the "local-classifier" extra (transformers) on
-# top of the already-satisfied torch.
-RUN pip install --upgrade pip \
- && pip install torch --index-url https://download.pytorch.org/whl/cpu \
- && pip install -e ".[local-classifier]"
+# Alembic ships in the image so the compose `migrate` service can run
+# `alembic upgrade head` from inside the container.
+COPY apps/api/alembic ./alembic
+COPY apps/api/alembic.ini ./alembic.ini
 
-# Bake the fine-tuned classifier in so CLASSIFIER_BACKEND=local serves in-process.
-# Last so model retrains don't bust the dependency layer cache.
-COPY models/email-classifier ./models/email-classifier
+# The in-process torch classifier is optional -- off by default so the image
+# stays small and the build stays fast (torch pulls ~1.5GB). Flip to true to
+# install it; otherwise CLASSIFIER_BACKEND=local degrades to the heuristic
+# backend, which needs no extra deps. torch is CPU-only (the default PyPI wheel
+# bundles CUDA and is multi-GB).
+ARG INSTALL_LOCAL_CLASSIFIER=false
+RUN pip install --upgrade pip
+RUN if [ "$INSTALL_LOCAL_CLASSIFIER" = "true" ]; then \
+      pip install torch --index-url https://download.pytorch.org/whl/cpu && \
+      pip install -e ".[local-classifier]"; \
+    else \
+      pip install -e .; \
+    fi
 
+# The model is not baked into the image -- compose bind-mounts ./models read-only
+# so anyone with a trained model gets local classification without a rebuild.
 ENV PORT=8000 \
-    CLASSIFIER_BACKEND=local \
     CLASSIFIER_MODEL_PATH=/app/models/email-classifier
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
