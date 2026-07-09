@@ -10,6 +10,7 @@ import {
 import type { BucketKey, Label } from "@/lib/types";
 import { ALL_LABELS, BUCKETS } from "@/lib/types";
 import { LABEL_META, bucketLabel } from "@/lib/labels";
+import type { Arrangement } from "@/lib/layout";
 
 interface Props {
   open: boolean;
@@ -22,6 +23,7 @@ interface Props {
   hasFocusedThread: boolean;
   onToggleSidebar: () => void;
   onToggleDetail: () => void;
+  onArrangement: (patch: Partial<Arrangement>) => void;
   onFocusSearch: () => void;
   onDelete: () => void;
 }
@@ -37,6 +39,7 @@ export function CommandPalette({
   hasFocusedThread,
   onToggleSidebar,
   onToggleDetail,
+  onArrangement,
   onFocusSearch,
   onDelete,
 }: Props) {
@@ -85,6 +88,24 @@ export function CommandPalette({
               >
                 toggle thread detail pane
               </CommandItem>
+              {(["left", "right"] as const).map((side) => (
+                <CommandItem
+                  key={`sb-${side}`}
+                  onSelect={() => run(() => onArrangement({ sidebar: side }))}
+                  value={`layout buckets sidebar ${side}`}
+                >
+                  layout: buckets → {side}
+                </CommandItem>
+              ))}
+              {(["right", "bottom", "left"] as const).map((side) => (
+                <CommandItem
+                  key={`rd-${side}`}
+                  onSelect={() => run(() => onArrangement({ reading: side }))}
+                  value={`layout reading pane ${side}`}
+                >
+                  layout: reading pane → {side}
+                </CommandItem>
+              ))}
             </CommandGroup>
             <CommandGroup heading="actions">
               <CommandItem onSelect={() => run(onIngest)} value="ingest gmail">

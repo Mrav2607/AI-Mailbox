@@ -1,9 +1,11 @@
 import { useState } from "react";
-import { Loader2, Download, Sparkles, LogOut } from "lucide-react";
+import { Loader2, Download, Sparkles, LogOut, Columns3 } from "lucide-react";
 import { Mark } from "./Mark";
 import { Popover } from "./Popover";
+import { LayoutPicker } from "./LayoutPicker";
 import { bucketLabel } from "@/lib/labels";
 import { BUCKETS } from "@/lib/types";
+import type { Arrangement } from "@/lib/layout";
 import type {
   BackfillOptions,
   BucketKey,
@@ -26,6 +28,10 @@ interface Props {
   onIngestOpenChange: (v: boolean) => void;
   backfillOpen: boolean;
   onBackfillOpenChange: (v: boolean) => void;
+  layoutOpen: boolean;
+  onLayoutOpenChange: (v: boolean) => void;
+  arrangement: Arrangement;
+  onArrangement: (a: Arrangement) => void;
 }
 
 const BACKENDS: { value: ClassifierBackend; label: string }[] = [
@@ -226,6 +232,10 @@ export function TopBar({
   onIngestOpenChange,
   backfillOpen,
   onBackfillOpenChange,
+  layoutOpen,
+  onLayoutOpenChange,
+  arrangement,
+  onArrangement,
 }: Props) {
   const s = overview?.summary;
   return (
@@ -242,7 +252,9 @@ export function TopBar({
         </span>
       </div>
 
-      <div className="flex items-center gap-1.5">
+      {/* Stats and the email are the first things to go on narrow windows —
+          the action buttons matter more than the vanity row. */}
+      <div className="hidden md:flex items-center gap-1.5">
         <Stat label="threads" value={s?.threads ?? "—"} />
         <Stat label="msgs" value={s?.messages ?? "—"} />
         <Stat label="classified" value={s?.classified ?? "—"} />
@@ -307,9 +319,26 @@ export function TopBar({
         />
       </Popover>
 
+      <Popover
+        open={layoutOpen}
+        onOpenChange={onLayoutOpenChange}
+        trigger={
+          <button
+            onClick={() => onLayoutOpenChange(!layoutOpen)}
+            aria-expanded={layoutOpen}
+            className="h-7 px-2.5 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors"
+          >
+            <Columns3 className="h-3 w-3" />
+            layout
+          </button>
+        }
+      >
+        <LayoutPicker arrangement={arrangement} onArrangement={onArrangement} />
+      </Popover>
+
       <div className="mx-1 h-5 w-px bg-border" />
 
-      <span className="text-[11.5px] font-mono text-muted-foreground truncate max-w-[180px]">
+      <span className="hidden md:inline text-[11.5px] font-mono text-muted-foreground truncate max-w-[180px]">
         {user?.email ?? "—"}
       </span>
       <button

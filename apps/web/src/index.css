@@ -184,3 +184,24 @@
 .email-html :last-child {
   margin-bottom: 0;
 }
+
+/* Resizable pane separators (react-resizable-panels). The hairline reads as
+   the old border-r/b between panes; it lights amber while hovered, keyboard
+   focused, or mid-drag. The library keeps the grab target ~10px wide around
+   the 1px visual, and stores its interaction state in the data attribute. */
+[data-separator] {
+  background: var(--color-border);
+  transition: background-color 120ms;
+}
+[data-separator="hover"],
+[data-separator="focus"],
+[data-separator="active"] {
+  background: var(--color-primary);
+}
+
+/* While a pane grip is being dragged to a new spot. */
+body.pane-dragging,
+body.pane-dragging * {
+  cursor: grabbing !important;
+  user-select: none;
+}

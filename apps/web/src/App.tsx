@@ -39,26 +39,20 @@ import { Shortcuts } from "@/components/console/Shortcuts";
 import { LoginScreen } from "@/components/console/LoginScreen";
 import { useHotkeys } from "@/lib/use-hotkeys";
 import { Toaster } from "@/components/ui/sonner";
-import { PanelLeftOpen, PanelRightOpen, Search, X } from "lucide-react";
+import { ConsoleLayout } from "@/components/console/ConsoleLayout";
+import { UI_KEY, loadUi } from "@/lib/layout";
+import type { Arrangement, PaneLayout, PaneSizes } from "@/lib/layout";
+import { PanelRightOpen, Search, X } from "lucide-react";
 
 type SortMode = "recent" | "confidence_asc" | "confidence_desc";
 
-// Which chrome panels are visible. Persisted so the operator's layout sticks.
+// Which chrome panels are visible. Persisted (with the pane arrangement and
+// sizes, see lib/layout.ts) so the operator's layout sticks.
 // The shortcuts hint lives inside the sidebar, so it tracks `sidebar`.
 type Panels = { sidebar: boolean; detail: boolean };
-const UI_KEY = "ai_mailbox_ui";
-const DEFAULT_PANELS: Panels = { sidebar: true, detail: true };
 
-function loadPanels(): Panels {
-  if (typeof window === "undefined") return DEFAULT_PANELS;
-  try {
-    const raw = window.localStorage.getItem(UI_KEY);
-    if (raw) return { ...DEFAULT_PANELS, ...JSON.parse(raw) };
-  } catch {
-    /* fall through to defaults */
-  }
-  return DEFAULT_PANELS;
-}
+// One read at module load; the states below fan out from it.
+const INITIAL_UI = loadUi();
 
 // How long the "thread deleted · undo" window stays open before the delete is
 // actually sent to the server.
@@ -104,7 +98,15 @@ export default function Console() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [sortMode, setSortMode] = useState<SortMode>("recent");
 
-  const [panels, setPanels] = useState<Panels>(loadPanels);
+  const [panels, setPanels] = useState<Panels>({
+    sidebar: INITIAL_UI.sidebar,
+    detail: INITIAL_UI.detail,
+  });
+  const [arrangement, setArrangement] = useState<Arrangement>(
+    INITIAL_UI.arrangement,
+  );
+  const [paneSizes, setPaneSizes] = useState<PaneSizes>(INITIAL_UI.paneSizes);
+  const [layoutOpen, setLayoutOpen] = useState(false);
 
   // Search: `query` drives the instant client-side filter of the loaded bucket;
   // running a search (Enter) flips `searchMode` on and shows whole-mailbox
@@ -123,14 +125,21 @@ export default function Console() {
 
   useEffect(() => {
     try {
-      window.localStorage.setItem(UI_KEY, JSON.stringify(panels));
+      window.localStorage.setItem(
+        UI_KEY,
+        JSON.stringify({ ...panels, arrangement, paneSizes }),
+      );
     } catch {
       /* storage unavailable; layout just won't persist */
     }
-  }, [panels]);
+  }, [panels, arrangement, paneSizes]);
 
   const togglePanel = useCallback((key: keyof Panels) => {
     setPanels((p) => ({ ...p, [key]: !p[key] }));
+  }, []);
+
+  const handlePaneSizes = useCallback((key: string, layout: PaneLayout) => {
+    setPaneSizes((s) => ({ ...s, [key]: layout }));
   }, []);
 
   // ---- auth ----------------------------------------------------------------
@@ -734,32 +743,35 @@ export default function Console() {
         onIngestOpenChange={setIngestOpen}
         backfillOpen={backfillOpen}
         onBackfillOpenChange={setBackfillOpen}
+        layoutOpen={layoutOpen}
+        onLayoutOpenChange={setLayoutOpen}
+        arrangement={arrangement}
+        onArrangement={setArrangement}
         onLogout={() => {
           setToken(null);
           setUser(null);
         }}
       />
 
-      <div className="flex-1 min-h-0 flex">
-        {panels.sidebar ? (
+      <ConsoleLayout
+        arrangement={arrangement}
+        onArrangementChange={setArrangement}
+        sidebarVisible={panels.sidebar}
+        detailVisible={panels.detail}
+        onExpandSidebar={() => togglePanel("sidebar")}
+        paneSizes={paneSizes}
+        onPaneSizesChange={handlePaneSizes}
+        sidebar={
           <BucketSidebar
             active={bucket}
             counts={allCounts}
             onSelect={(b) => setBucket(b)}
             onCollapse={() => togglePanel("sidebar")}
+            side={arrangement.sidebar}
           />
-        ) : (
-          <button
-            onClick={() => togglePanel("sidebar")}
-            aria-label="Show buckets"
-            title="Show buckets ( [ )"
-            className="w-8 shrink-0 border-r border-border bg-[var(--color-panel)] flex items-start justify-center pt-2.5 text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
-          >
-            <PanelLeftOpen className="h-4 w-4" />
-          </button>
-        )}
-
-        <section className="flex-1 min-w-0 flex flex-col border-r border-border">
+        }
+        list={
+          <section className="flex-1 min-w-0 min-h-0 flex flex-col">
           <div className="h-10 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center px-3 gap-2.5 font-mono text-[11.5px]">
             <span className="text-primary font-semibold tracking-tight shrink-0">
               {searchMode ? "search" : bucket.replace("_", " ")}
@@ -833,35 +845,32 @@ export default function Console() {
               </button>
             )}
           </div>
-          <div className="flex-1 overflow-y-auto scrollbar-thin">
-            <ThreadList
-              items={visibleItems}
-              selectedId={selectedId}
-              onSelect={(id) => setSelectedId(id)}
-              loading={listLoading || searching}
-              error={listError}
-            />
-          </div>
-        </section>
-
-        {panels.detail && (
-          <section className="w-[42%] min-w-[380px] max-w-[640px] flex flex-col bg-[var(--color-panel)]/30">
-            <ThreadDetailPane
-              data={thread}
-              classification={focusedItem?.classification ?? null}
-              loading={threadLoading}
-              error={threadError}
-              onReclassify={doReclassify}
-              onCollapse={() => togglePanel("detail")}
-              onDelete={
-                focusedItem
-                  ? () => doDelete(focusedItem.thread_id)
-                  : undefined
-              }
-            />
+            <div className="flex-1 overflow-y-auto scrollbar-thin">
+              <ThreadList
+                items={visibleItems}
+                selectedId={selectedId}
+                onSelect={(id) => setSelectedId(id)}
+                loading={listLoading || searching}
+                error={listError}
+              />
+            </div>
           </section>
-        )}
-      </div>
+        }
+        detail={
+          <ThreadDetailPane
+            data={thread}
+            classification={focusedItem?.classification ?? null}
+            loading={threadLoading}
+            error={threadError}
+            onReclassify={doReclassify}
+            onCollapse={() => togglePanel("detail")}
+            onDelete={
+              focusedItem ? () => doDelete(focusedItem.thread_id) : undefined
+            }
+            side={arrangement.reading}
+          />
+        }
+      />
 
       <CommandPalette
         open={paletteOpen}
@@ -874,6 +883,7 @@ export default function Console() {
         hasFocusedThread={!!focusedItem}
         onToggleSidebar={() => togglePanel("sidebar")}
         onToggleDetail={() => togglePanel("detail")}
+        onArrangement={(patch) => setArrangement((a) => ({ ...a, ...patch }))}
         onFocusSearch={() =>
           setTimeout(() => searchInputRef.current?.focus(), 60)
         }

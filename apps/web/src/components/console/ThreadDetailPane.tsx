@@ -1,10 +1,24 @@
 import { useMemo } from "react";
 import DOMPurify from "dompurify";
-import { MailOpen, PanelRightClose, Trash2 } from "lucide-react";
+import {
+  MailOpen,
+  PanelBottomClose,
+  PanelLeftClose,
+  PanelRightClose,
+  Trash2,
+} from "lucide-react";
 import { LABEL_META, confidenceColor, confidenceText } from "@/lib/labels";
 import { absTime } from "@/lib/time";
 import type { Classification, Label, ThreadDetail, ThreadMessage } from "@/lib/types";
 import { ALL_LABELS } from "@/lib/types";
+import type { ReadingSide } from "@/lib/layout";
+import { PaneDragHandle } from "./ConsoleLayout";
+
+const COLLAPSE_ICONS = {
+  right: PanelRightClose,
+  left: PanelLeftClose,
+  bottom: PanelBottomClose,
+} as const;
 
 // Strip scripts/handlers and keep <style> out so email CSS can't bleed into
 // the console. Inline style attributes survive (emails lean on them heavily).
@@ -52,6 +66,7 @@ interface Props {
   onReclassify: (label: Label) => void;
   onCollapse?: () => void;
   onDelete?: () => void;
+  side?: ReadingSide;
 }
 
 export function ThreadDetailPane({
@@ -62,7 +77,9 @@ export function ThreadDetailPane({
   onReclassify,
   onCollapse,
   onDelete,
+  side = "right",
 }: Props) {
+  const CollapseIcon = COLLAPSE_ICONS[side];
   if (error) {
     return (
       <div role="alert" className="p-6 text-sm text-destructive font-mono">
@@ -81,14 +98,15 @@ export function ThreadDetailPane({
     return (
       <div className="h-full flex flex-col">
         {onCollapse && (
-          <div className="flex justify-end p-2">
+          <div className="flex justify-end items-center gap-2 p-2">
+            <PaneDragHandle source="detail" />
             <button
               onClick={onCollapse}
               aria-label="Hide thread detail"
               title="Hide detail ( ] )"
               className="text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
             >
-              <PanelRightClose className="h-3.5 w-3.5" />
+              <CollapseIcon className="h-3.5 w-3.5" />
             </button>
           </div>
         )}
@@ -115,6 +133,7 @@ export function ThreadDetailPane({
           <div className="flex-1 min-w-0 text-[11px] text-muted-foreground font-mono lowercase truncate">
             {data.thread.provider} · {absTime(data.thread.last_message_at)}
           </div>
+          <PaneDragHandle source="detail" />
           {onDelete && (
             <button
               onClick={onDelete}
@@ -132,7 +151,7 @@ export function ThreadDetailPane({
               title="Hide detail ( ] )"
               className="text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
             >
-              <PanelRightClose className="h-3.5 w-3.5" />
+              <CollapseIcon className="h-3.5 w-3.5" />
             </button>
           )}
         </div>
