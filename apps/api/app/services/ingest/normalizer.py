@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import base64
+import re
 from datetime import datetime, timezone
 from typing import Any
+
+from bs4 import BeautifulSoup
 
 
 def _decode_base64url(data: str | None) -> str | None:
@@ -20,25 +23,50 @@ def _extract_headers(headers: list[dict[str, Any]]) -> dict[str, str]:
     return {h.get("name", ""): h.get("value", "") for h in headers if h.get("name")}
 
 
-def _extract_body(payload: dict[str, Any]) -> tuple[str | None, str | None]:
-    if not payload:
-        return None, None
-    mime_type = payload.get("mimeType")
-    body_data = payload.get("body", {}).get("data")
-    if mime_type == "text/plain":
-        return _decode_base64url(body_data), None
-    if mime_type == "text/html":
-        return None, _decode_base64url(body_data)
+def _html_to_text(html: str) -> str | None:
+    """Plain-text fallback for HTML-only messages, so body_text is never None
+    when any body exists (it feeds the classifier and the UI's text view)."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        return None
+    for tag in soup(["script", "style", "head", "title"]):
+        tag.decompose()
+    # The separator puts a newline between any two text nodes, which already
+    # covers <br> and block boundaries.
+    text = "\n".join(line.strip() for line in soup.get_text(separator="\n").splitlines())
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text or None
 
-    text_body = None
-    html_body = None
-    for part in payload.get("parts", []) or []:
-        part_type = part.get("mimeType")
-        part_data = part.get("body", {}).get("data")
-        if part_type == "text/plain" and text_body is None:
-            text_body = _decode_base64url(part_data)
-        elif part_type == "text/html" and html_body is None:
-            html_body = _decode_base64url(part_data)
+
+def _extract_body(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    """First text/plain and text/html found anywhere in the MIME tree.
+
+    Gmail nests bodies (multipart/mixed -> multipart/alternative -> text/*),
+    so walk depth-first instead of only scanning the top level. Parts with a
+    filename are attachments, not bodies."""
+    text_body: str | None = None
+    html_body: str | None = None
+
+    def walk(part: dict[str, Any]) -> None:
+        nonlocal text_body, html_body
+        if not part or (text_body is not None and html_body is not None):
+            return
+        if part.get("filename"):
+            return
+        mime_type = part.get("mimeType")
+        data = part.get("body", {}).get("data")
+        if mime_type == "text/plain" and text_body is None:
+            text_body = _decode_base64url(data)
+        elif mime_type == "text/html" and html_body is None:
+            html_body = _decode_base64url(data)
+        for child in part.get("parts", []) or []:
+            walk(child)
+
+    if payload:
+        walk(payload)
+    if text_body is None and html_body:
+        text_body = _html_to_text(html_body)
     return text_body, html_body
 
 

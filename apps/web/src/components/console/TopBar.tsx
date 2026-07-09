@@ -63,12 +63,17 @@ function IngestForm({
   // and clamp on submit instead.
   const [count, setCount] = useState("100");
   const [classify, setClassify] = useState(true);
+  const [refreshExisting, setRefreshExisting] = useState(false);
   return (
     <form
       onSubmit={(e) => {
         e.preventDefault();
         const n = parseInt(count, 10);
-        onSubmit({ maxResults: clamp(Number.isNaN(n) ? 100 : n, 1, 500), classify });
+        onSubmit({
+          maxResults: clamp(Number.isNaN(n) ? 100 : n, 1, 500),
+          classify,
+          refreshExisting,
+        });
       }}
       className="space-y-2.5"
     >
@@ -92,6 +97,15 @@ function IngestForm({
           className="accent-primary"
         />
         classify on ingest
+      </label>
+      <label className="flex items-center gap-2 cursor-pointer text-[12px] font-mono text-foreground/85">
+        <input
+          type="checkbox"
+          checked={refreshExisting}
+          onChange={(e) => setRefreshExisting(e.target.checked)}
+          className="accent-primary"
+        />
+        re-fetch existing threads
       </label>
       <button
         type="submit"

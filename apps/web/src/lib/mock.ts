@@ -141,6 +141,11 @@ export function mockThread(id: string): ThreadDetail {
       rand(SNIPPETS, k + id.length) +
       "\n\nMore context follows — this is the full message body rendered in the right pane for QA against the model prediction. The operator should be able to scan it quickly and decide whether the label is correct.\n\nThanks,\n" +
       rand(SENDERS, k + id.length),
+    // Last message renders as HTML so preview mode exercises that path too.
+    body_html:
+      k === 2
+        ? `<p>${rand(SNIPPETS, k + id.length)}</p><p>This message arrived as <strong>HTML</strong>, so it renders formatted: <a href="https://example.com">a link</a>, a list…</p><ul><li>first point</li><li>second point</li></ul><p>Thanks,<br>${rand(SENDERS, k + id.length)}</p>`
+        : null,
   }));
   return {
     thread: {

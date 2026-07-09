@@ -146,3 +146,41 @@
     animation-duration: 0.01ms !important;
   }
 }
+
+/* Sanitized email HTML renders on its own light card (email assumes a light
+   background and the console theme is dark). Keep its layout tame. */
+.email-html {
+  color-scheme: light;
+  overflow-wrap: break-word;
+}
+.email-html img {
+  max-width: 100%;
+  height: auto;
+}
+.email-html a {
+  color: #1d4ed8;
+  text-decoration: underline;
+}
+.email-html p,
+.email-html ul,
+.email-html ol,
+.email-html table {
+  margin: 0 0 0.75em;
+}
+.email-html ul,
+.email-html ol {
+  padding-left: 1.25em;
+}
+.email-html blockquote {
+  margin: 0 0 0.75em;
+  padding-left: 0.75em;
+  border-left: 2px solid #d4d4d4;
+  color: #525252;
+}
+.email-html table {
+  border-collapse: collapse;
+  max-width: 100%;
+}
+.email-html :last-child {
+  margin-bottom: 0;
+}

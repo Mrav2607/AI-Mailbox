@@ -455,7 +455,7 @@ export default function Console() {
     async (opts: IngestOptions) => {
       setIngesting(true);
       try {
-        const r = await ingestGmail(opts.maxResults, opts.classify);
+        const r = await ingestGmail(opts.maxResults, opts.classify, opts.refreshExisting);
         // Mock / synchronous path: no task to wait on, data is already there.
         if (!r.task_id) {
           toast.success(`ingest complete · ${opts.maxResults} threads`);
@@ -664,7 +664,7 @@ export default function Console() {
         refreshOverview();
         refreshCounts();
       } else if (e.key === "i") {
-        doIngest({ maxResults: 100, classify: true });
+        doIngest({ maxResults: 100, classify: true, refreshExisting: false });
       } else if (e.key === "b") {
         doBackfill({ limit: 200, bucket, backend: "local", force: false });
       } else if (e.key === "q") {

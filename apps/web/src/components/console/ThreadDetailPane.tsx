@@ -1,8 +1,48 @@
+import { useMemo } from "react";
+import DOMPurify from "dompurify";
 import { MailOpen, PanelRightClose, Trash2 } from "lucide-react";
 import { LABEL_META, confidenceColor, confidenceText } from "@/lib/labels";
 import { absTime } from "@/lib/time";
-import type { Classification, Label, ThreadDetail } from "@/lib/types";
+import type { Classification, Label, ThreadDetail, ThreadMessage } from "@/lib/types";
 import { ALL_LABELS } from "@/lib/types";
+
+// Strip scripts/handlers and keep <style> out so email CSS can't bleed into
+// the console. Inline style attributes survive (emails lean on them heavily).
+const PURIFY_CONFIG = {
+  USE_PROFILES: { html: true },
+  FORBID_TAGS: ["style"],
+};
+
+// Every link in an email opens in a new tab, without handing the mail page a
+// window reference back to us. Registered once at module load.
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "A") {
+    node.setAttribute("target", "_blank");
+    node.setAttribute("rel", "noopener noreferrer");
+  }
+});
+
+function MessageBody({ m }: { m: ThreadMessage }) {
+  const html = useMemo(
+    () => (m.body_html ? DOMPurify.sanitize(m.body_html, PURIFY_CONFIG) : null),
+    [m.body_html],
+  );
+  if (html) {
+    return (
+      <div
+        // Email HTML assumes a light background, and the console is dark-only,
+        // so the body sits on its own light card.
+        className="email-html rounded border border-border bg-white text-neutral-900 px-4 py-3 text-[13px] leading-relaxed overflow-x-auto"
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    );
+  }
+  return (
+    <pre className="whitespace-pre-wrap font-sans text-[13px] leading-relaxed text-foreground/85">
+      {m.body_text ?? m.snippet ?? ""}
+    </pre>
+  );
+}
 
 interface Props {
   data: ThreadDetail | null;
@@ -173,9 +213,7 @@ export function ThreadDetailPane({
                 {absTime(m.sent_at)}
               </span>
             </header>
-            <pre className="whitespace-pre-wrap font-sans text-[13px] leading-relaxed text-foreground/85">
-              {m.body_text ?? m.snippet ?? ""}
-            </pre>
+            <MessageBody m={m} />
           </article>
         ))}
       </div>

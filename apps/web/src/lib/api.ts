@@ -176,18 +176,22 @@ export async function getOverview(): Promise<Overview> {
 }
 
 // Queues a Gmail pull on the worker. `max_results` is a THREAD count now, so N
-// gives you N threads (and all their messages), not N messages. The real API
+// gives you N threads (and all their messages), not N messages. With
+// `refreshExisting` the pull re-fetches threads already in the DB (the upsert
+// refreshes their bodies) instead of skipping ahead to new ones. The real API
 // returns a task_id to poll; the mock resolves as if already done.
 export async function ingestGmail(
   max_results = 50,
   classify = true,
+  refreshExisting = false,
 ): Promise<{ status: string; task_id?: string }> {
   if (USE_MOCK) {
     await new Promise((r) => setTimeout(r, 700));
     return { status: "ok" };
   }
   return request<{ status: string; task_id?: string }>(
-    `/mail/ingest/gmail?max_results=${max_results}&classify=${classify}`,
+    `/mail/ingest/gmail?max_results=${max_results}&classify=${classify}` +
+      `&skip_existing=${!refreshExisting}`,
     { method: "POST" },
   );
 }

@@ -227,6 +227,7 @@ def get_thread(
                 "sender": m.sender,
                 "snippet": m.snippet,
                 "body_text": m.body_text,
+                "body_html": m.body_html,
             }
             for m in messages
         ],

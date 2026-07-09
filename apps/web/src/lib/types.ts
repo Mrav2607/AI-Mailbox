@@ -63,6 +63,8 @@ export type ClassifierBackend = "local" | "gemini" | "heuristic";
 export interface IngestOptions {
   maxResults: number;
   classify: boolean;
+  // Re-pull threads that are already in the DB (refreshes their bodies).
+  refreshExisting: boolean;
 }
 
 export interface BackfillOptions {
@@ -84,6 +86,7 @@ export interface ThreadMessage {
   sender: string | null;
   snippet: string | null;
   body_text: string | null;
+  body_html: string | null;
 }
 
 export interface ThreadDetail {
