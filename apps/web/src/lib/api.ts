@@ -192,9 +192,10 @@ export async function ingestGmail(
   );
 }
 
-// Result payload a worker task reports back through the status endpoint. For
-// ingest that's the upsert counts; `status: "error"` is a user-facing problem
-// (e.g. Gmail not connected) that still comes back as a *completed* task.
+// Result payload a worker task reports back through the status endpoint.
+// Ingest reports upsert counts, backfill reports created/scanned, and the
+// classify queue reports created/processed; `status: "error"` is a user-facing
+// problem (e.g. Gmail not connected) that still comes back as a *completed* task.
 export interface TaskResult {
   status?: string;
   detail?: string;
@@ -203,6 +204,9 @@ export interface TaskResult {
   classified?: number;
   fetched?: number;
   skipped_existing?: number;
+  created?: number;
+  scanned?: number;
+  processed?: number;
 }
 
 export interface TaskStatus {
@@ -214,6 +218,11 @@ export interface TaskStatus {
 }
 
 export async function getTaskStatus(taskId: string): Promise<TaskStatus> {
+  if (USE_MOCK) {
+    // Mock "workers" finish instantly, so any polled task is already done.
+    await new Promise((r) => setTimeout(r, 300));
+    return { task_id: taskId, state: "SUCCESS", ready: true, result: { status: "ok" } };
+  }
   return request<TaskStatus>(`/mail/tasks/${encodeURIComponent(taskId)}`);
 }
 

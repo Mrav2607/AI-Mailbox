@@ -164,4 +164,6 @@ def classify_latest_threads(
             db.commit()
             processed += 1
 
-        return {"status": "ok", "created": created, "processed": processed}
+        # user_id rides along so the task-status endpoint can refuse to hand
+        # this result to a different user, same as the other worker tasks.
+        return {"status": "ok", "user_id": user_id, "created": created, "processed": processed}

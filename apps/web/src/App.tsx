@@ -16,6 +16,7 @@ import {
   setToken,
   waitForTask,
 } from "@/lib/api";
+import type { TaskResult } from "@/lib/api";
 import { BUCKET_KEYS } from "@/lib/labels";
 import type {
   BackfillOptions,
@@ -414,11 +415,45 @@ export default function Console() {
     [selectedId, items, searchResults, visibleItems, refreshCounts, refreshOverview],
   );
 
+  const refreshAll = useCallback(
+    () => Promise.all([refreshList(bucket), refreshOverview(), refreshCounts()]),
+    [bucket, refreshList, refreshOverview, refreshCounts],
+  );
+
+  // Shared tail for every queued worker job (ingest / backfill / classify):
+  // the API answers 202 as soon as the task is QUEUED, so wait for the worker
+  // to actually finish before refreshing — otherwise the UI refetches a
+  // mailbox the worker hasn't written to yet.
+  const trackTask = useCallback(
+    async (
+      taskId: string,
+      label: string,
+      summarize: (res: TaskResult) => string,
+    ) => {
+      const t = toast.loading(`${label} running…`);
+      const final = await waitForTask(taskId);
+      const res = final.result;
+      if (res?.status === "error") {
+        toast.error(res.detail ?? `${label} failed`, { id: t });
+        return;
+      }
+      if (final.error) {
+        toast.error(final.error, { id: t });
+        return;
+      }
+      if (!final.ready) {
+        toast.message(`${label} still running — showing what's landed so far`, { id: t });
+      } else {
+        toast.success(summarize(res ?? {}), { id: t });
+      }
+      await refreshAll();
+    },
+    [refreshAll],
+  );
+
   const doIngest = useCallback(
     async (opts: IngestOptions) => {
       setIngesting(true);
-      const refreshAll = () =>
-        Promise.all([refreshList(bucket), refreshOverview(), refreshCounts()]);
       try {
         const r = await ingestGmail(opts.maxResults, opts.classify);
         // Mock / synchronous path: no task to wait on, data is already there.
@@ -427,36 +462,20 @@ export default function Console() {
           await refreshAll();
           return;
         }
-        // The API returns as soon as the job is QUEUED; wait for the worker to
-        // actually finish before refreshing, or the UI shows a stale mailbox.
-        const t = toast.loading("ingest running…");
-        const final = await waitForTask(r.task_id);
-        const res = final.result;
-        if (res?.status === "error") {
-          toast.error(res.detail ?? "ingest failed", { id: t });
-          return;
-        }
-        if (final.error) {
-          toast.error(final.error, { id: t });
-          return;
-        }
-        if (!final.ready) {
-          toast.message("ingest still running — showing what's landed so far", { id: t });
-        } else {
-          toast.success(
-            `ingest complete · ${res?.threads_upserted ?? 0} threads · ` +
-              `${res?.messages_upserted ?? 0} msgs`,
-            { id: t },
-          );
-        }
-        await refreshAll();
+        await trackTask(
+          r.task_id,
+          "ingest",
+          (res) =>
+            `ingest complete · ${res.threads_upserted ?? 0} threads · ` +
+            `${res.messages_upserted ?? 0} msgs`,
+        );
       } catch (e) {
         toast.error((e as Error).message ?? "ingest failed");
       } finally {
         setIngesting(false);
       }
     },
-    [bucket, refreshList, refreshOverview, refreshCounts],
+    [trackTask, refreshAll],
   );
 
   const doBackfill = useCallback(
@@ -465,34 +484,41 @@ export default function Console() {
       try {
         const r = await classifyBackfill(opts);
         if (r.status === "queued") {
-          // Big batch went to the worker; results land later, so there's
-          // nothing to refresh yet.
-          toast.success(`backfill queued · ${r.task_id}`);
+          // Big batch went to the worker; wait it out like ingest does.
+          await trackTask(
+            r.task_id,
+            "backfill",
+            (res) =>
+              `backfill complete · ${res.created ?? 0} classified · ` +
+              `${res.scanned ?? 0} scanned`,
+          );
           return;
         }
         toast.success(`classified ${r.created} · scanned ${r.scanned}`);
-        await Promise.all([
-          refreshList(bucket),
-          refreshOverview(),
-          refreshCounts(),
-        ]);
+        await refreshAll();
       } catch (e) {
         toast.error((e as Error).message ?? "backfill failed");
       } finally {
         setBackfilling(false);
       }
     },
-    [bucket, refreshList, refreshOverview, refreshCounts],
+    [trackTask, refreshAll],
   );
 
   const doQueue = useCallback(async () => {
     try {
       const r = await classifyQueue(200, false);
-      toast.success(`queued · ${r.task_id}`);
+      await trackTask(
+        r.task_id,
+        "classify",
+        (res) =>
+          `classify complete · ${res.created ?? 0} new labels · ` +
+          `${res.processed ?? 0} processed`,
+      );
     } catch (e) {
       toast.error((e as Error).message ?? "queue failed");
     }
-  }, []);
+  }, [trackTask]);
 
   const doReclassify = useCallback(
     async (label: Label) => {
