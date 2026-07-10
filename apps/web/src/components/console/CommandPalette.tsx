@@ -29,6 +29,9 @@ interface Props {
   onTheme: (t: ThemePref) => void;
   onArrangement: (patch: Partial<Arrangement>) => void;
   onFocusSearch: () => void;
+  onDone: () => void;
+  inDoneBucket: boolean;
+  onOpenGmail: () => void;
   onDelete: () => void;
 }
 
@@ -47,6 +50,9 @@ export function CommandPalette({
   onTheme,
   onArrangement,
   onFocusSearch,
+  onDone,
+  inDoneBucket,
+  onOpenGmail,
   onDelete,
 }: Props) {
   const run = (fn: () => void) => {
@@ -147,6 +153,18 @@ export function CommandPalette({
             </CommandGroup>
             {hasFocusedThread && (
               <CommandGroup heading="focused thread">
+                <CommandItem
+                  onSelect={() => run(onDone)}
+                  value="done archive restore thread"
+                >
+                  {inDoneBucket ? "restore thread" : "mark thread done"}
+                </CommandItem>
+                <CommandItem
+                  onSelect={() => run(onOpenGmail)}
+                  value="open thread in gmail"
+                >
+                  open in gmail
+                </CommandItem>
                 {ALL_LABELS.map((l) => (
                   <CommandItem
                     key={l}

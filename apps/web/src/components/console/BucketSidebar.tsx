@@ -1,6 +1,6 @@
 import { LABEL_META, bucketLabel } from "@/lib/labels";
-import type { BucketKey } from "@/lib/types";
-import { BUCKETS } from "@/lib/types";
+import type { BucketKey, Label } from "@/lib/types";
+import { ALL_LABELS, BUCKETS } from "@/lib/types";
 import type { SidebarSide } from "@/lib/layout";
 import { PaneDragHandle } from "./ConsoleLayout";
 import { Inbox, PanelLeftClose, PanelRightClose } from "lucide-react";
@@ -40,7 +40,9 @@ export function BucketSidebar({
       <nav className="flex-1 overflow-y-auto scrollbar-thin py-1">
         {BUCKETS.map((b, i) => {
           const isActive = b === active;
-          const meta = b !== "all" && b !== "unclassified" ? LABEL_META[b] : null;
+          const meta = (ALL_LABELS as readonly string[]).includes(b)
+            ? LABEL_META[b as Label]
+            : null;
           return (
             <button
               key={b}
@@ -56,7 +58,11 @@ export function BucketSidebar({
               <span
                 className={[
                   "h-2 w-2 rounded-full shrink-0",
-                  meta ? meta.dot : b === "unclassified" ? "bg-muted-foreground/40" : "bg-foreground/40",
+                  meta
+                    ? meta.dot
+                    : b === "all"
+                      ? "bg-foreground/40"
+                      : "bg-muted-foreground/40",
                 ].join(" ")}
               />
               <span className="flex-1 truncate">{bucketLabel(b)}</span>

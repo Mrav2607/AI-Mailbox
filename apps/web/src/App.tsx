@@ -13,11 +13,13 @@ import {
   ingestGmail,
   reclassify,
   searchThreads,
+  setThreadDone,
   setToken,
   waitForTask,
 } from "@/lib/api";
 import type { TaskResult } from "@/lib/api";
 import { BUCKET_KEYS } from "@/lib/labels";
+import { gmailThreadUrl } from "@/lib/utils";
 import type {
   BackfillOptions,
   BucketKey,
@@ -28,6 +30,7 @@ import type {
   TriageItem,
   User,
 } from "@/lib/types";
+import { ALL_LABELS } from "@/lib/types";
 import { toast } from "sonner";
 
 import { BucketSidebar } from "@/components/console/BucketSidebar";
@@ -81,6 +84,7 @@ export default function Console() {
     spam: 0,
     all: 0,
     unclassified: 0,
+    done: 0,
   });
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
@@ -134,6 +138,9 @@ export default function Console() {
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   const gPressedAt = useRef<number>(0);
+  // Timed `l` prefix (Gmail-style "label"): l then 1-6 reclassifies the
+  // focused thread. Plain digits still switch buckets.
+  const lPressedAt = useRef<number>(0);
   // thread_id -> timer for deletes still inside their undo window.
   const pendingDeletes = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map(),
@@ -440,6 +447,77 @@ export default function Console() {
     [selectedId, items, searchResults, visibleItems, refreshCounts, refreshOverview],
   );
 
+  // ---- done (non-destructive exit from triage; inverse action in `done`) ----
+  const doDone = useCallback(
+    (idArg?: string) => {
+      const id = idArg ?? selectedId;
+      if (!id) return;
+      // In the done bucket the same action restores the thread instead.
+      const marking = bucket !== "done";
+
+      // Snapshot the row so undo (or a rejected call) can put it back exactly.
+      const bucketIdx = items.findIndex((i) => i.thread_id === id);
+      const removed = bucketIdx >= 0 ? items[bucketIdx] : null;
+
+      // Flow mode: hand focus to a neighbour before the row disappears. In
+      // search mode the row stays (done threads remain searchable), so the
+      // selection stays put too.
+      if (selectedId === id && !searchMode) {
+        const vi = visibleItems.findIndex((i) => i.thread_id === id);
+        const next = visibleItems[vi + 1] ?? visibleItems[vi - 1] ?? null;
+        setSelectedId(next?.thread_id ?? null);
+      }
+      setItems((prev) => prev.filter((i) => i.thread_id !== id));
+
+      const restore = () => {
+        if (removed) {
+          setItems((prev) => {
+            const copy = [...prev];
+            copy.splice(Math.min(bucketIdx, copy.length), 0, removed);
+            return copy;
+          });
+        }
+        setSelectedId(id);
+      };
+
+      void (async () => {
+        try {
+          await setThreadDone(id, marking);
+          refreshCounts();
+          toast(marking ? "thread done" : "thread restored", {
+            action: {
+              label: "undo",
+              onClick: () => {
+                setThreadDone(id, !marking)
+                  .then(() => {
+                    restore();
+                    refreshCounts();
+                  })
+                  .catch((e) =>
+                    toast.error((e as Error).message ?? "undo failed"),
+                  );
+              },
+            },
+          });
+        } catch (e) {
+          restore();
+          toast.error(
+            (e as Error).message ?? (marking ? "done failed" : "restore failed"),
+          );
+        }
+      })();
+    },
+    [selectedId, bucket, items, searchMode, visibleItems, refreshCounts],
+  );
+
+  // Jump to the thread in the Gmail web UI (default signed-in account).
+  const openInGmail = useCallback(() => {
+    const t = thread?.thread;
+    if (!t || t.id !== selectedId) return;
+    if (t.provider !== "gmail" || !t.provider_thread_id) return;
+    window.open(gmailThreadUrl(t.provider_thread_id), "_blank", "noopener");
+  }, [thread, selectedId]);
+
   const refreshAll = useCallback(
     () => Promise.all([refreshList(bucket), refreshOverview(), refreshCounts()]),
     [bucket, refreshList, refreshOverview, refreshCounts],
@@ -549,6 +627,22 @@ export default function Console() {
     async (label: Label) => {
       const id = selectedId;
       if (!id) return;
+      // Flow mode: a relabeled thread leaves a bucket it no longer matches,
+      // and the selection moves on either way. "all", "done", and search
+      // results keep the row (with its new label) in place.
+      const leavesBucket =
+        !searchMode &&
+        (bucket === "unclassified" ||
+          (bucket !== "all" && bucket !== "done" && bucket !== label));
+      const bucketIdx = items.findIndex((i) => i.thread_id === id);
+      const removed = bucketIdx >= 0 ? items[bucketIdx] : null;
+      const vi = visibleItems.findIndex((i) => i.thread_id === id);
+      const next =
+        visibleItems[vi + 1] ?? (leavesBucket ? visibleItems[vi - 1] : null);
+      if (vi >= 0 && (next || leavesBucket)) {
+        setSelectedId(next?.thread_id ?? null);
+      }
+
       // Snapshot the row (captured from the updaters' live state, so we don't
       // depend on `items` here) to roll back if the server rejects the change.
       // Search results are a separate list rendered while searchMode is on, so
@@ -566,28 +660,42 @@ export default function Console() {
           },
         };
       };
-      setItems((prev) => prev.map(applyOverride));
+      setItems((prev) => {
+        const mapped = prev.map(applyOverride);
+        return leavesBucket ? mapped.filter((it) => it.thread_id !== id) : mapped;
+      });
       setSearchResults((prev) => prev.map(applyOverride));
       try {
         await reclassify(id, label);
         toast.success(`label → ${label}`);
         refreshCounts();
       } catch (e) {
-        // Restore the pre-optimistic label so the row doesn't keep a change the
-        // server never accepted.
-        if (prevItem) {
+        // Restore the pre-optimistic label (and the row itself, if flow mode
+        // dropped it from the bucket) so nothing keeps a change the server
+        // never accepted.
+        if (leavesBucket && removed) {
+          setItems((prev) => {
+            const copy = [...prev];
+            copy.splice(Math.min(bucketIdx, copy.length), 0, removed);
+            return copy;
+          });
+        } else if (prevItem) {
           const restored = prevItem;
           setItems((prev) =>
             prev.map((it) => (it.thread_id === id ? restored : it)),
           );
+        }
+        if (prevItem) {
+          const restored = prevItem;
           setSearchResults((prev) =>
             prev.map((it) => (it.thread_id === id ? restored : it)),
           );
         }
+        setSelectedId(id);
         toast.error((e as Error).message ?? "reclassify failed");
       }
     },
-    [selectedId, refreshCounts],
+    [selectedId, bucket, items, searchMode, visibleItems, refreshCounts],
   );
 
   // ---- hotkeys -------------------------------------------------------------
@@ -644,7 +752,29 @@ export default function Console() {
         doDelete();
         return;
       }
-      // bucket switching 1-8
+      if (e.key === "e") {
+        e.preventDefault();
+        doDone();
+        return;
+      }
+      if (e.key === "o") {
+        e.preventDefault();
+        openInGmail();
+        return;
+      }
+      if (e.key === "l") {
+        lPressedAt.current = Date.now();
+        return;
+      }
+      // l then 1-6: relabel the focused thread (checked before bucket
+      // switching so the digit doesn't change buckets instead).
+      if (Date.now() - lPressedAt.current < 800 && /^[1-6]$/.test(e.key)) {
+        e.preventDefault();
+        lPressedAt.current = 0;
+        doReclassify(ALL_LABELS[Number(e.key) - 1]);
+        return;
+      }
+      // bucket switching 1-9
       for (const [b, key] of Object.entries(BUCKET_KEYS)) {
         if (e.key === key) {
           e.preventDefault();
@@ -708,6 +838,9 @@ export default function Console() {
       clearSearch,
       togglePanel,
       doDelete,
+      doDone,
+      doReclassify,
+      openInGmail,
       refreshList,
       refreshOverview,
       refreshCounts,
@@ -884,6 +1017,7 @@ export default function Console() {
             error={threadError}
             onReclassify={doReclassify}
             onCollapse={() => togglePanel("detail")}
+            onDone={focusedItem ? () => doDone(focusedItem.thread_id) : undefined}
             onDelete={
               focusedItem ? () => doDelete(focusedItem.thread_id) : undefined
             }
@@ -911,6 +1045,9 @@ export default function Console() {
         onFocusSearch={() =>
           setTimeout(() => searchInputRef.current?.focus(), 60)
         }
+        onDone={() => doDone()}
+        inDoneBucket={bucket === "done"}
+        onOpenGmail={openInGmail}
         onDelete={() => doDelete()}
       />
       <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />

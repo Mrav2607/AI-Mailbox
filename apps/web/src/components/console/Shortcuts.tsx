@@ -1,10 +1,13 @@
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 
 const ROWS: [string, string][] = [
-  ["1 – 8", "switch bucket"],
+  ["1 – 9", "switch bucket (9 = done)"],
   ["j / k", "next / previous thread"],
   ["↵", "open focused thread"],
   ["g g / G", "jump to top / bottom"],
+  ["e", "mark done (restore, in the done bucket)"],
+  ["l then 1 – 6", "relabel focused thread"],
+  ["o", "open focused thread in gmail"],
   ["/", "search threads (↵ = all buckets)"],
   ["c", "sort by confidence (asc ↔ desc)"],
   ["[ / ]", "toggle sidebar / detail pane"],

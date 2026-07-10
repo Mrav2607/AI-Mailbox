@@ -1,19 +1,23 @@
 import { useMemo } from "react";
 import DOMPurify from "dompurify";
 import {
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
+  ExternalLink,
   MailOpen,
   PanelBottomClose,
   PanelLeftClose,
   PanelRightClose,
   Trash2,
+  Undo2,
 } from "lucide-react";
 import { LABEL_META, confidenceColor, confidenceText } from "@/lib/labels";
 import { absTime } from "@/lib/time";
 import type { Classification, Label, ThreadDetail, ThreadMessage } from "@/lib/types";
 import { ALL_LABELS } from "@/lib/types";
 import type { ReadingSide } from "@/lib/layout";
+import { gmailThreadUrl } from "@/lib/utils";
 import { PaneDragHandle } from "./ConsoleLayout";
 
 const COLLAPSE_ICONS = {
@@ -67,6 +71,7 @@ interface Props {
   error?: string | null;
   onReclassify: (label: Label) => void;
   onCollapse?: () => void;
+  onDone?: () => void;
   onDelete?: () => void;
   side?: ReadingSide;
   predictionOpen?: boolean;
@@ -80,6 +85,7 @@ export function ThreadDetailPane({
   error,
   onReclassify,
   onCollapse,
+  onDone,
   onDelete,
   side = "right",
   predictionOpen = true,
@@ -140,6 +146,32 @@ export function ThreadDetailPane({
             {data.thread.provider} · {absTime(data.thread.last_message_at)}
           </div>
           <PaneDragHandle source="detail" />
+          {data.thread.provider === "gmail" && data.thread.provider_thread_id && (
+            <a
+              href={gmailThreadUrl(data.thread.provider_thread_id)}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="Open in Gmail"
+              title="Open in Gmail ( o )"
+              className="text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+          )}
+          {onDone && (
+            <button
+              onClick={onDone}
+              aria-label={data.thread.done ? "Restore thread" : "Mark thread done"}
+              title={data.thread.done ? "Restore thread ( e )" : "Mark done ( e )"}
+              className="text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+            >
+              {data.thread.done ? (
+                <Undo2 className="h-3.5 w-3.5" />
+              ) : (
+                <CheckCircle2 className="h-3.5 w-3.5" />
+              )}
+            </button>
+          )}
           {onDelete && (
             <button
               onClick={onDelete}

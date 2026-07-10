@@ -18,6 +18,7 @@ import {
   mockDeleteThread,
   mockOverview,
   mockSearch,
+  mockSetDone,
   mockThread,
   mockTriage,
   mockUser,
@@ -157,6 +158,23 @@ export async function searchThreads(
   }
   return request<SearchResponse>(
     `/mail/search?q=${encodeURIComponent(q)}&limit=${limit}`,
+  );
+}
+
+// Mark a thread done (clears it from the open triage buckets, keeps it
+// searchable and in the `done` bucket) or restore it with done=false.
+export async function setThreadDone(
+  threadId: string,
+  done: boolean,
+): Promise<void> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 120));
+    mockSetDone(threadId, done);
+    return;
+  }
+  await request<{ thread_id: string; done: boolean }>(
+    `/mail/thread/${threadId}/done`,
+    { method: "POST", body: JSON.stringify({ done }) },
   );
 }
 

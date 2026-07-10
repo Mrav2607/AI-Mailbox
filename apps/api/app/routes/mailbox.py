@@ -27,8 +27,11 @@ _MAX_INGEST_RESULTS = 500
 # anything bigger goes to the Celery worker (a 500-thread Gemini run can hold
 # a request open for minutes).
 _MAX_INLINE_BACKFILL = 50
-# Valid triage filters: every classifier label plus the two synthetic buckets.
-_TRIAGE_BUCKETS = frozenset(LABELS) | {"all", "unclassified"}
+# Valid triage filters: every classifier label plus the synthetic buckets.
+_TRIAGE_BUCKETS = frozenset(LABELS) | {"all", "unclassified", "done"}
+# Backfill scopes by classification state, not done-ness, so it doesn't take
+# the "done" bucket.
+_BACKFILL_BUCKETS = _TRIAGE_BUCKETS - {"done"}
 # Classifier backends a caller may request per run (see services.nlp.classify).
 _CLASSIFIER_BACKENDS = frozenset({"local", "gemini", "heuristic", "auto"})
 # Marks a label set by a human in the console rather than a model, so it's
@@ -39,6 +42,10 @@ _OPERATOR_MODEL_VERSION = "user-override"
 
 class ReclassifyRequest(BaseModel):
     label: str
+
+
+class DoneRequest(BaseModel):
+    done: bool
 
 
 def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]:
@@ -134,11 +141,16 @@ def get_triage(
     query = select(MailThread).where(MailThread.user_id == current_user.id)
     # Filter by bucket in SQL, before the limit, so a specific-label view returns
     # up to `limit` matching threads instead of whatever matches happen to fall
-    # inside the `limit` most-recent threads overall.
-    if bucket == "unclassified":
-        query = query.where(latest_label_subquery().is_(None))
-    elif bucket != "all":
-        query = query.where(latest_label_subquery() == bucket)
+    # inside the `limit` most-recent threads overall. Done threads live only in
+    # the `done` bucket; every open bucket (including `all`) excludes them.
+    if bucket == "done":
+        query = query.where(MailThread.done_at.is_not(None))
+    else:
+        query = query.where(MailThread.done_at.is_(None))
+        if bucket == "unclassified":
+            query = query.where(latest_label_subquery().is_(None))
+        elif bucket != "all":
+            query = query.where(latest_label_subquery() == bucket)
 
     threads = list(
         db.execute(
@@ -169,7 +181,11 @@ def get_counts(
     grouped = (
         select(bucket_label)
         .select_from(MailThread)
-        .where(MailThread.user_id == current_user.id)
+        .where(
+            MailThread.user_id == current_user.id,
+            # Open buckets only; done threads are counted separately below.
+            MailThread.done_at.is_(None),
+        )
         .subquery()
     )
     rows = db.execute(
@@ -186,6 +202,14 @@ def get_counts(
         elif label in counts:
             counts[label] += count
     counts["all"] = total
+    counts["done"] = db.execute(
+        select(func.count())
+        .select_from(MailThread)
+        .where(
+            MailThread.user_id == current_user.id,
+            MailThread.done_at.is_not(None),
+        )
+    ).scalar_one()
     return {"counts": counts}
 
 
@@ -218,7 +242,11 @@ def get_thread(
             "id": str(thread.id),
             "subject": thread.subject,
             "provider": thread.provider,
+            # The provider's own thread id, so the console can deep-link back
+            # to the source mailbox (Gmail's #all/<id> URL).
+            "provider_thread_id": thread.provider_thread_id,
             "last_message_at": thread.last_message_at,
+            "done": thread.done_at is not None,
         },
         "messages": [
             {
@@ -296,6 +324,37 @@ def reclassify_thread(
             "confidence": 1.0,
             "model_version": _OPERATOR_MODEL_VERSION,
         },
+    }
+
+
+@router.post("/thread/{thread_id}/done")
+def set_thread_done(
+    thread_id: UUID,
+    payload: DoneRequest,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Mark a thread done (cleared from triage) or restore it.
+
+    Done is the non-destructive exit from the triage buckets: the thread moves
+    to the ``done`` bucket and stays searchable, unlike delete. Idempotent —
+    re-marking a done thread keeps its original ``done_at``.
+    """
+    thread = db.get(MailThread, thread_id)
+    # 404 (not 403) for another user's thread so we don't leak that it exists.
+    if not thread or thread.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    if payload.done and thread.done_at is None:
+        thread.done_at = datetime.now(timezone.utc)
+    elif not payload.done:
+        thread.done_at = None
+    db.commit()
+
+    return {
+        "thread_id": str(thread_id),
+        "done": thread.done_at is not None,
+        "done_at": thread.done_at,
     }
 
 
@@ -458,10 +517,10 @@ def backfill_classifications(
     anything bigger is handed to the worker and answered with 202 + task id,
     since a large Gemini batch can hold the request open for minutes.
     """
-    if bucket not in _TRIAGE_BUCKETS:
+    if bucket not in _BACKFILL_BUCKETS:
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid bucket '{bucket}'. Valid: {sorted(_TRIAGE_BUCKETS)}",
+            detail=f"Invalid bucket '{bucket}'. Valid: {sorted(_BACKFILL_BUCKETS)}",
         )
     # classify() lowercases its backend anyway, but normalize here so one
     # canonical value flows into task kwargs and logs.

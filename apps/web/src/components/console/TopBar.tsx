@@ -181,7 +181,8 @@ function BackfillForm({
           }}
           className={control}
         >
-          {BUCKETS.map((b) => (
+          {/* No "done" here: backfill scopes by classification, not done-ness. */}
+          {BUCKETS.filter((b) => b !== "done").map((b) => (
             <option key={b} value={b}>
               {bucketLabel(b)}
             </option>

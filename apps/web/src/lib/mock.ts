@@ -88,6 +88,10 @@ function makeItems(count: number): TriageItem[] {
 
 const ALL = makeItems(140);
 
+// Thread ids the operator has marked done — the mock's stand-in for the
+// server's done_at column. Done threads leave every open bucket.
+const DONE = new Set<string>();
+
 export function mockUser(): User {
   return { id: "u_local", email: "operator@local.dev", display_name: "Operator" };
 }
@@ -101,10 +105,14 @@ export function mockOverview(): Overview {
 
 export function mockTriage(bucket: BucketKey, limit: number): TriageResponse {
   let items: TriageItem[];
-  if (bucket === "all") items = ALL;
-  else if (bucket === "unclassified")
-    items = ALL.filter((i) => !i.classification.label);
-  else items = ALL.filter((i) => i.classification.label === bucket);
+  if (bucket === "done") items = ALL.filter((i) => DONE.has(i.thread_id));
+  else {
+    const open = ALL.filter((i) => !DONE.has(i.thread_id));
+    if (bucket === "all") items = open;
+    else if (bucket === "unclassified")
+      items = open.filter((i) => !i.classification.label);
+    else items = open.filter((i) => i.classification.label === bucket);
+  }
   return { bucket, items: items.slice(0, limit) };
 }
 
@@ -116,15 +124,26 @@ export function mockCounts(): Record<BucketKey, number> {
     promotional: 0,
     security_alert: 0,
     spam: 0,
-    all: ALL.length,
+    all: 0,
     unclassified: 0,
+    done: 0,
   };
   for (const item of ALL) {
+    if (DONE.has(item.thread_id)) {
+      counts.done += 1;
+      continue;
+    }
+    counts.all += 1;
     const label = item.classification.label;
     if (label) counts[label] += 1;
     else counts.unclassified += 1;
   }
   return counts;
+}
+
+export function mockSetDone(threadId: string, done: boolean) {
+  if (done) DONE.add(threadId);
+  else DONE.delete(threadId);
 }
 
 export function mockThread(id: string): ThreadDetail {
@@ -152,7 +171,11 @@ export function mockThread(id: string): ThreadDetail {
       id,
       subject: item.subject,
       provider: "gmail",
+      // Fake but shaped like Gmail's hex thread ids, so the open-in-Gmail
+      // link renders in preview (it just won't resolve to real mail).
+      provider_thread_id: id.replace(/-/g, ""),
       last_message_at: item.last_message_at,
+      done: DONE.has(id),
     },
     messages,
   };

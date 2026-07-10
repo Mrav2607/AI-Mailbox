@@ -78,11 +78,13 @@ export const BUCKET_KEYS: Record<BucketKey, string> = {
   spam: "6",
   all: "7",
   unclassified: "8",
+  done: "9",
 };
 
 export function bucketLabel(b: BucketKey): string {
   if (b === "all") return "all";
   if (b === "unclassified") return "unclassified";
+  if (b === "done") return "done";
   return LABEL_META[b].name;
 }
 
