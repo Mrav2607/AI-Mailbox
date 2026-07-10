@@ -141,6 +141,29 @@ export function mockCounts(): Record<BucketKey, number> {
   return counts;
 }
 
+// Each mock "ingest" delivers exactly two fresh threads — deterministic on
+// purpose so preview demos and headless tests can assert exact pill counts.
+let ingestSeq = 0;
+
+export function mockIngest(): number {
+  const now = Date.now();
+  for (let n = 0; n < 2; n++) {
+    ingestSeq += 1;
+    ALL.unshift({
+      thread_id: `mock-new-${ingestSeq}`,
+      subject: `New mail #${ingestSeq}`,
+      last_message_at: new Date(now - n * 1000).toISOString(),
+      latest_message_snippet: rand(SNIPPETS, ingestSeq),
+      classification: {
+        label: "needs_reply",
+        confidence: 0.9,
+        model_version: "heuristic-v1",
+      },
+    });
+  }
+  return 2;
+}
+
 export function mockSetDone(threadId: string, done: boolean) {
   if (done) DONE.add(threadId);
   else DONE.delete(threadId);

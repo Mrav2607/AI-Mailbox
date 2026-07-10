@@ -16,6 +16,7 @@ import {
   mockBackfill,
   mockCounts,
   mockDeleteThread,
+  mockIngest,
   mockOverview,
   mockSearch,
   mockSetDone,
@@ -202,10 +203,12 @@ export async function ingestGmail(
   max_results = 50,
   classify = true,
   refreshExisting = false,
-): Promise<{ status: string; task_id?: string }> {
+): Promise<{ status: string; task_id?: string; new_threads?: number }> {
   if (USE_MOCK) {
-    await new Promise((r) => setTimeout(r, 700));
-    return { status: "ok" };
+    await new Promise((r) => setTimeout(r, 150));
+    // The mock "inbox" actually receives mail on each pull, so auto-sync and
+    // the new-mail pill are demoable (and testable) offline.
+    return { status: "ok", new_threads: mockIngest() };
   }
   return request<{ status: string; task_id?: string }>(
     `/mail/ingest/gmail?max_results=${max_results}&classify=${classify}` +

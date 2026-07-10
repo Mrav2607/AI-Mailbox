@@ -90,6 +90,7 @@ export type UiState = {
   theme: ThemePref;
   arrangement: Arrangement;
   paneSizes: PaneSizes;
+  autoSync: number; // seconds between background syncs, 0 = off
 };
 
 export const UI_KEY = "ai_mailbox_ui";
@@ -101,6 +102,7 @@ export const DEFAULT_UI: UiState = {
   theme: "system",
   arrangement: DEFAULT_ARRANGEMENT,
   paneSizes: {},
+  autoSync: 180,
 };
 
 function isPaneLayout(v: unknown): v is PaneLayout {
@@ -154,5 +156,11 @@ export function loadUi(): UiState {
     theme: isThemePref(o.theme) ? o.theme : DEFAULT_UI.theme,
     arrangement,
     paneSizes,
+    // Any non-negative number is honored, not just the preset choices — handy
+    // for tests and hand-tuning.
+    autoSync:
+      typeof o.autoSync === "number" && Number.isFinite(o.autoSync) && o.autoSync >= 0
+        ? o.autoSync
+        : DEFAULT_UI.autoSync,
   };
 }

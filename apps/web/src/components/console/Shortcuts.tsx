@@ -12,7 +12,7 @@ const ROWS: [string, string][] = [
   ["c", "sort by confidence (asc ↔ desc)"],
   ["[ / ]", "toggle sidebar / detail pane"],
   ["#", "delete focused thread"],
-  ["r", "re-fetch list + overview"],
+  ["r", "re-fetch list + overview (clears the new-mail pill)"],
   ["i", "ingest gmail (quick; click for options)"],
   ["b", "backfill (quick; click for model/bucket)"],
   ["q", "queue classification"],

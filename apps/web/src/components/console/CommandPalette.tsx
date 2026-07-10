@@ -13,6 +13,7 @@ import { LABEL_META, bucketLabel } from "@/lib/labels";
 import type { Arrangement } from "@/lib/layout";
 import { THEME_PREFS } from "@/lib/theme";
 import type { ThemePref } from "@/lib/theme";
+import { AUTO_SYNC_CHOICES } from "@/lib/use-auto-sync";
 
 interface Props {
   open: boolean;
@@ -27,6 +28,7 @@ interface Props {
   onToggleDetail: () => void;
   onTogglePrediction: () => void;
   onTheme: (t: ThemePref) => void;
+  onAutoSync: (s: number) => void;
   onArrangement: (patch: Partial<Arrangement>) => void;
   onFocusSearch: () => void;
   onDone: () => void;
@@ -48,6 +50,7 @@ export function CommandPalette({
   onToggleDetail,
   onTogglePrediction,
   onTheme,
+  onAutoSync,
   onArrangement,
   onFocusSearch,
   onDone,
@@ -150,6 +153,15 @@ export function CommandPalette({
               >
                 queue classification (async)
               </CommandItem>
+              {AUTO_SYNC_CHOICES.map((c) => (
+                <CommandItem
+                  key={`as-${c.value}`}
+                  onSelect={() => run(() => onAutoSync(c.value))}
+                  value={`auto sync ${c.label}`}
+                >
+                  auto-sync: {c.label}
+                </CommandItem>
+              ))}
             </CommandGroup>
             {hasFocusedThread && (
               <CommandGroup heading="focused thread">

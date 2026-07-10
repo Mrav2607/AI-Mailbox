@@ -41,6 +41,7 @@ import { CommandPalette } from "@/components/console/CommandPalette";
 import { Shortcuts } from "@/components/console/Shortcuts";
 import { LoginScreen } from "@/components/console/LoginScreen";
 import { useHotkeys } from "@/lib/use-hotkeys";
+import { useAutoSync } from "@/lib/use-auto-sync";
 import { Toaster } from "@/components/ui/sonner";
 import { ConsoleLayout } from "@/components/console/ConsoleLayout";
 import { UI_KEY, loadUi } from "@/lib/layout";
@@ -116,6 +117,7 @@ export default function Console() {
   const [paneSizes, setPaneSizes] = useState<PaneSizes>(INITIAL_UI.paneSizes);
   const [layoutOpen, setLayoutOpen] = useState(false);
   const [theme, setTheme] = useState<ThemePref>(INITIAL_UI.theme);
+  const [autoSync, setAutoSync] = useState<number>(INITIAL_UI.autoSync);
   // Resolved dark/light, tracked as state so theme-aware children (the
   // toaster) re-render when a "system" preference follows an OS flip.
   const [resolvedTheme, setResolvedTheme] = useState<"dark" | "light">(() =>
@@ -150,12 +152,12 @@ export default function Console() {
     try {
       window.localStorage.setItem(
         UI_KEY,
-        JSON.stringify({ ...panels, arrangement, paneSizes, theme }),
+        JSON.stringify({ ...panels, arrangement, paneSizes, theme, autoSync }),
       );
     } catch {
       /* storage unavailable; layout just won't persist */
     }
-  }, [panels, arrangement, paneSizes, theme]);
+  }, [panels, arrangement, paneSizes, theme, autoSync]);
 
   const togglePanel = useCallback((key: keyof Panels) => {
     setPanels((p) => ({ ...p, [key]: !p[key] }));
@@ -213,6 +215,15 @@ export default function Console() {
     toast.error("session expired — please sign in again");
   }, []);
 
+  // Background sync: quiet periodic ingest feeding the "N new · refresh"
+  // pill in the list header. Never touches the list on its own.
+  const { pendingNew, clearNew, syncFailed } = useAutoSync({
+    intervalSec: autoSync,
+    enabled: !!user,
+    busy: ingesting || backfilling,
+    onSessionExpired: handleSessionExpired,
+  });
+
   // ---- data fetching -------------------------------------------------------
   const refreshOverview = useCallback(async () => {
     try {
@@ -257,14 +268,17 @@ export default function Console() {
     [handleSessionExpired],
   );
 
-  // initial + bucket changes. Switching buckets also exits any active search.
+  // initial + bucket changes. Switching buckets also exits any active search
+  // and clears the new-mail pill — the fresh fetch already includes whatever
+  // it was counting.
   useEffect(() => {
     if (!user) return;
     setSearchMode(false);
     setSearchResults([]);
     setQuery("");
+    clearNew();
     refreshList(bucket);
-  }, [user, bucket, refreshList]);
+  }, [user, bucket, refreshList, clearNew]);
 
   useEffect(() => {
     if (!user) return;
@@ -561,24 +575,26 @@ export default function Console() {
         const r = await ingestGmail(opts.maxResults, opts.classify, opts.refreshExisting);
         // Mock / synchronous path: no task to wait on, data is already there.
         if (!r.task_id) {
-          toast.success(`ingest complete · ${opts.maxResults} threads`);
+          toast.success(`ingest complete · ${r.new_threads ?? 0} new threads`);
           await refreshAll();
-          return;
+        } else {
+          await trackTask(
+            r.task_id,
+            "ingest",
+            (res) =>
+              `ingest complete · ${res.threads_upserted ?? 0} threads · ` +
+              `${res.messages_upserted ?? 0} msgs`,
+          );
         }
-        await trackTask(
-          r.task_id,
-          "ingest",
-          (res) =>
-            `ingest complete · ${res.threads_upserted ?? 0} threads · ` +
-            `${res.messages_upserted ?? 0} msgs`,
-        );
+        // The refresh above already picked up whatever the pill was counting.
+        clearNew();
       } catch (e) {
         toast.error((e as Error).message ?? "ingest failed");
       } finally {
         setIngesting(false);
       }
     },
-    [trackTask, refreshAll],
+    [trackTask, refreshAll, clearNew],
   );
 
   const doBackfill = useCallback(
@@ -815,6 +831,7 @@ export default function Console() {
               : "confidence_asc",
         );
       } else if (e.key === "r") {
+        clearNew();
         refreshList(bucket);
         refreshOverview();
         refreshCounts();
@@ -847,6 +864,7 @@ export default function Console() {
       doIngest,
       doBackfill,
       doQueue,
+      clearNew,
     ],
   );
 
@@ -900,6 +918,8 @@ export default function Console() {
         onArrangement={setArrangement}
         theme={theme}
         onTheme={setTheme}
+        autoSync={autoSync}
+        onAutoSync={setAutoSync}
         onLogout={() => {
           setToken(null);
           setUser(null);
@@ -935,6 +955,27 @@ export default function Console() {
               {visibleItems.length === 1 ? "" : "s"}
               {searchMode ? " · all buckets" : ""}
             </span>
+
+            {pendingNew > 0 && (
+              <button
+                data-testid="new-mail-pill"
+                onClick={() => {
+                  clearNew();
+                  refreshAll();
+                }}
+                title="new mail arrived — refresh the list"
+                className="shrink-0 h-6 px-2 rounded-full border border-primary/40 bg-primary/10 text-primary hover:bg-primary/20 tabular-nums cursor-pointer transition-colors"
+              >
+                {pendingNew} new · refresh
+              </button>
+            )}
+            {syncFailed && (
+              <span
+                data-testid="sync-failed-dot"
+                title="auto-sync failing — retrying in the background"
+                className="shrink-0 h-1.5 w-1.5 rounded-full bg-destructive/70"
+              />
+            )}
 
             <div className="flex-1 flex items-center min-w-0 max-w-[380px] ml-1">
               <div className="flex items-center gap-1.5 w-full rounded border border-border bg-background px-2 h-6 focus-within:border-primary transition-colors">
@@ -1041,6 +1082,7 @@ export default function Console() {
         onToggleDetail={() => togglePanel("detail")}
         onTogglePrediction={() => togglePanel("prediction")}
         onTheme={setTheme}
+        onAutoSync={setAutoSync}
         onArrangement={(patch) => setArrangement((a) => ({ ...a, ...patch }))}
         onFocusSearch={() =>
           setTimeout(() => searchInputRef.current?.focus(), 60)

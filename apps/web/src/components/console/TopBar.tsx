@@ -17,6 +17,7 @@ import { BUCKETS } from "@/lib/types";
 import type { Arrangement } from "@/lib/layout";
 import { THEME_PREFS } from "@/lib/theme";
 import type { ThemePref } from "@/lib/theme";
+import { AUTO_SYNC_CHOICES } from "@/lib/use-auto-sync";
 import type {
   BackfillOptions,
   BucketKey,
@@ -45,6 +46,8 @@ interface Props {
   onArrangement: (a: Arrangement) => void;
   theme: ThemePref;
   onTheme: (t: ThemePref) => void;
+  autoSync: number;
+  onAutoSync: (s: number) => void;
 }
 
 const THEME_ICONS: Record<ThemePref, typeof Sun> = {
@@ -80,9 +83,13 @@ const control =
 function IngestForm({
   busy,
   onSubmit,
+  autoSync,
+  onAutoSync,
 }: {
   busy: boolean;
   onSubmit: (o: IngestOptions) => void;
+  autoSync: number;
+  onAutoSync: (s: number) => void;
 }) {
   // String state so a mid-edit (cleared) field never becomes NaN; we parse
   // and clamp on submit instead.
@@ -139,6 +146,24 @@ function IngestForm({
       >
         run ingest
       </button>
+      {/* Lives with the ingest controls but applies immediately, no submit. */}
+      <label className="block space-y-1 pt-2 border-t border-border">
+        <span className={fieldLabel}>auto-sync</span>
+        <select
+          value={autoSync}
+          onChange={(e) => onAutoSync(Number(e.target.value))}
+          className={control}
+        >
+          {AUTO_SYNC_CHOICES.map((c) => (
+            <option key={c.value} value={c.value}>
+              {c.label}
+            </option>
+          ))}
+          {!AUTO_SYNC_CHOICES.some((c) => c.value === autoSync) && (
+            <option value={autoSync}>{autoSync}s (custom)</option>
+          )}
+        </select>
+      </label>
     </form>
   );
 }
@@ -258,6 +283,8 @@ export function TopBar({
   onArrangement,
   theme,
   onTheme,
+  autoSync,
+  onAutoSync,
 }: Props) {
   const s = overview?.summary;
   const ThemeIcon = THEME_ICONS[theme];
@@ -312,6 +339,8 @@ export function TopBar({
             onIngestOpenChange(false);
             onIngest(o);
           }}
+          autoSync={autoSync}
+          onAutoSync={onAutoSync}
         />
       </Popover>
 
