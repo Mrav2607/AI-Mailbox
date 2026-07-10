@@ -16,8 +16,8 @@ const Toaster = ({ ...props }: ToasterProps) => {
           description: "group-[.toast]:text-muted-foreground",
           actionButton: "group-[.toast]:bg-primary group-[.toast]:text-primary-foreground",
           cancelButton: "group-[.toast]:bg-muted group-[.toast]:text-muted-foreground",
-          success: "group-[.toaster]:text-[oklch(0.82_0.13_150)]",
-          error: "group-[.toaster]:text-[oklch(0.74_0.17_25)]",
+          success: "group-[.toaster]:text-[var(--success)]",
+          error: "group-[.toaster]:text-destructive",
         },
       }}
       {...props}

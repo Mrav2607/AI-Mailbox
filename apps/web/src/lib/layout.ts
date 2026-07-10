@@ -1,3 +1,6 @@
+import { isThemePref } from "./theme";
+import type { ThemePref } from "./theme";
+
 // Console layout model: the three panes arrange along two independent axes,
 // giving six pre-configured layouts. `sidebar` picks which edge the bucket
 // sidebar hugs; `reading` puts the detail pane beside or below the list.
@@ -83,6 +86,8 @@ export function hitTestZone(
 export type UiState = {
   sidebar: boolean; // bucket sidebar visible
   detail: boolean; // detail pane visible
+  prediction: boolean; // prediction/reclassify bar expanded
+  theme: ThemePref;
   arrangement: Arrangement;
   paneSizes: PaneSizes;
 };
@@ -92,6 +97,8 @@ export const UI_KEY = "ai_mailbox_ui";
 export const DEFAULT_UI: UiState = {
   sidebar: true,
   detail: true,
+  prediction: true,
+  theme: "system",
   arrangement: DEFAULT_ARRANGEMENT,
   paneSizes: {},
 };
@@ -142,6 +149,9 @@ export function loadUi(): UiState {
   return {
     sidebar: typeof o.sidebar === "boolean" ? o.sidebar : DEFAULT_UI.sidebar,
     detail: typeof o.detail === "boolean" ? o.detail : DEFAULT_UI.detail,
+    prediction:
+      typeof o.prediction === "boolean" ? o.prediction : DEFAULT_UI.prediction,
+    theme: isThemePref(o.theme) ? o.theme : DEFAULT_UI.theme,
     arrangement,
     paneSizes,
   };

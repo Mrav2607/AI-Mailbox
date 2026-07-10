@@ -1,11 +1,22 @@
 import { useState } from "react";
-import { Loader2, Download, Sparkles, LogOut, Columns3 } from "lucide-react";
+import {
+  Loader2,
+  Download,
+  Sparkles,
+  LogOut,
+  Columns3,
+  Monitor,
+  Moon,
+  Sun,
+} from "lucide-react";
 import { Mark } from "./Mark";
 import { Popover } from "./Popover";
 import { LayoutPicker } from "./LayoutPicker";
 import { bucketLabel } from "@/lib/labels";
 import { BUCKETS } from "@/lib/types";
 import type { Arrangement } from "@/lib/layout";
+import { THEME_PREFS } from "@/lib/theme";
+import type { ThemePref } from "@/lib/theme";
 import type {
   BackfillOptions,
   BucketKey,
@@ -32,7 +43,15 @@ interface Props {
   onLayoutOpenChange: (v: boolean) => void;
   arrangement: Arrangement;
   onArrangement: (a: Arrangement) => void;
+  theme: ThemePref;
+  onTheme: (t: ThemePref) => void;
 }
+
+const THEME_ICONS: Record<ThemePref, typeof Sun> = {
+  system: Monitor,
+  light: Sun,
+  dark: Moon,
+};
 
 const BACKENDS: { value: ClassifierBackend; label: string }[] = [
   { value: "local", label: "local encoder" },
@@ -236,8 +255,13 @@ export function TopBar({
   onLayoutOpenChange,
   arrangement,
   onArrangement,
+  theme,
+  onTheme,
 }: Props) {
   const s = overview?.summary;
+  const ThemeIcon = THEME_ICONS[theme];
+  const nextTheme =
+    THEME_PREFS[(THEME_PREFS.indexOf(theme) + 1) % THEME_PREFS.length];
   return (
     <header className="h-11 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center gap-3 px-3">
       <div className="flex items-center gap-2 mr-1">
@@ -335,6 +359,15 @@ export function TopBar({
       >
         <LayoutPicker arrangement={arrangement} onArrangement={onArrangement} />
       </Popover>
+
+      <button
+        onClick={() => onTheme(nextTheme)}
+        aria-label={`Theme: ${theme}. Switch to ${nextTheme}.`}
+        title={`theme: ${theme} → ${nextTheme}`}
+        className="h-7 w-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center justify-center text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+      >
+        <ThemeIcon className="h-3 w-3" />
+      </button>
 
       <div className="mx-1 h-5 w-px bg-border" />
 

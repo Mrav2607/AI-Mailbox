@@ -13,56 +13,58 @@ import type { BucketKey, Label } from "./types";
   - soft:   low-alpha background for the one chip that earns a fill (prediction)
   - border: tinted hairline for that same chip
 */
+// Values live as CSS variables in index.css (per-theme, light + dark) so the
+// six hues can be tuned for contrast on both palettes without touching code.
 export const LABEL_META: Record<
   Label,
   { name: string; dot: string; text: string; soft: string; border: string; key: string }
 > = {
   needs_reply: {
     name: "needs reply",
-    dot: "bg-[oklch(0.66_0.18_22)]",
-    text: "text-[oklch(0.78_0.14_22)]",
-    soft: "bg-[oklch(0.66_0.18_22_/_0.12)]",
-    border: "border-[oklch(0.66_0.18_22_/_0.45)]",
+    dot: "bg-[var(--lbl-needs-reply-dot)]",
+    text: "text-[var(--lbl-needs-reply-text)]",
+    soft: "bg-[var(--lbl-needs-reply-soft)]",
+    border: "border-[var(--lbl-needs-reply-border)]",
     key: "1",
   },
   action_required: {
     name: "action req",
-    dot: "bg-[oklch(0.74_0.15_52)]",
-    text: "text-[oklch(0.82_0.12_54)]",
-    soft: "bg-[oklch(0.74_0.15_52_/_0.12)]",
-    border: "border-[oklch(0.74_0.15_52_/_0.45)]",
+    dot: "bg-[var(--lbl-action-required-dot)]",
+    text: "text-[var(--lbl-action-required-text)]",
+    soft: "bg-[var(--lbl-action-required-soft)]",
+    border: "border-[var(--lbl-action-required-border)]",
     key: "2",
   },
   fyi: {
     name: "fyi",
-    dot: "bg-[oklch(0.68_0.09_235)]",
-    text: "text-[oklch(0.78_0.08_235)]",
-    soft: "bg-[oklch(0.68_0.09_235_/_0.12)]",
-    border: "border-[oklch(0.68_0.09_235_/_0.45)]",
+    dot: "bg-[var(--lbl-fyi-dot)]",
+    text: "text-[var(--lbl-fyi-text)]",
+    soft: "bg-[var(--lbl-fyi-soft)]",
+    border: "border-[var(--lbl-fyi-border)]",
     key: "3",
   },
   promotional: {
     name: "promo",
-    dot: "bg-[oklch(0.66_0.13_322)]",
-    text: "text-[oklch(0.77_0.11_322)]",
-    soft: "bg-[oklch(0.66_0.13_322_/_0.12)]",
-    border: "border-[oklch(0.66_0.13_322_/_0.45)]",
+    dot: "bg-[var(--lbl-promotional-dot)]",
+    text: "text-[var(--lbl-promotional-text)]",
+    soft: "bg-[var(--lbl-promotional-soft)]",
+    border: "border-[var(--lbl-promotional-border)]",
     key: "4",
   },
   security_alert: {
     name: "security",
-    dot: "bg-[oklch(0.64_0.21_12)]",
-    text: "text-[oklch(0.76_0.17_14)]",
-    soft: "bg-[oklch(0.64_0.21_12_/_0.12)]",
-    border: "border-[oklch(0.64_0.21_12_/_0.45)]",
+    dot: "bg-[var(--lbl-security-alert-dot)]",
+    text: "text-[var(--lbl-security-alert-text)]",
+    soft: "bg-[var(--lbl-security-alert-soft)]",
+    border: "border-[var(--lbl-security-alert-border)]",
     key: "5",
   },
   spam: {
     name: "spam",
-    dot: "bg-[oklch(0.55_0.015_260)]",
-    text: "text-[oklch(0.66_0.012_260)]",
-    soft: "bg-[oklch(0.55_0.015_260_/_0.14)]",
-    border: "border-[oklch(0.55_0.015_260_/_0.5)]",
+    dot: "bg-[var(--lbl-spam-dot)]",
+    text: "text-[var(--lbl-spam-text)]",
+    soft: "bg-[var(--lbl-spam-soft)]",
+    border: "border-[var(--lbl-spam-border)]",
     key: "6",
   },
 };
@@ -88,13 +90,13 @@ export function bucketLabel(b: BucketKey): string {
 // terminal palette rather than glow like a status LED.
 export function confidenceColor(c: number | null): string {
   if (c == null) return "bg-muted";
-  if (c >= 0.8) return "bg-[oklch(0.72_0.15_150)]";
-  if (c >= 0.5) return "bg-[oklch(0.78_0.13_82)]";
-  return "bg-[oklch(0.66_0.19_25)]";
+  if (c >= 0.8) return "bg-[var(--conf-hi)]";
+  if (c >= 0.5) return "bg-[var(--conf-mid)]";
+  return "bg-[var(--conf-low)]";
 }
 export function confidenceText(c: number | null): string {
   if (c == null) return "text-muted-foreground";
-  if (c >= 0.8) return "text-[oklch(0.78_0.13_150)]";
-  if (c >= 0.5) return "text-[oklch(0.82_0.12_82)]";
-  return "text-[oklch(0.74_0.17_25)]";
+  if (c >= 0.8) return "text-[var(--conf-hi-text)]";
+  if (c >= 0.5) return "text-[var(--conf-mid-text)]";
+  return "text-[var(--conf-low-text)]";
 }

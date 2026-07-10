@@ -5,6 +5,23 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AI Mailbox</title>
+    <script>
+      // Set the theme class before first paint so dark users never see a
+      // light flash. lib/theme.ts owns this logic once the app is running.
+      (function () {
+        try {
+          var ui = JSON.parse(localStorage.getItem("ai_mailbox_ui") || "{}") || {};
+          var dark =
+            ui.theme === "dark" ||
+            (ui.theme !== "light" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.toggle("dark", dark);
+          document.documentElement.style.colorScheme = dark ? "dark" : "light";
+        } catch (e) {
+          /* no storage — system default applies via matchMedia below the app */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

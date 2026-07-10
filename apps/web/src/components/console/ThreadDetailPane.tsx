@@ -1,6 +1,8 @@
 import { useMemo } from "react";
 import DOMPurify from "dompurify";
 import {
+  ChevronDown,
+  ChevronRight,
   MailOpen,
   PanelBottomClose,
   PanelLeftClose,
@@ -67,6 +69,8 @@ interface Props {
   onCollapse?: () => void;
   onDelete?: () => void;
   side?: ReadingSide;
+  predictionOpen?: boolean;
+  onTogglePrediction?: () => void;
 }
 
 export function ThreadDetailPane({
@@ -78,6 +82,8 @@ export function ThreadDetailPane({
   onCollapse,
   onDelete,
   side = "right",
+  predictionOpen = true,
+  onTogglePrediction,
 }: Props) {
   const CollapseIcon = COLLAPSE_ICONS[side];
   if (error) {
@@ -160,61 +166,76 @@ export function ThreadDetailPane({
         </h2>
       </header>
 
-      {/* Prediction */}
-      <section className="px-4 py-3 border-b border-border bg-[var(--color-panel)]/40">
-        <div className="text-[11px] text-muted-foreground font-mono mb-2">
+      {/* Prediction — heading doubles as the collapse toggle so the bar can
+          get out of the way of long threads. */}
+      <section className="border-b border-border bg-[var(--color-panel)]/40">
+        <button
+          onClick={onTogglePrediction}
+          aria-expanded={predictionOpen}
+          title={predictionOpen ? "hide prediction" : "show prediction"}
+          className="w-full flex items-center gap-1 px-4 py-2 text-[11px] text-muted-foreground hover:text-foreground font-mono cursor-pointer transition-colors"
+        >
+          {predictionOpen ? (
+            <ChevronDown className="h-3 w-3" />
+          ) : (
+            <ChevronRight className="h-3 w-3" />
+          )}
           prediction
-        </div>
-        <div className="flex items-center gap-3 flex-wrap">
-          <span
-            className={[
-              "inline-flex items-center gap-1.5 px-2 py-1 rounded border font-mono text-[11px]",
-              meta ? `${meta.soft} ${meta.text} ${meta.border}` : "bg-muted text-muted-foreground border-border",
-            ].join(" ")}
-          >
-            <span className={["h-1.5 w-1.5 rounded-full", meta ? meta.dot : "bg-muted-foreground/40"].join(" ")} />
-            {classification?.label ?? "unclassified"}
-          </span>
-          <div className="flex items-center gap-1.5">
-            <div className="h-[3px] w-24 rounded-full bg-muted overflow-hidden">
-              <div
-                className={`h-full ${confidenceColor(conf)}`}
-                style={{ width: `${confPct ?? 0}%` }}
-              />
-            </div>
-            <span className={`text-xs font-mono tabular-nums ${confidenceText(conf)}`}>
-              {confPct == null ? "—" : `${confPct}%`}
-            </span>
-          </div>
-          <span className="text-[11px] font-mono text-muted-foreground px-1.5 py-0.5 rounded border border-border">
-            {classification?.model_version ?? "no model"}
-          </span>
-        </div>
-        <div className="mt-3 flex items-center gap-1.5 flex-wrap">
-          <span className="text-[11px] text-muted-foreground font-mono mr-1">
-            reclassify →
-          </span>
-          {ALL_LABELS.map((l) => {
-            const lm = LABEL_META[l];
-            const active = classification?.label === l;
-            return (
-              <button
-                key={l}
-                onClick={() => onReclassify(l)}
-                aria-pressed={active}
+        </button>
+        {predictionOpen && (
+          <div className="px-4 pb-3">
+            <div className="flex items-center gap-3 flex-wrap">
+              <span
                 className={[
-                  "inline-flex items-center gap-1.5 px-2 py-1 rounded text-[10.5px] font-mono border transition-colors duration-100 cursor-pointer",
-                  active
-                    ? `${lm.soft} ${lm.text} ${lm.border}`
-                    : "border-border text-muted-foreground hover:text-foreground hover:border-foreground/30",
+                  "inline-flex items-center gap-1.5 px-2 py-1 rounded border font-mono text-[11px]",
+                  meta ? `${meta.soft} ${meta.text} ${meta.border}` : "bg-muted text-muted-foreground border-border",
                 ].join(" ")}
               >
-                <span className={`h-1.5 w-1.5 rounded-full ${lm.dot}`} />
-                {lm.name}
-              </button>
-            );
-          })}
-        </div>
+                <span className={["h-1.5 w-1.5 rounded-full", meta ? meta.dot : "bg-muted-foreground/40"].join(" ")} />
+                {classification?.label ?? "unclassified"}
+              </span>
+              <div className="flex items-center gap-1.5">
+                <div className="h-[3px] w-24 rounded-full bg-muted overflow-hidden">
+                  <div
+                    className={`h-full ${confidenceColor(conf)}`}
+                    style={{ width: `${confPct ?? 0}%` }}
+                  />
+                </div>
+                <span className={`text-xs font-mono tabular-nums ${confidenceText(conf)}`}>
+                  {confPct == null ? "—" : `${confPct}%`}
+                </span>
+              </div>
+              <span className="text-[11px] font-mono text-muted-foreground px-1.5 py-0.5 rounded border border-border">
+                {classification?.model_version ?? "no model"}
+              </span>
+            </div>
+            <div className="mt-3 flex items-center gap-1.5 flex-wrap">
+              <span className="text-[11px] text-muted-foreground font-mono mr-1">
+                reclassify →
+              </span>
+              {ALL_LABELS.map((l) => {
+                const lm = LABEL_META[l];
+                const active = classification?.label === l;
+                return (
+                  <button
+                    key={l}
+                    onClick={() => onReclassify(l)}
+                    aria-pressed={active}
+                    className={[
+                      "inline-flex items-center gap-1.5 px-2 py-1 rounded text-[10.5px] font-mono border transition-colors duration-100 cursor-pointer",
+                      active
+                        ? `${lm.soft} ${lm.text} ${lm.border}`
+                        : "border-border text-muted-foreground hover:text-foreground hover:border-foreground/30",
+                    ].join(" ")}
+                  >
+                    <span className={`h-1.5 w-1.5 rounded-full ${lm.dot}`} />
+                    {lm.name}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </section>
 
       {/* Messages */}

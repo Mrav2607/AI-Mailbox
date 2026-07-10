@@ -42,14 +42,17 @@ import { Toaster } from "@/components/ui/sonner";
 import { ConsoleLayout } from "@/components/console/ConsoleLayout";
 import { UI_KEY, loadUi } from "@/lib/layout";
 import type { Arrangement, PaneLayout, PaneSizes } from "@/lib/layout";
+import { applyTheme, resolveTheme, watchSystemTheme } from "@/lib/theme";
+import type { ThemePref } from "@/lib/theme";
 import { PanelRightOpen, Search, X } from "lucide-react";
 
 type SortMode = "recent" | "confidence_asc" | "confidence_desc";
 
-// Which chrome panels are visible. Persisted (with the pane arrangement and
-// sizes, see lib/layout.ts) so the operator's layout sticks.
+// Which chrome panels are visible (`prediction` is the collapsible bar inside
+// the detail pane). Persisted (with the pane arrangement and sizes, see
+// lib/layout.ts) so the operator's layout sticks.
 // The shortcuts hint lives inside the sidebar, so it tracks `sidebar`.
-type Panels = { sidebar: boolean; detail: boolean };
+type Panels = { sidebar: boolean; detail: boolean; prediction: boolean };
 
 // One read at module load; the states below fan out from it.
 const INITIAL_UI = loadUi();
@@ -101,12 +104,25 @@ export default function Console() {
   const [panels, setPanels] = useState<Panels>({
     sidebar: INITIAL_UI.sidebar,
     detail: INITIAL_UI.detail,
+    prediction: INITIAL_UI.prediction,
   });
   const [arrangement, setArrangement] = useState<Arrangement>(
     INITIAL_UI.arrangement,
   );
   const [paneSizes, setPaneSizes] = useState<PaneSizes>(INITIAL_UI.paneSizes);
   const [layoutOpen, setLayoutOpen] = useState(false);
+  const [theme, setTheme] = useState<ThemePref>(INITIAL_UI.theme);
+  // Resolved dark/light, tracked as state so theme-aware children (the
+  // toaster) re-render when a "system" preference follows an OS flip.
+  const [resolvedTheme, setResolvedTheme] = useState<"dark" | "light">(() =>
+    resolveTheme(INITIAL_UI.theme),
+  );
+
+  useEffect(() => {
+    applyTheme(theme);
+    setResolvedTheme(resolveTheme(theme));
+    return watchSystemTheme(theme, setResolvedTheme);
+  }, [theme]);
 
   // Search: `query` drives the instant client-side filter of the loaded bucket;
   // running a search (Enter) flips `searchMode` on and shows whole-mailbox
@@ -127,12 +143,12 @@ export default function Console() {
     try {
       window.localStorage.setItem(
         UI_KEY,
-        JSON.stringify({ ...panels, arrangement, paneSizes }),
+        JSON.stringify({ ...panels, arrangement, paneSizes, theme }),
       );
     } catch {
       /* storage unavailable; layout just won't persist */
     }
-  }, [panels, arrangement, paneSizes]);
+  }, [panels, arrangement, paneSizes, theme]);
 
   const togglePanel = useCallback((key: keyof Panels) => {
     setPanels((p) => ({ ...p, [key]: !p[key] }));
@@ -717,7 +733,7 @@ export default function Console() {
             setUser(u);
           }}
         />
-        <Toaster />
+        <Toaster theme={resolvedTheme} />
       </>
     );
   }
@@ -730,7 +746,9 @@ export default function Console() {
         : "conf ↓";
 
   return (
-    <div className="h-screen flex flex-col bg-background text-foreground">
+    // overflow-clip: no descendant (however hostile an email's CSS) may ever
+    // grow the page a scrollbar — panes own all scrolling.
+    <div className="h-screen flex flex-col overflow-clip bg-background text-foreground">
       <TopBar
         user={user}
         overview={overview}
@@ -747,6 +765,8 @@ export default function Console() {
         onLayoutOpenChange={setLayoutOpen}
         arrangement={arrangement}
         onArrangement={setArrangement}
+        theme={theme}
+        onTheme={setTheme}
         onLogout={() => {
           setToken(null);
           setUser(null);
@@ -868,6 +888,8 @@ export default function Console() {
               focusedItem ? () => doDelete(focusedItem.thread_id) : undefined
             }
             side={arrangement.reading}
+            predictionOpen={panels.prediction}
+            onTogglePrediction={() => togglePanel("prediction")}
           />
         }
       />
@@ -883,6 +905,8 @@ export default function Console() {
         hasFocusedThread={!!focusedItem}
         onToggleSidebar={() => togglePanel("sidebar")}
         onToggleDetail={() => togglePanel("detail")}
+        onTogglePrediction={() => togglePanel("prediction")}
+        onTheme={setTheme}
         onArrangement={(patch) => setArrangement((a) => ({ ...a, ...patch }))}
         onFocusSearch={() =>
           setTimeout(() => searchInputRef.current?.focus(), 60)
@@ -890,7 +914,7 @@ export default function Console() {
         onDelete={() => doDelete()}
       />
       <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
-      <Toaster />
+      <Toaster theme={resolvedTheme} />
     </div>
   );
 }

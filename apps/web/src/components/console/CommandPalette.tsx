@@ -11,6 +11,8 @@ import type { BucketKey, Label } from "@/lib/types";
 import { ALL_LABELS, BUCKETS } from "@/lib/types";
 import { LABEL_META, bucketLabel } from "@/lib/labels";
 import type { Arrangement } from "@/lib/layout";
+import { THEME_PREFS } from "@/lib/theme";
+import type { ThemePref } from "@/lib/theme";
 
 interface Props {
   open: boolean;
@@ -23,6 +25,8 @@ interface Props {
   hasFocusedThread: boolean;
   onToggleSidebar: () => void;
   onToggleDetail: () => void;
+  onTogglePrediction: () => void;
+  onTheme: (t: ThemePref) => void;
   onArrangement: (patch: Partial<Arrangement>) => void;
   onFocusSearch: () => void;
   onDelete: () => void;
@@ -39,6 +43,8 @@ export function CommandPalette({
   hasFocusedThread,
   onToggleSidebar,
   onToggleDetail,
+  onTogglePrediction,
+  onTheme,
   onArrangement,
   onFocusSearch,
   onDelete,
@@ -88,6 +94,21 @@ export function CommandPalette({
               >
                 toggle thread detail pane
               </CommandItem>
+              <CommandItem
+                onSelect={() => run(onTogglePrediction)}
+                value="toggle prediction reclassify bar"
+              >
+                toggle prediction bar
+              </CommandItem>
+              {THEME_PREFS.map((t) => (
+                <CommandItem
+                  key={`theme-${t}`}
+                  onSelect={() => run(() => onTheme(t))}
+                  value={`theme ${t}`}
+                >
+                  theme: {t}
+                </CommandItem>
+              ))}
               {(["left", "right"] as const).map((side) => (
                 <CommandItem
                   key={`sb-${side}`}
@@ -138,7 +159,7 @@ export function CommandPalette({
                 <CommandItem
                   onSelect={() => run(onDelete)}
                   value="delete thread"
-                  className="text-[oklch(0.74_0.17_25)]"
+                  className="text-destructive"
                 >
                   delete thread
                 </CommandItem>
