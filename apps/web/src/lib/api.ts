@@ -245,6 +245,11 @@ export interface TaskStatus {
   error?: string;
 }
 
+// Ingest workers have a 30-minute hard limit. Poll beyond that boundary so a
+// slow but healthy task still produces one authoritative UI refresh instead
+// of silently finishing after the browser gave up at 90/120 seconds.
+export const WORKER_TASK_TIMEOUT_MS = 35 * 60 * 1000;
+
 export async function getTaskStatus(taskId: string): Promise<TaskStatus> {
   if (USE_MOCK) {
     // Mock "workers" finish instantly, so any polled task is already done.

@@ -16,6 +16,7 @@ import {
   setThreadDone,
   setToken,
   waitForTask,
+  WORKER_TASK_TIMEOUT_MS,
 } from "@/lib/api";
 import type { TaskResult } from "@/lib/api";
 import { BUCKET_KEYS } from "@/lib/labels";
@@ -41,7 +42,7 @@ import { CommandPalette } from "@/components/console/CommandPalette";
 import { Shortcuts } from "@/components/console/Shortcuts";
 import { LoginScreen } from "@/components/console/LoginScreen";
 import { useHotkeys } from "@/lib/use-hotkeys";
-import { useAutoSync } from "@/lib/use-auto-sync";
+import { NEW_MAIL_SCAN_LIMIT, useAutoSync } from "@/lib/use-auto-sync";
 import { Toaster } from "@/components/ui/sonner";
 import { ConsoleLayout } from "@/components/console/ConsoleLayout";
 import { UI_KEY, loadUi } from "@/lib/layout";
@@ -138,6 +139,8 @@ export default function Console() {
   const [searchResults, setSearchResults] = useState<TriageItem[]>([]);
   const [searching, setSearching] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  // The thread-list scroll container, so the new-mail pill can jump to top.
+  const listScrollRef = useRef<HTMLDivElement>(null);
 
   const gPressedAt = useRef<number>(0);
   // Timed `l` prefix (Gmail-style "label"): l then 1-6 reclassifies the
@@ -235,17 +238,22 @@ export default function Console() {
   }, [handleSessionExpired]);
 
   const refreshList = useCallback(
-    async (b: BucketKey) => {
-      setListLoading(true);
+    async (b: BucketKey, opts?: { quiet?: boolean }) => {
+      const quiet = opts?.quiet ?? false;
+      // Quiet refreshes (background sync) skip the loading flash and never
+      // touch the selection — rows may shift, but the open thread stays open.
+      if (!quiet) setListLoading(true);
       setListError(null);
       try {
         const res = await getTriage(b, 200);
         setItems(res.items);
-        // ensure a valid selection
-        setSelectedId((prev) => {
-          if (prev && res.items.some((i) => i.thread_id === prev)) return prev;
-          return res.items[0]?.thread_id ?? null;
-        });
+        if (!quiet) {
+          // ensure a valid selection
+          setSelectedId((prev) => {
+            if (prev && res.items.some((i) => i.thread_id === prev)) return prev;
+            return res.items[0]?.thread_id ?? null;
+          });
+        }
       } catch (e) {
         if (e instanceof ApiError && e.status === 401) {
           handleSessionExpired();
@@ -253,37 +261,41 @@ export default function Console() {
         }
         setListError((e as Error).message ?? "failed to load");
       } finally {
-        setListLoading(false);
+        if (!quiet) setListLoading(false);
       }
     },
     [handleSessionExpired],
   );
 
-  // Background sync: quiet periodic ingest feeding the "N new · refresh" pill
-  // in the list header. The list itself never moves on its own, but sidebar
-  // counts and overview stats refresh whenever a sync changed the DB.
+  const refreshAll = useCallback(
+    (opts?: { quiet?: boolean }) =>
+      Promise.all([refreshList(bucket, opts), refreshOverview(), refreshCounts()]),
+    [bucket, refreshList, refreshOverview, refreshCounts],
+  );
+
+  // Background sync: quiet periodic ingest. After any sync that changed the
+  // DB the whole console refreshes in place (no loading flash, selection kept)
+  // and the "N new" pill re-derives from the persisted acknowledged-mail
+  // watermark — so it survives reloads and syncs this tab never saw finish.
   const { pendingNew, clearNew, syncFailed } = useAutoSync({
     intervalSec: autoSync,
     enabled: !!user,
     busy: ingesting || backfilling,
+    userId: user?.id ?? null,
     onSessionExpired: handleSessionExpired,
-    onSynced: () => {
-      refreshOverview();
-      refreshCounts();
-    },
+    onSynced: () => refreshAll({ quiet: true }).then(() => undefined),
   });
 
-  // initial + bucket changes. Switching buckets also exits any active search
-  // and clears the new-mail pill — the fresh fetch already includes whatever
-  // it was counting.
+  // initial + bucket changes. Switching buckets also exits any active search.
+  // The new-mail pill deliberately survives bucket switches: it clears only on
+  // explicit acknowledgment (pill click, `r`, manual ingest).
   useEffect(() => {
     if (!user) return;
     setSearchMode(false);
     setSearchResults([]);
     setQuery("");
-    clearNew();
     refreshList(bucket);
-  }, [user, bucket, refreshList, clearNew]);
+  }, [user, bucket, refreshList]);
 
   useEffect(() => {
     if (!user) return;
@@ -537,11 +549,6 @@ export default function Console() {
     window.open(gmailThreadUrl(t.provider_thread_id), "_blank", "noopener");
   }, [thread, selectedId]);
 
-  const refreshAll = useCallback(
-    () => Promise.all([refreshList(bucket), refreshOverview(), refreshCounts()]),
-    [bucket, refreshList, refreshOverview, refreshCounts],
-  );
-
   // Shared tail for every queued worker job (ingest / backfill / classify):
   // the API answers 202 as soon as the task is QUEUED, so wait for the worker
   // to actually finish before refreshing — otherwise the UI refetches a
@@ -553,7 +560,9 @@ export default function Console() {
       summarize: (res: TaskResult) => string,
     ) => {
       const t = toast.loading(`${label} running…`);
-      const final = await waitForTask(taskId);
+      const final = await waitForTask(taskId, {
+        timeoutMs: WORKER_TASK_TIMEOUT_MS,
+      });
       const res = final.result;
       if (res?.status === "error") {
         toast.error(res.detail ?? `${label} failed`, { id: t });
@@ -591,7 +600,7 @@ export default function Console() {
               `${res.messages_upserted ?? 0} msgs`,
           );
         }
-        // The refresh above already picked up whatever the pill was counting.
+        // A deliberate pull acknowledges everything it just surfaced.
         clearNew();
       } catch (e) {
         toast.error((e as Error).message ?? "ingest failed");
@@ -967,11 +976,12 @@ export default function Console() {
                 onClick={() => {
                   clearNew();
                   refreshAll();
+                  listScrollRef.current?.scrollTo({ top: 0 });
                 }}
-                title="new mail arrived — refresh the list"
+                title="new mail — click to jump to the top"
                 className="shrink-0 h-6 px-2 rounded-full border border-primary/40 bg-primary/10 text-primary hover:bg-primary/20 tabular-nums cursor-pointer transition-colors"
               >
-                {pendingNew} new · refresh
+                {pendingNew >= NEW_MAIL_SCAN_LIMIT ? `${NEW_MAIL_SCAN_LIMIT}+` : pendingNew} new
               </button>
             )}
             {syncFailed && (
@@ -1044,7 +1054,7 @@ export default function Console() {
               </button>
             )}
           </div>
-            <div className="flex-1 overflow-y-auto scrollbar-thin">
+            <div ref={listScrollRef} className="flex-1 overflow-y-auto scrollbar-thin">
               <ThreadList
                 items={visibleItems}
                 selectedId={selectedId}
