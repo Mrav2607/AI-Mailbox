@@ -215,15 +215,6 @@ export default function Console() {
     toast.error("session expired — please sign in again");
   }, []);
 
-  // Background sync: quiet periodic ingest feeding the "N new · refresh"
-  // pill in the list header. Never touches the list on its own.
-  const { pendingNew, clearNew, syncFailed } = useAutoSync({
-    intervalSec: autoSync,
-    enabled: !!user,
-    busy: ingesting || backfilling,
-    onSessionExpired: handleSessionExpired,
-  });
-
   // ---- data fetching -------------------------------------------------------
   const refreshOverview = useCallback(async () => {
     try {
@@ -267,6 +258,20 @@ export default function Console() {
     },
     [handleSessionExpired],
   );
+
+  // Background sync: quiet periodic ingest feeding the "N new · refresh" pill
+  // in the list header. The list itself never moves on its own, but sidebar
+  // counts and overview stats refresh whenever a sync changed the DB.
+  const { pendingNew, clearNew, syncFailed } = useAutoSync({
+    intervalSec: autoSync,
+    enabled: !!user,
+    busy: ingesting || backfilling,
+    onSessionExpired: handleSessionExpired,
+    onSynced: () => {
+      refreshOverview();
+      refreshCounts();
+    },
+  });
 
   // initial + bucket changes. Switching buckets also exits any active search
   // and clears the new-mail pill — the fresh fetch already includes whatever

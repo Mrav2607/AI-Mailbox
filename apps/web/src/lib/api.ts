@@ -229,6 +229,9 @@ export interface TaskResult {
   classified?: number;
   fetched?: number;
   skipped_existing?: number;
+  // Mail that actually arrived since the last pull; threads_upserted also
+  // counts older history the deduping ingest backfilled.
+  new_threads?: number;
   created?: number;
   scanned?: number;
   processed?: number;

@@ -88,8 +88,16 @@ def ingest_gmail_messages(
             .all()
         )
 
-    def collect_new_thread_ids() -> list[str]:
+    def collect_new_thread_ids() -> tuple[list[str], int]:
+        """Walk Gmail's newest-first listing collecting unknown threads.
+
+        Also counts how many of them sit BEFORE the first already-known
+        thread: those actually arrived since the last pull, as opposed to
+        older history the DB just hasn't backfilled yet.
+        """
         new_ids: list[str] = []
+        head_new = 0
+        seen_known = False
         seen: set[str] = set()
         page_token: str | None = None
         pages = 0
@@ -101,7 +109,10 @@ def ingest_gmail_messages(
                     continue
                 seen.add(tid)
                 if skip_existing and tid in existing_thread_ids:
+                    seen_known = True
                     continue
+                if not seen_known:
+                    head_new += 1
                 new_ids.append(tid)
                 if len(new_ids) >= max_results:
                     break
@@ -109,7 +120,7 @@ def ingest_gmail_messages(
             page_token = batch.get("nextPageToken")
             if not page_token:
                 break
-        return new_ids[:max_results]
+        return new_ids[:max_results], head_new
 
     def refresh_client() -> bool:
         """Refresh the access token and rebuild the client. Returns success."""
@@ -133,7 +144,7 @@ def ingest_gmail_messages(
                 return call()
             raise
 
-    thread_ids = with_token_retry(collect_new_thread_ids)
+    thread_ids, new_threads = with_token_retry(collect_new_thread_ids)
 
     threads_upserted = 0
     messages_upserted = 0
@@ -251,4 +262,8 @@ def ingest_gmail_messages(
         "classified": classified,
         "fetched": len(thread_ids),
         "skipped_existing": len(existing_thread_ids),
+        # Genuinely new arrivals, not backfilled history — threads_upserted
+        # counts both, so it can't distinguish "you have mail" from "the DB
+        # is still catching up". Meaningful only with skip_existing.
+        "new_threads": new_threads,
     }

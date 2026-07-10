@@ -16,6 +16,10 @@ interface AutoSyncOptions {
   enabled: boolean; // false while logged out
   busy: boolean; // a manual ingest/backfill is running — stay out of its way
   onSessionExpired: () => void;
+  // Fires after any sync that changed the DB (new mail OR backfilled
+  // history), so cheap chrome like sidebar counts and overview stats can
+  // stay current without the operator touching anything.
+  onSynced: () => void;
 }
 
 /*
@@ -35,6 +39,7 @@ export function useAutoSync({
   enabled,
   busy,
   onSessionExpired,
+  onSynced,
 }: AutoSyncOptions): {
   pendingNew: number;
   clearNew: () => void;
@@ -53,6 +58,8 @@ export function useAutoSync({
   busyRef.current = busy;
   const onSessionExpiredRef = useRef(onSessionExpired);
   onSessionExpiredRef.current = onSessionExpired;
+  const onSyncedRef = useRef(onSynced);
+  onSyncedRef.current = onSynced;
 
   useEffect(() => {
     if (!enabled || intervalSec <= 0) return;
@@ -68,6 +75,7 @@ export function useAutoSync({
       try {
         const r = await ingestGmail(25, true, false);
         let newCount: number;
+        let changed: boolean;
         if (r.task_id) {
           const final = await waitForTask(r.task_id, {
             intervalMs: 2000,
@@ -79,13 +87,19 @@ export function useAutoSync({
           // Timed out still-running: neutral — the threads land eventually and
           // the next refresh (manual or auto) picks them up.
           if (!final.ready) return;
-          newCount = final.result?.threads_upserted ?? 0;
+          // new_threads = mail that actually arrived; threads_upserted also
+          // counts older history the pull backfilled, which is DB progress
+          // worth reflecting in the stats but not a "you have mail" signal.
+          newCount = final.result?.new_threads ?? 0;
+          changed = (final.result?.threads_upserted ?? 0) > 0;
         } else {
           newCount = r.new_threads ?? 0;
+          changed = newCount > 0;
         }
         failStreakRef.current = 0;
         setSyncFailed(false);
         if (newCount > 0) setPendingNew((p) => p + newCount);
+        if (changed) onSyncedRef.current();
       } catch (e) {
         if (e instanceof ApiError && e.status === 401) {
           onSessionExpiredRef.current();
