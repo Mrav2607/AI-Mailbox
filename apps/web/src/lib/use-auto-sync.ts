@@ -46,7 +46,10 @@ function writeSeen(userId: string, iso: string) {
 
 interface AutoSyncOptions {
   intervalSec: number; // 0 disables
-  enabled: boolean; // false while logged out
+  // False while logged out — and while the mailbox is empty: a new-only pull
+  // has no baseline thread to anchor against, so auto-sync waits for the
+  // first manual ingest.
+  enabled: boolean;
   busy: boolean; // a manual ingest/backfill is running — stay out of its way
   userId: string | null; // scopes the acknowledged-mail watermark
   onSessionExpired: () => void;
@@ -57,12 +60,13 @@ interface AutoSyncOptions {
 }
 
 /*
-  Background mail sync. Every `intervalSec` seconds this quietly queues the
-  same deduping Gmail ingest the toolbar button uses, then re-derives the
-  "N new" pill: open threads whose last_message_at is newer than the persisted
-  acknowledged watermark. Deriving (rather than accumulating worker-reported
-  counts) makes the pill reload-proof — a sync that completes while the tab is
-  gone still surfaces on the next mount's check.
+  Background mail sync. Every `intervalSec` seconds this quietly queues a
+  new-only Gmail pull — threads that arrived after the newest one already in
+  the DB, never older backfill — then re-derives the "N new" pill: open
+  threads whose last_message_at is newer than the persisted acknowledged
+  watermark. Deriving (rather than accumulating worker-reported counts) makes
+  the pill reload-proof — a sync that completes while the tab is gone still
+  surfaces on the next mount's check.
 
   Runs are chained (next scheduled only after the previous finishes), so a
   slow worker can never stack two ingests. The timer pauses while the tab is
@@ -169,7 +173,9 @@ export function useAutoSync({
     const runOnce = async () => {
       runningRef.current = true;
       try {
-        const r = await ingestGmail(25, true, false);
+        // new-only: pull everything that arrived after the newest known
+        // thread and nothing else — background cycles never backfill.
+        const r = await ingestGmail(100, true, false, true);
         let changed: boolean;
         if (r.task_id) {
           const final = await waitForTask(r.task_id, {

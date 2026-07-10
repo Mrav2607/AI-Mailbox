@@ -273,13 +273,16 @@ export default function Console() {
     [bucket, refreshList, refreshOverview, refreshCounts],
   );
 
-  // Background sync: quiet periodic ingest. After any sync that changed the
-  // DB the whole console refreshes in place (no loading flash, selection kept)
-  // and the "N new" pill re-derives from the persisted acknowledged-mail
-  // watermark — so it survives reloads and syncs this tab never saw finish.
+  // Background sync: quiet periodic new-only ingest. After any sync that
+  // changed the DB the whole console refreshes in place (no loading flash,
+  // selection kept) and the "N new" pill re-derives from the persisted
+  // acknowledged-mail watermark — so it survives reloads and syncs this tab
+  // never saw finish. An empty mailbox pauses the loop entirely: there's no
+  // baseline to sync against until the first manual ingest (which refreshes
+  // the overview and thereby resumes it).
   const { pendingNew, clearNew, syncFailed } = useAutoSync({
     intervalSec: autoSync,
-    enabled: !!user,
+    enabled: !!user && (overview?.summary.threads ?? 0) > 0,
     busy: ingesting || backfilling,
     userId: user?.id ?? null,
     onSessionExpired: handleSessionExpired,
