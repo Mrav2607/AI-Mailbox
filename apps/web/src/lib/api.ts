@@ -189,6 +189,24 @@ export async function deleteThread(threadId: string): Promise<void> {
   await request<void>(`/mail/thread/${threadId}`, { method: "DELETE" });
 }
 
+// Fire-and-forget delete for when the page is going away while a delete is
+// still inside its undo window — keepalive lets the request outlive the
+// document, so a reload/close doesn't silently drop the deletion.
+export function flushDeleteThread(threadId: string): void {
+  if (USE_MOCK) {
+    mockDeleteThread(threadId);
+    return;
+  }
+  const token = getToken();
+  void fetch(`${BASE}/mail/thread/${encodeURIComponent(threadId)}`, {
+    method: "DELETE",
+    keepalive: true,
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  }).catch(() => {
+    /* page is unloading; nothing left to report to */
+  });
+}
+
 export async function getOverview(): Promise<Overview> {
   if (USE_MOCK) return mockOverview();
   return request<Overview>("/analytics/overview");

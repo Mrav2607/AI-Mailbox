@@ -4,6 +4,7 @@ import {
   classifyBackfill,
   classifyQueue,
   deleteThread,
+  flushDeleteThread,
   getCounts,
   getMe,
   googleAuthCallback,
@@ -246,12 +247,15 @@ export default function Console() {
       setListError(null);
       try {
         const res = await getTriage(b, 200);
-        setItems(res.items);
+        // Rows mid-undo-window are already gone from the UI but not yet from
+        // the server; a refresh must not resurrect them.
+        const rows = res.items.filter((i) => !pendingDeletes.current.has(i.thread_id));
+        setItems(rows);
         if (!quiet) {
           // ensure a valid selection
           setSelectedId((prev) => {
-            if (prev && res.items.some((i) => i.thread_id === prev)) return prev;
-            return res.items[0]?.thread_id ?? null;
+            if (prev && rows.some((i) => i.thread_id === prev)) return prev;
+            return rows[0]?.thread_id ?? null;
           });
         }
       } catch (e) {
@@ -396,9 +400,10 @@ export default function Console() {
     setSearching(true);
     try {
       const res = await searchThreads(q, 100);
-      setSearchResults(res.items);
+      const rows = res.items.filter((i) => !pendingDeletes.current.has(i.thread_id));
+      setSearchResults(rows);
       setSearchMode(true);
-      setSelectedId(res.items[0]?.thread_id ?? null);
+      setSelectedId(rows[0]?.thread_id ?? null);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
         handleSessionExpired();
@@ -463,8 +468,9 @@ export default function Console() {
         pendingDeletes.current.delete(id);
         try {
           await deleteThread(id);
-          refreshCounts();
-          refreshOverview();
+          // Full quiet refresh: counts AND the list, so anything a background
+          // refresh showed during the undo window reconciles right here.
+          refreshAll({ quiet: true });
         } catch (e) {
           toast.error((e as Error).message ?? "delete failed");
           undo(); // put it back if the server rejected it
@@ -478,8 +484,22 @@ export default function Console() {
         duration: UNDO_MS,
       });
     },
-    [selectedId, items, searchResults, visibleItems, refreshCounts, refreshOverview],
+    [selectedId, items, searchResults, visibleItems, refreshAll],
   );
+
+  // Deletes still inside their undo window must survive the page going away —
+  // otherwise a reload quietly resurrects "deleted" threads.
+  useEffect(() => {
+    const flush = () => {
+      for (const [id, timer] of pendingDeletes.current) {
+        clearTimeout(timer);
+        flushDeleteThread(id);
+      }
+      pendingDeletes.current.clear();
+    };
+    window.addEventListener("pagehide", flush);
+    return () => window.removeEventListener("pagehide", flush);
+  }, []);
 
   // ---- done (non-destructive exit from triage; inverse action in `done`) ----
   const doDone = useCallback(
