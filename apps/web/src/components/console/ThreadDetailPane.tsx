@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import DOMPurify from "dompurify";
 import {
   CheckCircle2,
@@ -30,8 +30,11 @@ const COLLAPSE_ICONS = {
 // the console. Inline style attributes survive (emails lean on them heavily).
 const PURIFY_CONFIG = {
   USE_PROFILES: { html: true },
-  FORBID_TAGS: ["style"],
+  FORBID_TAGS: ["style", "iframe", "object", "embed", "video", "audio"],
 };
+
+let blockRemote = false;
+let blockedSomething = false;
 
 // Every link in an email opens in a new tab, without handing the mail page a
 // window reference back to us. Registered once at module load.
@@ -40,21 +43,58 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
     node.setAttribute("target", "_blank");
     node.setAttribute("rel", "noopener noreferrer");
   }
+  if (blockRemote) {
+    for (const attribute of ["src", "srcset", "poster"]) {
+      const value = node.getAttribute(attribute)?.trim();
+      if (value && /^(?:https?:|\/\/)/i.test(value)) {
+        node.removeAttribute(attribute);
+        blockedSomething = true;
+      }
+    }
+    if (/url\s*\(/i.test(node.getAttribute("style") ?? "")) {
+      node.removeAttribute("style");
+      blockedSomething = true;
+    }
+  }
 });
 
+function sanitizeEmailHtml(
+  html: string,
+  allowRemote: boolean,
+): { html: string; blocked: boolean } {
+  blockRemote = !allowRemote;
+  blockedSomething = false;
+  const sanitized = DOMPurify.sanitize(html, PURIFY_CONFIG);
+  const blocked = blockedSomething;
+  blockRemote = false;
+  blockedSomething = false;
+  return { html: sanitized, blocked };
+}
+
 function MessageBody({ m }: { m: ThreadMessage }) {
-  const html = useMemo(
-    () => (m.body_html ? DOMPurify.sanitize(m.body_html, PURIFY_CONFIG) : null),
-    [m.body_html],
+  const [showRemote, setShowRemote] = useState(false);
+  const sanitized = useMemo(
+    () => (m.body_html ? sanitizeEmailHtml(m.body_html, showRemote) : null),
+    [m.body_html, showRemote],
   );
-  if (html) {
+  if (sanitized?.html) {
     return (
-      <div
-        // Email HTML assumes a light background, and the console is dark-only,
-        // so the body sits on its own light card.
-        className="email-html rounded border border-border bg-white text-neutral-900 px-4 py-3 text-[13px] leading-relaxed overflow-x-auto"
-        dangerouslySetInnerHTML={{ __html: html }}
-      />
+      <>
+        {sanitized.blocked && !showRemote && (
+          <button
+            onClick={() => setShowRemote(true)}
+            className="mb-2 rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:border-foreground/30 cursor-pointer transition-colors"
+          >
+            remote images blocked — load
+          </button>
+        )}
+        <div
+          // Email HTML assumes a light background in either console theme, so
+          // the body always sits on its own light card.
+          className="email-html rounded border border-border bg-white text-neutral-900 px-4 py-3 text-[13px] leading-relaxed overflow-x-auto"
+          dangerouslySetInnerHTML={{ __html: sanitized.html }}
+        />
+      </>
     );
   }
   return (
