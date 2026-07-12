@@ -87,7 +87,7 @@ def ingest_gmail_for_user(
     except Exception as exc:
         if self.request.retries < self.max_retries:
             set_state("retrying", error="transient sync failure")
-            raise self.retry(exc=exc, countdown=2 ** self.request.retries)
+            raise self.retry(exc=exc, countdown=2 ** self.request.retries) from exc
         set_state("failed", error="sync failed after retries")
         raise
 

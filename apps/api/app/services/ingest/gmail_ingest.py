@@ -299,7 +299,7 @@ def ingest_gmail_messages(
     threads_reopened = 0
 
     for index, tid in enumerate(thread_ids):
-        raw_thread = with_token_retry(lambda: client.get_thread(tid))
+        raw_thread = with_token_retry(lambda tid=tid: client.get_thread(tid))
 
         normalized_msgs = [normalize_message(m) for m in raw_thread.get("messages", [])]
         normalized_msgs = [
@@ -340,13 +340,16 @@ def ingest_gmail_messages(
 
         thread_state = db.get(MailThread, thread_id)
         done_at = thread_state.done_at if thread_state else None
-        existing_message_ids = set(
-            db.execute(
-                select(MailMessage.provider_message_id).where(
-                    MailMessage.thread_id == thread_id
-                )
-            ).scalars()
-        )
+        existing_message_ids: set[str] = set()
+        # Existing IDs only matter when checking whether a done thread reopened.
+        if done_at is not None:
+            existing_message_ids = set(
+                db.execute(
+                    select(MailMessage.provider_message_id).where(
+                        MailMessage.thread_id == thread_id
+                    )
+                ).scalars()
+            )
         should_reopen = _should_reopen_thread(
             done_at, existing_message_ids, normalized_msgs
         )
