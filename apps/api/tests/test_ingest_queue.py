@@ -3,7 +3,7 @@ back 202 with a task id, and classification backfills do the same once the
 batch is too big to run inline.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -23,6 +23,7 @@ def client():
     # Same empty-result DB stub as test_validation: the inline backfill path
     # reads eligible threads, and against this stub it finds none.
     db = MagicMock()
+    db.scalar.return_value = None
     db.execute.return_value.scalars.return_value.all.return_value = []
     app.dependency_overrides[get_current_user] = lambda: user
     app.dependency_overrides[get_db] = lambda: db
@@ -56,12 +57,16 @@ def test_ingest_queues_task_and_returns_202(client, fake_delay):
         "/api/v1/mail/ingest/gmail?max_results=50&skip_existing=false&classify=false"
     )
     assert resp.status_code == 202
-    assert resp.json() == {"status": "queued", "task_id": "task-123"}
+    assert resp.json()["status"] == "queued"
+    assert resp.json()["task_id"] == "task-123"
+    assert resp.json()["deduplicated"] is False
     fake_delay.assert_called_once_with(
+        run_id=ANY,
         user_id=str(USER_ID),
         max_results=50,
         skip_existing=False,
         classify_messages=False,
+        new_only=False,
     )
 
 
@@ -69,10 +74,12 @@ def test_ingest_defaults_pass_through(client, fake_delay):
     resp = client.post("/api/v1/mail/ingest/gmail")
     assert resp.status_code == 202
     fake_delay.assert_called_once_with(
+        run_id=ANY,
         user_id=str(USER_ID),
         max_results=25,
         skip_existing=True,
         classify_messages=True,
+        new_only=False,
     )
 
 
@@ -123,3 +130,16 @@ def test_large_backfill_still_validates_before_queueing(client, fake_backfill_de
         == 422
     )
     fake_backfill_delay.assert_not_called()
+
+
+def test_ingest_new_only_passes_through(client, fake_delay):
+    resp = client.post("/api/v1/mail/ingest/gmail?new_only=true")
+    assert resp.status_code == 202
+    fake_delay.assert_called_once_with(
+        run_id=ANY,
+        user_id=str(USER_ID),
+        max_results=25,
+        skip_existing=True,
+        classify_messages=True,
+        new_only=True,
+    )

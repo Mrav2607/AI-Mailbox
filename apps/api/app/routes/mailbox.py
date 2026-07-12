@@ -1,21 +1,23 @@
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 from sqlalchemy import select, desc, or_, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.ratelimit import user_rate_limit
 from app.deps import get_db, get_current_user
-from app.db.models import MailThread, MailMessage, Classification, AppUser
+from app.db.models import MailThread, MailMessage, Classification, AppUser, MailSyncRun
 from app.workers.celery_app import celery_app
 from app.workers.tasks_ingest import ingest_gmail_for_user
 from app.workers.tasks_nlp import backfill_threads_for_user, classify_latest_threads
 from app.services.nlp.backfill import latest_label_subquery, run_backfill
 from app.services.nlp.classifier import LABELS
 from app.services.nlp.persistence import upsert_classification
+from app.services.sync_runs import QUEUED_SYNC_LEASE, active_sync, now_utc, sync_payload
 
 router = APIRouter(prefix="/mail")
 
@@ -443,7 +445,11 @@ def ingest_gmail(
     max_results: int = Query(default=25, ge=1, le=_MAX_INGEST_RESULTS),
     skip_existing: bool = True,
     classify: bool = True,
+    # Pull only mail newer than the newest known thread (what auto-sync
+    # wants), instead of also backfilling older history up to max_results.
+    new_only: bool = False,
     current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict:
     """Queue a Gmail pull for the worker instead of running it inline.
 
@@ -451,13 +457,78 @@ def ingest_gmail(
     way too slow to hold a request open for, so we hand it to Celery and
     return 202 with the task id.
     """
-    task = cast(Any, ingest_gmail_for_user).delay(
-        user_id=str(current_user.id),
-        max_results=max_results,
-        skip_existing=skip_existing,
-        classify_messages=classify,
+    existing = active_sync(db, current_user.id)
+    if existing:
+        return sync_payload(existing, deduplicated=True)
+
+    now = now_utc()
+    run = MailSyncRun(
+        id=uuid4(),
+        user_id=current_user.id,
+        mode="auto" if new_only else ("refresh" if not skip_existing else "manual"),
+        status="queued",
+        options={
+            "max_results": max_results,
+            "skip_existing": skip_existing,
+            "classify_messages": classify,
+            "new_only": new_only,
+        },
+        lease_expires_at=now + QUEUED_SYNC_LEASE,
     )
-    return {"status": "queued", "task_id": task.id}
+    db.add(run)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        winner = active_sync(db, current_user.id)
+        if winner:
+            return sync_payload(winner, deduplicated=True)
+        raise
+
+    try:
+        task = cast(Any, ingest_gmail_for_user).delay(
+            run_id=str(run.id),
+            user_id=str(current_user.id),
+            max_results=max_results,
+            skip_existing=skip_existing,
+            classify_messages=classify,
+            new_only=new_only,
+        )
+        run.task_id = task.id
+        db.commit()
+    except Exception:
+        run.status = "failed"
+        run.error = "failed to enqueue sync"
+        run.completed_at = now_utc()
+        db.commit()
+        raise
+    return sync_payload(run)
+
+
+@router.get("/sync/active")
+def get_active_sync(
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict | None:
+    run = active_sync(db, current_user.id)
+    return sync_payload(run) if run else None
+
+
+@router.get("/sync/{run_id}")
+def get_sync_run(
+    run_id: UUID,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    run = db.get(MailSyncRun, run_id)
+    if not run or run.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if run.status in ("queued", "running", "retrying") and run.lease_expires_at < now_utc():
+        run.status = "failed"
+        run.error = "sync lease expired"
+        run.completed_at = now_utc()
+        db.commit()
+    return sync_payload(run)
 
 
 @router.get("/tasks/{task_id}")

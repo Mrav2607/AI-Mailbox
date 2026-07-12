@@ -97,4 +97,8 @@ def normalize_message(raw: dict[str, Any]) -> dict[str, Any]:
         "body_text": text_body,
         "body_html": html_body,
         "headers": headers,
+        # Retained for ingest policy decisions (not persisted yet). Gmail's
+        # SENT label is more reliable than parsing display-name email headers
+        # when deciding whether a new message is inbound.
+        "label_ids": raw.get("labelIds", []),
     }

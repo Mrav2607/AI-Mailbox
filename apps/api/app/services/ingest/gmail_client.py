@@ -60,3 +60,33 @@ class GmailClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+    def get_profile(self) -> dict[str, Any]:
+        resp = httpx.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+            headers=self._headers(),
+            timeout=20.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_history(
+        self,
+        start_history_id: str,
+        page_token: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "startHistoryId": start_history_id,
+            "historyTypes": "messageAdded",
+            "maxResults": 500,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        resp = httpx.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/history",
+            headers=self._headers(),
+            params=params,
+            timeout=20.0,
+        )
+        resp.raise_for_status()
+        return resp.json()

@@ -224,14 +224,24 @@ export async function ingestGmail(
   classify = true,
   refreshExisting = false,
   newOnly = false,
-): Promise<{ status: string; task_id?: string; new_threads?: number }> {
+): Promise<SyncRunStatus & { new_threads?: number }> {
   if (USE_MOCK) {
     await new Promise((r) => setTimeout(r, 150));
+    const newThreads = mockIngest();
     // The mock "inbox" actually receives mail on each pull, so auto-sync and
     // the new-mail pill are demoable (and testable) offline.
-    return { status: "ok", new_threads: mockIngest() };
+    return {
+      run_id: "mock-run",
+      task_id: undefined,
+      mode: newOnly ? "auto" : "manual",
+      status: "succeeded",
+      ready: true,
+      deduplicated: false,
+      result: { status: "ok", threads_upserted: newThreads, new_threads: newThreads },
+      new_threads: newThreads,
+    };
   }
-  return request<{ status: string; task_id?: string }>(
+  return request<SyncRunStatus>(
     `/mail/ingest/gmail?max_results=${max_results}&classify=${classify}` +
       `&skip_existing=${!refreshExisting}&new_only=${newOnly}`,
     { method: "POST" },
@@ -248,6 +258,7 @@ export interface TaskResult {
   threads_upserted?: number;
   messages_upserted?: number;
   classified?: number;
+  threads_reopened?: number;
   fetched?: number;
   skipped_existing?: number;
   // Mail that actually arrived since the last pull; threads_upserted also
@@ -256,6 +267,73 @@ export interface TaskResult {
   created?: number;
   scanned?: number;
   processed?: number;
+}
+
+export interface SyncRunStatus {
+  run_id: string;
+  task_id?: string;
+  mode: string;
+  status: string;
+  ready: boolean;
+  deduplicated: boolean;
+  result?: TaskResult | null;
+  error?: string | null;
+}
+
+export async function getActiveSync(signal?: AbortSignal): Promise<SyncRunStatus | null> {
+  if (USE_MOCK) return null;
+  return request<SyncRunStatus | null>("/mail/sync/active", { signal });
+}
+
+export async function getSyncRun(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<SyncRunStatus> {
+  if (USE_MOCK) {
+    return {
+      run_id: runId,
+      mode: "auto",
+      status: "succeeded",
+      ready: true,
+      deduplicated: false,
+      result: { status: "ok" },
+    };
+  }
+  return request<SyncRunStatus>(`/mail/sync/${encodeURIComponent(runId)}`, { signal });
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export async function waitForSyncRun(
+  runId: string,
+  {
+    signal,
+    timeoutMs = WORKER_TASK_TIMEOUT_MS,
+  }: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<SyncRunStatus> {
+  const started = Date.now();
+  for (;;) {
+    const run = await getSyncRun(runId, signal);
+    if (run.ready) return run;
+    if (Date.now() - started >= timeoutMs) return run;
+    await abortableDelay(Date.now() - started < 60_000 ? 2000 : 10_000, signal);
+  }
 }
 
 export interface TaskStatus {
@@ -285,7 +363,11 @@ export async function getTaskStatus(taskId: string): Promise<TaskStatus> {
 // caller can decide what to do rather than hanging forever.
 export async function waitForTask(
   taskId: string,
-  { intervalMs = 1500, timeoutMs = 120_000 }: { intervalMs?: number; timeoutMs?: number } = {},
+  {
+    intervalMs = 1500,
+    timeoutMs = 120_000,
+    signal,
+  }: { intervalMs?: number; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<TaskStatus> {
   const start = Date.now();
   // eslint-disable-next-line no-constant-condition
@@ -293,7 +375,7 @@ export async function waitForTask(
     const status = await getTaskStatus(taskId);
     if (status.ready) return status;
     if (Date.now() - start >= timeoutMs) return status;
-    await new Promise((r) => setTimeout(r, intervalMs));
+    await abortableDelay(intervalMs, signal);
   }
 }
 

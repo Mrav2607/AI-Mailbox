@@ -112,6 +112,7 @@ def test_normalize_message_end_to_end_nested():
     raw = {
         "id": "msg-1",
         "threadId": "thr-1",
+        "labelIds": ["INBOX", "IMPORTANT"],
         "snippet": "snip",
         "internalDate": "1751900000000",
         "payload": {
@@ -140,3 +141,4 @@ def test_normalize_message_end_to_end_nested():
     assert n["body_text"] == "full body text"
     assert n["body_html"] == "<p>full body html</p>"
     assert n["subject"] == "Hello"
+    assert n["label_ids"] == ["INBOX", "IMPORTANT"]

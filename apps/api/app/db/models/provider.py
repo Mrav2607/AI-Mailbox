@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, Text, ForeignKey
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Text, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -39,6 +39,13 @@ class ProviderAccount(Base):
     refresh_token: Mapped[str | None] = mapped_column(EncryptedText, nullable=True)
     token_expiry: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     scope: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Cursor for Gmail's incremental History API. Stored as text because Gmail
+    # history IDs are opaque, monotonically increasing decimal strings that can
+    # exceed JavaScript's safe integer range.
+    gmail_history_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gmail_backfill_complete: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default="now()"
     )

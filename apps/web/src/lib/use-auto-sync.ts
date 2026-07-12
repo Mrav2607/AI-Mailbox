@@ -2,10 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   ApiError,
+  getActiveSync,
   getTriage,
   ingestGmail,
-  waitForTask,
-  WORKER_TASK_TIMEOUT_MS,
+  waitForSyncRun,
 } from "./api";
 
 // Cadence presets for the UI; loadUi accepts any non-negative number though,
@@ -25,6 +25,93 @@ export const NEW_MAIL_SCAN_LIMIT = 50;
 // survives reloads: it's derived by comparing server data against this mark,
 // never by catching a one-shot task result that a reload could orphan.
 const seenKey = (userId: string) => `ai_mailbox_seen:${userId}`;
+const channelName = (userId: string) => `ai-mailbox-sync:${userId}`;
+
+export function broadcastSyncComplete(userId: string) {
+  if (!("BroadcastChannel" in window)) return;
+  const channel = new BroadcastChannel(channelName(userId));
+  channel.postMessage({ type: "sync-complete" });
+  channel.close();
+}
+
+function useSyncLeader(enabled: boolean, userId: string | null): boolean {
+  const [leader, setLeader] = useState(false);
+
+  useEffect(() => {
+    if (!enabled || !userId) {
+      setLeader(false);
+      return;
+    }
+    if (!("locks" in navigator)) {
+      // No Web Locks (insecure context, e.g. plain-http LAN access): treat
+      // visibility as leadership so hiding the tab still pauses-and-resumes
+      // the loop. Multiple visible tabs may all sync; backend single-flight
+      // dedupes them.
+      const sync = () => setLeader(!document.hidden);
+      sync();
+      document.addEventListener("visibilitychange", sync);
+      return () => {
+        document.removeEventListener("visibilitychange", sync);
+        setLeader(false);
+      };
+    }
+
+    let cancelled = false;
+    let acquiring = false;
+    let release: (() => void) | null = null;
+    let lockController: AbortController | null = null;
+    const acquire = () => {
+      if (cancelled || acquiring || document.hidden) return;
+      acquiring = true;
+      const controller = new AbortController();
+      lockController = controller;
+      void navigator.locks
+        .request(
+          `ai-mailbox-auto-sync:${userId}`,
+          { signal: controller.signal },
+          async () => {
+            acquiring = false;
+            if (cancelled) return;
+            setLeader(true);
+            await new Promise<void>((resolve) => {
+              release = resolve;
+            });
+            release = null;
+            setLeader(false);
+          },
+        )
+        .catch(() => {
+          acquiring = false;
+          // Abort is expected when a queued/visible tab becomes hidden. Other
+          // lock failures fall back to backend single-flight correctness.
+          if (!cancelled && !document.hidden) {
+            if (controller.signal.aborted) acquire();
+            else setLeader(true);
+          }
+        });
+    };
+    const onVisibility = () => {
+      if (document.hidden) {
+        lockController?.abort();
+        release?.();
+        setLeader(false);
+      } else {
+        acquire();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    acquire();
+    return () => {
+      cancelled = true;
+      lockController?.abort();
+      release?.();
+      setLeader(false);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [enabled, userId]);
+
+  return leader;
+}
 
 function readSeenMs(userId: string): number {
   try {
@@ -89,7 +176,6 @@ export function useAutoSync({
   const [syncFailed, setSyncFailed] = useState(false);
 
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const nextDueRef = useRef(0);
   const runningRef = useRef(false);
   const failStreakRef = useRef(0);
   // Newest last_message_at the check has observed (server timestamp, so the
@@ -105,6 +191,8 @@ export function useAutoSync({
   onSessionExpiredRef.current = onSessionExpired;
   const onSyncedRef = useRef(onSynced);
   onSyncedRef.current = onSynced;
+  const leader = useSyncLeader(enabled && intervalSec > 0, userId);
+  const channelRef = useRef<BroadcastChannel | null>(null);
 
   // Re-derive pendingNew from the newest open threads. With `acknowledge`,
   // instead mark everything currently on the server as seen.
@@ -147,11 +235,29 @@ export function useAutoSync({
     }
   }, []);
 
+  useEffect(() => {
+    if (!enabled || !userId || !("BroadcastChannel" in window)) return;
+    const channel = new BroadcastChannel(channelName(userId));
+    channelRef.current = channel;
+    channel.onmessage = (event) => {
+      if (event.data?.type === "sync-complete") {
+        void Promise.all([onSyncedRef.current(), checkNew()]);
+      } else if (event.data?.type === "acknowledged") {
+        void checkNew();
+      }
+    };
+    return () => {
+      channelRef.current = null;
+      channel.close();
+    };
+  }, [enabled, userId, checkNew]);
+
   const clearNew = useCallback(() => {
     // Optimistically drop the pill, then persist the acknowledgment against
     // fresh server data so anything even newer immediately re-counts.
     setPendingNew(0);
     void checkNew(true);
+    channelRef.current?.postMessage({ type: "acknowledged" });
   }, [checkNew]);
 
   // Mount / login: derive the pill from persisted state so mail that landed
@@ -162,11 +268,14 @@ export function useAutoSync({
   }, [enabled, userId, checkNew]);
 
   useEffect(() => {
-    if (!enabled || intervalSec <= 0) return;
+    if (!enabled || intervalSec <= 0 || !leader) return;
+
+    let cancelled = false;
+    const controller = new AbortController();
 
     const schedule = (delayMs: number) => {
+      if (cancelled) return;
       if (timerRef.current) clearTimeout(timerRef.current);
-      nextDueRef.current = Date.now() + delayMs;
       timerRef.current = setTimeout(tick, delayMs);
     };
 
@@ -175,30 +284,24 @@ export function useAutoSync({
       try {
         // new-only: pull everything that arrived after the newest known
         // thread and nothing else — background cycles never backfill.
-        const r = await ingestGmail(100, true, false, true);
-        let changed: boolean;
-        if (r.task_id) {
-          const final = await waitForTask(r.task_id, {
-            intervalMs: 2000,
-            timeoutMs: WORKER_TASK_TIMEOUT_MS,
-          });
-          if (final.result?.status === "error" || final.error) {
-            throw new Error(final.result?.detail ?? final.error ?? "sync failed");
-          }
-          // The timeout extends beyond the worker's hard execution limit. If
-          // the broker itself is unavailable for longer, treat the outcome as
-          // unknown: refresh whatever landed and let the check re-derive.
-          changed = !final.ready || (final.result?.threads_upserted ?? 0) > 0;
-        } else {
-          changed = (r.new_threads ?? 0) > 0;
+        const queued = await ingestGmail(100, true, false, true);
+        const final = queued.ready
+          ? queued
+          : await waitForSyncRun(queued.run_id, { signal: controller.signal });
+        if (final.status === "failed" || final.result?.status === "error") {
+          throw new Error(final.result?.detail ?? final.error ?? "sync failed");
         }
+        const changed = !final.ready || (final.result?.threads_upserted ?? 0) > 0;
+        if (cancelled) return;
         failStreakRef.current = 0;
         setSyncFailed(false);
         if (changed) await onSyncedRef.current();
         // Always re-derive: mail can also land via another tab's manual
         // ingest, and the check is one cheap unthrottled GET.
         await checkNew();
+        channelRef.current?.postMessage({ type: "sync-complete" });
       } catch (e) {
+        if (e instanceof DOMException && e.name === "AbortError") return;
         if (e instanceof ApiError && e.status === 401) {
           onSessionExpiredRef.current();
           return;
@@ -222,28 +325,31 @@ export function useAutoSync({
         schedule(15_000);
         return;
       }
-      void runOnce().finally(() => schedule(intervalSec * 1000));
+      void runOnce().finally(() => {
+        if (!cancelled) schedule(intervalSec * 1000);
+      });
     };
 
-    const onVisibility = () => {
-      if (document.hidden) {
-        // Keep nextDue so the return handler knows whether we're overdue.
-        if (timerRef.current) clearTimeout(timerRef.current);
-        return;
-      }
-      const remaining = nextDueRef.current - Date.now();
-      if (remaining <= 0) tick();
-      else schedule(remaining);
-    };
-
-    document.addEventListener("visibilitychange", onVisibility);
-    // First run a full interval out — mount already loads fresh data.
-    schedule(intervalSec * 1000);
+    // Reattach to work orphaned by a reload before starting a new cadence.
+    void getActiveSync(controller.signal)
+      .then(async (active) => {
+        if (!active || cancelled) return;
+        const final = await waitForSyncRun(active.run_id, { signal: controller.signal });
+        if (!cancelled && final.status === "succeeded") {
+          await Promise.all([onSyncedRef.current(), checkNew()]);
+          channelRef.current?.postMessage({ type: "sync-complete" });
+        }
+      })
+      .catch((e) => {
+        if (!(e instanceof DOMException && e.name === "AbortError")) setSyncFailed(true);
+      })
+      .finally(() => schedule(intervalSec * 1000));
     return () => {
-      document.removeEventListener("visibilitychange", onVisibility);
+      cancelled = true;
+      controller.abort();
       if (timerRef.current) clearTimeout(timerRef.current);
     };
-  }, [enabled, intervalSec, checkNew]);
+  }, [enabled, intervalSec, checkNew, leader]);
 
   return { pendingNew, clearNew, syncFailed };
 }

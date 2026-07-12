@@ -17,6 +17,7 @@ import {
   setThreadDone,
   setToken,
   waitForTask,
+  waitForSyncRun,
   WORKER_TASK_TIMEOUT_MS,
 } from "@/lib/api";
 import type { TaskResult } from "@/lib/api";
@@ -43,7 +44,11 @@ import { CommandPalette } from "@/components/console/CommandPalette";
 import { Shortcuts } from "@/components/console/Shortcuts";
 import { LoginScreen } from "@/components/console/LoginScreen";
 import { useHotkeys } from "@/lib/use-hotkeys";
-import { NEW_MAIL_SCAN_LIMIT, useAutoSync } from "@/lib/use-auto-sync";
+import {
+  broadcastSyncComplete,
+  NEW_MAIL_SCAN_LIMIT,
+  useAutoSync,
+} from "@/lib/use-auto-sync";
 import { Toaster } from "@/components/ui/sonner";
 import { ConsoleLayout } from "@/components/console/ConsoleLayout";
 import { UI_KEY, loadUi } from "@/lib/layout";
@@ -609,20 +614,38 @@ export default function Console() {
     async (opts: IngestOptions) => {
       setIngesting(true);
       try {
-        const r = await ingestGmail(opts.maxResults, opts.classify, opts.refreshExisting);
-        // Mock / synchronous path: no task to wait on, data is already there.
-        if (!r.task_id) {
-          toast.success(`ingest complete · ${r.new_threads ?? 0} new threads`);
-          await refreshAll();
-        } else {
-          await trackTask(
-            r.task_id,
-            "ingest",
-            (res) =>
-              `ingest complete · ${res.threads_upserted ?? 0} threads · ` +
-              `${res.messages_upserted ?? 0} msgs`,
-          );
+        const intendedMode = opts.refreshExisting ? "refresh" : "manual";
+        let r = await ingestGmail(opts.maxResults, opts.classify, opts.refreshExisting);
+        let final = r;
+        let retried = false;
+        for (;;) {
+          if (r.deduplicated) {
+            toast("another sync is already running — waiting for it");
+          }
+          final = r.ready ? r : await waitForSyncRun(r.run_id);
+          if (!final.ready) {
+            toast.message("ingest still running in the background — showing what's landed so far");
+            await refreshAll({ quiet: true });
+            return;
+          }
+          if (!r.deduplicated || r.mode === intendedMode) break;
+          if (retried) {
+            toast("another sync took precedence again — please try again");
+            return;
+          }
+          retried = true;
+          r = await ingestGmail(opts.maxResults, opts.classify, opts.refreshExisting);
         }
+        if (final.status === "failed" || final.result?.status === "error") {
+          throw new Error(final.result?.detail ?? final.error ?? "ingest failed");
+        }
+        const res = final.result ?? {};
+        toast.success(
+          `ingest complete · ${res.threads_upserted ?? r.new_threads ?? 0} threads · ` +
+            `${res.messages_upserted ?? 0} msgs`,
+        );
+        await refreshAll();
+        if (user) broadcastSyncComplete(user.id);
         // A deliberate pull acknowledges everything it just surfaced.
         clearNew();
       } catch (e) {
@@ -631,7 +654,7 @@ export default function Console() {
         setIngesting(false);
       }
     },
-    [trackTask, refreshAll, clearNew],
+    [refreshAll, clearNew, user],
   );
 
   const doBackfill = useCallback(
