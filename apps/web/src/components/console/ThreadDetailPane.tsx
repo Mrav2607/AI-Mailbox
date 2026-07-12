@@ -44,7 +44,7 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
     node.setAttribute("rel", "noopener noreferrer");
   }
   if (blockRemote) {
-    for (const attribute of ["src", "srcset", "poster"]) {
+    for (const attribute of ["src", "srcset", "poster", "background"]) {
       const value = node.getAttribute(attribute)?.trim();
       if (value && /^(?:https?:|\/\/)/i.test(value)) {
         node.removeAttribute(attribute);
