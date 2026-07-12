@@ -174,7 +174,7 @@ export async function setThreadDone(
     return;
   }
   await request<{ thread_id: string; done: boolean }>(
-    `/mail/thread/${threadId}/done`,
+    `/mail/thread/${encodeURIComponent(threadId)}/done`,
     { method: "POST", body: JSON.stringify({ done }) },
   );
 }

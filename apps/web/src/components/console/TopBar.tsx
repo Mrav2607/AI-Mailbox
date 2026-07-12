@@ -180,7 +180,9 @@ function BackfillForm({
   // Same string-state trick as IngestForm: parse/clamp on submit so a cleared
   // field never submits NaN.
   const [limit, setLimit] = useState("200");
-  const [bucket, setBucket] = useState<BucketKey>(currentBucket);
+  const [bucket, setBucket] = useState<BucketKey>(
+    currentBucket === "done" ? "all" : currentBucket,
+  );
   const [backend, setBackend] = useState<ClassifierBackend>("local");
   const labeled = bucket !== "unclassified" && bucket !== "all";
   // A labeled bucket is already classified, so re-running it needs force.

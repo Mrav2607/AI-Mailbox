@@ -542,6 +542,11 @@ export default function Console() {
       void (async () => {
         try {
           await setThreadDone(id, marking);
+          setThread((prev) =>
+            prev && prev.thread.id === id
+              ? { ...prev, thread: { ...prev.thread, done: marking } }
+              : prev,
+          );
           refreshCounts();
           toast(marking ? "thread done" : "thread restored", {
             action: {
@@ -549,6 +554,11 @@ export default function Console() {
               onClick: () => {
                 setThreadDone(id, !marking)
                   .then(() => {
+                    setThread((prev) =>
+                      prev && prev.thread.id === id
+                        ? { ...prev, thread: { ...prev.thread, done: !marking } }
+                        : prev,
+                    );
                     restore();
                     refreshCounts();
                   })
