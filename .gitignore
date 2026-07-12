@@ -47,3 +47,5 @@ ai-mailbox/apps/api/receipts_export.csv
 /audit-report.md
 /.mcp.json
 apps/web/_shot*.mjs
+/.claude
+/AGENTS.md

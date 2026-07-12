@@ -10,6 +10,10 @@ import {
 import type { BucketKey, Label } from "@/lib/types";
 import { ALL_LABELS, BUCKETS } from "@/lib/types";
 import { LABEL_META, bucketLabel } from "@/lib/labels";
+import type { Arrangement } from "@/lib/layout";
+import { THEME_PREFS } from "@/lib/theme";
+import type { ThemePref } from "@/lib/theme";
+import { AUTO_SYNC_CHOICES } from "@/lib/use-auto-sync";
 
 interface Props {
   open: boolean;
@@ -22,7 +26,14 @@ interface Props {
   hasFocusedThread: boolean;
   onToggleSidebar: () => void;
   onToggleDetail: () => void;
+  onTogglePrediction: () => void;
+  onTheme: (t: ThemePref) => void;
+  onAutoSync: (s: number) => void;
+  onArrangement: (patch: Partial<Arrangement>) => void;
   onFocusSearch: () => void;
+  onDone: () => void;
+  inDoneBucket: boolean;
+  onOpenGmail: () => void;
   onDelete: () => void;
 }
 
@@ -37,7 +48,14 @@ export function CommandPalette({
   hasFocusedThread,
   onToggleSidebar,
   onToggleDetail,
+  onTogglePrediction,
+  onTheme,
+  onAutoSync,
+  onArrangement,
   onFocusSearch,
+  onDone,
+  inDoneBucket,
+  onOpenGmail,
   onDelete,
 }: Props) {
   const run = (fn: () => void) => {
@@ -85,6 +103,39 @@ export function CommandPalette({
               >
                 toggle thread detail pane
               </CommandItem>
+              <CommandItem
+                onSelect={() => run(onTogglePrediction)}
+                value="toggle prediction reclassify bar"
+              >
+                toggle prediction bar
+              </CommandItem>
+              {THEME_PREFS.map((t) => (
+                <CommandItem
+                  key={`theme-${t}`}
+                  onSelect={() => run(() => onTheme(t))}
+                  value={`theme ${t}`}
+                >
+                  theme: {t}
+                </CommandItem>
+              ))}
+              {(["left", "right"] as const).map((side) => (
+                <CommandItem
+                  key={`sb-${side}`}
+                  onSelect={() => run(() => onArrangement({ sidebar: side }))}
+                  value={`layout buckets sidebar ${side}`}
+                >
+                  layout: buckets → {side}
+                </CommandItem>
+              ))}
+              {(["right", "bottom", "left"] as const).map((side) => (
+                <CommandItem
+                  key={`rd-${side}`}
+                  onSelect={() => run(() => onArrangement({ reading: side }))}
+                  value={`layout reading pane ${side}`}
+                >
+                  layout: reading pane → {side}
+                </CommandItem>
+              ))}
             </CommandGroup>
             <CommandGroup heading="actions">
               <CommandItem onSelect={() => run(onIngest)} value="ingest gmail">
@@ -102,9 +153,30 @@ export function CommandPalette({
               >
                 queue classification (async)
               </CommandItem>
+              {AUTO_SYNC_CHOICES.map((c) => (
+                <CommandItem
+                  key={`as-${c.value}`}
+                  onSelect={() => run(() => onAutoSync(c.value))}
+                  value={`auto sync ${c.label}`}
+                >
+                  auto-sync: {c.label}
+                </CommandItem>
+              ))}
             </CommandGroup>
             {hasFocusedThread && (
               <CommandGroup heading="focused thread">
+                <CommandItem
+                  onSelect={() => run(onDone)}
+                  value="done archive restore thread"
+                >
+                  {inDoneBucket ? "restore thread" : "mark thread done"}
+                </CommandItem>
+                <CommandItem
+                  onSelect={() => run(onOpenGmail)}
+                  value="open thread in gmail"
+                >
+                  open in gmail
+                </CommandItem>
                 {ALL_LABELS.map((l) => (
                   <CommandItem
                     key={l}
@@ -117,7 +189,7 @@ export function CommandPalette({
                 <CommandItem
                   onSelect={() => run(onDelete)}
                   value="delete thread"
-                  className="text-[oklch(0.74_0.17_25)]"
+                  className="text-destructive"
                 >
                   delete thread
                 </CommandItem>

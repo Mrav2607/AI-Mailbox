@@ -1,9 +1,23 @@
 import { useState } from "react";
-import { Loader2, Download, Sparkles, LogOut } from "lucide-react";
+import {
+  Loader2,
+  Download,
+  Sparkles,
+  LogOut,
+  Columns3,
+  Monitor,
+  Moon,
+  Sun,
+} from "lucide-react";
 import { Mark } from "./Mark";
 import { Popover } from "./Popover";
+import { LayoutPicker } from "./LayoutPicker";
 import { bucketLabel } from "@/lib/labels";
 import { BUCKETS } from "@/lib/types";
+import type { Arrangement } from "@/lib/layout";
+import { THEME_PREFS } from "@/lib/theme";
+import type { ThemePref } from "@/lib/theme";
+import { AUTO_SYNC_CHOICES } from "@/lib/use-auto-sync";
 import type {
   BackfillOptions,
   BucketKey,
@@ -26,7 +40,21 @@ interface Props {
   onIngestOpenChange: (v: boolean) => void;
   backfillOpen: boolean;
   onBackfillOpenChange: (v: boolean) => void;
+  layoutOpen: boolean;
+  onLayoutOpenChange: (v: boolean) => void;
+  arrangement: Arrangement;
+  onArrangement: (a: Arrangement) => void;
+  theme: ThemePref;
+  onTheme: (t: ThemePref) => void;
+  autoSync: number;
+  onAutoSync: (s: number) => void;
 }
+
+const THEME_ICONS: Record<ThemePref, typeof Sun> = {
+  system: Monitor,
+  light: Sun,
+  dark: Moon,
+};
 
 const BACKENDS: { value: ClassifierBackend; label: string }[] = [
   { value: "local", label: "local encoder" },
@@ -55,26 +83,35 @@ const control =
 function IngestForm({
   busy,
   onSubmit,
+  autoSync,
+  onAutoSync,
 }: {
   busy: boolean;
   onSubmit: (o: IngestOptions) => void;
+  autoSync: number;
+  onAutoSync: (s: number) => void;
 }) {
   // String state so a mid-edit (cleared) field never becomes NaN; we parse
   // and clamp on submit instead.
   const [count, setCount] = useState("100");
   const [classify, setClassify] = useState(true);
+  const [refreshExisting, setRefreshExisting] = useState(false);
   return (
     <form
       onSubmit={(e) => {
         e.preventDefault();
         const n = parseInt(count, 10);
-        onSubmit({ maxResults: clamp(Number.isNaN(n) ? 100 : n, 1, 500), classify });
+        onSubmit({
+          maxResults: clamp(Number.isNaN(n) ? 100 : n, 1, 500),
+          classify,
+          refreshExisting,
+        });
       }}
       className="space-y-2.5"
     >
       <div className={fieldLabel}>ingest gmail</div>
       <label className="block space-y-1">
-        <span className={fieldLabel}>how many (1–500)</span>
+        <span className={fieldLabel}>how many threads (1–500)</span>
         <input
           type="number"
           min={1}
@@ -93,6 +130,15 @@ function IngestForm({
         />
         classify on ingest
       </label>
+      <label className="flex items-center gap-2 cursor-pointer text-[12px] font-mono text-foreground/85">
+        <input
+          type="checkbox"
+          checked={refreshExisting}
+          onChange={(e) => setRefreshExisting(e.target.checked)}
+          className="accent-primary"
+        />
+        re-fetch existing threads
+      </label>
       <button
         type="submit"
         disabled={busy}
@@ -100,6 +146,24 @@ function IngestForm({
       >
         run ingest
       </button>
+      {/* Lives with the ingest controls but applies immediately, no submit. */}
+      <label className="block space-y-1 pt-2 border-t border-border">
+        <span className={fieldLabel}>auto-sync</span>
+        <select
+          value={autoSync}
+          onChange={(e) => onAutoSync(Number(e.target.value))}
+          className={control}
+        >
+          {AUTO_SYNC_CHOICES.map((c) => (
+            <option key={c.value} value={c.value}>
+              {c.label}
+            </option>
+          ))}
+          {!AUTO_SYNC_CHOICES.some((c) => c.value === autoSync) && (
+            <option value={autoSync}>{autoSync}s (custom)</option>
+          )}
+        </select>
+      </label>
     </form>
   );
 }
@@ -116,7 +180,9 @@ function BackfillForm({
   // Same string-state trick as IngestForm: parse/clamp on submit so a cleared
   // field never submits NaN.
   const [limit, setLimit] = useState("200");
-  const [bucket, setBucket] = useState<BucketKey>(currentBucket);
+  const [bucket, setBucket] = useState<BucketKey>(
+    currentBucket === "done" ? "all" : currentBucket,
+  );
   const [backend, setBackend] = useState<ClassifierBackend>("local");
   const labeled = bucket !== "unclassified" && bucket !== "all";
   // A labeled bucket is already classified, so re-running it needs force.
@@ -142,7 +208,8 @@ function BackfillForm({
           }}
           className={control}
         >
-          {BUCKETS.map((b) => (
+          {/* No "done" here: backfill scopes by classification, not done-ness. */}
+          {BUCKETS.filter((b) => b !== "done").map((b) => (
             <option key={b} value={b}>
               {bucketLabel(b)}
             </option>
@@ -212,8 +279,19 @@ export function TopBar({
   onIngestOpenChange,
   backfillOpen,
   onBackfillOpenChange,
+  layoutOpen,
+  onLayoutOpenChange,
+  arrangement,
+  onArrangement,
+  theme,
+  onTheme,
+  autoSync,
+  onAutoSync,
 }: Props) {
   const s = overview?.summary;
+  const ThemeIcon = THEME_ICONS[theme];
+  const nextTheme =
+    THEME_PREFS[(THEME_PREFS.indexOf(theme) + 1) % THEME_PREFS.length];
   return (
     <header className="h-11 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center gap-3 px-3">
       <div className="flex items-center gap-2 mr-1">
@@ -228,7 +306,9 @@ export function TopBar({
         </span>
       </div>
 
-      <div className="flex items-center gap-1.5">
+      {/* Stats and the email are the first things to go on narrow windows —
+          the action buttons matter more than the vanity row. */}
+      <div className="hidden md:flex items-center gap-1.5">
         <Stat label="threads" value={s?.threads ?? "—"} />
         <Stat label="msgs" value={s?.messages ?? "—"} />
         <Stat label="classified" value={s?.classified ?? "—"} />
@@ -261,6 +341,8 @@ export function TopBar({
             onIngestOpenChange(false);
             onIngest(o);
           }}
+          autoSync={autoSync}
+          onAutoSync={onAutoSync}
         />
       </Popover>
 
@@ -293,9 +375,35 @@ export function TopBar({
         />
       </Popover>
 
+      <Popover
+        open={layoutOpen}
+        onOpenChange={onLayoutOpenChange}
+        trigger={
+          <button
+            onClick={() => onLayoutOpenChange(!layoutOpen)}
+            aria-expanded={layoutOpen}
+            className="h-7 px-2.5 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors"
+          >
+            <Columns3 className="h-3 w-3" />
+            layout
+          </button>
+        }
+      >
+        <LayoutPicker arrangement={arrangement} onArrangement={onArrangement} />
+      </Popover>
+
+      <button
+        onClick={() => onTheme(nextTheme)}
+        aria-label={`Theme: ${theme}. Switch to ${nextTheme}.`}
+        title={`theme: ${theme} → ${nextTheme}`}
+        className="h-7 w-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center justify-center text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+      >
+        <ThemeIcon className="h-3 w-3" />
+      </button>
+
       <div className="mx-1 h-5 w-px bg-border" />
 
-      <span className="text-[11.5px] font-mono text-muted-foreground truncate max-w-[180px]">
+      <span className="hidden md:inline text-[11.5px] font-mono text-muted-foreground truncate max-w-[180px]">
         {user?.email ?? "—"}
       </span>
       <button

@@ -36,12 +36,81 @@
 }
 
 /*
-  Phosphor Terminal — a true-neutral near-black console lit by a single amber
-  phosphor accent. Neutrals sit at chroma 0 so the only color in the chrome is
-  the amber (selection, primary) and the six label hues; nothing else competes.
+  Phosphor Terminal — true-neutral chroma-0 surfaces lit by a single amber
+  phosphor accent, so the only color in the chrome is the amber (selection,
+  primary) and the six label hues; nothing else competes.
+
+  Two palettes: light "paper terminal" on :root, the original near-black
+  console under .dark (a tiny script in index.html sets the class before
+  first paint; lib/theme.ts keeps it in sync with the user's preference).
 */
 :root {
   --radius: 0.3125rem;
+  --background: oklch(0.965 0 0);
+  --foreground: oklch(0.22 0 0);
+  --panel: oklch(0.99 0 0);
+  --panel-hi: oklch(0.925 0 0);
+  --card: oklch(0.99 0 0);
+  --card-foreground: oklch(0.22 0 0);
+  --popover: oklch(0.985 0 0);
+  --popover-foreground: oklch(0.22 0 0);
+  --primary: oklch(0.55 0.13 80);
+  --primary-foreground: oklch(0.98 0.02 80);
+  --secondary: oklch(0.92 0 0);
+  --secondary-foreground: oklch(0.25 0 0);
+  --muted: oklch(0.92 0 0);
+  --muted-foreground: oklch(0.45 0 0);
+  --accent: oklch(0.92 0 0);
+  --accent-foreground: oklch(0.15 0 0);
+  --destructive: oklch(0.55 0.2 25);
+  --destructive-foreground: oklch(0.98 0 0);
+  --border: oklch(0.87 0 0);
+  --input: oklch(0.87 0 0);
+  --ring: oklch(0.55 0.13 80);
+
+  /* six label hues + confidence tiers, tuned for ~4.5:1 on the light panels */
+  --lbl-needs-reply-dot: oklch(0.58 0.19 22);
+  --lbl-needs-reply-text: oklch(0.5 0.17 22);
+  --lbl-needs-reply-soft: oklch(0.58 0.19 22 / 0.1);
+  --lbl-needs-reply-border: oklch(0.58 0.19 22 / 0.4);
+  --lbl-action-required-dot: oklch(0.6 0.15 52);
+  --lbl-action-required-text: oklch(0.5 0.13 54);
+  --lbl-action-required-soft: oklch(0.6 0.15 52 / 0.1);
+  --lbl-action-required-border: oklch(0.6 0.15 52 / 0.4);
+  --lbl-fyi-dot: oklch(0.55 0.11 235);
+  --lbl-fyi-text: oklch(0.47 0.1 235);
+  --lbl-fyi-soft: oklch(0.55 0.11 235 / 0.1);
+  --lbl-fyi-border: oklch(0.55 0.11 235 / 0.4);
+  --lbl-promotional-dot: oklch(0.55 0.15 322);
+  --lbl-promotional-text: oklch(0.48 0.13 322);
+  --lbl-promotional-soft: oklch(0.55 0.15 322 / 0.1);
+  --lbl-promotional-border: oklch(0.55 0.15 322 / 0.4);
+  --lbl-security-alert-dot: oklch(0.55 0.21 12);
+  --lbl-security-alert-text: oklch(0.48 0.19 14);
+  --lbl-security-alert-soft: oklch(0.55 0.21 12 / 0.1);
+  --lbl-security-alert-border: oklch(0.55 0.21 12 / 0.4);
+  --lbl-spam-dot: oklch(0.55 0.015 260);
+  --lbl-spam-text: oklch(0.48 0.012 260);
+  --lbl-spam-soft: oklch(0.55 0.015 260 / 0.12);
+  --lbl-spam-border: oklch(0.55 0.015 260 / 0.45);
+  --conf-hi: oklch(0.55 0.15 150);
+  --conf-hi-text: oklch(0.5 0.14 150);
+  --conf-mid: oklch(0.62 0.12 82);
+  --conf-mid-text: oklch(0.52 0.11 82);
+  --conf-low: oklch(0.55 0.19 25);
+  --conf-low-text: oklch(0.5 0.17 25);
+  --success: oklch(0.5 0.14 150);
+
+  /* per-theme shadow + selection ingredients */
+  --shadow-lift: inset 0 1px 0 oklch(1 0 0 / 0.6);
+  --shadow-elevated: 0 0 0 1px oklch(0 0 0 / 0.08),
+    0 24px 48px -16px oklch(0 0 0 / 0.25), inset 0 1px 0 oklch(1 0 0 / 0.7);
+  --shadow-phosphor: 0 0 0 1px oklch(0.55 0.13 80 / 0.4),
+    0 0 16px -6px oklch(0.55 0.13 80 / 0.35);
+  --selection-bg: oklch(0.55 0.13 80 / 0.22);
+}
+
+.dark {
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.925 0 0);
   --panel: oklch(0.185 0 0);
@@ -63,6 +132,45 @@
   --border: oklch(0.275 0 0);
   --input: oklch(0.275 0 0);
   --ring: oklch(0.82 0.145 80);
+
+  --lbl-needs-reply-dot: oklch(0.66 0.18 22);
+  --lbl-needs-reply-text: oklch(0.78 0.14 22);
+  --lbl-needs-reply-soft: oklch(0.66 0.18 22 / 0.12);
+  --lbl-needs-reply-border: oklch(0.66 0.18 22 / 0.45);
+  --lbl-action-required-dot: oklch(0.74 0.15 52);
+  --lbl-action-required-text: oklch(0.82 0.12 54);
+  --lbl-action-required-soft: oklch(0.74 0.15 52 / 0.12);
+  --lbl-action-required-border: oklch(0.74 0.15 52 / 0.45);
+  --lbl-fyi-dot: oklch(0.68 0.09 235);
+  --lbl-fyi-text: oklch(0.78 0.08 235);
+  --lbl-fyi-soft: oklch(0.68 0.09 235 / 0.12);
+  --lbl-fyi-border: oklch(0.68 0.09 235 / 0.45);
+  --lbl-promotional-dot: oklch(0.66 0.13 322);
+  --lbl-promotional-text: oklch(0.77 0.11 322);
+  --lbl-promotional-soft: oklch(0.66 0.13 322 / 0.12);
+  --lbl-promotional-border: oklch(0.66 0.13 322 / 0.45);
+  --lbl-security-alert-dot: oklch(0.64 0.21 12);
+  --lbl-security-alert-text: oklch(0.76 0.17 14);
+  --lbl-security-alert-soft: oklch(0.64 0.21 12 / 0.12);
+  --lbl-security-alert-border: oklch(0.64 0.21 12 / 0.45);
+  --lbl-spam-dot: oklch(0.55 0.015 260);
+  --lbl-spam-text: oklch(0.66 0.012 260);
+  --lbl-spam-soft: oklch(0.55 0.015 260 / 0.14);
+  --lbl-spam-border: oklch(0.55 0.015 260 / 0.5);
+  --conf-hi: oklch(0.72 0.15 150);
+  --conf-hi-text: oklch(0.78 0.13 150);
+  --conf-mid: oklch(0.78 0.13 82);
+  --conf-mid-text: oklch(0.82 0.12 82);
+  --conf-low: oklch(0.66 0.19 25);
+  --conf-low-text: oklch(0.74 0.17 25);
+  --success: oklch(0.82 0.13 150);
+
+  --shadow-lift: inset 0 1px 0 oklch(1 0 0 / 0.04);
+  --shadow-elevated: 0 0 0 1px oklch(0 0 0 / 0.55),
+    0 28px 64px -20px oklch(0 0 0 / 0.75), inset 0 1px 0 oklch(1 0 0 / 0.05);
+  --shadow-phosphor: 0 0 0 1px oklch(0.82 0.145 80 / 0.35),
+    0 0 16px -6px oklch(0.82 0.145 80 / 0.5);
+  --selection-bg: oklch(0.82 0.145 80 / 0.28);
 }
 
 @layer base {
@@ -83,7 +191,7 @@
     text-rendering: optimizeLegibility;
   }
   ::selection {
-    background: oklch(0.82 0.145 80 / 0.28);
+    background: var(--selection-bg);
     color: var(--color-foreground);
   }
   /* Keyboard focus is first-class in an operator console: a crisp amber ring,
@@ -100,22 +208,18 @@
 
 /* Subtle "lit from above" highlight that gives flat panels a touch of depth. */
 @utility panel-lift {
-  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.04);
+  box-shadow: var(--shadow-lift);
 }
 
 /* Overlay elevation: a defined ring + deep shadow so modals read as floating,
    not painted on. One purposeful shadow, not decoration. */
 @utility elevated {
-  box-shadow:
-    0 0 0 1px oklch(0 0 0 / 0.55),
-    0 28px 64px -20px oklch(0 0 0 / 0.75),
-    inset 0 1px 0 oklch(1 0 0 / 0.05);
+  box-shadow: var(--shadow-elevated);
 }
 
 /* A key on the amber accent — for the primary CTA and the selected row rail. */
 @utility phosphor {
-  box-shadow: 0 0 0 1px oklch(0.82 0.145 80 / 0.35),
-    0 0 16px -6px oklch(0.82 0.145 80 / 0.5);
+  box-shadow: var(--shadow-phosphor);
 }
 
 @utility kbd {
@@ -145,4 +249,68 @@
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
   }
+}
+
+/* Sanitized email HTML renders on its own light card (email assumes a light
+   background, whatever theme the console is in). Keep its layout tame:
+   `contain: paint` makes the card the containing block for any absolutely or
+   fixed positioned email content and clips its painting to the card — without
+   it, a `position:absolute; top:3000px` newsletter escapes the pane and grows
+   a page-level scrollbar to nowhere. */
+.email-html {
+  color-scheme: light;
+  overflow-wrap: break-word;
+  contain: paint;
+}
+.email-html img {
+  max-width: 100%;
+  height: auto;
+}
+.email-html a {
+  color: #1d4ed8;
+  text-decoration: underline;
+}
+.email-html p,
+.email-html ul,
+.email-html ol,
+.email-html table {
+  margin: 0 0 0.75em;
+}
+.email-html ul,
+.email-html ol {
+  padding-left: 1.25em;
+}
+.email-html blockquote {
+  margin: 0 0 0.75em;
+  padding-left: 0.75em;
+  border-left: 2px solid #d4d4d4;
+  color: #525252;
+}
+.email-html table {
+  border-collapse: collapse;
+  max-width: 100%;
+}
+.email-html :last-child {
+  margin-bottom: 0;
+}
+
+/* Resizable pane separators (react-resizable-panels). The hairline reads as
+   the old border-r/b between panes; it lights amber while hovered, keyboard
+   focused, or mid-drag. The library keeps the grab target ~10px wide around
+   the 1px visual, and stores its interaction state in the data attribute. */
+[data-separator] {
+  background: var(--color-border);
+  transition: background-color 120ms;
+}
+[data-separator="hover"],
+[data-separator="focus"],
+[data-separator="active"] {
+  background: var(--color-primary);
+}
+
+/* While a pane grip is being dragged to a new spot. */
+body.pane-dragging,
+body.pane-dragging * {
+  cursor: grabbing !important;
+  user-select: none;
 }

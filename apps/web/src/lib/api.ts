@@ -16,8 +16,10 @@ import {
   mockBackfill,
   mockCounts,
   mockDeleteThread,
+  mockIngest,
   mockOverview,
   mockSearch,
+  mockSetDone,
   mockThread,
   mockTriage,
   mockUser,
@@ -160,6 +162,23 @@ export async function searchThreads(
   );
 }
 
+// Mark a thread done (clears it from the open triage buckets, keeps it
+// searchable and in the `done` bucket) or restore it with done=false.
+export async function setThreadDone(
+  threadId: string,
+  done: boolean,
+): Promise<void> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 120));
+    mockSetDone(threadId, done);
+    return;
+  }
+  await request<{ thread_id: string; done: boolean }>(
+    `/mail/thread/${encodeURIComponent(threadId)}/done`,
+    { method: "POST", body: JSON.stringify({ done }) },
+  );
+}
+
 // Permanently delete a thread (and its messages/classifications via cascade).
 export async function deleteThread(threadId: string): Promise<void> {
   if (USE_MOCK) {
@@ -170,23 +189,194 @@ export async function deleteThread(threadId: string): Promise<void> {
   await request<void>(`/mail/thread/${threadId}`, { method: "DELETE" });
 }
 
+// Fire-and-forget delete for when the page is going away while a delete is
+// still inside its undo window — keepalive lets the request outlive the
+// document, so a reload/close doesn't silently drop the deletion.
+export function flushDeleteThread(threadId: string): void {
+  if (USE_MOCK) {
+    mockDeleteThread(threadId);
+    return;
+  }
+  const token = getToken();
+  void fetch(`${BASE}/mail/thread/${encodeURIComponent(threadId)}`, {
+    method: "DELETE",
+    keepalive: true,
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  }).catch(() => {
+    /* page is unloading; nothing left to report to */
+  });
+}
+
 export async function getOverview(): Promise<Overview> {
   if (USE_MOCK) return mockOverview();
   return request<Overview>("/analytics/overview");
 }
 
+// Queues a Gmail pull on the worker. `max_results` is a THREAD count now, so N
+// gives you N threads (and all their messages), not N messages. With
+// `refreshExisting` the pull re-fetches threads already in the DB (the upsert
+// refreshes their bodies) instead of skipping ahead to new ones. `newOnly`
+// (auto-sync) pulls just mail newer than the newest known thread — no
+// backfill of older history. The real API returns a task_id to poll; the
+// mock resolves as if already done.
 export async function ingestGmail(
   max_results = 50,
   classify = true,
-): Promise<{ status: string; ingested?: number }> {
+  refreshExisting = false,
+  newOnly = false,
+): Promise<SyncRunStatus & { new_threads?: number }> {
   if (USE_MOCK) {
-    await new Promise((r) => setTimeout(r, 700));
-    return { status: "ok", ingested: max_results };
+    await new Promise((r) => setTimeout(r, 150));
+    const newThreads = mockIngest();
+    // The mock "inbox" actually receives mail on each pull, so auto-sync and
+    // the new-mail pill are demoable (and testable) offline.
+    return {
+      run_id: "mock-run",
+      task_id: undefined,
+      mode: newOnly ? "auto" : "manual",
+      status: "succeeded",
+      ready: true,
+      deduplicated: false,
+      result: { status: "ok", threads_upserted: newThreads, new_threads: newThreads },
+      new_threads: newThreads,
+    };
   }
-  return request<{ status: string; ingested?: number }>(
-    `/mail/ingest/gmail?max_results=${max_results}&classify=${classify}`,
+  return request<SyncRunStatus>(
+    `/mail/ingest/gmail?max_results=${max_results}&classify=${classify}` +
+      `&skip_existing=${!refreshExisting}&new_only=${newOnly}`,
     { method: "POST" },
   );
+}
+
+// Result payload a worker task reports back through the status endpoint.
+// Ingest reports upsert counts, backfill reports created/scanned, and the
+// classify queue reports created/processed; `status: "error"` is a user-facing
+// problem (e.g. Gmail not connected) that still comes back as a *completed* task.
+export interface TaskResult {
+  status?: string;
+  detail?: string;
+  threads_upserted?: number;
+  messages_upserted?: number;
+  classified?: number;
+  threads_reopened?: number;
+  fetched?: number;
+  skipped_existing?: number;
+  // Mail that actually arrived since the last pull; threads_upserted also
+  // counts older history the deduping ingest backfilled.
+  new_threads?: number;
+  created?: number;
+  scanned?: number;
+  processed?: number;
+}
+
+export interface SyncRunStatus {
+  run_id: string;
+  task_id?: string;
+  mode: string;
+  status: string;
+  ready: boolean;
+  deduplicated: boolean;
+  result?: TaskResult | null;
+  error?: string | null;
+}
+
+export async function getActiveSync(signal?: AbortSignal): Promise<SyncRunStatus | null> {
+  if (USE_MOCK) return null;
+  return request<SyncRunStatus | null>("/mail/sync/active", { signal });
+}
+
+export async function getSyncRun(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<SyncRunStatus> {
+  if (USE_MOCK) {
+    return {
+      run_id: runId,
+      mode: "auto",
+      status: "succeeded",
+      ready: true,
+      deduplicated: false,
+      result: { status: "ok" },
+    };
+  }
+  return request<SyncRunStatus>(`/mail/sync/${encodeURIComponent(runId)}`, { signal });
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export async function waitForSyncRun(
+  runId: string,
+  {
+    signal,
+    timeoutMs = WORKER_TASK_TIMEOUT_MS,
+  }: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<SyncRunStatus> {
+  const started = Date.now();
+  for (;;) {
+    const run = await getSyncRun(runId, signal);
+    if (run.ready) return run;
+    if (Date.now() - started >= timeoutMs) return run;
+    await abortableDelay(Date.now() - started < 60_000 ? 2000 : 10_000, signal);
+  }
+}
+
+export interface TaskStatus {
+  task_id: string;
+  state: string;
+  ready: boolean;
+  result?: TaskResult | null;
+  error?: string;
+}
+
+// Ingest workers have a 30-minute hard limit. Poll beyond that boundary so a
+// slow but healthy task still produces one authoritative UI refresh instead
+// of silently finishing after the browser gave up at 90/120 seconds.
+export const WORKER_TASK_TIMEOUT_MS = 35 * 60 * 1000;
+
+export async function getTaskStatus(taskId: string): Promise<TaskStatus> {
+  if (USE_MOCK) {
+    // Mock "workers" finish instantly, so any polled task is already done.
+    await new Promise((r) => setTimeout(r, 300));
+    return { task_id: taskId, state: "SUCCESS", ready: true, result: { status: "ok" } };
+  }
+  return request<TaskStatus>(`/mail/tasks/${encodeURIComponent(taskId)}`);
+}
+
+// Poll a queued task until it finishes. Returns the final status; if it's still
+// running when the timeout hits, returns the last (not-ready) status so the
+// caller can decide what to do rather than hanging forever.
+export async function waitForTask(
+  taskId: string,
+  {
+    intervalMs = 1500,
+    timeoutMs = 120_000,
+    signal,
+  }: { intervalMs?: number; timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<TaskStatus> {
+  const start = Date.now();
+  // eslint-disable-next-line no-constant-condition
+  for (;;) {
+    const status = await getTaskStatus(taskId);
+    if (status.ready) return status;
+    if (Date.now() - start >= timeoutMs) return status;
+    await abortableDelay(intervalMs, signal);
+  }
 }
 
 export async function classifyBackfill(

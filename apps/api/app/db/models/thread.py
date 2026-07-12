@@ -42,6 +42,9 @@ class MailThread(Base):
     provider_thread_id: Mapped[str] = mapped_column(Text, nullable=False)
     subject: Mapped[str | None] = mapped_column(Text)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Triage "done" marker: null = open, timestamp = when the operator cleared
+    # it. Done threads leave every open bucket but stay searchable.
+    done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default="now()"
     )

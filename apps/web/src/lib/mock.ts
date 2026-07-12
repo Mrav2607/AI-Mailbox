@@ -88,6 +88,10 @@ function makeItems(count: number): TriageItem[] {
 
 const ALL = makeItems(140);
 
+// Thread ids the operator has marked done — the mock's stand-in for the
+// server's done_at column. Done threads leave every open bucket.
+const DONE = new Set<string>();
+
 export function mockUser(): User {
   return { id: "u_local", email: "operator@local.dev", display_name: "Operator" };
 }
@@ -101,10 +105,14 @@ export function mockOverview(): Overview {
 
 export function mockTriage(bucket: BucketKey, limit: number): TriageResponse {
   let items: TriageItem[];
-  if (bucket === "all") items = ALL;
-  else if (bucket === "unclassified")
-    items = ALL.filter((i) => !i.classification.label);
-  else items = ALL.filter((i) => i.classification.label === bucket);
+  if (bucket === "done") items = ALL.filter((i) => DONE.has(i.thread_id));
+  else {
+    const open = ALL.filter((i) => !DONE.has(i.thread_id));
+    if (bucket === "all") items = open;
+    else if (bucket === "unclassified")
+      items = open.filter((i) => !i.classification.label);
+    else items = open.filter((i) => i.classification.label === bucket);
+  }
   return { bucket, items: items.slice(0, limit) };
 }
 
@@ -116,15 +124,49 @@ export function mockCounts(): Record<BucketKey, number> {
     promotional: 0,
     security_alert: 0,
     spam: 0,
-    all: ALL.length,
+    all: 0,
     unclassified: 0,
+    done: 0,
   };
   for (const item of ALL) {
+    if (DONE.has(item.thread_id)) {
+      counts.done += 1;
+      continue;
+    }
+    counts.all += 1;
     const label = item.classification.label;
     if (label) counts[label] += 1;
     else counts.unclassified += 1;
   }
   return counts;
+}
+
+// Each mock "ingest" delivers exactly two fresh threads — deterministic on
+// purpose so preview demos and headless tests can assert exact pill counts.
+let ingestSeq = 0;
+
+export function mockIngest(): number {
+  const now = Date.now();
+  for (let n = 0; n < 2; n++) {
+    ingestSeq += 1;
+    ALL.unshift({
+      thread_id: `mock-new-${ingestSeq}`,
+      subject: `New mail #${ingestSeq}`,
+      last_message_at: new Date(now - n * 1000).toISOString(),
+      latest_message_snippet: rand(SNIPPETS, ingestSeq),
+      classification: {
+        label: "needs_reply",
+        confidence: 0.9,
+        model_version: "heuristic-v1",
+      },
+    });
+  }
+  return 2;
+}
+
+export function mockSetDone(threadId: string, done: boolean) {
+  if (done) DONE.add(threadId);
+  else DONE.delete(threadId);
 }
 
 export function mockThread(id: string): ThreadDetail {
@@ -141,13 +183,22 @@ export function mockThread(id: string): ThreadDetail {
       rand(SNIPPETS, k + id.length) +
       "\n\nMore context follows — this is the full message body rendered in the right pane for QA against the model prediction. The operator should be able to scan it quickly and decide whether the label is correct.\n\nThanks,\n" +
       rand(SENDERS, k + id.length),
+    // Last message renders as HTML so preview mode exercises that path too.
+    body_html:
+      k === 2
+        ? `<p>${rand(SNIPPETS, k + id.length)}</p><p>This message arrived as <strong>HTML</strong>, so it renders formatted: <a href="https://example.com">a link</a>, a list…</p><ul><li>first point</li><li>second point</li></ul><p>Thanks,<br>${rand(SENDERS, k + id.length)}</p>`
+        : null,
   }));
   return {
     thread: {
       id,
       subject: item.subject,
       provider: "gmail",
+      // Fake but shaped like Gmail's hex thread ids, so the open-in-Gmail
+      // link renders in preview (it just won't resolve to real mail).
+      provider_thread_id: id.replace(/-/g, ""),
       last_message_at: item.last_message_at,
+      done: DONE.has(id),
     },
     messages,
   };

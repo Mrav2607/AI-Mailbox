@@ -15,7 +15,7 @@ export const ALL_LABELS: Label[] = [
   "spam",
 ];
 
-export type BucketKey = Label | "all" | "unclassified";
+export type BucketKey = Label | "all" | "unclassified" | "done";
 
 export const BUCKETS: BucketKey[] = [
   "needs_reply",
@@ -26,6 +26,7 @@ export const BUCKETS: BucketKey[] = [
   "spam",
   "all",
   "unclassified",
+  "done",
 ];
 
 export interface Classification {
@@ -63,6 +64,8 @@ export type ClassifierBackend = "local" | "gemini" | "heuristic";
 export interface IngestOptions {
   maxResults: number;
   classify: boolean;
+  // Re-pull threads that are already in the DB (refreshes their bodies).
+  refreshExisting: boolean;
 }
 
 export interface BackfillOptions {
@@ -84,6 +87,7 @@ export interface ThreadMessage {
   sender: string | null;
   snippet: string | null;
   body_text: string | null;
+  body_html: string | null;
 }
 
 export interface ThreadDetail {
@@ -91,7 +95,10 @@ export interface ThreadDetail {
     id: string;
     subject: string | null;
     provider: string;
+    // The provider's own thread id — powers the open-in-Gmail deep link.
+    provider_thread_id: string | null;
     last_message_at: string | null;
+    done: boolean;
   };
   messages: ThreadMessage[];
 }

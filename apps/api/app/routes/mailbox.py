@@ -1,20 +1,23 @@
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 from sqlalchemy import select, desc, or_, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.ratelimit import user_rate_limit
 from app.deps import get_db, get_current_user
-from app.db.models import MailThread, MailMessage, Classification, AppUser
+from app.db.models import MailThread, MailMessage, Classification, AppUser, MailSyncRun
+from app.workers.celery_app import celery_app
 from app.workers.tasks_ingest import ingest_gmail_for_user
 from app.workers.tasks_nlp import backfill_threads_for_user, classify_latest_threads
 from app.services.nlp.backfill import latest_label_subquery, run_backfill
 from app.services.nlp.classifier import LABELS
 from app.services.nlp.persistence import upsert_classification
+from app.services.sync_runs import QUEUED_SYNC_LEASE, active_sync, now_utc, sync_payload
 
 router = APIRouter(prefix="/mail")
 
@@ -26,8 +29,11 @@ _MAX_INGEST_RESULTS = 500
 # anything bigger goes to the Celery worker (a 500-thread Gemini run can hold
 # a request open for minutes).
 _MAX_INLINE_BACKFILL = 50
-# Valid triage filters: every classifier label plus the two synthetic buckets.
-_TRIAGE_BUCKETS = frozenset(LABELS) | {"all", "unclassified"}
+# Valid triage filters: every classifier label plus the synthetic buckets.
+_TRIAGE_BUCKETS = frozenset(LABELS) | {"all", "unclassified", "done"}
+# Backfill scopes by classification state, not done-ness, so it doesn't take
+# the "done" bucket.
+_BACKFILL_BUCKETS = _TRIAGE_BUCKETS - {"done"}
 # Classifier backends a caller may request per run (see services.nlp.classify).
 _CLASSIFIER_BACKENDS = frozenset({"local", "gemini", "heuristic", "auto"})
 # Marks a label set by a human in the console rather than a model, so it's
@@ -38,6 +44,10 @@ _OPERATOR_MODEL_VERSION = "user-override"
 
 class ReclassifyRequest(BaseModel):
     label: str
+
+
+class DoneRequest(BaseModel):
+    done: bool
 
 
 def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]:
@@ -133,11 +143,16 @@ def get_triage(
     query = select(MailThread).where(MailThread.user_id == current_user.id)
     # Filter by bucket in SQL, before the limit, so a specific-label view returns
     # up to `limit` matching threads instead of whatever matches happen to fall
-    # inside the `limit` most-recent threads overall.
-    if bucket == "unclassified":
-        query = query.where(latest_label_subquery().is_(None))
-    elif bucket != "all":
-        query = query.where(latest_label_subquery() == bucket)
+    # inside the `limit` most-recent threads overall. Done threads live only in
+    # the `done` bucket; every open bucket (including `all`) excludes them.
+    if bucket == "done":
+        query = query.where(MailThread.done_at.is_not(None))
+    else:
+        query = query.where(MailThread.done_at.is_(None))
+        if bucket == "unclassified":
+            query = query.where(latest_label_subquery().is_(None))
+        elif bucket != "all":
+            query = query.where(latest_label_subquery() == bucket)
 
     threads = list(
         db.execute(
@@ -168,7 +183,11 @@ def get_counts(
     grouped = (
         select(bucket_label)
         .select_from(MailThread)
-        .where(MailThread.user_id == current_user.id)
+        .where(
+            MailThread.user_id == current_user.id,
+            # Open buckets only; done threads are counted separately below.
+            MailThread.done_at.is_(None),
+        )
         .subquery()
     )
     rows = db.execute(
@@ -185,6 +204,14 @@ def get_counts(
         elif label in counts:
             counts[label] += count
     counts["all"] = total
+    counts["done"] = db.execute(
+        select(func.count())
+        .select_from(MailThread)
+        .where(
+            MailThread.user_id == current_user.id,
+            MailThread.done_at.is_not(None),
+        )
+    ).scalar_one()
     return {"counts": counts}
 
 
@@ -217,7 +244,11 @@ def get_thread(
             "id": str(thread.id),
             "subject": thread.subject,
             "provider": thread.provider,
+            # The provider's own thread id, so the console can deep-link back
+            # to the source mailbox (Gmail's #all/<id> URL).
+            "provider_thread_id": thread.provider_thread_id,
             "last_message_at": thread.last_message_at,
+            "done": thread.done_at is not None,
         },
         "messages": [
             {
@@ -226,6 +257,7 @@ def get_thread(
                 "sender": m.sender,
                 "snippet": m.snippet,
                 "body_text": m.body_text,
+                "body_html": m.body_html,
             }
             for m in messages
         ],
@@ -294,6 +326,37 @@ def reclassify_thread(
             "confidence": 1.0,
             "model_version": _OPERATOR_MODEL_VERSION,
         },
+    }
+
+
+@router.post("/thread/{thread_id}/done")
+def set_thread_done(
+    thread_id: UUID,
+    payload: DoneRequest,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Mark a thread done (cleared from triage) or restore it.
+
+    Done is the non-destructive exit from the triage buckets: the thread moves
+    to the ``done`` bucket and stays searchable, unlike delete. Idempotent —
+    re-marking a done thread keeps its original ``done_at``.
+    """
+    thread = db.get(MailThread, thread_id)
+    # 404 (not 403) for another user's thread so we don't leak that it exists.
+    if not thread or thread.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    if payload.done and thread.done_at is None:
+        thread.done_at = datetime.now(timezone.utc)
+    elif not payload.done:
+        thread.done_at = None
+    db.commit()
+
+    return {
+        "thread_id": str(thread_id),
+        "done": thread.done_at is not None,
+        "done_at": thread.done_at,
     }
 
 
@@ -382,7 +445,11 @@ def ingest_gmail(
     max_results: int = Query(default=25, ge=1, le=_MAX_INGEST_RESULTS),
     skip_existing: bool = True,
     classify: bool = True,
+    # Pull only mail newer than the newest known thread (what auto-sync
+    # wants), instead of also backfilling older history up to max_results.
+    new_only: bool = False,
     current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict:
     """Queue a Gmail pull for the worker instead of running it inline.
 
@@ -390,13 +457,104 @@ def ingest_gmail(
     way too slow to hold a request open for, so we hand it to Celery and
     return 202 with the task id.
     """
-    task = cast(Any, ingest_gmail_for_user).delay(
-        user_id=str(current_user.id),
-        max_results=max_results,
-        skip_existing=skip_existing,
-        classify_messages=classify,
+    existing = active_sync(db, current_user.id)
+    if existing:
+        return sync_payload(existing, deduplicated=True)
+
+    now = now_utc()
+    run = MailSyncRun(
+        id=uuid4(),
+        user_id=current_user.id,
+        mode="auto" if new_only else ("refresh" if not skip_existing else "manual"),
+        status="queued",
+        options={
+            "max_results": max_results,
+            "skip_existing": skip_existing,
+            "classify_messages": classify,
+            "new_only": new_only,
+        },
+        lease_expires_at=now + QUEUED_SYNC_LEASE,
     )
-    return {"status": "queued", "task_id": task.id}
+    db.add(run)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        winner = active_sync(db, current_user.id)
+        if winner:
+            return sync_payload(winner, deduplicated=True)
+        raise
+
+    try:
+        task = cast(Any, ingest_gmail_for_user).delay(
+            run_id=str(run.id),
+            user_id=str(current_user.id),
+            max_results=max_results,
+            skip_existing=skip_existing,
+            classify_messages=classify,
+            new_only=new_only,
+        )
+        run.task_id = task.id
+        db.commit()
+    except Exception:
+        run.status = "failed"
+        run.error = "failed to enqueue sync"
+        run.completed_at = now_utc()
+        db.commit()
+        raise
+    return sync_payload(run)
+
+
+@router.get("/sync/active")
+def get_active_sync(
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict | None:
+    run = active_sync(db, current_user.id)
+    return sync_payload(run) if run else None
+
+
+@router.get("/sync/{run_id}")
+def get_sync_run(
+    run_id: UUID,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    run = db.get(MailSyncRun, run_id)
+    if not run or run.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if run.status in ("queued", "running", "retrying") and run.lease_expires_at < now_utc():
+        run.status = "failed"
+        run.error = "sync lease expired"
+        run.completed_at = now_utc()
+        db.commit()
+    return sync_payload(run)
+
+
+@router.get("/tasks/{task_id}")
+def get_task_status(
+    task_id: str,
+    current_user: AppUser = Depends(get_current_user),
+) -> dict:
+    """Report a queued job's state so the UI can wait for it to finish before
+    refreshing -- otherwise it refetches against a DB the worker hasn't written
+    to yet, and nothing appears until the operator navigates or reloads.
+    """
+    result = celery_app.AsyncResult(task_id)
+    ready = result.ready()
+    payload: dict[str, Any] = {"task_id": task_id, "state": result.state, "ready": ready}
+    if ready:
+        if result.successful():
+            data = result.result
+            # Worker tasks return a dict carrying user_id; don't hand one user
+            # another user's job outcome (task ids are opaque, but cheap to check).
+            if isinstance(data, dict) and data.get("user_id") not in (None, str(current_user.id)):
+                raise HTTPException(status_code=404, detail="Not Found")
+            payload["result"] = data
+        else:
+            # A failed task stores the exception; surface a string, not a 500.
+            payload["error"] = str(result.result) if result.result else "task failed"
+    return payload
 
 
 @router.post(
@@ -430,10 +588,10 @@ def backfill_classifications(
     anything bigger is handed to the worker and answered with 202 + task id,
     since a large Gemini batch can hold the request open for minutes.
     """
-    if bucket not in _TRIAGE_BUCKETS:
+    if bucket not in _BACKFILL_BUCKETS:
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid bucket '{bucket}'. Valid: {sorted(_TRIAGE_BUCKETS)}",
+            detail=f"Invalid bucket '{bucket}'. Valid: {sorted(_BACKFILL_BUCKETS)}",
         )
     # classify() lowercases its backend anyway, but normalize here so one
     # canonical value flows into task kwargs and logs.

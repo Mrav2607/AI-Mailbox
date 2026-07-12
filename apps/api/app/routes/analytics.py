@@ -25,6 +25,11 @@ async def analytics_overview(
         .select_from(Classification)
         .join(MailMessage, Classification.message_id == MailMessage.id)
         .join(MailThread, MailMessage.thread_id == MailThread.id)
-        .where(MailThread.user_id == user_id)
+        .where(
+            MailThread.user_id == user_id,
+            # A classifier may persist a row with label=None. That remains
+            # unclassified everywhere else and must not inflate this metric.
+            Classification.label.is_not(None),
+        )
     ) or 0
     return {"summary": {"threads": threads_count, "messages": messages_count, "classified": classified_count}}
