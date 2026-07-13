@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.core.logging import logger
 from app.core.security import create_access_token
 from app.db.models import AppUser, ProviderAccount
+from app.db.schemas.auth import AuthUrl, TokenOut
 from app.deps import get_db
 
 router = APIRouter()
@@ -56,7 +57,7 @@ def _consume_state(state: str) -> bool:
     return _state_store().getdel(f"{_STATE_KEY_PREFIX}{state}") is not None
 
 
-@router.get("/start")
+@router.get("/start", response_model=AuthUrl)
 # Sync on purpose. Redis and SQLAlchemy here are both blocking, so an async
 # handler would run them straight on the event loop and stall every other
 # request (and the health probes) for the duration. A plain def gets handed to
@@ -89,7 +90,7 @@ def google_auth_start() -> dict:
     return {"auth_url": f"{GOOGLE_AUTH_URL}?{urlencode(query)}"}
 
 
-@router.get("/callback")
+@router.get("/callback", response_model=TokenOut)
 # Sync for the same reason as /start: this one also commits to Postgres.
 def google_auth_callback(
     code: str | None = None, state: str | None = None, db: Session = Depends(get_db)

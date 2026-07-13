@@ -11,6 +11,18 @@ from sqlalchemy.orm import Session
 from app.core.logging import logger
 from app.core.ratelimit import user_rate_limit
 from app.deps import get_db, get_current_user
+from app.db.schemas.mailbox import (
+    BackfillDone,
+    Counts,
+    Queued,
+    Reclassified,
+    Search,
+    SyncRun,
+    TaskStatus,
+    ThreadDetail,
+    ThreadDone,
+    Triage,
+)
 from app.db.models import MailThread, MailMessage, Classification, AppUser, MailSyncRun
 from app.workers.celery_app import celery_app
 from app.workers.tasks_ingest import ingest_gmail_for_user
@@ -105,7 +117,7 @@ def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]
     return items
 
 
-@router.get("/triage")
+@router.get("/triage", response_model=Triage)
 def get_triage(
     bucket: str = "needs_reply",
     limit: int = Query(default=50, ge=1, le=_MAX_PAGE_LIMIT),
@@ -148,7 +160,7 @@ def get_triage(
     return {"bucket": bucket, "items": _assemble_triage_items(db, threads)}
 
 
-@router.get("/counts")
+@router.get("/counts", response_model=Counts)
 def get_counts(
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -195,7 +207,7 @@ def get_counts(
     return {"counts": counts}
 
 
-@router.get("/thread/{thread_id}")
+@router.get("/thread/{thread_id}", response_model=ThreadDetail)
 def get_thread(
     thread_id: UUID,
     current_user: AppUser = Depends(get_current_user),
@@ -239,7 +251,7 @@ def get_thread(
     }
 
 
-@router.post("/thread/{thread_id}/classification")
+@router.post("/thread/{thread_id}/classification", response_model=Reclassified)
 def reclassify_thread(
     thread_id: UUID,
     payload: ReclassifyRequest,
@@ -299,7 +311,7 @@ def reclassify_thread(
     }
 
 
-@router.post("/thread/{thread_id}/done")
+@router.post("/thread/{thread_id}/done", response_model=ThreadDone)
 def set_thread_done(
     thread_id: UUID,
     payload: DoneRequest,
@@ -339,7 +351,11 @@ def _escape_like(q: str) -> str:
 
 # Generous per-user limit -- the console fires a search per keystroke, but each
 # one is an unanchored ILIKE over body_text, so cap runaway callers.
-@router.get("/search", dependencies=[Depends(user_rate_limit("search", 60, 60))])
+@router.get(
+    "/search",
+    response_model=Search,
+    dependencies=[Depends(user_rate_limit("search", 60, 60))],
+)
 def search_threads(
     q: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(default=50, ge=1, le=_MAX_PAGE_LIMIT),
@@ -384,7 +400,9 @@ def search_threads(
     return {"query": q, "items": _assemble_triage_items(db, threads)}
 
 
-@router.delete("/thread/{thread_id}", status_code=204)
+# response_model=None: a 204 carries no body, so there is nothing to validate
+# and declaring a model here would be a lie in the OpenAPI schema.
+@router.delete("/thread/{thread_id}", status_code=204, response_model=None)
 def delete_thread(
     thread_id: UUID,
     current_user: AppUser = Depends(get_current_user),
@@ -407,6 +425,7 @@ def delete_thread(
 
 @router.post(
     "/ingest/gmail",
+    response_model=SyncRun,
     status_code=202,
     # Each call queues up to 500 Gmail fetches of Celery work; keep it rare.
     dependencies=[Depends(user_rate_limit("ingest-gmail", 5, 60))],
@@ -475,7 +494,8 @@ def ingest_gmail(
     return sync_payload(run)
 
 
-@router.get("/sync/active")
+# Optional: no active run is a legitimate answer, and the SPA branches on null.
+@router.get("/sync/active", response_model=SyncRun | None)
 def get_active_sync(
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -484,7 +504,7 @@ def get_active_sync(
     return sync_payload(run) if run else None
 
 
-@router.get("/sync/{run_id}")
+@router.get("/sync/{run_id}", response_model=SyncRun)
 def get_sync_run(
     run_id: UUID,
     current_user: AppUser = Depends(get_current_user),
@@ -501,7 +521,7 @@ def get_sync_run(
     return sync_payload(run)
 
 
-@router.get("/tasks/{task_id}")
+@router.get("/tasks/{task_id}", response_model=TaskStatus)
 def get_task_status(
     task_id: str,
     current_user: AppUser = Depends(get_current_user),
@@ -538,8 +558,11 @@ def get_task_status(
     return payload
 
 
+# Two shapes on purpose: inline runs report counts, queued ones report a task
+# id. The union keeps both honest in the schema instead of widening to Any.
 @router.post(
     "/classify/backfill",
+    response_model=BackfillDone | Queued,
     # Small backfills run the classifier inline; big ones enqueue worker jobs.
     # Either way each call is expensive, so keep the per-user cadence low.
     dependencies=[Depends(user_rate_limit("classify-backfill", 5, 60))],
@@ -606,6 +629,7 @@ def backfill_classifications(
 
 @router.post(
     "/classify/queue",
+    response_model=Queued,
     # Same story as ingest: each call piles classification work on the worker.
     dependencies=[Depends(user_rate_limit("classify-queue", 5, 60))],
 )

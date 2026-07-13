@@ -6,13 +6,13 @@ Postgres and Redis and returns 503 if either is unreachable.
 """
 
 import redis
-from fastapi import APIRouter
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Response, status
 from sqlalchemy import text
 
 from app.core.config import settings
 from app.core.logging import logger
 from app.db.base import engine
+from app.db.schemas.health import Health, Readiness
 
 router = APIRouter()
 
@@ -20,7 +20,7 @@ router = APIRouter()
 _REDIS_TIMEOUT_SECONDS = 2
 
 
-@router.get("/health")
+@router.get("/health", response_model=Health)
 async def health_check():
     """Verifies liveness."""
     return {"status": "ok"}
@@ -58,13 +58,18 @@ def _check_redis() -> str | None:
             client.close()
 
 
-@router.get("/ready")
-def readiness_check():
+@router.get("/ready", response_model=Readiness)
+def readiness_check(response: Response):
     """Verifies readiness, checks whether backing services are reachable.
 
     Plain ``def`` (not ``async``) so FastAPI runs it in a threadpool -- the DB
     and Redis checks are blocking I/O and would otherwise stall the event loop
     during an outage.
+
+    The failure branch sets the status code on the shared response rather than
+    returning its own JSONResponse: a Response returned directly skips the
+    response_model entirely, so the 503 body would be the one shape nobody ever
+    validated -- which is exactly the shape an on-call probe is reading.
     """
     db_error = _check_database()
     redis_error = _check_redis()
@@ -73,8 +78,7 @@ def readiness_check():
         "redis": redis_error or "ok",
     }
     ready = db_error is None and redis_error is None
-    body = {"status": "ready" if ready else "not ready", "checks": checks}
-    if ready:
-        return body
-    # 503 so probes and load balancers treat the instance as out of rotation.
-    return JSONResponse(status_code=503, content=body)
+    if not ready:
+        # 503 so probes and load balancers treat the instance as out of rotation.
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {"status": "ready" if ready else "not ready", "checks": checks}

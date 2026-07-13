@@ -4,11 +4,12 @@ from sqlalchemy.orm import Session
 
 from app.deps import get_db, get_current_user
 from app.db.models import MailThread, MailMessage, Classification, AppUser
+from app.db.schemas.analytics import Overview
 
 router = APIRouter()
 
 
-@router.get("/analytics/overview")
+@router.get("/analytics/overview", response_model=Overview)
 # Keep this sync so FastAPI runs the blocking SQLAlchemy calls in its threadpool.
 def analytics_overview(
     current_user: AppUser = Depends(get_current_user), db: Session = Depends(get_db)

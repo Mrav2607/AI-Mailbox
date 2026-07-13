@@ -8,6 +8,7 @@ from app.core.ratelimit import rate_limit
 from app.core.security import create_access_token
 from app.deps import get_db, get_current_user
 from app.db.models import AppUser, ProviderAccount
+from app.db.schemas.auth import Connections, Providers, RevokeOut, TokenOut, UserOut
 
 router = APIRouter()
 
@@ -17,14 +18,14 @@ class DemoLoginRequest(BaseModel):
     display_name: str | None = None
 
 
-@router.get("/providers")
+@router.get("/providers", response_model=Providers)
 def list_providers() -> dict:
     # Only what actually works. Outlook is in the DB check constraint and
     # nowhere else -- advertising it here just sets callers up to fail.
     return {"providers": ["gmail"]}
 
 
-@router.get("/me")
+@router.get("/me", response_model=UserOut)
 def get_me(current_user: AppUser = Depends(get_current_user)) -> dict:
     """Return the authenticated user. Lets a client validate its stored token
     and restore the session on reload (401 if the token is missing/invalid)."""
@@ -37,7 +38,11 @@ def get_me(current_user: AppUser = Depends(get_current_user)) -> dict:
 
 # Per-IP limit: this route creates user rows on demand, so don't let one
 # caller mint them in bulk on dev/staging instances.
-@router.post("/demo-login", dependencies=[Depends(rate_limit("demo-login", 10, 60))])
+@router.post(
+    "/demo-login",
+    response_model=TokenOut,
+    dependencies=[Depends(rate_limit("demo-login", 10, 60))],
+)
 def demo_login(payload: DemoLoginRequest, db: Session = Depends(get_db)) -> dict:
     """
     Minimal user bootstrap for local dev. Creates the user record if missing
@@ -70,7 +75,7 @@ def demo_login(payload: DemoLoginRequest, db: Session = Depends(get_db)) -> dict
     }
 
 
-@router.post("/revoke-all")
+@router.post("/revoke-all", response_model=RevokeOut)
 def revoke_all_tokens(
     current_user: AppUser = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
@@ -90,7 +95,7 @@ def revoke_all_tokens(
     return {"status": "revoked"}
 
 
-@router.get("/connections")
+@router.get("/connections", response_model=Connections)
 def list_connections(
     current_user: AppUser = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
