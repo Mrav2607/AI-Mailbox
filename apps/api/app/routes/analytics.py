@@ -9,7 +9,8 @@ router = APIRouter()
 
 
 @router.get("/analytics/overview")
-async def analytics_overview(
+# Keep this sync so FastAPI runs the blocking SQLAlchemy calls in its threadpool.
+def analytics_overview(
     current_user: AppUser = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> dict:
     user_id = current_user.id

@@ -1,4 +1,3 @@
-import asyncio
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -10,7 +9,7 @@ def test_overview_counts_only_non_null_classification_labels():
     db = MagicMock()
     db.scalar.side_effect = [4, 7, 5]
 
-    result = asyncio.run(analytics_overview(current_user=user, db=db))
+    result = analytics_overview(current_user=user, db=db)
 
     assert result == {
         "summary": {"threads": 4, "messages": 7, "classified": 5}
