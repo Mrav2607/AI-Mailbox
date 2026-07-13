@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Text
+from sqlalchemy import Integer, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -24,3 +24,15 @@ class AppUser(Base):
     )
     email: Mapped[str] = mapped_column(Text, unique=True, nullable=False, index=True)
     display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Bump this to invalidate every token this user holds. Each JWT carries the
+    # version it was minted against, and auth rejects any token whose version
+    # doesn't match -- so a stolen token dies the moment the counter moves.
+    #
+    # An int, not a timestamp: iat is truncated to whole seconds, so a time-based
+    # cutoff either kills a token minted right after the revoke or spares one
+    # minted right before it. Integer equality has no such window, and no clock
+    # to disagree about.
+    token_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )

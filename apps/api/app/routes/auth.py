@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -59,7 +60,7 @@ def demo_login(payload: DemoLoginRequest, db: Session = Depends(get_db)) -> dict
         db.commit()
         db.refresh(user)
     return {
-        "access_token": create_access_token(str(user.id)),
+        "access_token": create_access_token(str(user.id), user.token_version),
         "token_type": "bearer",
         "user": {
             "id": str(user.id),
@@ -67,6 +68,26 @@ def demo_login(payload: DemoLoginRequest, db: Session = Depends(get_db)) -> dict
             "display_name": user.display_name,
         },
     }
+
+
+@router.post("/revoke-all")
+def revoke_all_tokens(
+    current_user: AppUser = Depends(get_current_user), db: Session = Depends(get_db)
+) -> dict:
+    """Kill every session token this user holds, including the one presenting
+    this request. Use it when a token leaks -- signing out only clears the
+    browser's copy, which does nothing about a token someone else already has.
+
+    The increment is a SQL expression rather than a read-then-write so two
+    concurrent calls can't both read version 3 and both write 4.
+    """
+    db.execute(
+        update(AppUser)
+        .where(AppUser.id == current_user.id)
+        .values(token_version=AppUser.token_version + 1)
+    )
+    db.commit()  # get_db never commits for us, and an uncommitted revoke is no revoke
+    return {"status": "revoked"}
 
 
 @router.get("/connections")

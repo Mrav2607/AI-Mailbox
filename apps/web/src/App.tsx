@@ -15,6 +15,7 @@ import {
   reclassify,
   searchThreads,
   setThreadDone,
+  revokeAllTokens,
   setToken,
   waitForTask,
   waitForSyncRun,
@@ -990,9 +991,19 @@ export default function Console() {
         onTheme={setTheme}
         autoSync={autoSync}
         onAutoSync={setAutoSync}
-        onLogout={() => {
-          setToken(null);
-          setUser(null);
+        onLogout={async () => {
+          // Revoke server-side first, so the token is dead even if someone has
+          // a copy of it. If that call fails we still clear locally — leaving
+          // the user stuck in a session they asked to leave would be worse —
+          // but we say so, because the token is still live out there.
+          try {
+            await revokeAllTokens();
+          } catch {
+            toast.error("signed out here, but couldn't revoke the session server-side");
+          } finally {
+            setToken(null);
+            setUser(null);
+          }
         }}
       />
 

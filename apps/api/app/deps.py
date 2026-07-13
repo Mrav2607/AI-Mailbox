@@ -38,18 +38,27 @@ def get_current_user(
 ) -> AppUser:
     """Resolve the authenticated AppUser from a ``Bearer`` session token.
 
-    Raises 401 if the token is missing, invalid, expired, or no longer maps to
-    a real user. Routes depend on this instead of trusting a ``user_id`` param.
+    Raises 401 if the token is missing, invalid, expired, revoked, or no longer
+    maps to a real user. Routes depend on this instead of trusting a ``user_id``
+    param.
     """
     if credentials is None or not credentials.credentials:
         raise _UNAUTHENTICATED
     try:
         payload = decode_access_token(credentials.credentials)
         user_id = UUID(payload["sub"])
+        token_version = int(payload["tv"])
     except (jwt.PyJWTError, KeyError, ValueError, TypeError) as exc:
         raise _UNAUTHENTICATED from exc
 
     user = db.get(AppUser, user_id)
     if user is None:
         raise _UNAUTHENTICATED
+
+    # The revocation check, and it's free: we already had to load the user. A
+    # token minted against an older version was issued before someone hit
+    # revoke-all, so it's dead no matter how valid its signature is.
+    if token_version != user.token_version:
+        raise _UNAUTHENTICATED
+
     return user

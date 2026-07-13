@@ -22,8 +22,15 @@ JWT_ISSUER = "ai-mailbox-api"
 JWT_AUDIENCE = "ai-mailbox"
 
 
-def create_access_token(subject: str, expires_minutes: int | None = None) -> str:
-    """Issue a signed token whose ``sub`` is ``subject`` (the AppUser id)."""
+def create_access_token(
+    subject: str, token_version: int, expires_minutes: int | None = None
+) -> str:
+    """Issue a signed token whose ``sub`` is ``subject`` (the AppUser id).
+
+    ``token_version`` is required on purpose -- pass the user's current
+    ``AppUser.token_version``. If it had a default, a new issuer could quietly
+    mint version-0 tokens that survive every revocation.
+    """
     now = datetime.now(timezone.utc)
     minutes = (
         expires_minutes
@@ -32,6 +39,7 @@ def create_access_token(subject: str, expires_minutes: int | None = None) -> str
     )
     payload = {
         "sub": subject,
+        "tv": token_version,
         "iss": JWT_ISSUER,
         "aud": JWT_AUDIENCE,
         "iat": int(now.timestamp()),
@@ -43,12 +51,18 @@ def create_access_token(subject: str, expires_minutes: int | None = None) -> str
 def decode_access_token(token: str) -> dict:
     """Verify a token and return its claims. Raises ``jwt.PyJWTError`` on an
     invalid signature, a wrong issuer/audience, missing required claims, or an
-    expired/malformed token."""
+    expired/malformed token.
+
+    ``tv`` is required, so a token minted before revocation existed is rejected
+    rather than treated as version 0 -- everyone re-signs-in once. Callers still
+    have to compare it against the user's current version; this only guarantees
+    the claim is present and signed.
+    """
     return jwt.decode(
         token,
         settings.api_secret,
         algorithms=[settings.jwt_algorithm],
         audience=JWT_AUDIENCE,
         issuer=JWT_ISSUER,
-        options={"require": ["sub", "exp", "iat"]},
+        options={"require": ["sub", "exp", "iat", "tv"]},
     )

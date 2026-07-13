@@ -408,8 +408,11 @@ export function TopBar({
       </span>
       <button
         onClick={onLogout}
-        title="sign out"
-        aria-label="Sign out"
+        // "everywhere" because this revokes the session server-side, not just in
+        // this browser. Don't shorten it back to "sign out" -- the label has to
+        // match what the button actually does.
+        title="sign out everywhere"
+        aria-label="Sign out everywhere"
         className="h-7 w-7 rounded border border-border hover:bg-accent hover:text-foreground flex items-center justify-center text-muted-foreground cursor-pointer transition-colors"
       >
         <LogOut className="h-3 w-3" />

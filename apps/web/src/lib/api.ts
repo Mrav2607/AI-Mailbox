@@ -105,6 +105,14 @@ export async function getMe(): Promise<User> {
   return request<User>("/auth/me");
 }
 
+// Kills every token this user holds, on the server, by bumping their
+// token_version. Clearing localStorage only drops *our* copy — it does nothing
+// about a token someone else already walked off with.
+export async function revokeAllTokens(): Promise<void> {
+  if (USE_MOCK) return;
+  await request<{ status: string }>("/auth/revoke-all", { method: "POST" });
+}
+
 // --- Google OAuth -----------------------------------------------------------
 // The backend owns the OAuth exchange. `start` returns the Google consent URL
 // to redirect the browser to; Google then redirects back to GOOGLE_REDIRECT_URI

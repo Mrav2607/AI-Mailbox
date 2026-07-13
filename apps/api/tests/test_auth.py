@@ -33,7 +33,7 @@ PROTECTED_GETS = [
 
 
 def test_token_roundtrip():
-    token = create_access_token("user-123")
+    token = create_access_token("user-123", 0)
     claims = decode_access_token(token)
     assert claims["sub"] == "user-123"
     assert "exp" in claims and "iat" in claims
@@ -42,13 +42,13 @@ def test_token_roundtrip():
 
 
 def test_expired_token_is_rejected():
-    token = create_access_token("user-123", expires_minutes=-1)
+    token = create_access_token("user-123", 0, expires_minutes=-1)
     with pytest.raises(jwt.PyJWTError):
         decode_access_token(token)
 
 
 def test_tampered_token_is_rejected():
-    token = create_access_token("user-123")
+    token = create_access_token("user-123", 0)
     with pytest.raises(jwt.PyJWTError):
         decode_access_token(token + "tampered")
 

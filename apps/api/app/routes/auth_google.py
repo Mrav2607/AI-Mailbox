@@ -193,7 +193,7 @@ def google_auth_callback(
     # The SPA only needs the session token and who it belongs to; provider
     # linkage details stay server-side.
     return {
-        "access_token": create_access_token(str(user.id)),
+        "access_token": create_access_token(str(user.id), user.token_version),
         "token_type": "bearer",
         "user": {"id": str(user.id), "email": user.email},
     }
