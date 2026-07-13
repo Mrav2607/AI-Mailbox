@@ -1,5 +1,4 @@
 import { useMemo, useState } from "react";
-import DOMPurify from "dompurify";
 import {
   CheckCircle2,
   ChevronDown,
@@ -12,6 +11,7 @@ import {
   Trash2,
   Undo2,
 } from "lucide-react";
+import { emailDocument, sanitizeEmailHtml } from "@/lib/email-html";
 import { LABEL_META, confidenceColor, confidenceText } from "@/lib/labels";
 import { absTime } from "@/lib/time";
 import type { Classification, Label, ThreadDetail, ThreadMessage } from "@/lib/types";
@@ -26,57 +26,6 @@ const COLLAPSE_ICONS = {
   bottom: PanelBottomClose,
 } as const;
 
-// Strip scripts/handlers and keep <style> out so email CSS can't bleed into
-// the console. Inline style attributes survive (emails lean on them heavily).
-const PURIFY_CONFIG = {
-  USE_PROFILES: { html: true },
-  FORBID_TAGS: [
-    "style",
-    "iframe",
-    "object",
-    "embed",
-    "video",
-    "audio",
-    "form",
-    "input",
-    "button",
-    "textarea",
-    "select",
-  ],
-};
-
-function sanitizeEmailHtml(
-  html: string,
-  allowRemote: boolean,
-): { html: string; blocked: boolean } {
-  let blocked = false;
-  const sanitizeAttributes = (node: Element) => {
-    if (node.tagName === "A") {
-      node.setAttribute("target", "_blank");
-      node.setAttribute("rel", "noopener noreferrer");
-    }
-    if (!allowRemote) {
-      for (const attribute of ["src", "srcset", "poster", "background"]) {
-        const value = node.getAttribute(attribute)?.trim();
-        if (value && /^(?:https?:|\/\/)/i.test(value)) {
-          node.removeAttribute(attribute);
-          blocked = true;
-        }
-      }
-      if (/url\s*\(/i.test(node.getAttribute("style") ?? "")) {
-        node.removeAttribute("style");
-        blocked = true;
-      }
-    }
-  };
-
-  DOMPurify.addHook("afterSanitizeAttributes", sanitizeAttributes);
-  try {
-    return { html: DOMPurify.sanitize(html, PURIFY_CONFIG), blocked };
-  } finally {
-    DOMPurify.removeHook("afterSanitizeAttributes", sanitizeAttributes);
-  }
-}
 
 function MessageBody({ m }: { m: ThreadMessage }) {
   const [showRemote, setShowRemote] = useState(false);
@@ -95,13 +44,29 @@ function MessageBody({ m }: { m: ThreadMessage }) {
             remote images blocked — load
           </button>
         )}
-        <div
-          // A sandboxed iframe would give email HTML a separate origin, but
-          // that renderer change needs its own UX and compatibility review.
-          // Email HTML assumes a light background in either console theme, so
-          // the body always sits on its own light card.
-          className="email-html rounded border border-border bg-white text-neutral-900 px-4 py-3 text-[13px] leading-relaxed overflow-x-auto"
-          dangerouslySetInnerHTML={{ __html: sanitized.html }}
+        {/*
+          The email renders in its own document with an opaque origin, so a
+          DOMPurify miss can't reach localStorage (where the session token
+          lives) or the console's DOM — it just gets a blank sandbox to itself.
+          DOMPurify stays as the first layer; this is the one that holds if it
+          ever loses.
+
+          Deliberately NOT here: allow-scripts and allow-same-origin. Either one
+          hands back the origin this exists to take away. That also rules out
+          auto-sizing the frame to its content (nothing can measure it), hence
+          the fixed height and internal scroll. allow-popups + escape-sandbox
+          are needed or every link in the email dies silently — the sanitizer
+          gives them all target="_blank".
+
+          Email HTML assumes a light background whatever the console theme is,
+          so the frame paints its own.
+        */}
+        <iframe
+          title="Email message"
+          sandbox="allow-popups allow-popups-to-escape-sandbox"
+          referrerPolicy="no-referrer"
+          srcDoc={emailDocument(sanitized.html, showRemote)}
+          className="w-full h-[min(70vh,32rem)] rounded border border-border bg-white"
         />
       </>
     );
