@@ -1,12 +1,17 @@
-# One-command local stack for AI-Mailbox. From the repo root:
+# Local stack for AI-Mailbox. From the repo root:
 #
-#   cp deploy/.env.example deploy/.env    # once — fill in secrets if you want Gmail
+#   cp deploy/local.env.example deploy/.env
 #   docker compose up --build
 #   open http://localhost:8080            # click "demo login" — no Google creds needed
+#
+# For a server, copy deploy/.env.example instead and replace every required
+# secret before starting the stack.
 #
 # Brings up Postgres (with pgvector), Redis, runs DB migrations to head, then the
 # API, the Celery worker, and the SPA behind nginx (which also proxies /api to the
 # API, so the whole app is one origin — no CORS to configure).
+# Only web is public; database, Redis, and direct API ports bind to loopback so
+# host-side tooling works without exposing infrastructure to the network.
 #
 # The in-process torch classifier is OFF by default so the image stays small and
 # the build stays fast; the app falls back to the keyword heuristic. To serve the
@@ -20,7 +25,7 @@ services:
     image: pgvector/pgvector:pg15 # stock postgres:15 has no `vector` extension
     env_file: ./deploy/.env
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -28,16 +33,23 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
+    env_file: ./deploy/.env
+    command:
+      - sh
+      - -ec
+      - test -n "$$REDIS_PASSWORD"; test "$$REDIS_PASSWORD" != "change_me"; exec redis-server --requirepass "$$REDIS_PASSWORD"
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping"]
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
 
   # One-shot: migrate the schema to head, then exit. api and worker wait for this
   # to finish so they never come up against an unmigrated database.
@@ -64,7 +76,7 @@ services:
     volumes:
       - ./models:/app/models:ro
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -82,6 +94,8 @@ services:
       timeout: 5s
       retries: 6
       start_period: 20s
+    mem_limit: 2g
+    restart: unless-stopped
 
   worker:
     build: *api-build
@@ -97,6 +111,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - celery -A app.workers.celery_app inspect ping --timeout=5
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    mem_limit: 3g
+    restart: unless-stopped
 
   web:
     build:
@@ -107,10 +131,11 @@ services:
         VITE_API_BASE_URL: /api/v1
     image: ai-mailbox-web:local
     ports:
-      - "8080:80"
+      - "8080:8080"
     depends_on:
       api:
         condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:
