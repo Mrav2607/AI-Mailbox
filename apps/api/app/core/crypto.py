@@ -64,7 +64,14 @@ def encrypt(plaintext: str) -> str:
 def decrypt(value: str) -> str:
     """Decrypt a stored value, passing through legacy plaintext unchanged."""
     if not _looks_like_fernet(value):
-        # Pre-encryption plaintext; will be re-encrypted on next write.
+        # Migration 0003 already re-encrypted every row that existed, so nothing
+        # should reach this path any more. If something does, a write bypassed
+        # the EncryptedText type and we're storing a secret in the clear -- say
+        # so loudly rather than hand the plaintext back as if all were well.
+        logger.warning(
+            "Read a provider secret that isn't encrypted at rest; a write path "
+            "is bypassing EncryptedText"
+        )
         return value
     try:
         return _fernet().decrypt(value.encode()).decode()
