@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from time import monotonic
 from uuid import UUID
 
 from .celery_app import celery_app
@@ -8,6 +9,9 @@ from app.db.base import SessionLocal
 from app.db.models import MailSyncRun
 from app.services.ingest.gmail_ingest import ingest_gmail_messages
 from app.services.sync_runs import renew_sync
+
+
+_HEARTBEAT_INTERVAL_SECONDS = 60
 
 
 # A 500-message pull with classification can legitimately run for many
@@ -69,6 +73,20 @@ def ingest_gmail_for_user(
             "user_id": user_id,
             "detail": "sync run is no longer active",
         }
+    last_heartbeat = monotonic()
+
+    def heartbeat() -> None:
+        # Renew on a timer, not once per thread: the lease is 40 minutes, so a
+        # write per thread was hundreds of pointless transactions per pull. We
+        # stamp the clock even when set_state says the run is gone, or a
+        # finalized run would go right back to hitting the DB every thread.
+        nonlocal last_heartbeat
+        now = monotonic()
+        if now - last_heartbeat < _HEARTBEAT_INTERVAL_SECONDS:
+            return
+        last_heartbeat = now
+        set_state("running")
+
     try:
         with SessionLocal() as db:
             result = ingest_gmail_messages(
@@ -78,7 +96,7 @@ def ingest_gmail_for_user(
                 skip_existing=skip_existing,
                 classify_messages=classify_messages,
                 new_only=new_only,
-                progress=lambda: set_state("running"),
+                progress=heartbeat,
             )
     except ValueError as exc:
         payload = {"status": "error", "user_id": user_id, "detail": str(exc)}
