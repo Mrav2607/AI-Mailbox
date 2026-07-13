@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
-from typing import Any
+
+import httpx
 
 from app.core.config import settings
 from app.core.logging import logger
@@ -169,18 +170,35 @@ def _classify_llm(text: str) -> tuple[str, float, str, str]:
         "- 'New sign-in to your account from a new device' -> security_alert\n\n"
         "Return JSON only with keys: label, confidence (0-1), rationale."
     )
-    try:
-        from google.genai import types
+    # Each step below catches only what it can actually fail with. The old blanket
+    # `except Exception` also swallowed our own bugs -- a typo in here came back as
+    # a confident heuristic answer instead of a 500, which is exactly how a broken
+    # classifier hides in plain sight.
+    def fallback(reason: str, exc: Exception) -> tuple[str, float, str, str]:
+        logger.warning("Gemini classify %s, falling back to heuristic: %s", reason, exc)
+        label, confidence, rationale, _ = _heuristic_classify(text)
+        return (label, confidence, rationale, "heuristic-fallback")
 
+    try:
+        from google.genai import errors as genai_errors
+        from google.genai import types
+    except ImportError as exc:
+        return fallback("SDK is unavailable", exc)
+
+    try:
         response = _genai_client().models.generate_content(
             model=settings.gemini_model,
             contents=f"{prompt}\n\nEmail:\n{text[:6000]}",
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        content = response.text or ""
-        label, confidence, rationale = _parse_llm_response(content)
-        return (label, confidence, rationale, settings.gemini_model)
-    except Exception as exc:
-        logger.warning("Classify failed: %s", exc)
-    label, confidence, rationale, _ = _heuristic_classify(text)
-    return (label, confidence, rationale, "heuristic-fallback")
+    except (genai_errors.APIError, httpx.HTTPError, TimeoutError) as exc:
+        # Gemini refused, rate-limited us, or never answered.
+        return fallback("call failed", exc)
+
+    try:
+        label, confidence, rationale = _parse_llm_response(response.text or "")
+    except (json.JSONDecodeError, ValueError) as exc:
+        # A reply we can't map onto our taxonomy is the model's problem, not ours.
+        return fallback("returned an unusable answer", exc)
+
+    return (label, confidence, rationale, settings.gemini_model)
