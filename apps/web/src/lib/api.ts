@@ -41,10 +41,31 @@ export function setToken(t: string | null) {
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, msg: string) {
+  // The API's 500s carry an error_id that matches a server log line. Keep it so
+  // a user reporting "it broke" can hand us something we can actually grep for.
+  errorId?: string;
+  constructor(status: number, msg: string, errorId?: string) {
     super(msg);
     this.status = status;
+    this.errorId = errorId;
   }
+}
+
+// The API answers errors with {detail, error_id?}. Read it if it's there, and
+// don't let a malformed body turn into a second, more confusing failure.
+async function errorFromResponse(res: Response): Promise<ApiError> {
+  let detail: string | undefined;
+  let errorId: string | undefined;
+  try {
+    const body = await res.json();
+    if (body && typeof body === "object") {
+      if (typeof body.detail === "string") detail = body.detail;
+      if (typeof body.error_id === "string") errorId = body.error_id;
+    }
+  } catch {
+    // No body, or not JSON -- fall back to the status line.
+  }
+  return new ApiError(res.status, detail ?? `${res.status} ${res.statusText}`, errorId);
 }
 
 async function request<T>(
@@ -65,7 +86,11 @@ async function request<T>(
     },
   });
   if (!res.ok) {
-    throw new ApiError(res.status, `${res.status} ${res.statusText}`);
+    // A 401 means the stored token is dead -- expired, or minted before a change
+    // to how we sign them. Drop it once, here, instead of leaving every caller to
+    // remember to do it.
+    if (res.status === 401) setToken(null);
+    throw await errorFromResponse(res);
   }
   // 204 No Content (e.g. DELETE) has no body to parse.
   if (res.status === 204) return undefined as T;
