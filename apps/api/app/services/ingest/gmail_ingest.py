@@ -157,6 +157,11 @@ def ingest_gmail_messages(
             "new_threads": 0,
         }
 
+    # Threads this run walked past because we already had them. Not the same as
+    # len(existing_thread_ids), which is every thread we've ever ingested -- that
+    # number told the operator nothing about what just happened.
+    skipped_existing = 0
+
     def collect_listed_thread_ids(
         *, include_recent: bool = False
     ) -> tuple[list[str], int, list[str], bool]:
@@ -168,6 +173,7 @@ def ingest_gmail_messages(
         used when establishing/recovering a history cursor so recent known
         threads are reconciled once as well.
         """
+        nonlocal skipped_existing
         new_ids: list[str] = []
         recent_ids: list[str] = []
         head_new = 0
@@ -191,6 +197,7 @@ def ingest_gmail_messages(
                     recent_ids.append(tid)
                 if skip_existing and tid in existing_thread_ids:
                     seen_known = True
+                    skipped_existing += 1
                     continue
                 if not seen_known:
                     head_new += 1
@@ -446,7 +453,7 @@ def ingest_gmail_messages(
         "classified": classified,
         "threads_reopened": threads_reopened,
         "fetched": len(thread_ids),
-        "skipped_existing": len(existing_thread_ids),
+        "skipped_existing": skipped_existing,
         # Genuinely new arrivals, not backfilled history — threads_upserted
         # counts both, so it can't distinguish "you have mail" from "the DB
         # is still catching up". Meaningful only with skip_existing.
