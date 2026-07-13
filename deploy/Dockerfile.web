@@ -17,6 +17,13 @@ RUN npm run build
 FROM nginx:1.27-alpine
 COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
-RUN sed -i 's#pid        /var/run/nginx.pid;#pid        /tmp/nginx.pid;#' /etc/nginx/nginx.conf && \
+
+# Everything below is what it takes to run nginx as a normal user. The pid file
+# defaults to /run, which only root can write, and the `user` directive is both
+# meaningless and noisy once the master process isn't root. The temp dirs under
+# /var/cache/nginx are where nginx buffers proxied responses, so they have to be
+# writable too. (The server block listens on 8080 for the same reason: a non-root
+# process can't bind port 80.)
+RUN sed -i -e 's|^pid .*|pid /tmp/nginx.pid;|' -e '/^user /d' /etc/nginx/nginx.conf && \
     chown -R nginx:nginx /var/cache/nginx
 USER nginx
