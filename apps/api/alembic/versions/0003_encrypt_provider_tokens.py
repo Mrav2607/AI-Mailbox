@@ -7,12 +7,56 @@ protected too, not just new writes.
 
 Uses the same key resolution as the app (TOKEN_ENCRYPTION_KEY, else derived from
 API_SECRET), so it must run in the same environment as the API.
+
+The Fernet logic below is deliberately duplicated from app.core.crypto rather
+than imported. A migration is frozen history: it has to keep doing what it did
+the day it was written, and importing live application code means a later
+refactor of crypto.py silently changes what this migration does on a fresh
+database.
 """
+
+import base64
+import binascii
+import hashlib
 
 import sqlalchemy as sa
 from alembic import op
+from cryptography.fernet import Fernet
 
-from app.core.crypto import decrypt, encrypt, _looks_like_fernet
+from app.core.config import settings
+
+# Fernet's version byte, and the minimum decoded length of a real token:
+# version(1) + timestamp(8) + IV(16) + one cipher block(16) + HMAC(32).
+_FERNET_VERSION = 0x80
+_FERNET_MIN_BYTES = 1 + 8 + 16 + 16 + 32
+
+
+def _fernet() -> Fernet:
+    key = settings.token_encryption_key
+    if key:
+        return Fernet(key.encode() if isinstance(key, str) else key)
+    derived = base64.urlsafe_b64encode(
+        hashlib.sha256(settings.api_secret.encode()).digest()
+    )
+    return Fernet(derived)
+
+
+def _looks_like_fernet(value: str) -> bool:
+    try:
+        decoded = base64.urlsafe_b64decode(value.encode())
+    except (binascii.Error, ValueError, TypeError):
+        return False
+    return len(decoded) >= _FERNET_MIN_BYTES and decoded[0] == _FERNET_VERSION
+
+
+def encrypt(plaintext: str) -> str:
+    return _fernet().encrypt(plaintext.encode()).decode()
+
+
+def decrypt(value: str) -> str:
+    if not _looks_like_fernet(value):
+        return value
+    return _fernet().decrypt(value.encode()).decode()
 
 
 revision = "0003_encrypt_provider_tokens"
