@@ -48,8 +48,6 @@ class Settings(BaseSettings):
     token_encryption_key: str | None = Field(default=None, alias="TOKEN_ENCRYPTION_KEY")
     database_url: str = Field(default="postgresql+psycopg://user:pass@localhost:5432/ai_mailbox", alias="DATABASE_URL")
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
-    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
-    openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
     # Email classifier backend: "local" (fine-tuned encoder in models/), "gemini"
@@ -137,6 +135,16 @@ class Settings(BaseSettings):
         # every stored provider token. Dev may fall back to the derived key.
         if not self.token_encryption_key:
             problems.append("TOKEN_ENCRYPTION_KEY is required in production")
+
+        # We send credentialed CORS responses, and "*" with credentials is both
+        # forbidden by the spec and handled awkwardly by Starlette -- it echoes
+        # the literal "*", browsers reject it, and the operator gets a confusing
+        # runtime failure instead of a clear one at boot.
+        if "*" in self.cors_origins_list:
+            problems.append(
+                'CORS_ORIGINS cannot be "*" while credentialed requests are '
+                "enabled; list the real frontend origin(s)"
+            )
 
         if problems:
             raise ValueError(
