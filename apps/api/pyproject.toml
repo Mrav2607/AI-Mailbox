@@ -22,6 +22,12 @@ dependencies = [
   "celery>=5.3",
   "google-genai>=1.9.0",
   "pydantic[email]>=2.0.0",
+  # normalizer.py strips HTML email down to text with BeautifulSoup. lxml never
+  # appears in an import -- it's named as the parser backend
+  # (BeautifulSoup(html, "lxml")), so nothing catches its absence until a real
+  # HTML email hits the ingest path at runtime. Keep them together.
+  "beautifulsoup4>=4.12.0",
+  "lxml>=5.0",
   # Pulled in transitively by google-genai -> google-auth. Pin to a range that
   # ships prebuilt wheels so pip never falls back to compiling the sdist, which
   # requires a Rust toolchain (maturin) that isn't available locally.
