@@ -1,9 +1,13 @@
 """Batch classification ("backfill") shared by the HTTP route and the Celery
 worker. Small runs execute inline in the request and big ones get queued, and
-both paths funnel through run_backfill so their behavior can't drift."""
+both paths funnel through run_backfill so their behavior can't drift.
 
-from datetime import datetime, timezone
+Also home to the two shared "what is a thread's latest message" queries, since
+every caller that answers that question has to answer it the *same* way or the
+bucket a thread lands in stops matching the message we show and label for it."""
+
 from uuid import UUID
+from typing import Any, Sequence
 
 from sqlalchemy import select, desc, func
 from sqlalchemy.orm import Session
@@ -11,6 +15,17 @@ from sqlalchemy.orm import Session
 from app.db.models import MailThread, MailMessage, Classification
 from app.services.nlp.classifier import classify, build_classification_text
 from app.services.nlp.persistence import upsert_classification
+
+
+def latest_message_ordering():
+    """The one true "newest message wins" ordering. Coalesce rather than plain
+    NULLS LAST: a message with no sent_at falls back to created_at, and every
+    consumer has to agree on that or they'll disagree about which message is a
+    thread's latest."""
+    return (
+        func.coalesce(MailMessage.sent_at, MailMessage.created_at).desc().nullslast(),
+        MailMessage.created_at.desc(),
+    )
 
 
 def latest_label_subquery():
@@ -22,17 +37,7 @@ def latest_label_subquery():
     latest_message = (
         select(MailMessage.id)
         .where(MailMessage.thread_id == MailThread.id)
-        .order_by(
-            # Coalesce rather than NULLS LAST: the Python-side picks (here in
-            # run_backfill, and in the triage assembly) treat a missing sent_at
-            # as "fall back to created_at", and this SQL pick has to agree or
-            # the bucket filter and the displayed label can disagree about
-            # which message is a thread's latest.
-            func.coalesce(MailMessage.sent_at, MailMessage.created_at)
-            .desc()
-            .nullslast(),
-            MailMessage.created_at.desc(),
-        )
+        .order_by(*latest_message_ordering())
         .limit(1)
         # Correlate explicitly: this is nested two levels deep, so without it
         # SQLAlchemy pulls mail_thread into this subquery's own FROM (turning the
@@ -47,6 +52,32 @@ def latest_label_subquery():
         .limit(1)
         .scalar_subquery()
     )
+
+
+def latest_messages_by_thread(
+    db: Session, thread_ids: Sequence[UUID], *, columns: Sequence[Any]
+) -> dict[UUID, Any]:
+    """Map each thread id to its latest message, selecting only ``columns``.
+
+    Postgres does the picking via DISTINCT ON, which matters: we used to pull
+    every message of every listed thread -- whole rows, body_text, body_html and
+    the headers JSONB -- and then drop all but the newest in Python. That's
+    megabytes over the wire to render a page of snippets.
+
+    ``columns`` must include ``MailMessage.thread_id``; it's what we key on.
+    """
+    if not thread_ids:
+        return {}
+    rows = db.execute(
+        select(*columns)
+        .where(MailMessage.thread_id.in_(thread_ids))
+        # DISTINCT ON keeps the first row per thread_id, so the ordering below
+        # decides which one that is -- and it's the same ordering the bucket
+        # filter uses.
+        .distinct(MailMessage.thread_id)
+        .order_by(MailMessage.thread_id, *latest_message_ordering())
+    ).all()
+    return {row.thread_id: row for row in rows}
 
 
 def run_backfill(
@@ -82,40 +113,16 @@ def run_backfill(
         .all()
     )
     thread_ids = [t.id for t in threads]
-    messages = (
-        db.execute(
-            select(MailMessage)
-            .where(MailMessage.thread_id.in_(thread_ids))
-            # Same coalesced ordering as latest_label_subquery: the loop below
-            # picks the max itself, but on exact-timestamp ties it keeps the
-            # first row it sees, so the DB order decides -- and it has to
-            # decide the same way the bucket filter does.
-            .order_by(
-                func.coalesce(MailMessage.sent_at, MailMessage.created_at)
-                .desc()
-                .nullslast(),
-                MailMessage.created_at.desc(),
-            )
-        )
-        .scalars()
-        .all()
-        if thread_ids
-        else []
+    latest_message_by_thread = latest_messages_by_thread(
+        db,
+        thread_ids,
+        columns=(
+            MailMessage.id,
+            MailMessage.thread_id,
+            MailMessage.snippet,
+            MailMessage.body_text,
+        ),
     )
-    latest_message_by_thread: dict[UUID, MailMessage] = {}
-    for message in messages:
-        message_time = message.sent_at or message.created_at
-        if not message_time:
-            message_time = datetime.min.replace(tzinfo=timezone.utc)
-        current = latest_message_by_thread.get(message.thread_id)
-        if not current:
-            latest_message_by_thread[message.thread_id] = message
-            continue
-        current_time = current.sent_at or current.created_at
-        if not current_time:
-            current_time = datetime.min.replace(tzinfo=timezone.utc)
-        if message_time > current_time:
-            latest_message_by_thread[message.thread_id] = message
 
     subject_by_thread = {t.id: t.subject for t in threads}
     message_ids = [m.id for m in latest_message_by_thread.values()]

@@ -15,7 +15,12 @@ from app.db.models import MailThread, MailMessage, Classification, AppUser, Mail
 from app.workers.celery_app import celery_app
 from app.workers.tasks_ingest import ingest_gmail_for_user
 from app.workers.tasks_nlp import backfill_threads_for_user, classify_latest_threads
-from app.services.nlp.backfill import latest_label_subquery, run_backfill
+from app.services.nlp.backfill import (
+    latest_label_subquery,
+    latest_message_ordering,
+    latest_messages_by_thread,
+    run_backfill,
+)
 from app.services.nlp.classifier import LABELS
 from app.services.nlp.persistence import upsert_classification
 from app.services.sync_runs import QUEUED_SYNC_LEASE, active_sync, now_utc, sync_payload
@@ -56,49 +61,23 @@ def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]
     latest message plus that message's latest classification. Shared by the
     triage and search endpoints so both return the same shape."""
     thread_ids = [t.id for t in threads]
-    messages = (
-        db.execute(
-            select(MailMessage)
-            .where(MailMessage.thread_id.in_(thread_ids))
-            # Same coalesced ordering as latest_label_subquery: the loop below
-            # compares `sent_at or created_at` itself, but on exact ties it
-            # keeps the first row it sees -- so the DB order has to break ties
-            # the same way the bucket filter does.
-            .order_by(
-                func.coalesce(MailMessage.sent_at, MailMessage.created_at)
-                .desc()
-                .nullslast(),
-                MailMessage.created_at.desc(),
-            )
-        )
-        .scalars()
-        .all()
-        if thread_ids
-        else []
+    latest_message_by_thread = latest_messages_by_thread(
+        db,
+        thread_ids,
+        # Snippets are all the list needs -- don't drag body_text/body_html/headers
+        # across the wire for a page we only render one line of.
+        columns=(MailMessage.id, MailMessage.thread_id, MailMessage.snippet),
     )
-    latest_message_by_thread: dict[UUID, MailMessage] = {}
-    for message in messages:
-        message_time = message.sent_at or message.created_at
-        if not message_time:
-            message_time = datetime.min.replace(tzinfo=timezone.utc)
-        current = latest_message_by_thread.get(message.thread_id)
-        if not current:
-            latest_message_by_thread[message.thread_id] = message
-            continue
-        current_time = current.sent_at or current.created_at
-        if not current_time:
-            current_time = datetime.min.replace(tzinfo=timezone.utc)
-        if message_time > current_time:
-            latest_message_by_thread[message.thread_id] = message
+    message_ids = [m.id for m in latest_message_by_thread.values()]
     latest_classifications = (
         db.execute(
             select(Classification)
-            .where(Classification.message_id.in_([m.id for m in messages]))
+            .where(Classification.message_id.in_(message_ids))
             .order_by(desc(Classification.created_at))
         )
         .scalars()
         .all()
-        if messages
+        if message_ids
         else []
     )
     classifications_by_msg = {}
@@ -230,12 +209,7 @@ def get_thread(
         db.execute(
             select(MailMessage)
             .where(MailMessage.thread_id == thread_id)
-            .order_by(
-                func.coalesce(MailMessage.sent_at, MailMessage.created_at)
-                .desc()
-                .nullslast(),
-                MailMessage.created_at.desc(),
-            )
+            .order_by(*latest_message_ordering())
         )
         .scalars()
         .all()
@@ -296,12 +270,7 @@ def reclassify_thread(
             .where(MailMessage.thread_id == thread_id)
             # Coalesced like latest_label_subquery, so the override lands on
             # the exact message whose classification drives the triage bucket.
-            .order_by(
-                func.coalesce(MailMessage.sent_at, MailMessage.created_at)
-                .desc()
-                .nullslast(),
-                MailMessage.created_at.desc(),
-            )
+            .order_by(*latest_message_ordering())
             .limit(1)
         )
         .scalars()
