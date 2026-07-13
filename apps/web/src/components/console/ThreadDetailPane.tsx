@@ -30,45 +30,52 @@ const COLLAPSE_ICONS = {
 // the console. Inline style attributes survive (emails lean on them heavily).
 const PURIFY_CONFIG = {
   USE_PROFILES: { html: true },
-  FORBID_TAGS: ["style", "iframe", "object", "embed", "video", "audio"],
+  FORBID_TAGS: [
+    "style",
+    "iframe",
+    "object",
+    "embed",
+    "video",
+    "audio",
+    "form",
+    "input",
+    "button",
+    "textarea",
+    "select",
+  ],
 };
-
-let blockRemote = false;
-let blockedSomething = false;
-
-// Every link in an email opens in a new tab, without handing the mail page a
-// window reference back to us. Registered once at module load.
-DOMPurify.addHook("afterSanitizeAttributes", (node) => {
-  if (node.tagName === "A") {
-    node.setAttribute("target", "_blank");
-    node.setAttribute("rel", "noopener noreferrer");
-  }
-  if (blockRemote) {
-    for (const attribute of ["src", "srcset", "poster", "background"]) {
-      const value = node.getAttribute(attribute)?.trim();
-      if (value && /^(?:https?:|\/\/)/i.test(value)) {
-        node.removeAttribute(attribute);
-        blockedSomething = true;
-      }
-    }
-    if (/url\s*\(/i.test(node.getAttribute("style") ?? "")) {
-      node.removeAttribute("style");
-      blockedSomething = true;
-    }
-  }
-});
 
 function sanitizeEmailHtml(
   html: string,
   allowRemote: boolean,
 ): { html: string; blocked: boolean } {
-  blockRemote = !allowRemote;
-  blockedSomething = false;
-  const sanitized = DOMPurify.sanitize(html, PURIFY_CONFIG);
-  const blocked = blockedSomething;
-  blockRemote = false;
-  blockedSomething = false;
-  return { html: sanitized, blocked };
+  let blocked = false;
+  const sanitizeAttributes = (node: Element) => {
+    if (node.tagName === "A") {
+      node.setAttribute("target", "_blank");
+      node.setAttribute("rel", "noopener noreferrer");
+    }
+    if (!allowRemote) {
+      for (const attribute of ["src", "srcset", "poster", "background"]) {
+        const value = node.getAttribute(attribute)?.trim();
+        if (value && /^(?:https?:|\/\/)/i.test(value)) {
+          node.removeAttribute(attribute);
+          blocked = true;
+        }
+      }
+      if (/url\s*\(/i.test(node.getAttribute("style") ?? "")) {
+        node.removeAttribute("style");
+        blocked = true;
+      }
+    }
+  };
+
+  DOMPurify.addHook("afterSanitizeAttributes", sanitizeAttributes);
+  try {
+    return { html: DOMPurify.sanitize(html, PURIFY_CONFIG), blocked };
+  } finally {
+    DOMPurify.removeHook("afterSanitizeAttributes", sanitizeAttributes);
+  }
 }
 
 function MessageBody({ m }: { m: ThreadMessage }) {
@@ -89,6 +96,8 @@ function MessageBody({ m }: { m: ThreadMessage }) {
           </button>
         )}
         <div
+          // A sandboxed iframe would give email HTML a separate origin, but
+          // that renderer change needs its own UX and compatibility review.
           // Email HTML assumes a light background in either console theme, so
           // the body always sits on its own light card.
           className="email-html rounded border border-border bg-white text-neutral-900 px-4 py-3 text-[13px] leading-relaxed overflow-x-auto"
