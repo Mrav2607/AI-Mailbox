@@ -20,12 +20,6 @@ dependencies = [
   "pyjwt>=2.8",
   "redis>=5.0",
   "celery>=5.3",
-  "tenacity>=8.2",
-  "beautifulsoup4",
-  "lxml",
-  "markdown-it-py",
-  "tiktoken",
-  "pgvector>=0.2.5",
   "google-genai>=1.9.0",
   "pydantic[email]>=2.0.0",
   # Pulled in transitively by google-genai -> google-auth. Pin to a range that

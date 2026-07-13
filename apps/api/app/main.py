@@ -1,7 +1,7 @@
 import threading
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .core.config import settings
@@ -44,9 +44,6 @@ app.include_router(auth.router, prefix="/api/v1/auth")
 app.include_router(auth_google_dev.router, prefix="/api/v1/auth/google")
 app.include_router(mailbox.router, prefix="/api/v1")
 app.include_router(analytics.router, prefix="/api/v1")
-
-
-router = APIRouter()
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -17,8 +17,10 @@ class DemoLoginRequest(BaseModel):
 
 
 @router.get("/providers")
-async def list_providers() -> dict:
-    return {"providers": ["gmail", "outlook"]}
+def list_providers() -> dict:
+    # Only what actually works. Outlook is in the DB check constraint and
+    # nowhere else -- advertising it here just sets callers up to fail.
+    return {"providers": ["gmail"]}
 
 
 @router.get("/me")

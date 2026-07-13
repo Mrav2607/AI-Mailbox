@@ -16,7 +16,9 @@ def test_health_ok():
 def test_list_providers():
     resp = client.get("/api/v1/auth/providers")
     assert resp.status_code == 200
-    assert resp.json() == {"providers": ["gmail", "outlook"]}
+    # Gmail is the only provider that actually works; we used to also advertise
+    # Outlook, which is implemented nowhere.
+    assert resp.json() == {"providers": ["gmail"]}
 
 
 def test_bare_prefix_is_404():

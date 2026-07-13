@@ -614,7 +614,7 @@ def queue_classification(
     force: bool = False,
     current_user: AppUser = Depends(get_current_user),
 ) -> dict:
-    task = getattr(classify_latest_threads, "delay")(
+    task = cast(Any, classify_latest_threads).delay(
         user_id=str(current_user.id),
         limit=limit,
         force=force,
