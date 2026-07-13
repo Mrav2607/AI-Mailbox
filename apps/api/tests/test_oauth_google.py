@@ -77,20 +77,20 @@ def test_callback_hides_google_error_bodies(monkeypatch):
         status_code = 400
         text = '{"error": "invalid_client", "client_id": "test-client-id"}'
 
-    class FakeAsyncClient:
+    class FakeClient:
         def __init__(self, *args, **kwargs):
             pass
 
-        async def __aenter__(self):
+        def __enter__(self):
             return self
 
-        async def __aexit__(self, *exc):
+        def __exit__(self, *exc):
             return False
 
-        async def post(self, *args, **kwargs):
+        def post(self, *args, **kwargs):
             return FakeResponse()
 
-    monkeypatch.setattr(auth_google.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(auth_google.httpx, "Client", FakeClient)
     resp = client.get(CALLBACK, params={"code": "abc", "state": "ours"})
     assert resp.status_code == 400
     assert resp.json()["detail"] == "Google sign-in failed; try again."

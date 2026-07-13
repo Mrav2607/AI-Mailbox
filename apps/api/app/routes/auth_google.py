@@ -57,7 +57,11 @@ def _consume_state(state: str) -> bool:
 
 
 @router.get("/start")
-async def google_dev_auth_start() -> dict:
+# Sync on purpose. Redis and SQLAlchemy here are both blocking, so an async
+# handler would run them straight on the event loop and stall every other
+# request (and the health probes) for the duration. A plain def gets handed to
+# FastAPI's threadpool instead.
+def google_auth_start() -> dict:
     """Begin Google sign-in. No user is required up front -- the user is
     identified (and created on first sign-in) from their Google email in the
     callback. ``state`` is a random nonce stashed in Redis; the callback
@@ -86,7 +90,8 @@ async def google_dev_auth_start() -> dict:
 
 
 @router.get("/callback")
-async def google_dev_auth_callback(
+# Sync for the same reason as /start: this one also commits to Postgres.
+def google_auth_callback(
     code: str | None = None, state: str | None = None, db: Session = Depends(get_db)
 ) -> dict:
     # Verify state before anything else -- a callback we can't tie to a /start
@@ -106,8 +111,8 @@ async def google_dev_auth_callback(
     if not settings.google_client_id or not settings.google_client_secret or not settings.google_redirect_uri:
         raise HTTPException(status_code=500, detail="Google OAuth config is missing.")
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        token_resp = await client.post(
+    with httpx.Client(timeout=20.0) as client:
+        token_resp = client.post(
             GOOGLE_TOKEN_URL,
             data={
                 "code": code,
@@ -130,7 +135,7 @@ async def google_dev_auth_callback(
         refresh_token = token_json.get("refresh_token")
         expires_in = token_json.get("expires_in")
 
-        profile_resp = await client.get(
+        profile_resp = client.get(
             GMAIL_PROFILE_URL, headers={"Authorization": f"Bearer {access_token}"}
         )
         if profile_resp.status_code >= 400:
