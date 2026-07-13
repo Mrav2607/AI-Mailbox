@@ -8,6 +8,7 @@ from sqlalchemy import select, desc, or_, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.logging import logger
 from app.core.ratelimit import user_rate_limit
 from app.deps import get_db, get_current_user
 from app.db.models import MailThread, MailMessage, Classification, AppUser, MailSyncRun
@@ -535,25 +536,36 @@ def get_sync_run(
 def get_task_status(
     task_id: str,
     current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict:
     """Report a queued job's state so the UI can wait for it to finish before
     refreshing -- otherwise it refetches against a DB the worker hasn't written
     to yet, and nothing appears until the operator navigates or reloads.
     """
     result = celery_app.AsyncResult(task_id)
+    sync_run = db.scalar(select(MailSyncRun).where(MailSyncRun.task_id == task_id))
+    if sync_run and sync_run.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Not Found")
+
     ready = result.ready()
     payload: dict[str, Any] = {"task_id": task_id, "state": result.state, "ready": ready}
     if ready:
         if result.successful():
             data = result.result
-            # Worker tasks return a dict carrying user_id; don't hand one user
-            # another user's job outcome (task ids are opaque, but cheap to check).
+            # Backfill/classify tasks don't have a sync-run row, so their result
+            # payload is the only ownership record we can check.
             if isinstance(data, dict) and data.get("user_id") not in (None, str(current_user.id)):
                 raise HTTPException(status_code=404, detail="Not Found")
             payload["result"] = data
         else:
-            # A failed task stores the exception; surface a string, not a 500.
-            payload["error"] = str(result.result) if result.result else "task failed"
+            error_id = uuid4().hex
+            logger.error("Worker task failed [%s] task_id=%s", error_id, task_id)
+            if result.result:
+                logger.debug(
+                    "Worker task failed [%s] detail: %r", error_id, result.result
+                )
+            payload["error"] = "task failed"
+            payload["error_id"] = error_id
     return payload
 
 
