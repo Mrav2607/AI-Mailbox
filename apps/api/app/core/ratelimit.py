@@ -27,7 +27,7 @@ _redis_client: redis.Redis | None = None
 
 def _client() -> redis.Redis:
     """Build the Redis client on first use so importing this module never
-    needs a live Redis (mirrors the lazy pattern in auth_google_dev)."""
+    needs a live Redis (mirrors the lazy pattern in auth_google)."""
     global _redis_client
     if _redis_client is None:
         _redis_client = redis.from_url(
