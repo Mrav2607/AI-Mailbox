@@ -57,6 +57,7 @@ def run_backfill(
     force: bool = False,
     bucket: str = "unclassified",
     backend: str | None = None,
+    include_task_counts: bool = False,
 ) -> dict:
     """Classify (or, with ``force``, re-classify) the latest message of up to
     ``limit`` of the user's threads currently in ``bucket``.
@@ -151,6 +152,9 @@ def run_backfill(
         for message in latest_message_by_thread.values()
         if force or message.id not in already_classified
     ]
+    task_created = sum(
+        message_id not in already_classified for message_id, _text in to_classify
+    )
     scanned = len(latest_message_by_thread)
     # Close the read transaction before classifying -- classify() can block on
     # a Gemini call or local inference, and we don't want to sit
@@ -188,8 +192,12 @@ def run_backfill(
     if pending:
         flush_pending()
 
-    return {
+    result = {
         "status": "ok",
         "created": created,
         "scanned": scanned,
     }
+    if include_task_counts:
+        result["task_created"] = task_created
+        result["task_processed"] = len(to_classify)
+    return result
