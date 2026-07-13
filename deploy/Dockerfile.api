@@ -33,4 +33,10 @@ RUN addgroup --system app && adduser --system --ingroup app app
 ENV PORT=8000 \
     CLASSIFIER_MODEL_PATH=/app/models/email-classifier
 USER app
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --proxy-headers with a wildcard trust list is only safe because nginx is the
+# only thing that can reach us: compose binds 8000 to loopback, so nothing off
+# the box can forge an X-Forwarded-For. Without this every request looks like it
+# came from nginx and the per-IP rate limiter buckets the whole internet as one
+# caller.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--proxy-headers", "--forwarded-allow-ips", "*"]
