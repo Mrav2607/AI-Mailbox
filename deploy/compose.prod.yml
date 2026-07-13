@@ -1,0 +1,57 @@
+# Production overlay: puts Caddy in front as the only public ingress.
+#
+#   docker compose --env-file deploy/.env \
+#     -f docker-compose.yml -f deploy/compose.prod.yml up -d
+#
+# The --env-file is not optional. Compose auto-loads a *root* .env and nothing
+# else, and the per-service `env_file:` entries populate containers -- they do
+# not feed ${APP_DOMAIN} into Compose's own interpolation. Without it, APP_DOMAIN
+# expands to empty and Caddy serves an unnamed site.
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # The cert store. If this isn't persisted, every restart re-issues from
+      # Let's Encrypt and you'll hit their rate limit and end up with no cert.
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      # Only these two. The edge container has no business holding the API
+      # secret, the Google client secret, or the database password.
+      APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN is required (did you pass --env-file deploy/.env?)}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required (Let's Encrypt expiry notices)}
+    networks:
+      - default
+      - edge
+    depends_on:
+      web:
+        condition: service_started
+
+  web:
+    # Caddy is the public door now. Keep the port bound to loopback rather than
+    # dropping it: it's what host-side curl and the local workflow use, and an
+    # env file can't conditionally add a port back.
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - default
+      - edge
+
+networks:
+  # A dedicated subnet holding nothing but Caddy and web. nginx trusts
+  # X-Forwarded-For only from this range (set_real_ip_from in nginx.conf), so it
+  # has to contain proxies that sanitize the header and nothing else. Widen it
+  # and you hand every caller the ability to pick its own client IP.
+  edge:
+    ipam:
+      config:
+        - subnet: 172.31.240.0/24
+
+volumes:
+  caddy_data:
+  caddy_config:

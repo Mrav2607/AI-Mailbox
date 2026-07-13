@@ -1,0 +1,24 @@
+# TLS terminator and the only thing facing the internet. Caddy gets a Let's
+# Encrypt cert on first boot and renews it on its own -- no cron, no reload hook.
+#
+# APP_DOMAIN is substituted by Compose before Caddy ever parses this, so it has
+# to be present in the environment (see deploy/compose.prod.yml, which marks it
+# required). A missing value would expand to an empty site block, and Caddy would
+# happily start serving nothing.
+{$APP_DOMAIN} {
+	# Caddy does NOT send HSTS on its own -- automatic HTTPS covers issuance,
+	# renewal and the http->https redirect, and stops there. Without this a
+	# first visit over http is still hijackable.
+	# Add includeSubDomains/preload only once every subdomain is permanently
+	# HTTPS; both are painful to walk back.
+	header Strict-Transport-Security "max-age=31536000"
+
+	reverse_proxy web:8080 {
+		# Overwrite rather than append. Caddy ignores an inbound X-Forwarded-For
+		# by default, but say so out loud: the API trusts the leftmost entry of
+		# this header to rate-limit by IP, so a caller that could inject its own
+		# would pick its own bucket.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}
