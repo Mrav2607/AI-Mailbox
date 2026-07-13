@@ -104,7 +104,11 @@ def ingest_gmail_messages(
     skip_existing: bool = True,
     max_pages: int = 20,
     classify_messages: bool = True,
-    commit_every: int = 50,
+    # Threads per transaction. Each one costs a Gmail round-trip plus a classify
+    # call per message, so a big batch means a connection sitting
+    # idle-in-transaction across minutes of network and inference -- which blocks
+    # vacuum and holds locks. Commit often; the upserts make a replay harmless.
+    commit_every: int = 5,
     new_only: bool = False,
     progress: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
