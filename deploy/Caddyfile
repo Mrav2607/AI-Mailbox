@@ -1,16 +1,22 @@
 # TLS terminator and the only thing facing the internet. Caddy gets a Let's
-# Encrypt cert on first boot and renews it on its own -- no cron, no reload hook.
+# Encrypt cert on first boot and renews it on its own.
 #
-# APP_DOMAIN is substituted by Compose before Caddy ever parses this, so it has
-# to be present in the environment (see deploy/compose.prod.yml, which marks it
-# required). A missing value would expand to an empty site block, and Caddy would
-# happily start serving nothing.
+# {$VAR} is Caddy's own placeholder syntax, not Compose's -- Compose never reads
+# this file, it just mounts it. Caddy expands these from its container environment
+# at parse time, which is why compose.prod.yml has to hand it APP_DOMAIN and
+# ACME_EMAIL explicitly (and marks them required). Leave APP_DOMAIN unset and this
+# expands to an empty site address, and Caddy starts serving nothing.
+
+{
+	email {$ACME_EMAIL}
+}
+
 {$APP_DOMAIN} {
 	# Caddy does NOT send HSTS on its own -- automatic HTTPS covers issuance,
 	# renewal and the http->https redirect, and stops there. Without this a
 	# first visit over http is still hijackable.
 	# Add includeSubDomains/preload only once every subdomain is permanently
-	# HTTPS; both are painful to walk back.
+	# HTTPS.
 	header Strict-Transport-Security "max-age=31536000"
 
 	reverse_proxy web:8080 {

@@ -25,8 +25,15 @@ services:
       # secret, the Google client secret, or the database password.
       APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN is required (did you pass --env-file deploy/.env?)}
       ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required (Let's Encrypt expiry notices)}
+    # Edge only, and it matters. Caddy talks to nothing but web, and web sits on
+    # both networks -- so if Caddy were on both too, Docker's DNS would hand back
+    # web's default-network address and the connection would leave from Caddy's
+    # default-network IP. That IP isn't in the edge subnet, so nginx's
+    # set_real_ip_from wouldn't match, it would ignore the X-Forwarded-For we went
+    # to the trouble of setting, and every caller on the internet would share one
+    # rate-limit bucket. Keeping Caddy here forces the trusted path. Outbound ACME
+    # still works: this network NATs out like any other.
     networks:
-      - default
       - edge
     depends_on:
       web:
@@ -36,7 +43,13 @@ services:
     # Caddy is the public door now. Keep the port bound to loopback rather than
     # dropping it: it's what host-side curl and the local workflow use, and an
     # env file can't conditionally add a port back.
-    ports:
+    #
+    # !override is load-bearing. Compose *appends* to a list it's overlaying, so
+    # without it the base file's "8080:8080" survives alongside this line and web
+    # stays published on 0.0.0.0 -- the whole app served over plaintext http on
+    # :8080, straight past Caddy and the TLS we just set up. !override replaces the
+    # list instead of adding to it.
+    ports: !override
       - "127.0.0.1:8080:8080"
     networks:
       - default
