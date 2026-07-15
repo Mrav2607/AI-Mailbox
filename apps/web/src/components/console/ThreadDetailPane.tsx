@@ -239,7 +239,7 @@ export function ThreadDetailPane({
           prediction
         </button>
         {predictionOpen && (
-          <div className="px-4 pb-3">
+          <div className="px-4 pb-3 animate-in fade-in-0 slide-in-from-top-1 duration-150">
             <div className="flex items-center gap-3 flex-wrap">
               <span
                 className={[
@@ -278,7 +278,7 @@ export function ThreadDetailPane({
                     onClick={() => onReclassify(l)}
                     aria-pressed={active}
                     className={[
-                      "inline-flex items-center gap-1.5 px-2 py-1 rounded text-[10.5px] font-mono border transition-colors duration-100 cursor-pointer",
+                      "inline-flex items-center gap-1.5 px-2 py-1 rounded text-[10.5px] font-mono border transition-colors duration-150 cursor-pointer",
                       active
                         ? `${lm.soft} ${lm.text} ${lm.border}`
                         : "border-border text-muted-foreground hover:text-foreground hover:border-foreground/30",

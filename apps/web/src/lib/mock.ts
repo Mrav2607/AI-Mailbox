@@ -68,6 +68,7 @@ function makeItems(count: number): TriageItem[] {
       subject: rand(SUBJECTS, i + (i % 3)),
       last_message_at: new Date(now - i * 1000 * 60 * (3 + (i % 47))).toISOString(),
       latest_message_snippet: rand(SNIPPETS, i),
+      latest_message_sender: rand(SENDERS, i),
       classification: {
         label,
         confidence: conf,
@@ -154,6 +155,7 @@ export function mockIngest(): number {
       subject: `New mail #${ingestSeq}`,
       last_message_at: new Date(now - n * 1000).toISOString(),
       latest_message_snippet: rand(SNIPPETS, ingestSeq),
+      latest_message_sender: rand(SENDERS, ingestSeq),
       classification: {
         label: "needs_reply",
         confidence: 0.9,

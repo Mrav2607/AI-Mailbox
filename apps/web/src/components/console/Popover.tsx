@@ -53,8 +53,8 @@ export function Popover({
         <div
           data-tour={panelTour}
           className={[
-            "absolute top-full mt-1.5 z-50 w-64 rounded-md border border-border bg-[var(--color-panel-hi)] elevated p-3",
-            align === "end" ? "right-0" : "left-0",
+            "absolute top-full mt-1.5 z-50 w-64 rounded-md border border-border bg-[var(--color-panel-hi)] elevated p-3 animate-in fade-in-0 zoom-in-95 duration-150",
+            align === "end" ? "right-0 origin-top-right" : "left-0 origin-top-left",
           ].join(" ")}
         >
           {children}

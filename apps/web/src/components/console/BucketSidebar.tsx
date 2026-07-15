@@ -51,8 +51,9 @@ export function BucketSidebar({
               key={b}
               data-tour={`bucket-${b}`}
               onClick={() => onSelect(b)}
+              aria-current={isActive ? "true" : undefined}
               className={[
-                "relative w-full text-left pl-3 pr-3 py-1.5 flex items-center gap-2 font-mono text-[12.5px] transition-colors duration-100 border-l-2 cursor-pointer focus-visible:outline-none focus-visible:bg-[var(--color-panel-hi)]",
+                "relative w-full text-left pl-3 pr-3 py-1.5 flex items-center gap-2 font-mono text-[12.5px] transition-colors duration-150 border-l-2 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset focus-visible:bg-[var(--color-panel-hi)]",
                 isActive
                   ? "border-primary bg-[var(--color-panel-hi)] text-foreground"
                   : "border-transparent text-muted-foreground hover:bg-[var(--color-panel-hi)]/60 hover:text-foreground",

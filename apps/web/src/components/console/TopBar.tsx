@@ -90,7 +90,7 @@ function Stat({
 
 const fieldLabel = "font-mono text-[11px] text-muted-foreground";
 const control =
-  "w-full bg-[var(--color-panel)] border border-border rounded px-2 py-1 text-[12px] font-mono text-foreground focus-visible:outline-none focus-visible:border-primary/60";
+  "w-full bg-[var(--color-panel)] border border-border rounded px-2 py-1 text-[12px] font-mono text-foreground";
 
 function IngestForm({
   busy,

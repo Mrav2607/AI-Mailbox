@@ -1124,7 +1124,7 @@ export default function Console() {
                   listScrollRef.current?.scrollTo({ top: 0 });
                 }}
                 title="new mail — click to jump to the top"
-                className="shrink-0 h-6 px-2 rounded-full border border-primary/40 bg-primary/10 text-primary hover:bg-primary/20 tabular-nums cursor-pointer transition-colors"
+                className="shrink-0 h-6 px-2 rounded-full border border-primary/40 bg-primary/10 text-primary hover:bg-primary/20 tabular-nums cursor-pointer transition-colors animate-in fade-in-0 zoom-in-95 duration-150"
               >
                 {pendingNew >= NEW_MAIL_SCAN_LIMIT ? `${NEW_MAIL_SCAN_LIMIT}+` : pendingNew} new
               </button>
@@ -1142,6 +1142,7 @@ export default function Console() {
                 <Search className="h-3 w-3 text-muted-foreground shrink-0" />
                 <input
                   data-tour="search"
+                  aria-label="filter threads — press enter to search all buckets"
                   ref={searchInputRef}
                   value={query}
                   onChange={(e) => {
@@ -1210,6 +1211,7 @@ export default function Console() {
                 items={visibleItems}
                 selectedId={selectedId}
                 onSelect={(id) => setSelectedId(id)}
+                showLabel={searchMode || bucket === "all" || bucket === "done"}
                 loading={listLoading || searching}
                 error={listError}
               />
