@@ -30,7 +30,7 @@ export type TourTargetResolution =
 export const TOUR_STEPS: TourStepDefinition[] = [
   {
     slug: "welcome",
-    title: "Welcome to AI Mailbox",
+    title: "Welcome to CortexMail",
     body: "Ingest brings in Gmail threads, while sync keeps an existing mailbox current. This walkthrough shows where everything lands.",
     target: '[data-tour="topbar-sync"]',
     preconditions: [],
@@ -40,7 +40,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
   {
     slug: "buckets",
     title: "Buckets organize your mail",
-    body: "AI Mailbox classifies each conversation into a focused bucket, with counts showing what needs your attention.",
+    body: "CortexMail classifies each conversation into a focused bucket, with counts showing what needs your attention.",
     target: '[data-tour="bucket-sidebar"]',
     preconditions: ["show-sidebar"],
     fallback: { kind: "skip" },

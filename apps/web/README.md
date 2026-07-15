@@ -1,6 +1,6 @@
-# AI Mailbox — Web
+# CortexMail — Web
 
-Vite + React + TypeScript SPA for the AI Mailbox triage app — a high-density,
+Vite + React + TypeScript SPA for the CortexMail triage app — a high-density,
 keyboard-driven "Command Center" for QA-ing the local email classifier. Talks to
 the FastAPI backend in `../api`.
 

@@ -1,7 +1,10 @@
 import { useState } from "react";
 import {
+  BrainCircuit,
   Loader2,
   Download,
+  Mail,
+  MessagesSquare,
   Sparkles,
   LogOut,
   Columns3,
@@ -67,9 +70,18 @@ function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
 }
 
-function Stat({ label, value }: { label: string; value: number | string }) {
+function Stat({
+  icon: Icon,
+  label,
+  value,
+}: {
+  icon: typeof Mail;
+  label: string;
+  value: number | string;
+}) {
   return (
-    <div className="px-2.5 py-1 rounded border border-border bg-[var(--color-panel)] flex items-baseline gap-1.5 font-mono">
+    <div className="px-2.5 py-1 rounded border border-border bg-[var(--color-panel)] flex items-center gap-1.5 font-mono">
+      <Icon className="h-3 w-3 text-muted-foreground/80 shrink-0" />
       <span className="text-[10.5px] text-muted-foreground">{label}</span>
       <span className="text-[12.5px] tabular-nums">{value}</span>
     </div>
@@ -299,7 +311,7 @@ export function TopBar({
           <Mark className="h-3.5 w-3.5" />
         </div>
         <span className="font-mono text-[13px] font-semibold tracking-tight">
-          AI&nbsp;Mailbox
+          CortexMail
         </span>
         <span className="text-[10px] font-mono text-muted-foreground border border-border rounded px-1 py-0.5">
           console
@@ -309,9 +321,9 @@ export function TopBar({
       {/* Stats and the email are the first things to go on narrow windows —
           the action buttons matter more than the vanity row. */}
       <div className="hidden md:flex items-center gap-1.5">
-        <Stat label="threads" value={s?.threads ?? "—"} />
-        <Stat label="msgs" value={s?.messages ?? "—"} />
-        <Stat label="classified" value={s?.classified ?? "—"} />
+        <Stat icon={MessagesSquare} label="threads" value={s?.threads ?? "—"} />
+        <Stat icon={Mail} label="msgs" value={s?.messages ?? "—"} />
+        <Stat icon={BrainCircuit} label="classified" value={s?.classified ?? "—"} />
       </div>
 
       <div className="flex-1" />

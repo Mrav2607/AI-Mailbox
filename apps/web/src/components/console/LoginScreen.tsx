@@ -54,7 +54,7 @@ export function LoginScreen({ onAuthed }: Props) {
             <Mark className="h-4 w-4" />
           </div>
           <h1 className="font-mono text-base font-semibold tracking-tight">
-            AI Mailbox
+            CortexMail
           </h1>
         </div>
         <p className="text-[12px] text-muted-foreground mb-5 font-mono">
