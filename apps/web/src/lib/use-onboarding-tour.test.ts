@@ -67,13 +67,13 @@ describe("resolveTourTarget", () => {
     expect(TOUR_STEPS.every((step) => step.placement === "auto")).toBe(true);
   });
 
-  it("prefers the open ingest form over its topbar anchor", () => {
+  it("prefers the open ingest panel over its topbar anchor", () => {
     const ingest = TOUR_STEPS.find((step) => step.slug === "ingest");
     expect(ingest).toBeDefined();
 
     expect(resolveTourTarget(ingest!, () => true)).toEqual({
       kind: "target",
-      selector: '[data-tour="topbar-sync"] form',
+      selector: '[data-tour="ingest-panel"]',
     });
   });
 

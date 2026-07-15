@@ -320,6 +320,7 @@ export function TopBar({
         <Popover
           open={ingestOpen}
           onOpenChange={onIngestOpenChange}
+          panelTour="ingest-panel"
           trigger={
             <button
               onClick={() => onIngestOpenChange(!ingestOpen)}

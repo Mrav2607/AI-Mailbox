@@ -129,7 +129,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
     title: "Ingest your mail",
     body: "Choose how many Gmail threads to bring in and whether to classify them immediately. This is the starting point for a new mailbox.",
     target: '[data-tour="topbar-sync"]',
-    preferredTarget: '[data-tour="topbar-sync"] form',
+    preferredTarget: '[data-tour="ingest-panel"]',
     preconditions: ["open-ingest"],
     fallback: { kind: "center" },
     placement: "auto",
