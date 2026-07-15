@@ -82,8 +82,12 @@ function TourTooltip({
         <div className="font-mono text-[11px] text-muted-foreground">
           {index + 1} / {size}
         </div>
-        <h2 className="mt-1 text-base font-semibold tracking-tight">{step.title}</h2>
-        <div className="mt-2 text-sm leading-6 text-foreground/85">{step.content}</div>
+        <h2 className="mt-1 font-mono text-[13px] font-semibold tracking-tight">
+          {step.title}
+        </h2>
+        <div className="mt-2 font-mono text-[12.5px] leading-relaxed text-foreground/85">
+          {step.content}
+        </div>
       </div>
 
       <div className="mt-4 flex items-center gap-2">
@@ -210,6 +214,8 @@ export default function OnboardingTour({
         primaryColor: "var(--color-primary)",
         scrollDuration: reducedMotion ? 0 : 300,
         showProgress: true,
+        // hug the target — the default 10px halo reads as a misaligned gap
+        spotlightPadding: 0,
         textColor: "var(--color-foreground)",
         zIndex: 1000,
       }}
