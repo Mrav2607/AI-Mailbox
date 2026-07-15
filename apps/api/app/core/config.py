@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 from cryptography.fernet import Fernet
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -67,10 +68,23 @@ class Settings(BaseSettings):
         alias="CORS_ORIGINS",
     )
 
+    # --- Logging ---
+    # log_format: "json" (one object per line, for a shipper/jq) or "text"
+    # (readable). Left unset it follows the environment -- JSON in production,
+    # text in dev (see effective_log_format).
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    log_format: Literal["json", "text"] | None = Field(default=None, alias="LOG_FORMAT")
+
     @property
     def cors_origins_list(self) -> list[str]:
         """Parse CORS_ORIGINS into a clean list, dropping blanks."""
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def effective_log_format(self) -> str:
+        """The log format to actually use: an explicit LOG_FORMAT wins, else JSON
+        in production and text everywhere else."""
+        return self.log_format or ("json" if self.is_production else "text")
 
     @property
     def is_production(self) -> bool:

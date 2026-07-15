@@ -5,9 +5,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .core.config import settings
+from .core.logging import configure_logging
 from .core.errors import register_exception_handlers
 from .routes import health, auth, mailbox, analytics, auth_google
 import uvicorn
+
+# Configure logging at import, not in lifespan: by the time lifespan runs uvicorn
+# has already emitted its startup lines in the default format. This is the
+# earliest our code runs when uvicorn imports "app.main:app". (The two banner
+# lines uvicorn prints before importing us stay in its own format -- that would
+# need a uvicorn --log-config, which isn't worth a config file in the image.)
+configure_logging()
 
 
 @asynccontextmanager
