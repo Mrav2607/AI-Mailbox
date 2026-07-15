@@ -316,70 +316,73 @@ export function TopBar({
 
       <div className="flex-1" />
 
-      <Popover
-        open={ingestOpen}
-        onOpenChange={onIngestOpenChange}
-        trigger={
-          <button
-            onClick={() => onIngestOpenChange(!ingestOpen)}
-            disabled={ingesting}
-            aria-expanded={ingestOpen}
-            className="h-7 px-2.5 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
-          >
-            {ingesting ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <Download className="h-3 w-3" />
-            )}
-            ingest
-          </button>
-        }
-      >
-        <IngestForm
-          busy={ingesting}
-          onSubmit={(o) => {
-            onIngestOpenChange(false);
-            onIngest(o);
-          }}
-          autoSync={autoSync}
-          onAutoSync={onAutoSync}
-        />
-      </Popover>
+      <div data-tour="topbar-sync" className="flex items-center gap-3">
+        <Popover
+          open={ingestOpen}
+          onOpenChange={onIngestOpenChange}
+          trigger={
+            <button
+              onClick={() => onIngestOpenChange(!ingestOpen)}
+              disabled={ingesting}
+              aria-expanded={ingestOpen}
+              className="h-7 px-2.5 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+            >
+              {ingesting ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <Download className="h-3 w-3" />
+              )}
+              ingest
+            </button>
+          }
+        >
+          <IngestForm
+            busy={ingesting}
+            onSubmit={(o) => {
+              onIngestOpenChange(false);
+              onIngest(o);
+            }}
+            autoSync={autoSync}
+            onAutoSync={onAutoSync}
+          />
+        </Popover>
 
-      <Popover
-        open={backfillOpen}
-        onOpenChange={onBackfillOpenChange}
-        trigger={
-          <button
-            onClick={() => onBackfillOpenChange(!backfillOpen)}
-            disabled={backfilling}
-            aria-expanded={backfillOpen}
-            className="h-7 px-2.5 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
-          >
-            {backfilling ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <Sparkles className="h-3 w-3" />
-            )}
-            backfill
-          </button>
-        }
-      >
-        <BackfillForm
-          busy={backfilling}
-          currentBucket={currentBucket}
-          onSubmit={(o) => {
-            onBackfillOpenChange(false);
-            onBackfill(o);
-          }}
-        />
-      </Popover>
+        <Popover
+          open={backfillOpen}
+          onOpenChange={onBackfillOpenChange}
+          trigger={
+            <button
+              onClick={() => onBackfillOpenChange(!backfillOpen)}
+              disabled={backfilling}
+              aria-expanded={backfillOpen}
+              className="h-7 px-2.5 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+            >
+              {backfilling ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <Sparkles className="h-3 w-3" />
+              )}
+              backfill
+            </button>
+          }
+        >
+          <BackfillForm
+            busy={backfilling}
+            currentBucket={currentBucket}
+            onSubmit={(o) => {
+              onBackfillOpenChange(false);
+              onBackfill(o);
+            }}
+          />
+        </Popover>
+      </div>
 
       <Popover
         open={layoutOpen}
         onOpenChange={onLayoutOpenChange}
         trigger={
           <button
+            data-tour="layout"
             onClick={() => onLayoutOpenChange(!layoutOpen)}
             aria-expanded={layoutOpen}
             className="h-7 px-2.5 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors"
@@ -393,6 +396,7 @@ export function TopBar({
       </Popover>
 
       <button
+        data-tour="theme"
         onClick={() => onTheme(nextTheme)}
         aria-label={`Theme: ${theme}. Switch to ${nextTheme}.`}
         title={`theme: ${theme} → ${nextTheme}`}

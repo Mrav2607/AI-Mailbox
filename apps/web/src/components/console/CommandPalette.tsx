@@ -35,6 +35,7 @@ interface Props {
   inDoneBucket: boolean;
   onOpenGmail: () => void;
   onDelete: () => void;
+  onRestartTour: () => void;
 }
 
 export function CommandPalette({
@@ -57,6 +58,7 @@ export function CommandPalette({
   inDoneBucket,
   onOpenGmail,
   onDelete,
+  onRestartTour,
 }: Props) {
   const run = (fn: () => void) => {
     onOpenChange(false);
@@ -138,6 +140,12 @@ export function CommandPalette({
               ))}
             </CommandGroup>
             <CommandGroup heading="actions">
+              <CommandItem
+                onSelect={() => run(onRestartTour)}
+                value="restart onboarding tour walkthrough"
+              >
+                restart tour
+              </CommandItem>
               <CommandItem onSelect={() => run(onIngest)} value="ingest gmail">
                 ingest gmail…
               </CommandItem>

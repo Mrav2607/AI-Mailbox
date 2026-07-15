@@ -108,21 +108,28 @@ export function ThreadDetailPane({
   const CollapseIcon = COLLAPSE_ICONS[side];
   if (error) {
     return (
-      <div role="alert" className="p-6 text-sm text-destructive font-mono">
+      <div
+        data-tour="detail-pane"
+        role="alert"
+        className="p-6 text-sm text-destructive font-mono"
+      >
         {error}
       </div>
     );
   }
   if (!data && loading) {
     return (
-      <div className="p-6 text-sm text-muted-foreground font-mono">
+      <div
+        data-tour="detail-pane"
+        className="p-6 text-sm text-muted-foreground font-mono"
+      >
         loading thread…
       </div>
     );
   }
   if (!data) {
     return (
-      <div className="h-full flex flex-col">
+      <div data-tour="detail-pane" className="h-full flex flex-col">
         {onCollapse && (
           <div className="flex justify-end items-center gap-2 p-2">
             <PaneDragHandle source="detail" />
@@ -153,7 +160,7 @@ export function ThreadDetailPane({
   const meta = classification?.label ? LABEL_META[classification.label] : null;
 
   return (
-    <div className="h-full flex flex-col">
+    <div data-tour="detail-pane" className="h-full flex flex-col">
       <header className="px-4 py-3 border-b border-border bg-[var(--color-panel)] panel-lift">
         <div className="flex items-center gap-2">
           <div className="flex-1 min-w-0 text-[11px] text-muted-foreground font-mono lowercase truncate">
@@ -214,7 +221,10 @@ export function ThreadDetailPane({
 
       {/* Prediction — heading doubles as the collapse toggle so the bar can
           get out of the way of long threads. */}
-      <section className="border-b border-border bg-[var(--color-panel)]/40">
+      <section
+        data-tour="prediction"
+        className="border-b border-border bg-[var(--color-panel)]/40"
+      >
         <button
           onClick={onTogglePrediction}
           aria-expanded={predictionOpen}

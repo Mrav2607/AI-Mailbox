@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ApiError,
   classifyBackfill,
@@ -44,7 +52,10 @@ import { TopBar } from "@/components/console/TopBar";
 import { CommandPalette } from "@/components/console/CommandPalette";
 import { Shortcuts } from "@/components/console/Shortcuts";
 import { LoginScreen } from "@/components/console/LoginScreen";
-import { useHotkeys } from "@/lib/use-hotkeys";
+import {
+  shouldSuppressConsoleHotkeys,
+  useHotkeys,
+} from "@/lib/use-hotkeys";
 import {
   broadcastSyncComplete,
   NEW_MAIL_SCAN_LIMIT,
@@ -52,8 +63,12 @@ import {
 } from "@/lib/use-auto-sync";
 import { Toaster } from "@/components/ui/sonner";
 import { ConsoleLayout } from "@/components/console/ConsoleLayout";
-import { UI_KEY, loadUi } from "@/lib/layout";
+import { TOUR_VERSION, UI_KEY, loadUi } from "@/lib/layout";
 import type { Arrangement, PaneLayout, PaneSizes } from "@/lib/layout";
+import {
+  useOnboardingTour,
+  type TourDeps,
+} from "@/lib/use-onboarding-tour";
 import { applyTheme, resolveTheme, watchSystemTheme } from "@/lib/theme";
 import type { ThemePref } from "@/lib/theme";
 import { PanelRightOpen, Search, X } from "lucide-react";
@@ -64,10 +79,14 @@ type SortMode = "recent" | "confidence_asc" | "confidence_desc";
 // the detail pane). Persisted (with the pane arrangement and sizes, see
 // lib/layout.ts) so the operator's layout sticks.
 // The shortcuts hint lives inside the sidebar, so it tracks `sidebar`.
-type Panels = { sidebar: boolean; detail: boolean; prediction: boolean };
+export type Panels = { sidebar: boolean; detail: boolean; prediction: boolean };
 
 // One read at module load; the states below fan out from it.
 const INITIAL_UI = loadUi();
+
+const OnboardingTour = lazy(
+  () => import("@/components/console/OnboardingTour"),
+);
 
 // How long the "thread deleted · undo" window stays open before the delete is
 // actually sent to the server.
@@ -97,6 +116,7 @@ export default function Console() {
   });
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
+  const [firstListLoadSettled, setFirstListLoadSettled] = useState(false);
 
   const [overview, setOverview] = useState<Overview | null>(null);
 
@@ -126,6 +146,7 @@ export default function Console() {
   const [layoutOpen, setLayoutOpen] = useState(false);
   const [theme, setTheme] = useState<ThemePref>(INITIAL_UI.theme);
   const [autoSync, setAutoSync] = useState<number>(INITIAL_UI.autoSync);
+  const [tourVersion, setTourVersion] = useState<number>(INITIAL_UI.tourVersion);
   // Resolved dark/light, tracked as state so theme-aware children (the
   // toaster) re-render when a "system" preference follows an OS flip.
   const [resolvedTheme, setResolvedTheme] = useState<"dark" | "light">(() =>
@@ -157,21 +178,69 @@ export default function Console() {
   const pendingDeletes = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map(),
   );
+  const panelsRef = useRef(panels);
+  panelsRef.current = panels;
 
   useEffect(() => {
     try {
       window.localStorage.setItem(
         UI_KEY,
-        JSON.stringify({ ...panels, arrangement, paneSizes, theme, autoSync }),
+        JSON.stringify({
+          ...panels,
+          arrangement,
+          paneSizes,
+          theme,
+          autoSync,
+          tourVersion,
+        }),
       );
     } catch {
       /* storage unavailable; layout just won't persist */
     }
-  }, [panels, arrangement, paneSizes, theme, autoSync]);
+  }, [panels, arrangement, paneSizes, theme, autoSync, tourVersion]);
 
   const togglePanel = useCallback((key: keyof Panels) => {
     setPanels((p) => ({ ...p, [key]: !p[key] }));
   }, []);
+
+  const showPanel = useCallback((key: keyof Panels) => {
+    setPanels((current) =>
+      current[key] ? current : { ...current, [key]: true },
+    );
+  }, []);
+
+  const snapshotPanels = useCallback((): Panels => ({ ...panelsRef.current }), []);
+  const restorePanels = useCallback((snapshot: Panels) => {
+    setPanels(snapshot);
+  }, []);
+
+  const tourDeps = useMemo<TourDeps>(
+    () => ({
+      showPanel,
+      setBucket,
+      openIngestDialog: () => setIngestOpen(true),
+      snapshotPanels,
+      restorePanels,
+    }),
+    [restorePanels, showPanel, snapshotPanels],
+  );
+
+  const {
+    tourActive,
+    stepIndex: tourStepIndex,
+    targetResolution: tourTargetResolution,
+    restartTour,
+    skipTour,
+    finishTour,
+    goToStep: goToTourStep,
+  } = useOnboardingTour({
+    authChecked,
+    hasUser: Boolean(user),
+    tourVersion,
+    firstListLoadSettled,
+    deps: tourDeps,
+    setTourVersion,
+  });
 
   const handlePaneSizes = useCallback((key: string, layout: PaneLayout) => {
     setPaneSizes((s) => ({ ...s, [key]: layout }));
@@ -271,7 +340,10 @@ export default function Console() {
         }
         setListError((e as Error).message ?? "failed to load");
       } finally {
-        if (!quiet) setListLoading(false);
+        if (!quiet) {
+          setListLoading(false);
+          setFirstListLoadSettled(true);
+        }
       }
     },
     [handleSessionExpired],
@@ -789,10 +861,14 @@ export default function Console() {
   useHotkeys(
     (e) => {
       // overlays open: only handle escape
-      if (paletteOpen || shortcutsOpen) {
+      if (shouldSuppressConsoleHotkeys(paletteOpen, shortcutsOpen, tourActive)) {
         if (e.key === "Escape") {
-          setPaletteOpen(false);
-          setShortcutsOpen(false);
+          if (tourActive) {
+            skipTour();
+          } else {
+            setPaletteOpen(false);
+            setShortcutsOpen(false);
+          }
         }
         return;
       }
@@ -917,6 +993,8 @@ export default function Console() {
     [
       paletteOpen,
       shortcutsOpen,
+      tourActive,
+      skipTour,
       searchMode,
       query,
       visibleItems,
@@ -1063,6 +1141,7 @@ export default function Console() {
               <div className="flex items-center gap-1.5 w-full rounded border border-border bg-background px-2 h-6 focus-within:border-primary transition-colors">
                 <Search className="h-3 w-3 text-muted-foreground shrink-0" />
                 <input
+                  data-tour="search"
                   ref={searchInputRef}
                   value={query}
                   onChange={(e) => {
@@ -1094,6 +1173,7 @@ export default function Console() {
             </div>
 
             <button
+              data-tour="sort"
               onClick={() =>
                 setSortMode((m) =>
                   m === "confidence_asc"
@@ -1121,7 +1201,11 @@ export default function Console() {
               </button>
             )}
           </div>
-            <div ref={listScrollRef} className="flex-1 overflow-y-auto scrollbar-thin">
+            <div
+              data-tour="thread-list"
+              ref={listScrollRef}
+              className="flex-1 overflow-y-auto scrollbar-thin"
+            >
               <ThreadList
                 items={visibleItems}
                 selectedId={selectedId}
@@ -1173,8 +1257,23 @@ export default function Console() {
         inDoneBucket={bucket === "done"}
         onOpenGmail={openInGmail}
         onDelete={() => doDelete()}
+        onRestartTour={restartTour}
       />
       <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+      {(tourActive || tourVersion < TOUR_VERSION) && (
+        <Suspense fallback={null}>
+          <OnboardingTour
+            run={tourActive}
+            stepIndex={tourStepIndex}
+            targetResolution={tourTargetResolution}
+            emptyThreadList={visibleItems.length === 0}
+            emptyDetail={!thread}
+            onStepChange={goToTourStep}
+            onFinish={finishTour}
+            onSkip={skipTour}
+          />
+        </Suspense>
+      )}
       <Toaster theme={resolvedTheme} />
     </div>
   );

@@ -23,7 +23,10 @@ export function BucketSidebar({
   const CollapseIcon = side === "left" ? PanelLeftClose : PanelRightClose;
   return (
     // Width and the dividing border belong to the layout's Panel/Separator now.
-    <aside className="flex-1 min-w-0 bg-[var(--color-panel)] panel-lift flex flex-col">
+    <aside
+      data-tour="bucket-sidebar"
+      className="flex-1 min-w-0 bg-[var(--color-panel)] panel-lift flex flex-col"
+    >
       <div className="px-3 py-2.5 border-b border-border flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
         <Inbox className="h-3.5 w-3.5" />
         <span className="flex-1">buckets</span>
@@ -46,6 +49,7 @@ export function BucketSidebar({
           return (
             <button
               key={b}
+              data-tour={`bucket-${b}`}
               onClick={() => onSelect(b)}
               className={[
                 "relative w-full text-left pl-3 pr-3 py-1.5 flex items-center gap-2 font-mono text-[12.5px] transition-colors duration-100 border-l-2 cursor-pointer focus-visible:outline-none focus-visible:bg-[var(--color-panel-hi)]",
