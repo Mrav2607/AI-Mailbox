@@ -308,9 +308,19 @@ def ingest_gmail_messages(
     messages_upserted = 0
     classified = 0
     threads_reopened = 0
+    threads_missing = 0
 
     for index, tid in enumerate(thread_ids):
-        raw_thread = with_token_retry(lambda tid=tid: client.get_thread(tid))
+        try:
+            raw_thread = with_token_retry(lambda tid=tid: client.get_thread(tid))
+        except httpx.HTTPStatusError as exc:
+            # Skip deleted threads
+            if exc.response is None or exc.response.status_code != 404:
+                raise
+            threads_missing += 1
+            if tid not in existing_thread_ids:
+                new_threads = max(0, new_threads - 1)
+            continue
 
         normalized_msgs = [normalize_message(m) for m in raw_thread.get("messages", [])]
         normalized_msgs = [
@@ -458,6 +468,7 @@ def ingest_gmail_messages(
         "threads_reopened": threads_reopened,
         "fetched": len(thread_ids),
         "skipped_existing": skipped_existing,
+        "threads_missing": threads_missing,
         # Genuinely new arrivals, not backfilled history — threads_upserted
         # counts both, so it can't distinguish "you have mail" from "the DB
         # is still catching up". Meaningful only with skip_existing.

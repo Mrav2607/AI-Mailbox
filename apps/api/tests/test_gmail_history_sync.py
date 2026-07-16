@@ -1,6 +1,10 @@
 from unittest.mock import MagicMock
 from datetime import datetime, timedelta, timezone
 
+import httpx
+import pytest
+
+from app.services.ingest import gmail_ingest
 from app.services.ingest.gmail_ingest import (
     _collect_history_thread_ids,
     _count_new_threads,
@@ -112,3 +116,47 @@ def test_new_inbound_reply_reopens_done_thread_but_sent_or_existing_mail_does_no
     assert _should_reopen_thread(done_at, {"old"}, [inbound]) is True
     assert _should_reopen_thread(done_at, {"old"}, [sent]) is False
     assert _should_reopen_thread(done_at, {"new-inbound"}, [inbound]) is False
+
+
+def _deleted_thread_setup(monkeypatch, status_code):
+    """A mailbox whose history names one thread that Gmail no longer has."""
+    provider = MagicMock(
+        access_token="tok", token_expiry=None, gmail_history_id="100"
+    )
+    db = MagicMock()
+    db.execute.return_value.scalars.return_value.first.return_value = provider
+    db.execute.return_value.scalars.return_value.all.return_value = ["known-thread"]
+
+    client = MagicMock()
+    client.list_history.return_value = {
+        "historyId": "110",
+        "history": [
+            {"messagesAdded": [{"message": {"id": "m1", "threadId": "gone-thread"}}]}
+        ],
+    }
+    response = MagicMock(status_code=status_code)
+    client.get_thread.side_effect = httpx.HTTPStatusError(
+        "boom", request=MagicMock(), response=response
+    )
+    monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
+    return db, provider
+
+
+def test_thread_deleted_after_history_named_it_is_skipped(monkeypatch):
+    db, provider = _deleted_thread_setup(monkeypatch, 404)
+
+    result = ingest_gmail_messages(db, "u1", new_only=True)
+
+    assert result["threads_missing"] == 1
+    assert result["threads_upserted"] == 0
+    assert result["new_threads"] == 0
+    assert provider.gmail_history_id == "110"
+
+
+def test_a_thread_fetch_failing_for_other_reasons_still_raises(monkeypatch):
+    db, provider = _deleted_thread_setup(monkeypatch, 500)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        ingest_gmail_messages(db, "u1", new_only=True)
+
+    assert provider.gmail_history_id == "100"
