@@ -25,6 +25,7 @@ interface AutoStartGate {
   hasUser: boolean;
   tourVersion: number;
   firstListLoadSettled: boolean;
+  narrowViewport: boolean;
 }
 
 interface UseOnboardingTourOptions extends AutoStartGate {
@@ -37,7 +38,8 @@ export function shouldAutoStartTour(gate: AutoStartGate): boolean {
     gate.authChecked &&
     gate.hasUser &&
     gate.tourVersion < TOUR_VERSION &&
-    gate.firstListLoadSettled
+    gate.firstListLoadSettled &&
+    !gate.narrowViewport
   );
 }
 
@@ -71,6 +73,7 @@ export function useOnboardingTour({
   hasUser,
   tourVersion,
   firstListLoadSettled,
+  narrowViewport,
   deps,
   setTourVersion,
 }: UseOnboardingTourOptions) {
@@ -118,6 +121,7 @@ export function useOnboardingTour({
         hasUser,
         tourVersion,
         firstListLoadSettled,
+        narrowViewport,
       })
     ) {
       return;
@@ -128,6 +132,7 @@ export function useOnboardingTour({
     hasUser,
     tourVersion,
     firstListLoadSettled,
+    narrowViewport,
     restartTour,
   ]);
 

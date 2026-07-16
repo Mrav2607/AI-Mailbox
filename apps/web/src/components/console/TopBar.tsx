@@ -313,7 +313,7 @@ export function TopBar({
         <span className="font-mono text-[13px] font-semibold tracking-tight">
           CortexMail
         </span>
-        <span className="text-[10px] font-mono text-muted-foreground border border-border rounded px-1 py-0.5">
+        <span className="hidden md:inline text-[10px] font-mono text-muted-foreground border border-border rounded px-1 py-0.5">
           console
         </span>
       </div>
@@ -338,14 +338,15 @@ export function TopBar({
               onClick={() => onIngestOpenChange(!ingestOpen)}
               disabled={ingesting}
               aria-expanded={ingestOpen}
-              className="h-7 px-2.5 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+              aria-label="Ingest gmail"
+              className="h-7 max-md:h-10 px-2.5 max-md:w-10 max-md:px-0 max-md:justify-center rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
               {ingesting ? (
                 <Loader2 className="h-3 w-3 animate-spin" />
               ) : (
                 <Download className="h-3 w-3" />
               )}
-              ingest
+              <span className="max-md:hidden">ingest</span>
             </button>
           }
         >
@@ -368,14 +369,15 @@ export function TopBar({
               onClick={() => onBackfillOpenChange(!backfillOpen)}
               disabled={backfilling}
               aria-expanded={backfillOpen}
-              className="h-7 px-2.5 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+              aria-label="Classify / backfill"
+              className="h-7 max-md:h-10 px-2.5 max-md:w-10 max-md:px-0 max-md:justify-center rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
               {backfilling ? (
                 <Loader2 className="h-3 w-3 animate-spin" />
               ) : (
                 <Sparkles className="h-3 w-3" />
               )}
-              backfill
+              <span className="max-md:hidden">backfill</span>
             </button>
           }
         >
@@ -390,35 +392,37 @@ export function TopBar({
         </Popover>
       </div>
 
-      <Popover
-        open={layoutOpen}
-        onOpenChange={onLayoutOpenChange}
-        trigger={
-          <button
-            data-tour="layout"
-            onClick={() => onLayoutOpenChange(!layoutOpen)}
-            aria-expanded={layoutOpen}
-            className="h-7 px-2.5 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors"
-          >
-            <Columns3 className="h-3 w-3" />
-            layout
-          </button>
-        }
-      >
-        <LayoutPicker arrangement={arrangement} onArrangement={onArrangement} />
-      </Popover>
+      <div className="hidden md:block">
+        <Popover
+          open={layoutOpen}
+          onOpenChange={onLayoutOpenChange}
+          trigger={
+            <button
+              data-tour="layout"
+              onClick={() => onLayoutOpenChange(!layoutOpen)}
+              aria-expanded={layoutOpen}
+              className="h-7 px-2.5 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors"
+            >
+              <Columns3 className="h-3 w-3" />
+              layout
+            </button>
+          }
+        >
+          <LayoutPicker arrangement={arrangement} onArrangement={onArrangement} />
+        </Popover>
+      </div>
 
       <button
         data-tour="theme"
         onClick={() => onTheme(nextTheme)}
         aria-label={`Theme: ${theme}. Switch to ${nextTheme}.`}
         title={`theme: ${theme} → ${nextTheme}`}
-        className="h-7 w-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center justify-center text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+        className="h-7 w-7 max-md:h-10 max-md:w-10 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center justify-center text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
       >
         <ThemeIcon className="h-3 w-3" />
       </button>
 
-      <div className="mx-1 h-5 w-px bg-border" />
+      <div className="hidden md:block mx-1 h-5 w-px bg-border" />
 
       <span className="hidden md:inline text-[11.5px] font-mono text-muted-foreground truncate max-w-[180px]">
         {user?.email ?? "—"}
@@ -430,7 +434,7 @@ export function TopBar({
         // match what the button actually does.
         title="sign out everywhere"
         aria-label="Sign out everywhere"
-        className="h-7 w-7 rounded border border-border hover:bg-accent hover:text-foreground flex items-center justify-center text-muted-foreground cursor-pointer transition-colors"
+        className="h-7 w-7 max-md:h-10 max-md:w-10 rounded border border-border hover:bg-accent hover:text-foreground flex items-center justify-center text-muted-foreground cursor-pointer transition-colors"
       >
         <LogOut className="h-3 w-3" />
       </button>

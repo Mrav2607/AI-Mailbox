@@ -15,6 +15,7 @@ describe("shouldAutoStartTour", () => {
     hasUser: true,
     tourVersion: TOUR_VERSION - 1,
     firstListLoadSettled: true,
+    narrowViewport: false,
   };
 
   it("starts only when every gate is ready", () => {
@@ -27,6 +28,7 @@ describe("shouldAutoStartTour", () => {
     { tourVersion: TOUR_VERSION },
     { tourVersion: TOUR_VERSION + 1 },
     { firstListLoadSettled: false },
+    { narrowViewport: true },
   ])("does not start when a gate fails: %o", (patch) => {
     expect(shouldAutoStartTour({ ...ready, ...patch })).toBe(false);
   });
