@@ -98,6 +98,16 @@ export function useOnboardingTour({
     setTargetResolution(null);
   }, [restorePanelSnapshot, setTourVersion]);
 
+  // Unlike endTour this doesn't touch tourVersion: a viewport shrink pauses
+  // the tour rather than completing it, and clearing the latch lets the
+  // auto-start effect pick it back up when the window widens again.
+  const deferTour = useCallback(() => {
+    restorePanelSnapshot();
+    autoStartLatched.current = false;
+    setTourActive(false);
+    setTargetResolution(null);
+  }, [restorePanelSnapshot]);
+
   const restartTour = useCallback(() => {
     autoStartLatched.current = true;
     panelSnapshot.current = deps.snapshotPanels();
@@ -175,6 +185,7 @@ export function useOnboardingTour({
     stepIndex,
     targetResolution,
     restartTour,
+    deferTour,
     skipTour: endTour,
     finishTour: endTour,
     goToStep,

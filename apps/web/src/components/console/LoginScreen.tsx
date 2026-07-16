@@ -65,7 +65,7 @@ export function LoginScreen({ onAuthed }: Props) {
             CortexMail
           </h1>
         </div>
-        <p className="text-[10.5px] tracking-tight whitespace-nowrap text-muted-foreground mb-5 font-mono">
+        <p className="text-[10.5px] tracking-tight text-muted-foreground mb-5 font-mono">
           your inbox, triaged by a cortex · sign in to continue
         </p>
 

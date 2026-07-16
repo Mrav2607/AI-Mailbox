@@ -310,7 +310,7 @@ export function TopBar({
         <div className="h-5 w-5 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor text-primary">
           <Mark className="h-3.5 w-3.5" />
         </div>
-        <span className="font-mono text-[13px] font-semibold tracking-tight">
+        <span className="max-[360px]:hidden font-mono text-[13px] font-semibold tracking-tight">
           CortexMail
         </span>
         <span className="hidden md:inline text-[10px] font-mono text-muted-foreground border border-border rounded px-1 py-0.5">

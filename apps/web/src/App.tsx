@@ -236,6 +236,7 @@ export default function Console() {
     stepIndex: tourStepIndex,
     targetResolution: tourTargetResolution,
     restartTour,
+    deferTour,
     skipTour,
     finishTour,
     goToStep: goToTourStep,
@@ -250,8 +251,10 @@ export default function Console() {
   });
 
   useEffect(() => {
-    if (isNarrow && tourActive) skipTour();
-  }, [isNarrow, skipTour, tourActive]);
+    // Defer, don't skip: shrinking mid-tour shouldn't burn tourVersion — the
+    // tour picks back up when the viewport widens.
+    if (isNarrow && tourActive) deferTour();
+  }, [isNarrow, deferTour, tourActive]);
 
   const handlePaneSizes = useCallback((key: string, layout: PaneLayout) => {
     setPaneSizes((s) => ({ ...s, [key]: layout }));
