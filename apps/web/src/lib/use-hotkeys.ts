@@ -2,6 +2,14 @@ import { useEffect } from "react";
 
 type Handler = (e: KeyboardEvent) => void;
 
+export function shouldSuppressConsoleHotkeys(
+  paletteOpen: boolean,
+  shortcutsOpen: boolean,
+  tourActive: boolean,
+): boolean {
+  return paletteOpen || shortcutsOpen || tourActive;
+}
+
 export function useHotkeys(handler: Handler, deps: unknown[] = []) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

@@ -1,7 +1,10 @@
 import { useState } from "react";
 import {
+  BrainCircuit,
   Loader2,
   Download,
+  Mail,
+  MessagesSquare,
   Sparkles,
   LogOut,
   Columns3,
@@ -67,9 +70,18 @@ function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
 }
 
-function Stat({ label, value }: { label: string; value: number | string }) {
+function Stat({
+  icon: Icon,
+  label,
+  value,
+}: {
+  icon: typeof Mail;
+  label: string;
+  value: number | string;
+}) {
   return (
-    <div className="px-2.5 py-1 rounded border border-border bg-[var(--color-panel)] flex items-baseline gap-1.5 font-mono">
+    <div className="px-2.5 py-1 rounded border border-border bg-[var(--color-panel)] flex items-center gap-1.5 font-mono">
+      <Icon className="h-3 w-3 text-muted-foreground/80 shrink-0" />
       <span className="text-[10.5px] text-muted-foreground">{label}</span>
       <span className="text-[12.5px] tabular-nums">{value}</span>
     </div>
@@ -78,7 +90,7 @@ function Stat({ label, value }: { label: string; value: number | string }) {
 
 const fieldLabel = "font-mono text-[11px] text-muted-foreground";
 const control =
-  "w-full bg-[var(--color-panel)] border border-border rounded px-2 py-1 text-[12px] font-mono text-foreground focus-visible:outline-none focus-visible:border-primary/60";
+  "w-full bg-[var(--color-panel)] border border-border rounded px-2 py-1 text-[12px] font-mono text-foreground";
 
 function IngestForm({
   busy,
@@ -298,10 +310,10 @@ export function TopBar({
         <div className="h-5 w-5 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor text-primary">
           <Mark className="h-3.5 w-3.5" />
         </div>
-        <span className="font-mono text-[13px] font-semibold tracking-tight">
-          AI&nbsp;Mailbox
+        <span className="max-[360px]:hidden font-mono text-[13px] font-semibold tracking-tight">
+          CortexMail
         </span>
-        <span className="text-[10px] font-mono text-muted-foreground border border-border rounded px-1 py-0.5">
+        <span className="hidden md:inline text-[10px] font-mono text-muted-foreground border border-border rounded px-1 py-0.5">
           console
         </span>
       </div>
@@ -309,99 +321,108 @@ export function TopBar({
       {/* Stats and the email are the first things to go on narrow windows —
           the action buttons matter more than the vanity row. */}
       <div className="hidden md:flex items-center gap-1.5">
-        <Stat label="threads" value={s?.threads ?? "—"} />
-        <Stat label="msgs" value={s?.messages ?? "—"} />
-        <Stat label="classified" value={s?.classified ?? "—"} />
+        <Stat icon={MessagesSquare} label="threads" value={s?.threads ?? "—"} />
+        <Stat icon={Mail} label="msgs" value={s?.messages ?? "—"} />
+        <Stat icon={BrainCircuit} label="classified" value={s?.classified ?? "—"} />
       </div>
 
       <div className="flex-1" />
 
-      <Popover
-        open={ingestOpen}
-        onOpenChange={onIngestOpenChange}
-        trigger={
-          <button
-            onClick={() => onIngestOpenChange(!ingestOpen)}
-            disabled={ingesting}
-            aria-expanded={ingestOpen}
-            className="h-7 px-2.5 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
-          >
-            {ingesting ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <Download className="h-3 w-3" />
-            )}
-            ingest
-          </button>
-        }
-      >
-        <IngestForm
-          busy={ingesting}
-          onSubmit={(o) => {
-            onIngestOpenChange(false);
-            onIngest(o);
-          }}
-          autoSync={autoSync}
-          onAutoSync={onAutoSync}
-        />
-      </Popover>
+      <div data-tour="topbar-sync" className="flex items-center gap-3">
+        <Popover
+          open={ingestOpen}
+          onOpenChange={onIngestOpenChange}
+          panelTour="ingest-panel"
+          trigger={
+            <button
+              onClick={() => onIngestOpenChange(!ingestOpen)}
+              disabled={ingesting}
+              aria-expanded={ingestOpen}
+              aria-label="Ingest gmail"
+              className="h-7 max-md:h-10 px-2.5 max-md:w-10 max-md:px-0 max-md:justify-center rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+            >
+              {ingesting ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <Download className="h-3 w-3" />
+              )}
+              <span className="max-md:hidden">ingest</span>
+            </button>
+          }
+        >
+          <IngestForm
+            busy={ingesting}
+            onSubmit={(o) => {
+              onIngestOpenChange(false);
+              onIngest(o);
+            }}
+            autoSync={autoSync}
+            onAutoSync={onAutoSync}
+          />
+        </Popover>
 
-      <Popover
-        open={backfillOpen}
-        onOpenChange={onBackfillOpenChange}
-        trigger={
-          <button
-            onClick={() => onBackfillOpenChange(!backfillOpen)}
-            disabled={backfilling}
-            aria-expanded={backfillOpen}
-            className="h-7 px-2.5 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
-          >
-            {backfilling ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <Sparkles className="h-3 w-3" />
-            )}
-            backfill
-          </button>
-        }
-      >
-        <BackfillForm
-          busy={backfilling}
-          currentBucket={currentBucket}
-          onSubmit={(o) => {
-            onBackfillOpenChange(false);
-            onBackfill(o);
-          }}
-        />
-      </Popover>
+        <Popover
+          open={backfillOpen}
+          onOpenChange={onBackfillOpenChange}
+          trigger={
+            <button
+              onClick={() => onBackfillOpenChange(!backfillOpen)}
+              disabled={backfilling}
+              aria-expanded={backfillOpen}
+              aria-label="Classify / backfill"
+              className="h-7 max-md:h-10 px-2.5 max-md:w-10 max-md:px-0 max-md:justify-center rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+            >
+              {backfilling ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <Sparkles className="h-3 w-3" />
+              )}
+              <span className="max-md:hidden">backfill</span>
+            </button>
+          }
+        >
+          <BackfillForm
+            busy={backfilling}
+            currentBucket={currentBucket}
+            onSubmit={(o) => {
+              onBackfillOpenChange(false);
+              onBackfill(o);
+            }}
+          />
+        </Popover>
+      </div>
 
-      <Popover
-        open={layoutOpen}
-        onOpenChange={onLayoutOpenChange}
-        trigger={
-          <button
-            onClick={() => onLayoutOpenChange(!layoutOpen)}
-            aria-expanded={layoutOpen}
-            className="h-7 px-2.5 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors"
-          >
-            <Columns3 className="h-3 w-3" />
-            layout
-          </button>
-        }
-      >
-        <LayoutPicker arrangement={arrangement} onArrangement={onArrangement} />
-      </Popover>
+      <div className="hidden md:block">
+        <Popover
+          open={layoutOpen}
+          onOpenChange={onLayoutOpenChange}
+          trigger={
+            <button
+              data-tour="layout"
+              onClick={() => onLayoutOpenChange(!layoutOpen)}
+              aria-expanded={layoutOpen}
+              className="h-7 px-2.5 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors"
+            >
+              <Columns3 className="h-3 w-3" />
+              layout
+            </button>
+          }
+        >
+          <LayoutPicker arrangement={arrangement} onArrangement={onArrangement} />
+        </Popover>
+      </div>
 
       <button
+        data-tour="theme"
         onClick={() => onTheme(nextTheme)}
         aria-label={`Theme: ${theme}. Switch to ${nextTheme}.`}
         title={`theme: ${theme} → ${nextTheme}`}
-        className="h-7 w-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center justify-center text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+        className="h-7 w-7 max-md:h-10 max-md:w-10 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center justify-center text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
       >
         <ThemeIcon className="h-3 w-3" />
       </button>
 
-      <div className="mx-1 h-5 w-px bg-border" />
+      <div className="hidden md:block mx-1 h-5 w-px bg-border" />
 
       <span className="hidden md:inline text-[11.5px] font-mono text-muted-foreground truncate max-w-[180px]">
         {user?.email ?? "—"}
@@ -413,7 +434,7 @@ export function TopBar({
         // match what the button actually does.
         title="sign out everywhere"
         aria-label="Sign out everywhere"
-        className="h-7 w-7 rounded border border-border hover:bg-accent hover:text-foreground flex items-center justify-center text-muted-foreground cursor-pointer transition-colors"
+        className="h-7 w-7 max-md:h-10 max-md:w-10 rounded border border-border hover:bg-accent hover:text-foreground flex items-center justify-center text-muted-foreground cursor-pointer transition-colors"
       >
         <LogOut className="h-3 w-3" />
       </button>

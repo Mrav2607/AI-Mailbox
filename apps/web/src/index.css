@@ -4,6 +4,12 @@
 
 @custom-variant dark (&:is(.dark *));
 
+@media (prefers-reduced-motion: reduce) {
+  .react-joyride__spotlight path {
+    transition: none !important;
+  }
+}
+
 @theme inline {
   --radius-sm: calc(var(--radius) - 3px);
   --radius-md: calc(var(--radius) - 1px);

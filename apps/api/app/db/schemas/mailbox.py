@@ -16,6 +16,7 @@ class TriageItem(Response):
     subject: str | None
     last_message_at: datetime | None
     latest_message_snippet: str | None
+    latest_message_sender: str | None
     classification: ClassificationOut
 
 

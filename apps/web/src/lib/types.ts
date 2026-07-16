@@ -40,6 +40,7 @@ export interface TriageItem {
   subject: string | null;
   last_message_at: string | null;
   latest_message_snippet: string | null;
+  latest_message_sender: string | null;
   classification: Classification;
 }
 

@@ -91,9 +91,11 @@ export type UiState = {
   arrangement: Arrangement;
   paneSizes: PaneSizes;
   autoSync: number; // seconds between background syncs, 0 = off
+  tourVersion: number; // 0 = never completed; N = completed tour version N
 };
 
 export const UI_KEY = "ai_mailbox_ui";
+export const TOUR_VERSION = 1;
 
 export const DEFAULT_UI: UiState = {
   sidebar: true,
@@ -103,6 +105,7 @@ export const DEFAULT_UI: UiState = {
   arrangement: DEFAULT_ARRANGEMENT,
   paneSizes: {},
   autoSync: 180,
+  tourVersion: 0,
 };
 
 function isPaneLayout(v: unknown): v is PaneLayout {
@@ -162,5 +165,11 @@ export function loadUi(): UiState {
       typeof o.autoSync === "number" && Number.isFinite(o.autoSync) && o.autoSync >= 0
         ? o.autoSync
         : DEFAULT_UI.autoSync,
+    tourVersion:
+      typeof o.tourVersion === "number" &&
+      Number.isFinite(o.tourVersion) &&
+      o.tourVersion >= 0
+        ? o.tourVersion
+        : DEFAULT_UI.tourVersion,
   };
 }

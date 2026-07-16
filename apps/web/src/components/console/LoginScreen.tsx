@@ -44,21 +44,29 @@ export function LoginScreen({ onAuthed }: Props) {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4 bg-background">
+    <div className="relative min-h-screen overflow-hidden flex items-center justify-center px-4 bg-background">
+      <div
+        aria-hidden="true"
+        className="absolute inset-0 pointer-events-none"
+        style={{
+          background:
+            "radial-gradient(ellipse 640px 480px at 50% 38%, color-mix(in oklab, var(--primary) 12%, transparent), transparent 70%)",
+        }}
+      />
       <form
         onSubmit={submit}
-        className="w-full max-w-sm rounded-lg border border-border bg-[var(--color-panel)] p-6 shadow-xl"
+        className="relative z-10 w-full max-w-sm rounded-lg border border-border bg-[var(--color-panel)] p-6 shadow-xl"
       >
-        <div className="flex items-center gap-2 mb-1">
-          <div className="h-6 w-6 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor text-primary">
-            <Mark className="h-4 w-4" />
+        <div className="flex items-center gap-3 mb-1.5">
+          <div className="h-10 w-10 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor text-primary">
+            <Mark className="h-6 w-6" />
           </div>
-          <h1 className="font-mono text-base font-semibold tracking-tight">
-            AI Mailbox
+          <h1 className="font-mono text-2xl font-semibold tracking-tight">
+            CortexMail
           </h1>
         </div>
-        <p className="text-[12px] text-muted-foreground mb-5 font-mono">
-          model QA console · sign in to continue
+        <p className="text-[10.5px] tracking-tight text-muted-foreground mb-5 font-mono">
+          your inbox, triaged by a cortex · sign in to continue
         </p>
 
         {!USE_MOCK && (

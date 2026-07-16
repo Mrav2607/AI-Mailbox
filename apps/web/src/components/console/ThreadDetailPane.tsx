@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import {
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   ExternalLink,
   MailOpen,
@@ -26,6 +27,18 @@ const COLLAPSE_ICONS = {
   bottom: PanelBottomClose,
 } as const;
 
+function BackToList({ onBack }: { onBack: () => void }) {
+  return (
+    <button
+      onClick={onBack}
+      aria-label="Back to list"
+      className="min-h-10 min-w-10 inline-flex items-center gap-1 pr-2 text-muted-foreground hover:text-foreground cursor-pointer transition-colors font-mono text-[11px]"
+    >
+      <ChevronLeft className="h-4 w-4" />
+      list
+    </button>
+  );
+}
 
 function MessageBody({ m }: { m: ThreadMessage }) {
   const [showRemote, setShowRemote] = useState(false);
@@ -84,6 +97,7 @@ interface Props {
   loading?: boolean;
   error?: string | null;
   onReclassify: (label: Label) => void;
+  onBack?: () => void;
   onCollapse?: () => void;
   onDone?: () => void;
   onDelete?: () => void;
@@ -98,6 +112,7 @@ export function ThreadDetailPane({
   loading,
   error,
   onReclassify,
+  onBack,
   onCollapse,
   onDone,
   onDelete,
@@ -107,23 +122,58 @@ export function ThreadDetailPane({
 }: Props) {
   const CollapseIcon = COLLAPSE_ICONS[side];
   if (error) {
+    if (onBack) {
+      return (
+        <div data-tour="detail-pane" className="h-full flex flex-col">
+          <div className="p-2">
+            <BackToList onBack={onBack} />
+          </div>
+          <div role="alert" className="p-6 text-sm text-destructive font-mono">
+            {error}
+          </div>
+        </div>
+      );
+    }
     return (
-      <div role="alert" className="p-6 text-sm text-destructive font-mono">
+      <div
+        data-tour="detail-pane"
+        role="alert"
+        className="p-6 text-sm text-destructive font-mono"
+      >
         {error}
       </div>
     );
   }
   if (!data && loading) {
+    if (onBack) {
+      return (
+        <div data-tour="detail-pane" className="h-full flex flex-col">
+          <div className="p-2">
+            <BackToList onBack={onBack} />
+          </div>
+          <div className="p-6 text-sm text-muted-foreground font-mono">
+            loading thread…
+          </div>
+        </div>
+      );
+    }
     return (
-      <div className="p-6 text-sm text-muted-foreground font-mono">
+      <div
+        data-tour="detail-pane"
+        className="p-6 text-sm text-muted-foreground font-mono"
+      >
         loading thread…
       </div>
     );
   }
   if (!data) {
     return (
-      <div className="h-full flex flex-col">
-        {onCollapse && (
+      <div data-tour="detail-pane" className="h-full flex flex-col">
+        {onBack ? (
+          <div className="flex items-center p-2">
+            <BackToList onBack={onBack} />
+          </div>
+        ) : onCollapse ? (
           <div className="flex justify-end items-center gap-2 p-2">
             <PaneDragHandle source="detail" />
             <button
@@ -135,14 +185,20 @@ export function ThreadDetailPane({
               <CollapseIcon className="h-3.5 w-3.5" />
             </button>
           </div>
-        )}
+        ) : null}
         <div className="flex-1 flex flex-col items-center justify-center gap-3 text-muted-foreground font-mono">
           <MailOpen className="h-7 w-7 opacity-35" />
           <div className="text-[13px]">no thread selected</div>
-          <div className="text-[11px] flex items-center gap-1.5 opacity-80">
-            <span className="kbd">j</span> / <span className="kbd">k</span> to
-            move · <span className="kbd">↵</span> to open
-          </div>
+          {onBack ? (
+            <div className="text-[11px] opacity-80">
+              tap a thread in the list to open it
+            </div>
+          ) : (
+            <div className="text-[11px] flex items-center gap-1.5 opacity-80">
+              <span className="kbd">j</span> / <span className="kbd">k</span> to
+              move · <span className="kbd">↵</span> to open
+            </div>
+          )}
         </div>
       </div>
     );
@@ -153,9 +209,10 @@ export function ThreadDetailPane({
   const meta = classification?.label ? LABEL_META[classification.label] : null;
 
   return (
-    <div className="h-full flex flex-col">
+    <div data-tour="detail-pane" className="h-full flex flex-col">
       <header className="px-4 py-3 border-b border-border bg-[var(--color-panel)] panel-lift">
         <div className="flex items-center gap-2">
+          {onBack && <BackToList onBack={onBack} />}
           <div className="flex-1 min-w-0 text-[11px] text-muted-foreground font-mono lowercase truncate">
             {data.thread.provider} · {absTime(data.thread.last_message_at)}
           </div>
@@ -167,7 +224,7 @@ export function ThreadDetailPane({
               rel="noopener noreferrer"
               aria-label="Open in Gmail"
               title="Open in Gmail ( o )"
-              className="text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+              className="inline-flex items-center justify-center max-md:h-10 max-md:w-10 text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
             >
               <ExternalLink className="h-3.5 w-3.5" />
             </a>
@@ -177,7 +234,7 @@ export function ThreadDetailPane({
               onClick={onDone}
               aria-label={data.thread.done ? "Restore thread" : "Mark thread done"}
               title={data.thread.done ? "Restore thread ( e )" : "Mark done ( e )"}
-              className="text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+              className="inline-flex items-center justify-center max-md:h-10 max-md:w-10 text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
             >
               {data.thread.done ? (
                 <Undo2 className="h-3.5 w-3.5" />
@@ -191,7 +248,7 @@ export function ThreadDetailPane({
               onClick={onDelete}
               aria-label="Delete thread"
               title="Delete thread ( # )"
-              className="text-muted-foreground hover:text-destructive cursor-pointer transition-colors"
+              className="inline-flex items-center justify-center max-md:h-10 max-md:w-10 text-muted-foreground hover:text-destructive cursor-pointer transition-colors"
             >
               <Trash2 className="h-3.5 w-3.5" />
             </button>
@@ -214,7 +271,10 @@ export function ThreadDetailPane({
 
       {/* Prediction — heading doubles as the collapse toggle so the bar can
           get out of the way of long threads. */}
-      <section className="border-b border-border bg-[var(--color-panel)]/40">
+      <section
+        data-tour="prediction"
+        className="border-b border-border bg-[var(--color-panel)]/40"
+      >
         <button
           onClick={onTogglePrediction}
           aria-expanded={predictionOpen}
@@ -229,7 +289,7 @@ export function ThreadDetailPane({
           prediction
         </button>
         {predictionOpen && (
-          <div className="px-4 pb-3">
+          <div className="px-4 pb-3 animate-in fade-in-0 slide-in-from-top-1 duration-150">
             <div className="flex items-center gap-3 flex-wrap">
               <span
                 className={[
@@ -268,7 +328,7 @@ export function ThreadDetailPane({
                     onClick={() => onReclassify(l)}
                     aria-pressed={active}
                     className={[
-                      "inline-flex items-center gap-1.5 px-2 py-1 rounded text-[10.5px] font-mono border transition-colors duration-100 cursor-pointer",
+                      "inline-flex items-center gap-1.5 px-2 py-1 max-md:min-h-10 rounded text-[10.5px] font-mono border transition-colors duration-150 cursor-pointer",
                       active
                         ? `${lm.soft} ${lm.text} ${lm.border}`
                         : "border-border text-muted-foreground hover:text-foreground hover:border-foreground/30",

@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ApiError,
   classifyBackfill,
@@ -44,7 +52,10 @@ import { TopBar } from "@/components/console/TopBar";
 import { CommandPalette } from "@/components/console/CommandPalette";
 import { Shortcuts } from "@/components/console/Shortcuts";
 import { LoginScreen } from "@/components/console/LoginScreen";
-import { useHotkeys } from "@/lib/use-hotkeys";
+import {
+  shouldSuppressConsoleHotkeys,
+  useHotkeys,
+} from "@/lib/use-hotkeys";
 import {
   broadcastSyncComplete,
   NEW_MAIL_SCAN_LIMIT,
@@ -52,8 +63,14 @@ import {
 } from "@/lib/use-auto-sync";
 import { Toaster } from "@/components/ui/sonner";
 import { ConsoleLayout } from "@/components/console/ConsoleLayout";
-import { UI_KEY, loadUi } from "@/lib/layout";
+import { NarrowShell } from "@/components/console/NarrowShell";
+import { TOUR_VERSION, UI_KEY, loadUi } from "@/lib/layout";
 import type { Arrangement, PaneLayout, PaneSizes } from "@/lib/layout";
+import {
+  useOnboardingTour,
+  type TourDeps,
+} from "@/lib/use-onboarding-tour";
+import { useIsNarrow } from "@/lib/use-viewport";
 import { applyTheme, resolveTheme, watchSystemTheme } from "@/lib/theme";
 import type { ThemePref } from "@/lib/theme";
 import { PanelRightOpen, Search, X } from "lucide-react";
@@ -64,10 +81,14 @@ type SortMode = "recent" | "confidence_asc" | "confidence_desc";
 // the detail pane). Persisted (with the pane arrangement and sizes, see
 // lib/layout.ts) so the operator's layout sticks.
 // The shortcuts hint lives inside the sidebar, so it tracks `sidebar`.
-type Panels = { sidebar: boolean; detail: boolean; prediction: boolean };
+export type Panels = { sidebar: boolean; detail: boolean; prediction: boolean };
 
 // One read at module load; the states below fan out from it.
 const INITIAL_UI = loadUi();
+
+const OnboardingTour = lazy(
+  () => import("@/components/console/OnboardingTour"),
+);
 
 // How long the "thread deleted · undo" window stays open before the delete is
 // actually sent to the server.
@@ -81,6 +102,10 @@ let oauthExchangeStarted = false;
 export default function Console() {
   const [user, setUser] = useState<User | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  const isNarrow = useIsNarrow();
+  const [narrowPane, setNarrowPane] = useState<
+    "buckets" | "list" | "reading"
+  >("list");
 
   const [bucket, setBucket] = useState<BucketKey>("needs_reply");
   const [items, setItems] = useState<TriageItem[]>([]);
@@ -97,6 +122,7 @@ export default function Console() {
   });
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
+  const [firstListLoadSettled, setFirstListLoadSettled] = useState(false);
 
   const [overview, setOverview] = useState<Overview | null>(null);
 
@@ -126,6 +152,7 @@ export default function Console() {
   const [layoutOpen, setLayoutOpen] = useState(false);
   const [theme, setTheme] = useState<ThemePref>(INITIAL_UI.theme);
   const [autoSync, setAutoSync] = useState<number>(INITIAL_UI.autoSync);
+  const [tourVersion, setTourVersion] = useState<number>(INITIAL_UI.tourVersion);
   // Resolved dark/light, tracked as state so theme-aware children (the
   // toaster) re-render when a "system" preference follows an OS flip.
   const [resolvedTheme, setResolvedTheme] = useState<"dark" | "light">(() =>
@@ -157,21 +184,77 @@ export default function Console() {
   const pendingDeletes = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map(),
   );
+  const panelsRef = useRef(panels);
+  panelsRef.current = panels;
 
   useEffect(() => {
     try {
       window.localStorage.setItem(
         UI_KEY,
-        JSON.stringify({ ...panels, arrangement, paneSizes, theme, autoSync }),
+        JSON.stringify({
+          ...panels,
+          arrangement,
+          paneSizes,
+          theme,
+          autoSync,
+          tourVersion,
+        }),
       );
     } catch {
       /* storage unavailable; layout just won't persist */
     }
-  }, [panels, arrangement, paneSizes, theme, autoSync]);
+  }, [panels, arrangement, paneSizes, theme, autoSync, tourVersion]);
 
   const togglePanel = useCallback((key: keyof Panels) => {
     setPanels((p) => ({ ...p, [key]: !p[key] }));
   }, []);
+
+  const showPanel = useCallback((key: keyof Panels) => {
+    setPanels((current) =>
+      current[key] ? current : { ...current, [key]: true },
+    );
+  }, []);
+
+  const snapshotPanels = useCallback((): Panels => ({ ...panelsRef.current }), []);
+  const restorePanels = useCallback((snapshot: Panels) => {
+    setPanels(snapshot);
+  }, []);
+
+  const tourDeps = useMemo<TourDeps>(
+    () => ({
+      showPanel,
+      setBucket,
+      openIngestDialog: () => setIngestOpen(true),
+      snapshotPanels,
+      restorePanels,
+    }),
+    [restorePanels, showPanel, snapshotPanels],
+  );
+
+  const {
+    tourActive,
+    stepIndex: tourStepIndex,
+    targetResolution: tourTargetResolution,
+    restartTour,
+    deferTour,
+    skipTour,
+    finishTour,
+    goToStep: goToTourStep,
+  } = useOnboardingTour({
+    authChecked,
+    hasUser: Boolean(user),
+    tourVersion,
+    firstListLoadSettled,
+    narrowViewport: isNarrow,
+    deps: tourDeps,
+    setTourVersion,
+  });
+
+  useEffect(() => {
+    // Defer, don't skip: shrinking mid-tour shouldn't burn tourVersion — the
+    // tour picks back up when the viewport widens.
+    if (isNarrow && tourActive) deferTour();
+  }, [isNarrow, deferTour, tourActive]);
 
   const handlePaneSizes = useCallback((key: string, layout: PaneLayout) => {
     setPaneSizes((s) => ({ ...s, [key]: layout }));
@@ -271,7 +354,10 @@ export default function Console() {
         }
         setListError((e as Error).message ?? "failed to load");
       } finally {
-        if (!quiet) setListLoading(false);
+        if (!quiet) {
+          setListLoading(false);
+          setFirstListLoadSettled(true);
+        }
       }
     },
     [handleSessionExpired],
@@ -789,10 +875,14 @@ export default function Console() {
   useHotkeys(
     (e) => {
       // overlays open: only handle escape
-      if (paletteOpen || shortcutsOpen) {
+      if (shouldSuppressConsoleHotkeys(paletteOpen, shortcutsOpen, tourActive)) {
         if (e.key === "Escape") {
-          setPaletteOpen(false);
-          setShortcutsOpen(false);
+          if (tourActive) {
+            skipTour();
+          } else {
+            setPaletteOpen(false);
+            setShortcutsOpen(false);
+          }
         }
         return;
       }
@@ -889,10 +979,12 @@ export default function Console() {
         }
       } else if (e.key === "Enter") {
         // already selected; this is a no-op besides ensuring scroll
-        if (focusedItem)
+        if (focusedItem) {
+          if (isNarrow) setNarrowPane("reading");
           document
             .querySelector(`[data-thread-row="${focusedItem.thread_id}"]`)
             ?.scrollIntoView({ block: "nearest" });
+        }
       } else if (e.key === "c") {
         setSortMode((m) =>
           m === "confidence_asc"
@@ -917,10 +1009,13 @@ export default function Console() {
     [
       paletteOpen,
       shortcutsOpen,
+      tourActive,
+      skipTour,
       searchMode,
       query,
       visibleItems,
       focusedItem,
+      isNarrow,
       bucket,
       moveSelection,
       clearSearch,
@@ -967,6 +1062,158 @@ export default function Console() {
         ? "conf ↑"
         : "conf ↓";
 
+  const sidebarPane = (
+    <BucketSidebar
+      active={bucket}
+      counts={allCounts}
+      onSelect={(b) => {
+        setBucket(b);
+        if (isNarrow) setNarrowPane("list");
+      }}
+      onCollapse={() => togglePanel("sidebar")}
+      side={arrangement.sidebar}
+      narrow={isNarrow}
+    />
+  );
+
+  const listPane = (
+    <section className="flex-1 min-w-0 min-h-0 flex flex-col">
+      <div className="h-10 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center px-3 gap-2.5 font-mono text-[11.5px]">
+        <span className="text-primary font-semibold tracking-tight shrink-0">
+          {searchMode ? "search" : bucket.replace("_", " ")}
+        </span>
+        <span className="text-muted-foreground tabular-nums shrink-0">
+          {visibleItems.length}
+          {searchMode ? " match" : " thread"}
+          {visibleItems.length === 1 ? "" : "s"}
+          {searchMode ? " · all buckets" : ""}
+        </span>
+
+        {pendingNew > 0 && (
+          <button
+            data-testid="new-mail-pill"
+            onClick={() => {
+              clearNew();
+              refreshAll();
+              listScrollRef.current?.scrollTo({ top: 0 });
+            }}
+            title="new mail — click to jump to the top"
+            className="shrink-0 h-6 px-2 rounded-full border border-primary/40 bg-primary/10 text-primary hover:bg-primary/20 tabular-nums cursor-pointer transition-colors animate-in fade-in-0 zoom-in-95 duration-150"
+          >
+            {pendingNew >= NEW_MAIL_SCAN_LIMIT ? `${NEW_MAIL_SCAN_LIMIT}+` : pendingNew} new
+          </button>
+        )}
+        {syncFailed && (
+          <span
+            data-testid="sync-failed-dot"
+            title="auto-sync failing — retrying in the background"
+            className="shrink-0 h-1.5 w-1.5 rounded-full bg-destructive/70"
+          />
+        )}
+
+        <div className="flex-1 flex items-center min-w-0 max-w-[380px] ml-1">
+          <div className="flex items-center gap-1.5 w-full rounded border border-border bg-background px-2 h-6 focus-within:border-primary transition-colors">
+            <Search className="h-3 w-3 text-muted-foreground shrink-0" />
+            <input
+              data-tour="search"
+              aria-label="filter threads — press enter to search all buckets"
+              ref={searchInputRef}
+              value={query}
+              onChange={(e) => {
+                setQuery(e.target.value);
+                if (searchMode) {
+                  setSearchMode(false);
+                  setSearchResults([]);
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  runSearch();
+                }
+              }}
+              placeholder="filter…  ↵ to search all buckets"
+              className="flex-1 min-w-0 bg-transparent outline-none text-[12px] placeholder:text-muted-foreground/60"
+            />
+            {(query || searchMode) && (
+              <button
+                onClick={clearSearch}
+                aria-label="Clear search"
+                className="shrink-0 text-muted-foreground hover:text-foreground cursor-pointer"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        <button
+          data-tour="sort"
+          onClick={() =>
+            setSortMode((m) =>
+              m === "confidence_asc"
+                ? "confidence_desc"
+                : m === "confidence_desc"
+                  ? "recent"
+                  : "confidence_asc",
+            )
+          }
+          title="press c"
+          aria-label={`Sort order: ${sortBadge}. Press c to cycle.`}
+          className="shrink-0 px-2 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+        >
+          sort: {sortBadge}
+        </button>
+
+        {!isNarrow && !panels.detail && (
+          <button
+            onClick={() => togglePanel("detail")}
+            aria-label="Show thread detail"
+            title="Show detail ( ] )"
+            className="shrink-0 h-6 px-1.5 rounded border border-border text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer transition-colors flex items-center"
+          >
+            <PanelRightOpen className="h-3.5 w-3.5" />
+          </button>
+        )}
+      </div>
+      <div
+        data-tour="thread-list"
+        ref={listScrollRef}
+        className="flex-1 overflow-y-auto scrollbar-thin"
+      >
+        <ThreadList
+          items={visibleItems}
+          selectedId={selectedId}
+          onSelect={(id) => {
+            setSelectedId(id);
+            if (isNarrow) setNarrowPane("reading");
+          }}
+          showLabel={searchMode || bucket === "all" || bucket === "done"}
+          narrow={isNarrow}
+          loading={listLoading || searching}
+          error={listError}
+        />
+      </div>
+    </section>
+  );
+
+  const detailPane = (
+    <ThreadDetailPane
+      data={thread}
+      classification={focusedItem?.classification ?? null}
+      loading={threadLoading}
+      error={threadError}
+      onReclassify={doReclassify}
+      onBack={isNarrow ? () => setNarrowPane("list") : undefined}
+      onCollapse={isNarrow ? undefined : () => togglePanel("detail")}
+      onDone={focusedItem ? () => doDone(focusedItem.thread_id) : undefined}
+      onDelete={focusedItem ? () => doDelete(focusedItem.thread_id) : undefined}
+      side={arrangement.reading}
+      predictionOpen={panels.prediction}
+      onTogglePrediction={() => togglePanel("prediction")}
+    />
+  );
+
   return (
     // overflow-clip: no descendant (however hostile an email's CSS) may ever
     // grow the page a scrollbar — panes own all scrolling.
@@ -1007,149 +1254,28 @@ export default function Console() {
         }}
       />
 
-      <ConsoleLayout
-        arrangement={arrangement}
-        onArrangementChange={setArrangement}
-        sidebarVisible={panels.sidebar}
-        detailVisible={panels.detail}
-        onExpandSidebar={() => togglePanel("sidebar")}
-        paneSizes={paneSizes}
-        onPaneSizesChange={handlePaneSizes}
-        sidebar={
-          <BucketSidebar
-            active={bucket}
-            counts={allCounts}
-            onSelect={(b) => setBucket(b)}
-            onCollapse={() => togglePanel("sidebar")}
-            side={arrangement.sidebar}
-          />
-        }
-        list={
-          <section className="flex-1 min-w-0 min-h-0 flex flex-col">
-          <div className="h-10 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center px-3 gap-2.5 font-mono text-[11.5px]">
-            <span className="text-primary font-semibold tracking-tight shrink-0">
-              {searchMode ? "search" : bucket.replace("_", " ")}
-            </span>
-            <span className="text-muted-foreground tabular-nums shrink-0">
-              {visibleItems.length}
-              {searchMode ? " match" : " thread"}
-              {visibleItems.length === 1 ? "" : "s"}
-              {searchMode ? " · all buckets" : ""}
-            </span>
-
-            {pendingNew > 0 && (
-              <button
-                data-testid="new-mail-pill"
-                onClick={() => {
-                  clearNew();
-                  refreshAll();
-                  listScrollRef.current?.scrollTo({ top: 0 });
-                }}
-                title="new mail — click to jump to the top"
-                className="shrink-0 h-6 px-2 rounded-full border border-primary/40 bg-primary/10 text-primary hover:bg-primary/20 tabular-nums cursor-pointer transition-colors"
-              >
-                {pendingNew >= NEW_MAIL_SCAN_LIMIT ? `${NEW_MAIL_SCAN_LIMIT}+` : pendingNew} new
-              </button>
-            )}
-            {syncFailed && (
-              <span
-                data-testid="sync-failed-dot"
-                title="auto-sync failing — retrying in the background"
-                className="shrink-0 h-1.5 w-1.5 rounded-full bg-destructive/70"
-              />
-            )}
-
-            <div className="flex-1 flex items-center min-w-0 max-w-[380px] ml-1">
-              <div className="flex items-center gap-1.5 w-full rounded border border-border bg-background px-2 h-6 focus-within:border-primary transition-colors">
-                <Search className="h-3 w-3 text-muted-foreground shrink-0" />
-                <input
-                  ref={searchInputRef}
-                  value={query}
-                  onChange={(e) => {
-                    setQuery(e.target.value);
-                    if (searchMode) {
-                      setSearchMode(false);
-                      setSearchResults([]);
-                    }
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      runSearch();
-                    }
-                  }}
-                  placeholder="filter…  ↵ to search all buckets"
-                  className="flex-1 min-w-0 bg-transparent outline-none text-[12px] placeholder:text-muted-foreground/60"
-                />
-                {(query || searchMode) && (
-                  <button
-                    onClick={clearSearch}
-                    aria-label="Clear search"
-                    className="shrink-0 text-muted-foreground hover:text-foreground cursor-pointer"
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                )}
-              </div>
-            </div>
-
-            <button
-              onClick={() =>
-                setSortMode((m) =>
-                  m === "confidence_asc"
-                    ? "confidence_desc"
-                    : m === "confidence_desc"
-                      ? "recent"
-                      : "confidence_asc",
-                )
-              }
-              title="press c"
-              aria-label={`Sort order: ${sortBadge}. Press c to cycle.`}
-              className="shrink-0 px-2 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
-            >
-              sort: {sortBadge}
-            </button>
-
-            {!panels.detail && (
-              <button
-                onClick={() => togglePanel("detail")}
-                aria-label="Show thread detail"
-                title="Show detail ( ] )"
-                className="shrink-0 h-6 px-1.5 rounded border border-border text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer transition-colors flex items-center"
-              >
-                <PanelRightOpen className="h-3.5 w-3.5" />
-              </button>
-            )}
-          </div>
-            <div ref={listScrollRef} className="flex-1 overflow-y-auto scrollbar-thin">
-              <ThreadList
-                items={visibleItems}
-                selectedId={selectedId}
-                onSelect={(id) => setSelectedId(id)}
-                loading={listLoading || searching}
-                error={listError}
-              />
-            </div>
-          </section>
-        }
-        detail={
-          <ThreadDetailPane
-            data={thread}
-            classification={focusedItem?.classification ?? null}
-            loading={threadLoading}
-            error={threadError}
-            onReclassify={doReclassify}
-            onCollapse={() => togglePanel("detail")}
-            onDone={focusedItem ? () => doDone(focusedItem.thread_id) : undefined}
-            onDelete={
-              focusedItem ? () => doDelete(focusedItem.thread_id) : undefined
-            }
-            side={arrangement.reading}
-            predictionOpen={panels.prediction}
-            onTogglePrediction={() => togglePanel("prediction")}
-          />
-        }
-      />
+      {isNarrow ? (
+        <NarrowShell
+          pane={narrowPane}
+          onPaneChange={setNarrowPane}
+          buckets={sidebarPane}
+          list={listPane}
+          reading={detailPane}
+        />
+      ) : (
+        <ConsoleLayout
+          arrangement={arrangement}
+          onArrangementChange={setArrangement}
+          sidebarVisible={panels.sidebar}
+          detailVisible={panels.detail}
+          onExpandSidebar={() => togglePanel("sidebar")}
+          paneSizes={paneSizes}
+          onPaneSizesChange={handlePaneSizes}
+          sidebar={sidebarPane}
+          list={listPane}
+          detail={detailPane}
+        />
+      )}
 
       <CommandPalette
         open={paletteOpen}
@@ -1173,8 +1299,23 @@ export default function Console() {
         inDoneBucket={bucket === "done"}
         onOpenGmail={openInGmail}
         onDelete={() => doDelete()}
+        onRestartTour={restartTour}
       />
       <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+      {!isNarrow && (tourActive || tourVersion < TOUR_VERSION) && (
+        <Suspense fallback={null}>
+          <OnboardingTour
+            run={tourActive}
+            stepIndex={tourStepIndex}
+            targetResolution={tourTargetResolution}
+            emptyThreadList={visibleItems.length === 0}
+            emptyDetail={!thread}
+            onStepChange={goToTourStep}
+            onFinish={finishTour}
+            onSkip={skipTour}
+          />
+        </Suspense>
+      )}
       <Toaster theme={resolvedTheme} />
     </div>
   );

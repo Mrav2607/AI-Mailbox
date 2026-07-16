@@ -76,9 +76,14 @@ def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]
     latest_message_by_thread = latest_messages_by_thread(
         db,
         thread_ids,
-        # Snippets are all the list needs -- don't drag body_text/body_html/headers
-        # across the wire for a page we only render one line of.
-        columns=(MailMessage.id, MailMessage.thread_id, MailMessage.snippet),
+        # The list only needs sender and snippet -- don't drag full bodies or
+        # headers across the wire for a page that renders one line of each.
+        columns=(
+            MailMessage.id,
+            MailMessage.thread_id,
+            MailMessage.snippet,
+            MailMessage.sender,
+        ),
     )
     message_ids = [m.id for m in latest_message_by_thread.values()]
     latest_classifications = (
@@ -107,6 +112,7 @@ def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]
                 "subject": thread.subject,
                 "last_message_at": thread.last_message_at,
                 "latest_message_snippet": latest_message.snippet if latest_message else None,
+                "latest_message_sender": latest_message.sender if latest_message else None,
                 "classification": {
                     "label": classification.label if classification else None,
                     "confidence": float(classification.confidence) if classification and classification.confidence is not None else None,
