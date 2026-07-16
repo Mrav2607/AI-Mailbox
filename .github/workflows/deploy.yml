@@ -1,0 +1,58 @@
+name: Deploy
+
+# Push to main -> run CI -> SSH to the production VM, fast-forward it to main, and
+# rebuild the docker-compose stack (Caddy + web + api + worker + db + redis). The
+# compose `migrate` service runs `alembic upgrade head` on the way up and api/worker
+# wait on it, so there's no separate migration step. See .github/DEPLOY.md for the
+# one-time secret setup.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  PROD_URL: https://cortexmail.dev
+
+jobs:
+  # Gate the deploy on the same checks PRs run.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy over SSH
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          VM_SSH_KNOWN_HOSTS: ${{ secrets.VM_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Pinned host key (no StrictHostKeyChecking=no) so we can't be MITM'd.
+          printf '%s\n' "$VM_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # reset --hard makes the box match main exactly. deploy/.env, models/,
+          # and data/ are gitignored, so secrets and the model are left untouched.
+          ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts \
+            "$VM_USER@$VM_HOST" \
+            'set -euo pipefail; cd ~/AI-Mailbox && git fetch --prune origin && git checkout -f main && git reset --hard origin/main && bash deploy/vm-deploy.sh'
+
+      - name: Smoke check
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 12); do
+            if curl -fsS "$PROD_URL/api/v1/health" | grep -q '"ok"'; then
+              echo "healthy"; exit 0
+            fi
+            echo "[$i] not ready yet..."; sleep 10
+          done
+          echo "Health check failed at $PROD_URL/api/v1/health"; exit 1
