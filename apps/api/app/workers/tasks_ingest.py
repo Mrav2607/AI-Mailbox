@@ -167,7 +167,17 @@ def write_dispatcher_heartbeat() -> None:
 
 
 def read_dispatcher_heartbeat() -> datetime | None:
-    raw = _heartbeat_redis().get(DISPATCHER_HEARTBEAT_KEY)
+    try:
+        raw = _heartbeat_redis().get(DISPATCHER_HEARTBEAT_KEY)
+    except redis.RedisError:
+        # Redis being down is exactly when the health endpoint gets hit, so it
+        # must degrade, not 500. "Can't tell" reads the same as "no heartbeat":
+        # scheduler_alive goes false, which is the honest answer. The cached
+        # client may hold a dead socket after a Redis restart, so drop it and
+        # let the next call rebuild the pool.
+        global _redis_client
+        _redis_client = None
+        return None
     if not raw:
         return None
     try:
@@ -263,6 +273,11 @@ def dispatch_scheduled_syncs() -> dict:
                     dispatched += 1
             except Exception:
                 # One user's bad state must never stop the others from syncing.
+                # An unhandled commit error (a connection blip, not the handled
+                # IntegrityError) leaves the shared session in an aborted
+                # transaction, so every later user this tick would fail with
+                # PendingRollbackError -- roll back to clear it.
+                db.rollback()
                 failed += 1
                 logger.exception("scheduled sync dispatch failed for user %s", user_id)
 
@@ -310,7 +325,10 @@ def prune_sync_runs() -> dict:
         select(MailSyncRun.id)
         .distinct(MailSyncRun.user_id)
         .where(MailSyncRun.status == "succeeded")
-        .order_by(MailSyncRun.user_id, MailSyncRun.completed_at.desc())
+        # nullslast: a succeeded row shouldn't have a null completed_at, but if
+        # one ever did, NULLS FIRST (Postgres' default for DESC) would make it
+        # the "anchor" and expose the real newest success to pruning.
+        .order_by(MailSyncRun.user_id, MailSyncRun.completed_at.desc().nullslast())
         .scalar_subquery()
     )
     with SessionLocal() as db:

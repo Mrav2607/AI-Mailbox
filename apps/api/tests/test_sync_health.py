@@ -138,3 +138,18 @@ def test_a_dead_scheduler_shows_even_while_data_is_fresh(health):
 def test_a_live_scheduler_reports_alive(health):
     body = health(provider=_provider(), last_succeeded_at=datetime.now(timezone.utc))
     assert body["scheduler_alive"] is True
+
+
+def test_disabled_scheduling_is_not_reported_as_a_dead_scheduler(health, monkeypatch):
+    # interval 0 is the documented off switch: no heartbeat is ever written and
+    # the browser fallback carries sync, so "no heartbeat" is expected, not a
+    # dead scheduler. Reporting it as down would alarm every user forever.
+    monkeypatch.setattr(
+        mailbox_routes.settings, "scheduled_sync_interval_seconds", 0
+    )
+    body = health(
+        provider=_provider(),
+        last_succeeded_at=datetime.now(timezone.utc),
+        heartbeat=False,
+    )
+    assert body["scheduler_alive"] is True

@@ -512,8 +512,13 @@ def get_sync_health(
             MailSyncRun.status == "succeeded",
         )
     )
-    heartbeat = read_dispatcher_heartbeat()
-    scheduler_alive = heartbeat is not None
+    # When scheduling is switched off (interval 0), no heartbeat is ever
+    # written and the browser fallback carries sync by design -- so "no
+    # heartbeat" is the expected state, not a dead scheduler. Report alive so
+    # the console doesn't cry "scheduler down" at everyone forever.
+    scheduling_enabled = settings.scheduled_sync_interval_seconds > 0
+    heartbeat = read_dispatcher_heartbeat() if scheduling_enabled else None
+    scheduler_alive = not scheduling_enabled or heartbeat is not None
     sync_in_progress = active_sync(db, current_user.id) is not None
     threshold = settings.sync_stale_after_seconds
 

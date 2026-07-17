@@ -157,3 +157,49 @@ def test_beat_schedule_is_registered_when_enabled():
         schedule["dispatch-scheduled-syncs"]["task"]
         == "app.workers.tasks_ingest.dispatch_scheduled_syncs"
     )
+
+
+def test_a_redis_outage_degrades_the_read_instead_of_raising(monkeypatch):
+    # The health endpoint calls this, and Redis being down is exactly when
+    # someone's looking at health -- it must return "can't tell" (None), not
+    # 500. It should also drop the cached client so the dead socket isn't reused.
+    monkeypatch.setattr(tasks_ingest, "_redis_client", object())
+    dead = MagicMock()
+    dead.get.side_effect = tasks_ingest.redis.ConnectionError("redis is down")
+    monkeypatch.setattr(tasks_ingest.redis, "from_url", lambda _url: dead)
+    monkeypatch.setattr(tasks_ingest, "_redis_client", dead)
+
+    assert tasks_ingest.read_dispatcher_heartbeat() is None
+    assert tasks_ingest._redis_client is None
+
+
+def test_prune_deletes_old_terminal_runs_while_shielding_the_latest_success(
+    monkeypatch,
+):
+    # A mock DB can't run the SQL, but it CAN capture the exact statement the
+    # real function builds. Compiling that catches a regression in prune itself
+    # -- someone dropping the anchor guard, the nullslast, or the terminal
+    # filter -- which a hand-mirrored copy of the query wouldn't.
+    from sqlalchemy.dialects import postgresql
+
+    captured = {}
+    db = MagicMock()
+
+    def execute(stmt):
+        captured["sql"] = str(stmt.compile(dialect=postgresql.dialect()))
+        return MagicMock(rowcount=3)
+
+    db.execute.side_effect = execute
+    monkeypatch.setattr(tasks_ingest, "SessionLocal", lambda: nullcontext(db))
+
+    result = tasks_ingest.prune_sync_runs.run()
+
+    sql = captured["sql"].upper()
+    assert result == {"deleted": 3}
+    # Keep-latest-success anchor, null-safe, and only finished runs are touched.
+    # (status values render as a bound POSTCOMPILE placeholder, not literals.)
+    assert "DISTINCT ON" in sql
+    assert "NULLS LAST" in sql
+    assert "NOT IN" in sql
+    assert "STATUS IN" in sql
+    db.commit.assert_called_once()

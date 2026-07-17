@@ -176,7 +176,7 @@ def google_auth_callback(
             existing.refresh_token = refresh_token
         existing.token_expiry = token_expiry
         existing.scope = " ".join(SCOPES)
-        # Reconnecting is the only cway to put the account back in the sync schedule.
+        # Reconnecting is the only way to put the account back in the sync schedule.
         existing.sync_paused_at = None
         existing.sync_pause_reason = None
         db.commit()
