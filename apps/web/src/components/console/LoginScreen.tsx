@@ -59,14 +59,14 @@ export function LoginScreen({ onAuthed }: Props) {
       >
         <div className="flex items-center gap-3 mb-1.5">
           <div className="h-10 w-10 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor text-primary">
-            <Mark className="h-6 w-6" />
+            <Mark className="h-8 w-8" />
           </div>
           <h1 className="font-mono text-2xl font-semibold tracking-tight">
             CortexMail
           </h1>
         </div>
         <p className="text-[10.5px] tracking-tight text-muted-foreground mb-5 font-mono">
-          your inbox, triaged by a cortex · sign in to continue
+          your inbox, triaged by Cortex · sign in to continue
         </p>
 
         {!USE_MOCK && (
