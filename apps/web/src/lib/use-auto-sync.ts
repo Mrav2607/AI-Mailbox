@@ -3,10 +3,16 @@ import { toast } from "sonner";
 import {
   ApiError,
   getActiveSync,
+  getSyncHealth,
   getTriage,
   ingestGmail,
   waitForSyncRun,
+  type SyncHealth,
 } from "./api";
+
+// The server pulls mail on its own schedule now, so this only has to be often
+// enough that the user notices a broken mailbox in reasonable time
+const HEALTH_POLL_MS = 60_000;
 
 // Cadence presets for the UI; loadUi accepts any non-negative number though,
 // so a hand-edited (or test-written) blob can run faster or slower.
@@ -171,9 +177,11 @@ export function useAutoSync({
   pendingNew: number;
   clearNew: () => void;
   syncFailed: boolean;
+  health: SyncHealth | null;
 } {
   const [pendingNew, setPendingNew] = useState(0);
   const [syncFailed, setSyncFailed] = useState(false);
+  const [health, setHealth] = useState<SyncHealth | null>(null);
 
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const runningRef = useRef(false);
@@ -234,6 +242,34 @@ export function useAutoSync({
       }
     }
   }, []);
+
+  // Server truth about whether mail is actually flowing. Polled on its own slow
+  // cadence and independent of `enabled`.
+  useEffect(() => {
+    if (!userId) return;
+    let cancelled = false;
+    const controller = new AbortController();
+
+    const poll = async () => {
+      try {
+        const next = await getSyncHealth(controller.signal);
+        if (!cancelled) setHealth(next);
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) onSessionExpiredRef.current();
+        // Otherwise stay quiet: a failed health check is not itself news.
+      }
+    };
+
+    void poll();
+    const timer = setInterval(() => {
+      if (!document.hidden) void poll();
+    }, HEALTH_POLL_MS);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      clearInterval(timer);
+    };
+  }, [userId]);
 
   useEffect(() => {
     if (!enabled || !userId || !("BroadcastChannel" in window)) return;
@@ -351,5 +387,5 @@ export function useAutoSync({
     };
   }, [enabled, intervalSec, checkNew, leader]);
 
-  return { pendingNew, clearNew, syncFailed };
+  return { pendingNew, clearNew, syncFailed, health };
 }

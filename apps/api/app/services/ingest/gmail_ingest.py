@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta, timezone
 from collections.abc import Callable
 from typing import Any
@@ -9,6 +10,7 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from app.db.base import SessionLocal
 from app.db.models import MailThread, MailMessage, ProviderAccount, Classification
 from app.core.config import settings
 from app.services.ingest.gmail_client import GmailClient
@@ -71,6 +73,27 @@ def _should_reopen_thread(
     )
 
 
+def _is_invalid_grant(resp: httpx.Response) -> bool:
+    # Check if the Google OAuth refresh token is dead for good.
+    if resp.status_code != 400:
+        return False
+    try:
+        return resp.json().get("error") == "invalid_grant"
+    except ValueError:
+        return False
+
+
+def _pause_provider(provider_id: uuid.UUID, reason: str) -> None:
+    # Park a provider whose refresh token is gone, in its own transaction
+    with SessionLocal() as db:
+        db.execute(
+            update(ProviderAccount)
+            .where(ProviderAccount.id == provider_id)
+            .values(sync_paused_at=datetime.now(timezone.utc), sync_pause_reason=reason)
+        )
+        db.commit()
+
+
 def _refresh_access_token(provider: ProviderAccount) -> tuple[str | None, datetime | None]:
     if not provider.refresh_token:
         return None, None
@@ -87,6 +110,10 @@ def _refresh_access_token(provider: ProviderAccount) -> tuple[str | None, dateti
         },
         timeout=20.0,
     )
+    if _is_invalid_grant(resp):
+        # ValueError is the task's terminal branch, no retries. 
+        _pause_provider(provider.id, "reauth_required")
+        raise ValueError("Gmail authorization was revoked. Reconnect the account.")
     resp.raise_for_status()
     data = resp.json()
     access_token = data.get("access_token")
@@ -114,9 +141,13 @@ def ingest_gmail_messages(
 ) -> dict[str, Any]:
     provider = (
         db.execute(
-            select(ProviderAccount).where(
+            select(ProviderAccount)
+            .where(
                 ProviderAccount.user_id == user_id, ProviderAccount.provider == "gmail"
             )
+            # A user may have more than one Gmail account connected, 
+            # and "whichever row came back first" is not a rule.
+            .order_by(ProviderAccount.created_at)
         )
         .scalars()
         .first()
@@ -142,7 +173,10 @@ def ingest_gmail_messages(
     if skip_existing:
         existing_thread_ids = set(
             db.execute(
-                select(MailThread.provider_thread_id).where(MailThread.user_id == user_id)
+                select(MailThread.provider_thread_id).where(
+                    MailThread.user_id == user_id,
+                    MailThread.provider == "gmail",
+                )
             )
             .scalars()
             .all()
@@ -151,7 +185,12 @@ def ingest_gmail_messages(
     # New-only mode has nothing to anchor "new" against on an empty mailbox —
     # pulling would mean importing the whole account. Auto-sync waits for a
     # manual ingest to establish the baseline (and the history cursor).
-    if new_only and skip_existing and not existing_thread_ids:
+    #
+    # A live cursor IS that baseline, though: an account whose first ingest
+    # found an empty mailbox still recorded one, and history alone tells us
+    # what arrived since. Without this, such a user would be stuck forever --
+    # no threads means no new-only pull, and no pull means no first thread.
+    if new_only and skip_existing and not existing_thread_ids and not provider.gmail_history_id:
         return {
             "threads_upserted": 0,
             "messages_upserted": 0,

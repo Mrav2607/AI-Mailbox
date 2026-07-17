@@ -1,13 +1,13 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 from sqlalchemy import select, desc, or_, func
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.logging import logger
 from app.core.ratelimit import user_rate_limit
 from app.deps import get_db, get_current_user
@@ -17,15 +17,23 @@ from app.db.schemas.mailbox import (
     Queued,
     Reclassified,
     Search,
+    SyncHealth,
     SyncRun,
     TaskStatus,
     ThreadDetail,
     ThreadDone,
     Triage,
 )
-from app.db.models import MailThread, MailMessage, Classification, AppUser, MailSyncRun
+from app.db.models import (
+    AppUser,
+    Classification,
+    MailMessage,
+    MailSyncRun,
+    MailThread,
+    ProviderAccount,
+)
 from app.workers.celery_app import celery_app
-from app.workers.tasks_ingest import ingest_gmail_for_user
+from app.workers.tasks_ingest import read_dispatcher_heartbeat
 from app.workers.tasks_nlp import backfill_threads_for_user, classify_latest_threads
 from app.services.nlp.backfill import (
     latest_label_subquery,
@@ -35,7 +43,7 @@ from app.services.nlp.backfill import (
 )
 from app.services.nlp.classifier import LABELS
 from app.services.nlp.persistence import upsert_classification
-from app.services.sync_runs import QUEUED_SYNC_LEASE, active_sync, now_utc, sync_payload
+from app.services.sync_runs import active_sync, now_utc, start_sync_run, sync_payload
 
 router = APIRouter(prefix="/mail")
 
@@ -452,52 +460,18 @@ def ingest_gmail(
     way too slow to hold a request open for, so we hand it to Celery and
     return 202 with the task id.
     """
-    existing = active_sync(db, current_user.id)
-    if existing:
-        return sync_payload(existing, deduplicated=True)
-
-    now = now_utc()
-    run = MailSyncRun(
-        id=uuid4(),
-        user_id=current_user.id,
+    run, deduplicated = start_sync_run(
+        db,
+        current_user.id,
         mode="auto" if new_only else ("refresh" if not skip_existing else "manual"),
-        status="queued",
         options={
             "max_results": max_results,
             "skip_existing": skip_existing,
             "classify_messages": classify,
             "new_only": new_only,
         },
-        lease_expires_at=now + QUEUED_SYNC_LEASE,
     )
-    db.add(run)
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        winner = active_sync(db, current_user.id)
-        if winner:
-            return sync_payload(winner, deduplicated=True)
-        raise
-
-    try:
-        task = cast(Any, ingest_gmail_for_user).delay(
-            run_id=str(run.id),
-            user_id=str(current_user.id),
-            max_results=max_results,
-            skip_existing=skip_existing,
-            classify_messages=classify,
-            new_only=new_only,
-        )
-        run.task_id = task.id
-        db.commit()
-    except Exception:
-        run.status = "failed"
-        run.error = "failed to enqueue sync"
-        run.completed_at = now_utc()
-        db.commit()
-        raise
-    return sync_payload(run)
+    return sync_payload(run, deduplicated=deduplicated)
 
 
 # Optional: no active run is a legitimate answer, and the SPA branches on null.
@@ -508,6 +482,62 @@ def get_active_sync(
 ) -> dict | None:
     run = active_sync(db, current_user.id)
     return sync_payload(run) if run else None
+
+
+# Must precede /sync/{run_id}: that route types run_id as a UUID, so a literal
+# "health" reaching it first would 422 instead of landing here.
+@router.get("/sync/health", response_model=SyncHealth)
+def get_sync_health(
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Whether this mailbox is actually current, and why not if it isn't.
+    Deliberately its own endpoint. /sync/active returns null when idle.
+    """
+    provider = (
+        db.execute(
+            select(ProviderAccount)
+            .where(
+                ProviderAccount.user_id == current_user.id,
+                ProviderAccount.provider == "gmail",
+            )
+            .order_by(ProviderAccount.created_at)
+        )
+        .scalars()
+        .first()
+    )
+    last_succeeded_at = db.scalar(
+        select(func.max(MailSyncRun.completed_at)).where(
+            MailSyncRun.user_id == current_user.id,
+            MailSyncRun.status == "succeeded",
+        )
+    )
+    heartbeat = read_dispatcher_heartbeat()
+    scheduler_alive = heartbeat is not None
+    sync_in_progress = active_sync(db, current_user.id) is not None
+    threshold = settings.sync_stale_after_seconds
+
+    reason: str | None = None
+    stale = False
+    if not provider or not provider.refresh_token:
+        reason = "not_connected"
+    elif provider.sync_paused_at is not None:
+        # Nothing but a reconnect fixes this, so say so instead of reporting a
+        # staleness the user can't act on.
+        reason = provider.sync_pause_reason or "reauth_required"
+    elif last_succeeded_at is None:
+        reason = "never_synced"
+    elif not sync_in_progress:
+        stale = last_succeeded_at < now_utc() - timedelta(seconds=threshold)
+
+    return {
+        "last_succeeded_at": last_succeeded_at,
+        "stale": stale,
+        "sync_in_progress": sync_in_progress,
+        "scheduler_alive": scheduler_alive,
+        "threshold_seconds": threshold,
+        "reason": reason,
+    }
 
 
 @router.get("/sync/{run_id}", response_model=SyncRun)

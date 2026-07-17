@@ -318,6 +318,33 @@ export async function getActiveSync(signal?: AbortSignal): Promise<SyncRunStatus
   return request<SyncRunStatus | null>("/mail/sync/active", { signal });
 }
 
+export interface SyncHealth {
+  last_succeeded_at: string | null;
+  // Is the mail itself behind?
+  stale: boolean;
+  sync_in_progress: boolean;
+  // Check if the server-side scheduler is still checking in. Separate from `stale` on
+  // purpose since the browser fallback can keep mail flowing while the scheduler is
+  // dead.
+  scheduler_alive: boolean;
+  threshold_seconds: number;
+  reason: "never_synced" | "reauth_required" | "not_connected" | null;
+}
+
+export async function getSyncHealth(signal?: AbortSignal): Promise<SyncHealth> {
+  if (USE_MOCK) {
+    return {
+      last_succeeded_at: new Date().toISOString(),
+      stale: false,
+      sync_in_progress: false,
+      scheduler_alive: true,
+      threshold_seconds: 1800,
+      reason: null,
+    };
+  }
+  return request<SyncHealth>("/mail/sync/health", { signal });
+}
+
 export async function getSyncRun(
   runId: string,
   signal?: AbortSignal,

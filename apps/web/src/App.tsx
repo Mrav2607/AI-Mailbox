@@ -99,6 +99,19 @@ const UNDO_MS = 5000;
 // latch the second run would re-POST the spent code and get `invalid_grant`.
 let oauthExchangeStarted = false;
 
+// Coarse on purpose: this only ever appears in a tooltip explaining why mail
+// looks behind, where "3 hours ago" reads better than a timestamp.
+function formatSyncTime(iso: string | null): string {
+  if (!iso) return "never";
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms)) return "never";
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 60) return `${Math.max(1, minutes)}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
 export default function Console() {
   const [user, setUser] = useState<User | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
@@ -369,14 +382,14 @@ export default function Console() {
     [bucket, refreshList, refreshOverview, refreshCounts],
   );
 
-  // Background sync: quiet periodic new-only ingest. After any sync that
+  // Background sync is quiet periodic new-only ingest. After any sync that
   // changed the DB the whole console refreshes in place (no loading flash,
   // selection kept) and the "N new" pill re-derives from the persisted
-  // acknowledged-mail watermark — so it survives reloads and syncs this tab
-  // never saw finish. An empty mailbox pauses the loop entirely: there's no
+  // acknowledged-mail watermark, so it survives reloads and syncs this tab
+  // never saw finish. An empty mailbox pauses the loop entirely as there's no
   // baseline to sync against until the first manual ingest (which refreshes
   // the overview and thereby resumes it).
-  const { pendingNew, clearNew, syncFailed } = useAutoSync({
+  const { pendingNew, clearNew, syncFailed, health } = useAutoSync({
     intervalSec: autoSync,
     enabled: !!user && (overview?.summary.threads ?? 0) > 0,
     busy: ingesting || backfilling,
@@ -384,6 +397,39 @@ export default function Console() {
     onSessionExpired: handleSessionExpired,
     onSynced: () => refreshAll({ quiet: true }).then(() => undefined),
   });
+
+  // What to say when mail isn't flowing. Ranked by what the operator can
+  // actually do about it: reconnecting beats knowing the mailbox is behind,
+  // and both beat "the scheduler is down" (which only we can fix).
+  const syncStatus = useMemo((): { label: string; detail: string } | null => {
+    if (health?.reason === "reauth_required") {
+      return {
+        label: "reconnect gmail",
+        detail: "Gmail access was revoked — reconnect the account to resume syncing",
+      };
+    }
+    if (health?.stale) {
+      return {
+        label: "mail may be stale",
+        detail: `no successful sync since ${formatSyncTime(health.last_succeeded_at)}`,
+      };
+    }
+    if (health && !health.scheduler_alive) {
+      return {
+        label: "scheduler down",
+        detail:
+          "the background sync scheduler isn't checking in — this tab is keeping mail current for now",
+      };
+    }
+    // Server says fine; fall back to what this tab has seen itself.
+    if (syncFailed) {
+      return {
+        label: "sync failing",
+        detail: "auto-sync is failing — retrying in the background",
+      };
+    }
+    return null;
+  }, [health, syncFailed]);
 
   // initial + bucket changes. Switching buckets also exits any active search.
   // The new-mail pill deliberately survives bucket switches: it clears only on
@@ -1103,12 +1149,15 @@ export default function Console() {
             {pendingNew >= NEW_MAIL_SCAN_LIMIT ? `${NEW_MAIL_SCAN_LIMIT}+` : pendingNew} new
           </button>
         )}
-        {syncFailed && (
+        {syncStatus && (
           <span
             data-testid="sync-failed-dot"
-            title="auto-sync failing — retrying in the background"
-            className="shrink-0 h-1.5 w-1.5 rounded-full bg-destructive/70"
-          />
+            title={syncStatus.detail}
+            className="shrink-0 flex items-center gap-1 text-[11px] text-destructive/90"
+          >
+            <span className="h-1.5 w-1.5 rounded-full bg-destructive/70" />
+            {syncStatus.label}
+          </span>
         )}
 
         <div className="flex-1 flex items-center min-w-0 max-w-[380px] ml-1">

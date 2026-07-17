@@ -68,6 +68,22 @@ class Settings(BaseSettings):
         alias="CORS_ORIGINS",
     )
 
+    # --- Scheduled sync ---
+    # How often the beat scheduler dispatches a new-only pull for every
+    # connected mailbox. 0 disables scheduling entirely (the browser fallback
+    # then carries sync on its own, as it did before server-side sync existed).
+    scheduled_sync_interval_seconds: int = Field(
+        default=300, alias="SCHEDULED_SYNC_INTERVAL_SECONDS"
+    )
+    scheduled_sync_max_results: int = Field(
+        default=100, alias="SCHEDULED_SYNC_MAX_RESULTS"
+    )
+    # How old the newest successful sync may get before we call the mailbox
+    # stale. Purely a data-freshness number: it says nothing about whether the
+    # scheduler is alive (that's the dispatcher heartbeat), because a single
+    # run can legitimately retry for well over an hour.
+    sync_stale_after_seconds: int = Field(default=1800, alias="SYNC_STALE_AFTER_SECONDS")
+
     # --- Logging ---
     # log_format: "json" (one object per line, for a shipper/jq) or "text"
     # (readable). Left unset it follows the environment -- JSON in production,

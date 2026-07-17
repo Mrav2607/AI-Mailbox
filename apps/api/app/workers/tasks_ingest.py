@@ -1,17 +1,27 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from time import monotonic
+from typing import Any, cast
 from uuid import UUID
 
+import redis
+from sqlalchemy import delete, func, or_, select
+from sqlalchemy.engine import CursorResult
+
 from .celery_app import celery_app
+from app.core.config import settings
+from app.core.logging import logger
 from app.db.base import SessionLocal
-from app.db.models import MailSyncRun
+from app.db.models import MailSyncRun, MailThread, ProviderAccount
 from app.services.ingest.gmail_ingest import ingest_gmail_messages
-from app.services.sync_runs import renew_sync
+from app.services.sync_runs import renew_sync, start_sync_run
 
 
 _HEARTBEAT_INTERVAL_SECONDS = 60
+# How long finished runs stick around. Long enough to debug last week's
+# incident, short enough that a 5-minute cadence doesn't accumulate forever.
+_RUN_RETENTION = timedelta(days=14)
 
 
 # A 500-message pull with classification can legitimately run for many
@@ -112,3 +122,189 @@ def ingest_gmail_for_user(
     payload = {"status": "ok", "user_id": user_id, **result}
     set_state("succeeded", result=payload)
     return payload
+
+
+# Redis key holding the dispatcher's last check-in. Liveness has to be measured
+# by "did the scheduler run", not "did a scheduled sync succeed": the dispatcher
+# correctly skips users who already have a run in flight, and with the browser
+# fallback still syncing, those skips are the common case. Keying liveness on
+# scheduled runs would report a perfectly healthy scheduler as dead.
+DISPATCHER_HEARTBEAT_KEY = "sync:dispatcher:heartbeat"
+
+
+def _heartbeat_ttl_seconds() -> int:
+    # Outlive a few missed cycles so a slow tick isn't read as death, but still
+    # expire on its own -- an absent key is the "scheduler is gone" signal.
+    return max(60, settings.scheduled_sync_interval_seconds * 3)
+
+
+def write_dispatcher_heartbeat() -> None:
+    client = redis.from_url(settings.redis_url)
+    try:
+        client.set(
+            DISPATCHER_HEARTBEAT_KEY,
+            datetime.now(timezone.utc).isoformat(),
+            ex=_heartbeat_ttl_seconds(),
+        )
+    finally:
+        client.close()
+
+
+def read_dispatcher_heartbeat() -> datetime | None:
+    client = redis.from_url(settings.redis_url)
+    try:
+        raw = client.get(DISPATCHER_HEARTBEAT_KEY)
+    finally:
+        client.close()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(
+            raw.decode() if isinstance(raw, bytes) else str(raw)
+        )
+    except ValueError:
+        return None
+
+
+def _eligible_provider_rows(db) -> list[tuple[UUID, UUID]]:
+    """(user_id, provider_id) for every Gmail account the scheduler should pull.
+
+    Eligible means: connected, has a refresh token, not paused for reauth, and
+    past the first-ingest baseline. That baseline is a history cursor OR a known
+    Gmail thread -- cursor alone counts, because an account whose first ingest
+    found an empty mailbox still has one, and requiring a thread would strand it
+    forever (no threads -> no new-only pull -> no first thread).
+    """
+    has_thread = (
+        select(MailThread.id)
+        .where(
+            MailThread.user_id == ProviderAccount.user_id,
+            MailThread.provider == "gmail",
+        )
+        .exists()
+    )
+    rows = db.execute(
+        select(ProviderAccount.user_id, ProviderAccount.id)
+        .where(
+            ProviderAccount.provider == "gmail",
+            ProviderAccount.refresh_token.is_not(None),
+            ProviderAccount.sync_paused_at.is_(None),
+            or_(ProviderAccount.gmail_history_id.is_not(None), has_thread),
+        )
+        .order_by(ProviderAccount.user_id, ProviderAccount.created_at)
+    ).all()
+    # One dispatch per user even if they've connected several Gmail accounts --
+    # the sync slot is per user, so a second row would only ever dedupe.
+    seen: set[UUID] = set()
+    unique: list[tuple[UUID, UUID]] = []
+    for user_id, provider_id in rows:
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        unique.append((user_id, provider_id))
+    return unique
+
+
+@celery_app.task(ignore_result=True, time_limit=120)
+def dispatch_scheduled_syncs() -> dict:
+    """Queue a new-only pull for every connected mailbox. Runs on the beat.
+
+    Makes sync independent of an open browser tab. It only ever
+    enqueues while the real work happens in ingest_gmail_for_user.
+    """
+    # First, before anything that can fail: the heartbeat is how the beat
+    # container's healthcheck and the sync-health endpoint know the scheduler is
+    # alive. A per-user Gmail problem must not read as a dead scheduler.
+    write_dispatcher_heartbeat()
+
+    dispatched = 0
+    skipped = 0
+    failed = 0
+    with SessionLocal() as db:
+        candidates = _eligible_provider_rows(db)
+        for user_id, _provider_id in candidates:
+            try:
+                run, deduplicated = start_sync_run(
+                    db,
+                    user_id,
+                    mode="scheduled",
+                    options={
+                        "max_results": settings.scheduled_sync_max_results,
+                        "skip_existing": True,
+                        "classify_messages": True,
+                        "new_only": True,
+                    },
+                )
+                if deduplicated:
+                    # Someone already holds the slot (a manual run, or the
+                    # browser fallback). Nothing to do -- next tick is minutes
+                    # away.
+                    skipped += 1
+                else:
+                    dispatched += 1
+            except Exception:
+                # One user's bad state must never stop the others from syncing.
+                failed += 1
+                logger.exception("scheduled sync dispatch failed for user %s", user_id)
+
+        _log_stale_mailboxes(db, [user_id for user_id, _ in candidates])
+
+    return {"dispatched": dispatched, "skipped": skipped, "failed": failed}
+
+
+def _log_stale_mailboxes(db, user_ids: list[UUID]) -> None:
+    """Shout if a mailbox hasn't had a successful sync in too long.
+    """
+    if not user_ids:
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=settings.sync_stale_after_seconds
+    )
+    rows = db.execute(
+        select(MailSyncRun.user_id, func.max(MailSyncRun.completed_at))
+        .where(MailSyncRun.user_id.in_(user_ids), MailSyncRun.status == "succeeded")
+        .group_by(MailSyncRun.user_id)
+    ).all()
+    newest = {user_id: completed for user_id, completed in rows}
+    for user_id in user_ids:
+        last = newest.get(user_id)
+        if last is not None and last < cutoff:
+            logger.error(
+                "mailbox stale: no successful sync for user %s since %s",
+                user_id,
+                last.isoformat(),
+            )
+
+
+@celery_app.task(ignore_result=True, time_limit=300)
+def prune_sync_runs() -> dict:
+    """Drop old finished runs. Hourly, not per dispatch.
+
+    Keeps each user's newest successful run whatever its age: it's what
+    last_succeeded_at reads, so pruning it would create a stale mailbox.
+    """
+    cutoff = datetime.now(timezone.utc) - _RUN_RETENTION
+    # Each user's newest successful run, resolved inside the same statement as
+    # the delete so there's no window where the anchor is computed but not yet
+    # protected.
+    anchors = (
+        select(MailSyncRun.id)
+        .distinct(MailSyncRun.user_id)
+        .where(MailSyncRun.status == "succeeded")
+        .order_by(MailSyncRun.user_id, MailSyncRun.completed_at.desc())
+        .scalar_subquery()
+    )
+    with SessionLocal() as db:
+        result = cast(
+            CursorResult[Any],
+            db.execute(
+                delete(MailSyncRun).where(
+                    MailSyncRun.status.in_(("succeeded", "failed")),
+                    MailSyncRun.completed_at < cutoff,
+                    MailSyncRun.id.notin_(anchors),
+                )
+            ),
+        )
+        deleted = result.rowcount
+        db.commit()
+    return {"deleted": deleted or 0}
