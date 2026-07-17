@@ -83,15 +83,18 @@ def test_an_old_success_is_stale(health):
     assert body["stale"] is True
 
 
-def test_a_run_in_flight_suppresses_stale(health):
-    # A long backfill is not a broken mailbox. Without this, a legitimate
-    # 30-minute run would report as an outage.
+def test_a_run_in_flight_does_not_mask_staleness(health):
+    # An in-flight run doesn't make old mail fresh. A run that keeps retrying --
+    # or sits queued against a dead worker for its 2h lease -- is "in progress"
+    # the entire time the mailbox rots, which is precisely the wedge this
+    # endpoint exists to surface. Both facts are reported; neither hides the
+    # other, and the console decides how loudly to say it.
     body = health(
         provider=_provider(),
         last_succeeded_at=datetime.now(timezone.utc) - timedelta(hours=6),
         active=True,
     )
-    assert body["stale"] is False
+    assert body["stale"] is True
     assert body["sync_in_progress"] is True
 
 

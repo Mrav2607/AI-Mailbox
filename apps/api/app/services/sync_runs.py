@@ -88,6 +88,9 @@ def start_sync_run(
     # module, so a top-level import would close the cycle.
     from app.workers.tasks_ingest import ingest_gmail_for_user
 
+    # Enqueue and recording the task id fail for different reasons and must be
+    # handled differently -- catching both together is how a run that's actually
+    # executing gets marked failed.
     try:
         task = cast(Any, ingest_gmail_for_user).delay(
             run_id=str(run.id),
@@ -97,16 +100,30 @@ def start_sync_run(
             classify_messages=options["classify_messages"],
             new_only=options["new_only"],
         )
-        run.task_id = task.id
-        db.commit()
     except Exception:
-        # The row is already committed and holds the user's only sync slot, so
-        # failing to enqueue must release it, otherwise the mailbox is wedged
-        # until the lease expires.
+        # Nothing is running, and the committed row holds the user's only sync
+        # slot -- release it or the mailbox is wedged until the lease expires.
+        db.rollback()
         run.status = "failed"
         run.error = "failed to enqueue sync"
         run.completed_at = now_utc()
         db.commit()
+        raise
+
+    try:
+        run.task_id = task.id
+        db.commit()
+    except Exception:
+        # The task IS queued; only our note of its id didn't land. Marking the
+        # run failed here would be a lie with teeth: 'failed' is terminal, so it
+        # both releases the slot while the ingest is still running (letting the
+        # scheduler start a second concurrent run for the same user) and makes
+        # the worker abort on set_state's terminal guard.
+        #
+        # Leave it 'queued' and let the worker take it from there -- it moves
+        # queued->running normally. The only casualty is task_id staying null,
+        # and nothing user-facing reads it (the console polls by run_id).
+        db.rollback()
         raise
     return run, False
 

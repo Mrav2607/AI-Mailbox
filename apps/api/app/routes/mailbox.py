@@ -527,7 +527,13 @@ def get_sync_health(
         reason = provider.sync_pause_reason or "reauth_required"
     elif last_succeeded_at is None:
         reason = "never_synced"
-    elif not sync_in_progress:
+    else:
+        # Purely a fact about the data: an in-flight run does NOT make old mail
+        # fresh. Letting it suppress this would hide the exact failure this
+        # endpoint exists for -- a run that keeps retrying, or sits queued
+        # against a dead worker for its 2h lease, is "in progress" the whole
+        # time the mailbox rots. Callers that want to soften the wording have
+        # sync_in_progress right there.
         stale = last_succeeded_at < now_utc() - timedelta(seconds=threshold)
 
     return {

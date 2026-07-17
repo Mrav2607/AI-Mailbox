@@ -409,10 +409,13 @@ export default function Console() {
       };
     }
     if (health?.stale) {
-      return {
-        label: "mail may be stale",
-        detail: `no successful sync since ${formatSyncTime(health.last_succeeded_at)}`,
-      };
+      // A run being in flight softens the wording but never silences it: a
+      // wedged sync retries for hours, so suppressing this while one is running
+      // would hide the mailbox rotting behind it.
+      const since = `no successful sync since ${formatSyncTime(health.last_succeeded_at)}`;
+      return health.sync_in_progress
+        ? { label: "syncing — mail is behind", detail: `${since}; a sync is running now` }
+        : { label: "mail may be stale", detail: since };
     }
     if (health && !health.scheduler_alive) {
       return {

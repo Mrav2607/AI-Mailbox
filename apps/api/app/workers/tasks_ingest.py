@@ -7,6 +7,7 @@ from uuid import UUID
 
 import redis
 from sqlalchemy import delete, func, or_, select
+from sqlalchemy.orm import aliased
 from sqlalchemy.engine import CursorResult
 
 from .celery_app import celery_app
@@ -174,35 +175,42 @@ def _eligible_provider_rows(db) -> list[tuple[UUID, UUID]]:
     Gmail thread -- cursor alone counts, because an account whose first ingest
     found an empty mailbox still has one, and requiring a thread would strand it
     forever (no threads -> no new-only pull -> no first thread).
+
+    Judged against each user's OLDEST Gmail account, because that's the one
+    ingest_gmail_messages actually loads. Filtering first and deduping after
+    would let a user with a paused oldest account and a healthy newer one look
+    eligible via the newer row, while every run ingest actually started picked
+    the paused one and died -- a doomed sync every cycle, forever. Until runs
+    carry an account identity, dispatcher and ingest have to agree on which
+    account they mean.
     """
+    oldest_per_user = (
+        select(ProviderAccount)
+        .where(ProviderAccount.provider == "gmail")
+        .distinct(ProviderAccount.user_id)
+        .order_by(ProviderAccount.user_id, ProviderAccount.created_at)
+        .subquery()
+    )
+    account = aliased(ProviderAccount, oldest_per_user)
+    # Correlated to the alias, not ProviderAccount -- the bare table isn't in
+    # this query any more, so correlating to it would compare against the wrong
+    # row (or nothing at all).
     has_thread = (
         select(MailThread.id)
         .where(
-            MailThread.user_id == ProviderAccount.user_id,
+            MailThread.user_id == account.user_id,
             MailThread.provider == "gmail",
         )
         .exists()
     )
     rows = db.execute(
-        select(ProviderAccount.user_id, ProviderAccount.id)
-        .where(
-            ProviderAccount.provider == "gmail",
-            ProviderAccount.refresh_token.is_not(None),
-            ProviderAccount.sync_paused_at.is_(None),
-            or_(ProviderAccount.gmail_history_id.is_not(None), has_thread),
+        select(account.user_id, account.id).where(
+            account.refresh_token.is_not(None),
+            account.sync_paused_at.is_(None),
+            or_(account.gmail_history_id.is_not(None), has_thread),
         )
-        .order_by(ProviderAccount.user_id, ProviderAccount.created_at)
     ).all()
-    # One dispatch per user even if they've connected several Gmail accounts --
-    # the sync slot is per user, so a second row would only ever dedupe.
-    seen: set[UUID] = set()
-    unique: list[tuple[UUID, UUID]] = []
-    for user_id, provider_id in rows:
-        if user_id in seen:
-            continue
-        seen.add(user_id)
-        unique.append((user_id, provider_id))
-    return unique
+    return [(user_id, provider_id) for user_id, provider_id in rows]
 
 
 @celery_app.task(ignore_result=True, time_limit=120)

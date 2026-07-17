@@ -72,17 +72,27 @@ class Settings(BaseSettings):
     # How often the beat scheduler dispatches a new-only pull for every
     # connected mailbox. 0 disables scheduling entirely (the browser fallback
     # then carries sync on its own, as it did before server-side sync existed).
+    # ge=0 because a negative would silently behave like the disable switch --
+    # scheduling and run pruning would both just stop, with nothing said.
     scheduled_sync_interval_seconds: int = Field(
-        default=300, alias="SCHEDULED_SYNC_INTERVAL_SECONDS"
+        default=300, ge=0, alias="SCHEDULED_SYNC_INTERVAL_SECONDS"
     )
+    # Goes straight to Gmail's maxResults, bypassing the ingest route's own
+    # bounds, so it needs its own. 500 mirrors _MAX_INGEST_RESULTS as a literal:
+    # routes import config, so importing it back would close the cycle.
     scheduled_sync_max_results: int = Field(
-        default=100, alias="SCHEDULED_SYNC_MAX_RESULTS"
+        default=100, ge=1, le=500, alias="SCHEDULED_SYNC_MAX_RESULTS"
     )
     # How old the newest successful sync may get before we call the mailbox
     # stale. Purely a data-freshness number: it says nothing about whether the
     # scheduler is alive (that's the dispatcher heartbeat), because a single
     # run can legitimately retry for well over an hour.
-    sync_stale_after_seconds: int = Field(default=1800, alias="SYNC_STALE_AFTER_SECONDS")
+    #
+    # gt=0 because 0 means "always stale", not "never" -- every mailbox would
+    # report stale and the dispatcher would log an error every tick.
+    sync_stale_after_seconds: int = Field(
+        default=1800, gt=0, alias="SYNC_STALE_AFTER_SECONDS"
+    )
 
     # --- Logging ---
     # log_format: "json" (one object per line, for a shipper/jq) or "text"
