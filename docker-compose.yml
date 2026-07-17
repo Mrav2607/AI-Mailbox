@@ -122,6 +122,28 @@ services:
     mem_limit: 3g
     restart: unless-stopped
 
+  # The scheduler that makes email sync independent of the browser.
+  beat:
+    build: *api-build
+    image: ai-mailbox-api:local
+    command: celery -A app.workers.celery_app beat --loglevel=info --schedule /tmp/celerybeat-schedule
+    env_file: ./deploy/.env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import sys; from app.workers.tasks_ingest import read_dispatcher_heartbeat; sys.exit(0 if read_dispatcher_heartbeat() else 1)"
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 420s
+    mem_limit: 512m
+    restart: unless-stopped
+
   web:
     build:
       context: .

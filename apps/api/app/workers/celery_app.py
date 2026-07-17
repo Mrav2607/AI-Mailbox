@@ -26,3 +26,22 @@ celery_app = Celery(
 )
 
 celery_app.conf.update(task_serializer="json", result_serializer="json", accept_content=["json"])
+
+# Server-side sync
+# Pruning runs regardless of whether scheduling is on: the browser fallback
+# still creates runs when the schedule is disabled, so the table needs tidying
+# either way.
+celery_app.conf.beat_schedule = {
+    "prune-sync-runs": {
+        "task": "app.workers.tasks_ingest.prune_sync_runs",
+        "schedule": 3600.0,
+        "options": {"expires": 3600},
+    },
+}
+
+if settings.scheduled_sync_interval_seconds > 0:
+    celery_app.conf.beat_schedule["dispatch-scheduled-syncs"] = {
+        "task": "app.workers.tasks_ingest.dispatch_scheduled_syncs",
+        "schedule": float(settings.scheduled_sync_interval_seconds),
+        "options": {"expires": settings.scheduled_sync_interval_seconds},
+    }

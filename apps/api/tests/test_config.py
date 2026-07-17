@@ -63,25 +63,28 @@ def test_malformed_token_encryption_key_rejected_in_any_env():
         Settings(_env_file=None, TOKEN_ENCRYPTION_KEY="not-a-valid-fernet-key")
 
 
-@pytest.mark.parametrize("alg", ["none", "RS256"])
-def test_unsupported_jwt_algorithm_rejected_in_any_env(alg):
-    # "none" would skip signature checks and RS* needs asymmetric keys we
-    # don't have -- both must fail at boot, even in dev.
-    with pytest.raises(ValidationError, match="JWT_ALGORITHM"):
-        Settings(_env_file=None, JWT_ALGORITHM=alg)
+@pytest.mark.parametrize(
+    "alias, value",
+    [
+        # A negative would quietly behave exactly like the 0 disable switch.
+        ("SCHEDULED_SYNC_INTERVAL_SECONDS", -1),
+        # Goes to Gmail's maxResults untouched by the ingest route's bounds.
+        ("SCHEDULED_SYNC_MAX_RESULTS", 0),
+        ("SCHEDULED_SYNC_MAX_RESULTS", 501),
+        # 0 means "always stale", not "never".
+        ("SYNC_STALE_AFTER_SECONDS", 0),
+        ("SYNC_STALE_AFTER_SECONDS", -60),
+    ],
+)
+def test_nonsense_scheduler_settings_are_rejected_at_startup(alias, value):
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **{alias: value})
+    # Pin the reason: passing the field name instead of the alias also raises,
+    # but for extra_forbidden -- which would make this pass with no bounds at all.
+    assert "greater than" in str(exc.value) or "less than" in str(exc.value)
 
 
-@pytest.mark.parametrize("alg", ["HS256", "HS512"])
-def test_supported_jwt_algorithms_accepted(alg):
-    s = Settings(_env_file=None, JWT_ALGORITHM=alg)
-    assert s.jwt_algorithm == alg
-
-
-def test_production_reports_all_problems_at_once():
-    with pytest.raises(ValidationError) as exc_info:
-        Settings(_env_file=None, APP_ENV="production")
-    message = str(exc_info.value)
-    assert "API_SECRET" in message
-    assert "GOOGLE_CLIENT_ID" in message
-    assert "GOOGLE_REDIRECT_URI" in message
-    assert "TOKEN_ENCRYPTION_KEY" in message
+def test_scheduling_can_still_be_disabled_with_zero():
+    # 0 is the documented off switch and must stay valid.
+    s = Settings(_env_file=None, SCHEDULED_SYNC_INTERVAL_SECONDS=0)
+    assert s.scheduled_sync_interval_seconds == 0

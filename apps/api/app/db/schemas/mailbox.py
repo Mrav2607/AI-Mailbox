@@ -85,6 +85,23 @@ class SyncRun(Response):
     error: str | None
 
 
+class SyncHealth(Response):
+    """
+    `stale` is about the DATA (has a sync succeeded recently), while
+    `scheduler_alive` is about the MACHINERY (is the dispatcher still checking
+    in). A dead scheduler with the browser fallback still working is stale=false,
+    scheduler_alive=false.
+    """
+
+    last_succeeded_at: datetime | None
+    stale: bool
+    sync_in_progress: bool
+    scheduler_alive: bool
+    threshold_seconds: int
+    # null | never_synced | reauth_required | not_connected
+    reason: str | None
+
+
 class TaskStatus(Response):
     task_id: str
     state: str
