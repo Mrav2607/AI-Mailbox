@@ -139,24 +139,35 @@ def _heartbeat_ttl_seconds() -> int:
     return max(60, settings.scheduled_sync_interval_seconds * 3)
 
 
+# Built on first use rather than at import: redis-py connection pools don't
+# survive a fork, and this module is imported before the prefork worker forks
+# its children. Lazily, each process ends up with its own.
+_redis_client: redis.Redis | None = None
+
+
+def _heartbeat_redis() -> redis.Redis:
+    """One pooled client per process.
+
+    Every health poll from every open tab reads the heartbeat, and from_url()
+    builds a fresh ConnectionPool each call -- that's a TCP connection set up
+    and torn down per read.
+    """
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(settings.redis_url)
+    return _redis_client
+
+
 def write_dispatcher_heartbeat() -> None:
-    client = redis.from_url(settings.redis_url)
-    try:
-        client.set(
-            DISPATCHER_HEARTBEAT_KEY,
-            datetime.now(timezone.utc).isoformat(),
-            ex=_heartbeat_ttl_seconds(),
-        )
-    finally:
-        client.close()
+    _heartbeat_redis().set(
+        DISPATCHER_HEARTBEAT_KEY,
+        datetime.now(timezone.utc).isoformat(),
+        ex=_heartbeat_ttl_seconds(),
+    )
 
 
 def read_dispatcher_heartbeat() -> datetime | None:
-    client = redis.from_url(settings.redis_url)
-    try:
-        raw = client.get(DISPATCHER_HEARTBEAT_KEY)
-    finally:
-        client.close()
+    raw = _heartbeat_redis().get(DISPATCHER_HEARTBEAT_KEY)
     if not raw:
         return None
     try:

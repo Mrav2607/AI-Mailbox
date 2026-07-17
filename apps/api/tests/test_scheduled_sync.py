@@ -19,6 +19,10 @@ def fake_redis(monkeypatch):
     client.set.side_effect = lambda key, value, ex=None: store.__setitem__(key, value)
     client.get.side_effect = lambda key: store.get(key)
     monkeypatch.setattr(tasks_ingest.redis, "from_url", lambda _url: client)
+    # The client is cached per process, so without clearing it a test would
+    # reuse whichever mock got there first -- and monkeypatch restores the
+    # attribute, not the cache.
+    monkeypatch.setattr(tasks_ingest, "_redis_client", None)
     return store
 
 
@@ -109,6 +113,22 @@ def test_dispatch_checks_in_before_doing_any_work(monkeypatch, fake_redis):
     )
 
     assert tasks_ingest.DISPATCHER_HEARTBEAT_KEY in fake_redis
+
+
+def test_the_redis_client_is_built_once_not_per_read(monkeypatch):
+    # Every health poll from every open tab reads the heartbeat; building a
+    # client per read means a TCP connection set up and torn down each time.
+    monkeypatch.setattr(tasks_ingest, "_redis_client", None)
+    built = []
+    monkeypatch.setattr(
+        tasks_ingest.redis, "from_url", lambda _url: built.append(1) or MagicMock()
+    )
+
+    tasks_ingest.read_dispatcher_heartbeat()
+    tasks_ingest.read_dispatcher_heartbeat()
+    tasks_ingest.write_dispatcher_heartbeat()
+
+    assert len(built) == 1
 
 
 def test_heartbeat_round_trips(monkeypatch, fake_redis):
