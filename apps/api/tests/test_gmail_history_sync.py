@@ -192,6 +192,17 @@ def test_a_thread_fetch_failing_for_other_reasons_still_raises(monkeypatch):
     assert provider.gmail_history_id == "100"
 
 
+@pytest.fixture
+def google_creds(monkeypatch):
+    """_refresh_access_token no-ops without client credentials.
+
+    Without this the token tests pass locally (where deploy/.env supplies real
+    ones) and vacuously "pass" anywhere else by never reaching the request.
+    """
+    monkeypatch.setattr(gmail_ingest.settings, "google_client_id", "cid")
+    monkeypatch.setattr(gmail_ingest.settings, "google_client_secret", "secret")
+
+
 def _token_response(status_code, payload=None, text="err"):
     resp = MagicMock(status_code=status_code)
     resp.json.return_value = payload if payload is not None else {}
@@ -203,7 +214,7 @@ def _token_response(status_code, payload=None, text="err"):
     return resp
 
 
-def test_revoked_refresh_token_pauses_the_account_and_does_not_retry(monkeypatch):
+def test_revoked_refresh_token_pauses_the_account_and_does_not_retry(monkeypatch, google_creds):
     # invalid_grant is permanent: only the user reconnecting fixes it. Raising
     # ValueError puts it on the task's terminal branch, so we stop hammering
     # Google every cycle forever.
@@ -225,7 +236,7 @@ def test_revoked_refresh_token_pauses_the_account_and_does_not_retry(monkeypatch
     assert paused["reason"] == "reauth_required"
 
 
-def test_a_transient_token_failure_still_raises_for_retry(monkeypatch):
+def test_a_transient_token_failure_still_raises_for_retry(monkeypatch, google_creds):
     # 500 is Google having a bad day -- retryable. Pausing here would take a
     # working account out of the schedule until someone noticed.
     provider = MagicMock(id=uuid4(), refresh_token="rt")
@@ -243,7 +254,7 @@ def test_a_transient_token_failure_still_raises_for_retry(monkeypatch):
     assert paused == {}
 
 
-def test_a_401_from_the_token_endpoint_is_our_problem_not_the_users(monkeypatch):
+def test_a_401_from_the_token_endpoint_is_our_problem_not_the_users(monkeypatch, google_creds):
     # 401 means invalid_client -- our credentials are misconfigured. Pausing the
     # user's account would blame them for an operator error.
     provider = MagicMock(id=uuid4(), refresh_token="rt")
@@ -263,7 +274,7 @@ def test_a_401_from_the_token_endpoint_is_our_problem_not_the_users(monkeypatch)
     assert paused == {}
 
 
-def test_a_non_json_400_is_not_mistaken_for_a_revoked_token(monkeypatch):
+def test_a_non_json_400_is_not_mistaken_for_a_revoked_token(monkeypatch, google_creds):
     provider = MagicMock(id=uuid4(), refresh_token="rt")
     paused = {}
     monkeypatch.setattr(
