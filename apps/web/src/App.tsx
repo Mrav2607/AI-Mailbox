@@ -15,7 +15,10 @@ import {
   flushDeleteThread,
   getCounts,
   getMe,
+  getSyncHealth,
   googleAuthCallback,
+  googleConnectCallback,
+  googleConnectStart,
   getOverview,
   getThread,
   getTriage,
@@ -29,7 +32,7 @@ import {
   waitForSyncRun,
   WORKER_TASK_TIMEOUT_MS,
 } from "@/lib/api";
-import type { TaskResult } from "@/lib/api";
+import type { SyncHealth, TaskResult } from "@/lib/api";
 import { BUCKET_KEYS } from "@/lib/labels";
 import { gmailThreadUrl } from "@/lib/utils";
 import type {
@@ -54,6 +57,7 @@ import { Shortcuts } from "@/components/console/Shortcuts";
 import { LoginScreen } from "@/components/console/LoginScreen";
 import { VerifyEmailScreen } from "@/components/console/VerifyEmailScreen";
 import { ResetPasswordScreen } from "@/components/console/ResetPasswordScreen";
+import { GoogleMark } from "@/components/console/GoogleMark";
 import {
   shouldSuppressConsoleHotkeys,
   useHotkeys,
@@ -75,6 +79,7 @@ import {
 import { useIsNarrow } from "@/lib/use-viewport";
 import { applyTheme, resolveTheme, watchSystemTheme } from "@/lib/theme";
 import type { ThemePref } from "@/lib/theme";
+import { extractStateFromAuthUrl, saveOauthBinding, takeOauthBinding } from "@/lib/oauthBinding";
 import { PanelRightOpen, Search, X } from "lucide-react";
 
 type SortMode = "recent" | "confidence_asc" | "confidence_desc";
@@ -143,6 +148,7 @@ export default function Console() {
   const [firstListLoadSettled, setFirstListLoadSettled] = useState(false);
 
   const [overview, setOverview] = useState<Overview | null>(null);
+  const [refreshedHealth, setRefreshedHealth] = useState<SyncHealth | null>(null);
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [thread, setThread] = useState<ThreadDetail | null>(null);
@@ -282,9 +288,8 @@ export default function Console() {
   useEffect(() => {
     if (isEmailAuthScreen) return;
     (async () => {
-      // If we're landing on the Google OAuth callback, exchange the `code` for a
-      // session token before the normal session check. The redirect URL is then
-      // scrubbed so a refresh doesn't replay a single-use code.
+      // The browser binding chooses the allowed callback endpoint and prevents
+      // an OAuth response from a different tab from being exchanged here.
       if (
         window.location.pathname.endsWith("/auth/google/callback") &&
         !oauthExchangeStarted
@@ -293,17 +298,42 @@ export default function Console() {
         const params = new URLSearchParams(window.location.search);
         const code = params.get("code");
         const oauthError = params.get("error");
-        try {
-          if (oauthError) {
-            toast.error(`google sign-in cancelled (${oauthError})`);
-          } else if (code) {
-            const res = await googleAuthCallback(code, params.get("state"));
-            setToken(res.access_token);
-          }
-        } catch (e) {
-          toast.error((e as Error).message || "google sign-in failed");
-        } finally {
+        const state = params.get("state");
+        const binding = takeOauthBinding();
+        if (!binding || binding.state !== state) {
           window.history.replaceState({}, "", "/");
+          toast.error("sign-in was interrupted — try again");
+        } else {
+          try {
+            if (oauthError || !code) {
+              throw new Error("google sign-in was interrupted");
+            }
+            if (binding.mode === "login") {
+              const res = await googleAuthCallback(code, state);
+              setToken(res.access_token);
+              setUser(res.user);
+            } else {
+              await googleConnectCallback(code, state);
+              toast.success("gmail connected — syncing");
+              try {
+                setRefreshedHealth(await getSyncHealth());
+              } catch {
+                // The normal health poll will retry if this immediate refresh fails.
+              }
+            }
+          } catch (e) {
+            if (binding.mode === "connect" && e instanceof ApiError && e.status === 409) {
+              toast.error(e.message);
+            } else {
+              toast.error(
+                binding.mode === "connect"
+                  ? "gmail connection failed"
+                  : (e as Error).message || "google sign-in failed",
+              );
+            }
+          } finally {
+            window.history.replaceState({}, "", "/");
+          }
         }
       }
 
@@ -404,26 +434,55 @@ export default function Console() {
     onSynced: () => refreshAll({ quiet: true }).then(() => undefined),
   });
 
+  useEffect(() => {
+    setRefreshedHealth(null);
+  }, [health]);
+
+  const activeHealth = refreshedHealth ?? health;
+
+  const handleConnectGmail = useCallback(async () => {
+    try {
+      const { auth_url } = await googleConnectStart();
+      const state = extractStateFromAuthUrl(auth_url);
+      if (state) saveOauthBinding({ mode: "connect", state, startedAt: Date.now() });
+      window.location.href = auth_url;
+    } catch (e) {
+      toast.error((e as Error).message || "gmail connection unavailable");
+    }
+  }, []);
+
   // What to say when mail isn't flowing. Ranked by what the operator can
   // actually do about it: reconnecting beats knowing the mailbox is behind,
   // and both beat "the scheduler is down" (which only we can fix).
-  const syncStatus = useMemo((): { label: string; detail: string } | null => {
-    if (health?.reason === "reauth_required") {
+  const syncStatus = useMemo((): {
+    label: string;
+    detail: string;
+    actionable?: boolean;
+  } | null => {
+    if (activeHealth?.reason === "not_connected") {
+      return {
+        label: "connect gmail",
+        detail: "No Gmail account is connected — connect one to start syncing.",
+        actionable: true,
+      };
+    }
+    if (activeHealth?.reason === "reauth_required") {
       return {
         label: "reconnect gmail",
         detail: "Gmail access was revoked — reconnect the account to resume syncing",
+        actionable: true,
       };
     }
-    if (health?.stale) {
+    if (activeHealth?.stale) {
       // A run being in flight softens the wording but never silences it: a
       // wedged sync retries for hours, so suppressing this while one is running
       // would hide the mailbox rotting behind it.
-      const since = `no successful sync since ${formatSyncTime(health.last_succeeded_at)}`;
-      return health.sync_in_progress
+      const since = `no successful sync since ${formatSyncTime(activeHealth.last_succeeded_at)}`;
+      return activeHealth.sync_in_progress
         ? { label: "syncing — mail is behind", detail: `${since}; a sync is running now` }
         : { label: "mail may be stale", detail: since };
     }
-    if (health && !health.scheduler_alive) {
+    if (activeHealth && !activeHealth.scheduler_alive) {
       return {
         label: "scheduler down",
         detail:
@@ -438,7 +497,7 @@ export default function Console() {
       };
     }
     return null;
-  }, [health, syncFailed]);
+  }, [activeHealth, syncFailed]);
 
   // initial + bucket changes. Switching buckets also exits any active search.
   // The new-mail pill deliberately survives bucket switches: it clears only on
@@ -1184,16 +1243,27 @@ export default function Console() {
             {pendingNew >= NEW_MAIL_SCAN_LIMIT ? `${NEW_MAIL_SCAN_LIMIT}+` : pendingNew} new
           </button>
         )}
-        {syncStatus && (
-          <span
-            data-testid="sync-failed-dot"
-            title={syncStatus.detail}
-            className="shrink-0 flex items-center gap-1 text-[11px] text-destructive/90"
-          >
-            <span className="h-1.5 w-1.5 rounded-full bg-destructive/70" />
-            {syncStatus.label}
-          </span>
-        )}
+        {syncStatus &&
+          (syncStatus.actionable ? (
+            <button
+              data-testid="sync-failed-dot"
+              onClick={handleConnectGmail}
+              title={syncStatus.detail}
+              className="shrink-0 h-6 px-2 rounded-full border border-amber-500/40 bg-amber-500/10 text-[11px] text-amber-700 dark:text-amber-300 hover:bg-amber-500/20 cursor-pointer transition-colors flex items-center gap-1"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-500/70" />
+              {syncStatus.label}
+            </button>
+          ) : (
+            <span
+              data-testid="sync-failed-dot"
+              title={syncStatus.detail}
+              className="shrink-0 flex items-center gap-1 text-[11px] text-destructive/90"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-destructive/70" />
+              {syncStatus.label}
+            </span>
+          ))}
 
         <div className="flex-1 flex items-center min-w-0 max-w-[380px] ml-1">
           <div className="flex items-center gap-1.5 w-full rounded border border-border bg-background px-2 h-6 focus-within:border-primary transition-colors">
@@ -1265,18 +1335,43 @@ export default function Console() {
         ref={listScrollRef}
         className="flex-1 overflow-y-auto scrollbar-thin"
       >
-        <ThreadList
-          items={visibleItems}
-          selectedId={selectedId}
-          onSelect={(id) => {
-            setSelectedId(id);
-            if (isNarrow) setNarrowPane("reading");
-          }}
-          showLabel={searchMode || bucket === "all" || bucket === "done"}
-          narrow={isNarrow}
-          loading={listLoading || searching}
-          error={listError}
-        />
+        {visibleItems.length === 0 &&
+        activeHealth?.reason === "not_connected" &&
+        !listLoading &&
+        !searching &&
+        !listError ? (
+          <div className="h-full flex items-center justify-center p-6">
+            <div className="w-full max-w-sm rounded-lg border border-border bg-[var(--color-panel)] p-6 text-center font-mono shadow-lg">
+              <div className="mx-auto mb-3 h-10 w-10 rounded bg-primary/15 border border-primary/40 flex items-center justify-center">
+                <GoogleMark />
+              </div>
+              <div className="text-[13px] font-semibold text-foreground">
+                Connect your Gmail to start triaging
+              </div>
+              <button
+                type="button"
+                onClick={handleConnectGmail}
+                className="mt-5 w-full h-9 rounded border border-border bg-background font-mono text-[13px] font-semibold flex items-center justify-center gap-2 hover:bg-accent cursor-pointer transition-colors"
+              >
+                <GoogleMark />
+                Connect Gmail
+              </button>
+            </div>
+          </div>
+        ) : (
+          <ThreadList
+            items={visibleItems}
+            selectedId={selectedId}
+            onSelect={(id) => {
+              setSelectedId(id);
+              if (isNarrow) setNarrowPane("reading");
+            }}
+            showLabel={searchMode || bucket === "all" || bucket === "done"}
+            narrow={isNarrow}
+            loading={listLoading || searching}
+            error={listError}
+          />
+        )}
       </div>
     </section>
   );
