@@ -35,6 +35,14 @@ class ProviderAccount(Base):
             "external_user_id",
             name="uq_provider_account_user_provider_external",
         ),
+        UniqueConstraint(
+            "provider",
+            "external_user_id",
+            name="uq_provider_account_provider_external_user",
+        ),
+        UniqueConstraint(
+            "user_id", "provider", name="uq_provider_account_user_provider"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

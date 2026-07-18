@@ -23,6 +23,11 @@ class AuthUrl(Response):
     auth_url: str
 
 
+class ConnectResult(Response):
+    status: Literal["connected"]
+    provider_email: str
+
+
 class TokenOut(Response):
     access_token: str
     token_type: str
