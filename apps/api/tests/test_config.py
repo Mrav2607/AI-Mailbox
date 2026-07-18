@@ -19,6 +19,8 @@ PROD_OK = dict(
     GOOGLE_CLIENT_SECRET="sec",
     GOOGLE_REDIRECT_URI="https://app.example.com/callback",
     TOKEN_ENCRYPTION_KEY=Fernet.generate_key().decode(),
+    RESEND_API_KEY="re_test_key",
+    FRONTEND_BASE_URL="https://app.example.com",
 )
 
 
@@ -55,6 +57,13 @@ def test_production_requires_token_encryption_key():
     cfg = PROD_OK | {"TOKEN_ENCRYPTION_KEY": None}
     with pytest.raises(ValidationError, match="TOKEN_ENCRYPTION_KEY"):
         Settings(**cfg)
+
+
+def test_production_requires_resend_and_a_safe_frontend_url():
+    with pytest.raises(ValidationError, match="RESEND_API_KEY"):
+        Settings(**(PROD_OK | {"RESEND_API_KEY": None}))
+    with pytest.raises(ValidationError, match="FRONTEND_BASE_URL"):
+        Settings(**(PROD_OK | {"FRONTEND_BASE_URL": "http://app.example.com"}))
 
 
 def test_malformed_token_encryption_key_rejected_in_any_env():

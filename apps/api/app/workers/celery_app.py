@@ -22,6 +22,7 @@ celery_app = Celery(
         "app.workers.tasks_nlp",
         "app.workers.tasks_ingest",
         "app.workers.tasks_actions",
+        "app.workers.tasks_email",
     ],
 )
 

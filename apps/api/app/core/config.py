@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from cryptography.fernet import Fernet
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -59,6 +60,13 @@ class Settings(BaseSettings):
     google_client_id: str | None = Field(default=None, alias="GOOGLE_CLIENT_ID")
     google_client_secret: str | None = Field(default=None, alias="GOOGLE_CLIENT_SECRET")
     google_redirect_uri: str | None = Field(default=None, alias="GOOGLE_REDIRECT_URI")
+    resend_api_key: str | None = Field(default=None, alias="RESEND_API_KEY")
+    email_from: str = Field(
+        default="CortexMail <onboarding@resend.dev>", alias="EMAIL_FROM"
+    )
+    frontend_base_url: str = Field(
+        default="http://localhost:5173", alias="FRONTEND_BASE_URL"
+    )
     # Comma-separated list of browser origins allowed to call the API (CORS).
     # Defaults cover the common local frontend dev servers (Next.js, Vite).
     # Set the real frontend origin(s) in production -- never use "*" here while
@@ -175,6 +183,29 @@ class Settings(BaseSettings):
         # every stored provider token. Dev may fall back to the derived key.
         if not self.token_encryption_key:
             problems.append("TOKEN_ENCRYPTION_KEY is required in production")
+
+        if not self.resend_api_key:
+            problems.append("RESEND_API_KEY is required in production")
+
+        frontend_url = urlparse(self.frontend_base_url)
+        try:
+            frontend_url.port
+        except ValueError:
+            valid_frontend_url = False
+        else:
+            valid_frontend_url = (
+                frontend_url.scheme == "https"
+                and frontend_url.hostname is not None
+                and frontend_url.username is None
+                and frontend_url.password is None
+                and frontend_url.query == ""
+                and frontend_url.fragment == ""
+            )
+        if not valid_frontend_url:
+            problems.append(
+                "FRONTEND_BASE_URL must be an absolute https:// URL with no "
+                "credentials, query, or fragment in production"
+            )
 
         # We send credentialed CORS responses, and "*" with credentials is both
         # forbidden by the spec and handled awkwardly by Starlette -- it echoes

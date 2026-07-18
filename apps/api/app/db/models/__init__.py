@@ -1,4 +1,5 @@
 from .user import AppUser  # noqa: F401
+from .auth_token import AuthToken  # noqa: F401
 from .provider import ProviderAccount  # noqa: F401
 from .thread import MailThread  # noqa: F401
 from .message import MailMessage  # noqa: F401
