@@ -35,6 +35,11 @@ def test_valid_production_config_passes():
     assert s.is_production is True
 
 
+def test_frontend_base_url_trailing_slash_is_stripped():
+    s = Settings(_env_file=None, FRONTEND_BASE_URL="https://app.example.com/")
+    assert s.frontend_base_url == "https://app.example.com"
+
+
 def test_production_rejects_default_secret():
     cfg = PROD_OK | {"API_SECRET": "change_me"}
     with pytest.raises(ValidationError, match="API_SECRET"):

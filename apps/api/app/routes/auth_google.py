@@ -204,7 +204,8 @@ def _upsert_gmail_account(
             existing.sync_paused_at = None
             existing.sync_pause_reason = None
         existing.token_expiry = token_expiry
-        existing.scope = granted_scope
+        if granted_scope:
+            existing.scope = granted_scope
         return existing
 
     account = ProviderAccount(
@@ -336,8 +337,24 @@ def _has_different_gmail_account(db: Session, user: AppUser, external_user_id: s
     return account is not None and account.external_user_id != external_user_id
 
 
+def _gmail_account_belongs_to_other_user(
+    db: Session, user: AppUser, external_user_id: str
+) -> bool:
+    account = (
+        db.query(ProviderAccount)
+        .filter(
+            ProviderAccount.provider == "gmail",
+            ProviderAccount.external_user_id == external_user_id,
+        )
+        .first()
+    )
+    return account is not None and account.user_id != user.id
+
+
 def _connect_conflict(db: Session, user: AppUser, email: str) -> HTTPException | None:
-    if _gmail_belongs_to_other_user(db, user, email):
+    if _gmail_belongs_to_other_user(
+        db, user, email
+    ) or _gmail_account_belongs_to_other_user(db, user, email):
         return HTTPException(
             status_code=409,
             detail=(

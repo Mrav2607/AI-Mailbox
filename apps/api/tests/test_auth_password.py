@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -32,9 +33,13 @@ class _Query:
         self.db = db
         self.model = model
         self.filters: dict[str, object] = {}
+        self.requires_unexpired = False
 
     def filter(self, *criteria):
         for criterion in criteria:
+            if criterion.left.name == "expires_at":
+                self.requires_unexpired = True
+                continue
             self.filters[criterion.left.name] = criterion.right.value
         return self
 
@@ -44,7 +49,9 @@ class _Query:
     def first(self):
         rows = self.db.users if self.model is AppUser else self.db.tokens
         for row in rows:
-            if all(getattr(row, name) == value for name, value in self.filters.items()):
+            if all(getattr(row, name) == value for name, value in self.filters.items()) and (
+                not self.requires_unexpired or row.expires_at > datetime.now(timezone.utc)
+            ):
                 return row
         return None
 
@@ -117,6 +124,7 @@ class _TokenStore:
             user_id=user_id,
             pending_password_hash=pending_password_hash,
             display_name=display_name,
+            expires_at=datetime.now(timezone.utc) + ttl,
         )
         self.by_raw[raw_token] = row
         self.db.tokens.append(row)
@@ -221,7 +229,9 @@ def test_verify_cannot_overwrite_an_existing_password(route_env):
         ttl=auth_password.VERIFY_TTL,
     )
 
-    verified = auth_password.verify_email(VerifyEmailRequest(token=raw_token), db)
+    verified_status = _status(
+        lambda: auth_password.verify_email(VerifyEmailRequest(token=raw_token), db)
+    )
     original_login = auth_password.login(
         LoginRequest(email=user.email, password=original_password), db
     )
@@ -231,7 +241,7 @@ def test_verify_cannot_overwrite_an_existing_password(route_env):
         )
     )
 
-    assert verified["token_type"] == "bearer"
+    assert verified_status == 400
     assert raw_token not in tokens.by_raw
     assert original_login["token_type"] == "bearer"
     assert pending_status == 401
@@ -360,3 +370,21 @@ def test_resend_is_fixed_and_only_enqueues_for_a_pending_token(route_env):
     purpose, email, link = delay.call_args.args
     assert (purpose, email) == ("verify_email", "pending@example.com")
     assert "/auth/verify-email#token=" in link
+
+
+def test_resend_expired_pending_token_is_fixed_and_does_not_enqueue(route_env):
+    db, tokens, delay = route_env
+    tokens.issue(
+        db,
+        purpose="verify_email",
+        email="expired@example.com",
+        pending_password_hash=hash_password("pending password"),
+        ttl=timedelta(seconds=-1),
+    )
+
+    response = auth_password.resend_verification(
+        ResendVerificationRequest(email="expired@example.com"), db
+    )
+
+    assert response == {"status": "verification_sent"}
+    delay.assert_not_called()

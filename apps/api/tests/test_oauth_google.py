@@ -333,6 +333,29 @@ def test_connect_stores_granted_scope_and_keeps_pause_without_refresh_token(monk
     assert existing.sync_pause_reason == "invalid_grant"
 
 
+def test_same_address_reconnect_keeps_scope_when_google_returns_none(monkeypatch):
+    user = _user()
+    existing = ProviderAccount(
+        user_id=user.id,
+        provider="gmail",
+        external_user_id="gmail@example.com",
+        access_token="old-access",
+        refresh_token="old-refresh",
+        scope="stored scope",
+    )
+    db = _DB()
+    db.accounts.append(existing)
+    monkeypatch.setattr(
+        auth_google,
+        "_consume_state",
+        lambda state: {"mode": "connect", "user_id": str(user.id), "pkce_verifier": "v"},
+    )
+    monkeypatch.setattr(auth_google, "_exchange_code", lambda *args: _exchange(scope=None))
+
+    assert auth_google.gmail_connect_callback("code", "state", user, db)["status"] == "connected"
+    assert existing.scope == "stored scope"
+
+
 def test_same_address_reconnect_unpauses_when_google_returns_refresh_token(monkeypatch):
     user = _user()
     existing = ProviderAccount(
@@ -417,6 +440,35 @@ def test_connect_integrity_error_rechecks_a_conflict(monkeypatch):
         error.detail
         == "That Gmail account belongs to a different account — sign in with Google instead."
     )
+
+
+def test_connect_rejects_mailbox_connected_by_a_different_user_before_insert(monkeypatch):
+    user = _user()
+    other_user = _user("other@example.com")
+    db = _DB()
+    db.accounts.append(
+        ProviderAccount(
+            user_id=other_user.id,
+            provider="gmail",
+            external_user_id="gmail@example.com",
+            access_token="access",
+        )
+    )
+    monkeypatch.setattr(
+        auth_google,
+        "_consume_state",
+        lambda state: {"mode": "connect", "user_id": str(user.id), "pkce_verifier": "v"},
+    )
+    monkeypatch.setattr(auth_google, "_exchange_code", lambda *args: _exchange())
+
+    error = _status(lambda: auth_google.gmail_connect_callback("code", "state", user, db))
+
+    assert error.status_code == 409
+    assert (
+        error.detail
+        == "That Gmail account belongs to a different account — sign in with Google instead."
+    )
+    assert db.pending == []
 
 
 def test_login_provider_failure_rolls_back_new_user(monkeypatch):

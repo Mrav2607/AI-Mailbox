@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -157,6 +157,7 @@ def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db)) -> 
         if user is None:
             user = AppUser(email=row.email, display_name=row.display_name)
             db.add(user)
+        already_passworded = user.password_hash is not None
         _apply_verified_password(user, row.pending_password_hash)
         db.commit()
     except IntegrityError:
@@ -174,8 +175,12 @@ def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db)) -> 
         )
         if user is None:
             raise _INVALID_LINK
+        already_passworded = user.password_hash is not None
         _apply_verified_password(user, row.pending_password_hash)
         db.commit()
+
+    if already_passworded:
+        raise _INVALID_LINK
 
     # Commit before minting so the JWT always carries the committed version.
     db.refresh(user)
@@ -194,7 +199,11 @@ def resend_verification(
     email = normalize_email(str(payload.email))
     pending = (
         db.query(AuthToken)
-        .filter(AuthToken.email == email, AuthToken.purpose == "verify_email")
+        .filter(
+            AuthToken.email == email,
+            AuthToken.purpose == "verify_email",
+            AuthToken.expires_at > func.now(),
+        )
         .first()
     )
     if pending is not None:

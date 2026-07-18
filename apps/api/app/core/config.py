@@ -4,7 +4,7 @@ from urllib.parse import urlparse
 
 from cryptography.fernet import Fernet
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 
 # api_secret signs HS256 JWTs; HMAC-SHA256 wants a key of at least this many
@@ -108,6 +108,11 @@ class Settings(BaseSettings):
     # text in dev (see effective_log_format).
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     log_format: Literal["json", "text"] | None = Field(default=None, alias="LOG_FORMAT")
+
+    @field_validator("frontend_base_url")
+    @classmethod
+    def _strip_frontend_base_url_trailing_slash(cls, value: str) -> str:
+        return value.rstrip("/")
 
     @property
     def cors_origins_list(self) -> list[str]:
