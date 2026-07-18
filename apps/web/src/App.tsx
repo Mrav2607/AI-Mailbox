@@ -52,6 +52,8 @@ import { TopBar } from "@/components/console/TopBar";
 import { CommandPalette } from "@/components/console/CommandPalette";
 import { Shortcuts } from "@/components/console/Shortcuts";
 import { LoginScreen } from "@/components/console/LoginScreen";
+import { VerifyEmailScreen } from "@/components/console/VerifyEmailScreen";
+import { ResetPasswordScreen } from "@/components/console/ResetPasswordScreen";
 import {
   shouldSuppressConsoleHotkeys,
   useHotkeys,
@@ -115,6 +117,9 @@ function formatSyncTime(iso: string | null): string {
 export default function Console() {
   const [user, setUser] = useState<User | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  const pathname = window.location.pathname;
+  const isEmailAuthScreen =
+    pathname === "/auth/verify-email" || pathname === "/auth/reset-password";
   const isNarrow = useIsNarrow();
   const [narrowPane, setNarrowPane] = useState<
     "buckets" | "list" | "reading"
@@ -275,6 +280,7 @@ export default function Console() {
 
   // ---- auth ----------------------------------------------------------------
   useEffect(() => {
+    if (isEmailAuthScreen) return;
     (async () => {
       // If we're landing on the Google OAuth callback, exchange the `code` for a
       // session token before the normal session check. The redirect URL is then
@@ -313,7 +319,7 @@ export default function Console() {
         setAuthChecked(true);
       }
     })();
-  }, []);
+  }, [isEmailAuthScreen]);
 
   const handleSessionExpired = useCallback(() => {
     setToken(null);
@@ -1084,6 +1090,32 @@ export default function Console() {
   );
 
   // ---- render --------------------------------------------------------------
+  if (pathname === "/auth/verify-email") {
+    return (
+      <>
+        <VerifyEmailScreen
+          onAuthed={(u) => {
+            setUser(u);
+            setAuthChecked(true);
+          }}
+        />
+        <Toaster theme={resolvedTheme} />
+      </>
+    );
+  }
+  if (pathname === "/auth/reset-password") {
+    return (
+      <>
+        <ResetPasswordScreen
+          onAuthed={(u) => {
+            setUser(u);
+            setAuthChecked(true);
+          }}
+        />
+        <Toaster theme={resolvedTheme} />
+      </>
+    );
+  }
   if (!authChecked) {
     return (
       <div className="min-h-screen flex items-center justify-center text-muted-foreground font-mono text-sm">

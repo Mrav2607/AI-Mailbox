@@ -158,6 +158,105 @@ export async function demoLogin(
   });
 }
 
+type TokenOut = { access_token: string; token_type: string; user: User };
+
+async function mockTokenOut(email: string): Promise<TokenOut> {
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  return {
+    access_token: "mock-token-" + Date.now(),
+    token_type: "bearer",
+    user: { ...mockUser(), email },
+  };
+}
+
+export async function signup(
+  email: string,
+  password: string,
+  displayName?: string,
+): Promise<{ status: string }> {
+  if (USE_MOCK) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    return { status: "verification_sent" };
+  }
+  return request<{ status: string }>("/auth/signup", {
+    method: "POST",
+    body: JSON.stringify({
+      email,
+      password,
+      ...(displayName ? { display_name: displayName } : {}),
+    }),
+  });
+}
+
+export async function login(email: string, password: string): Promise<TokenOut> {
+  if (USE_MOCK) return mockTokenOut(email);
+  return request<TokenOut>("/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  });
+}
+
+export async function verifyEmail(token: string): Promise<TokenOut> {
+  if (USE_MOCK) return mockTokenOut(mockUser().email);
+  return request<TokenOut>("/auth/verify-email", {
+    method: "POST",
+    body: JSON.stringify({ token }),
+  });
+}
+
+export async function resendVerification(email: string): Promise<{ status: string }> {
+  if (USE_MOCK) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    return { status: "verification_sent" };
+  }
+  return request<{ status: string }>("/auth/resend-verification", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+export async function forgotPassword(email: string): Promise<{ status: string }> {
+  if (USE_MOCK) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    return { status: "reset_sent" };
+  }
+  return request<{ status: string }>("/auth/forgot-password", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+export async function resetPassword(
+  token: string,
+  newPassword: string,
+): Promise<TokenOut> {
+  if (USE_MOCK) return mockTokenOut(mockUser().email);
+  return request<TokenOut>("/auth/reset-password", {
+    method: "POST",
+    body: JSON.stringify({ token, new_password: newPassword }),
+  });
+}
+
+export async function googleConnectStart(): Promise<{ auth_url: string }> {
+  if (USE_MOCK) {
+    throw new ApiError(0, "Google sign-in needs a live API (set VITE_API_BASE_URL)");
+  }
+  return request<{ auth_url: string }>("/auth/google/connect/start");
+}
+
+export async function googleConnectCallback(
+  code: string,
+  state: string,
+): Promise<{ status: string; provider_email: string }> {
+  if (USE_MOCK) {
+    throw new ApiError(0, "Google sign-in needs a live API (set VITE_API_BASE_URL)");
+  }
+  const qs = new URLSearchParams({ code, state });
+  return request<{ status: string; provider_email: string }>(
+    `/auth/google/connect/callback?${qs.toString()}`,
+  );
+}
+
 export async function getTriage(
   bucket: BucketKey,
   limit = 100,
