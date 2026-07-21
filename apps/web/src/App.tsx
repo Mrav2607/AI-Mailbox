@@ -8,9 +8,11 @@ import {
   useState,
 } from "react";
 import {
+  allRunsDeduplicated,
   ApiError,
   classifyBackfill,
   classifyQueue,
+  deleteConnection,
   deleteThread,
   flushDeleteThread,
   getCounts,
@@ -23,21 +25,24 @@ import {
   getThread,
   getTriage,
   ingestGmail,
+  listConnections,
   reclassify,
   searchThreads,
   setThreadDone,
   revokeAllTokens,
   setToken,
+  sumIngestResults,
   waitForTask,
-  waitForSyncRun,
+  waitForSyncRuns,
   WORKER_TASK_TIMEOUT_MS,
 } from "@/lib/api";
-import type { SyncHealth, TaskResult } from "@/lib/api";
+import type { SyncHealth, SyncRunStatus, TaskResult } from "@/lib/api";
 import { BUCKET_KEYS } from "@/lib/labels";
 import { gmailThreadUrl } from "@/lib/utils";
 import type {
   BackfillOptions,
   BucketKey,
+  Connection,
   IngestOptions,
   Label,
   Overview,
@@ -149,6 +154,8 @@ export default function Console() {
 
   const [overview, setOverview] = useState<Overview | null>(null);
   const [refreshedHealth, setRefreshedHealth] = useState<SyncHealth | null>(null);
+  const [connections, setConnections] = useState<Connection[]>([]);
+  const [accountsOpen, setAccountsOpen] = useState(false);
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [thread, setThread] = useState<ThreadDetail | null>(null);
@@ -313,12 +320,17 @@ export default function Console() {
               setToken(res.access_token);
               setUser(res.user);
             } else {
-              await googleConnectCallback(code, state);
-              toast.success("gmail connected — syncing");
+              const res = await googleConnectCallback(code, state);
+              toast.success(`${res.provider_email} connected — syncing`);
               try {
                 setRefreshedHealth(await getSyncHealth());
               } catch {
                 // The normal health poll will retry if this immediate refresh fails.
+              }
+              try {
+                setConnections(await listConnections());
+              } catch {
+                // The post-auth effect refreshes connections too; not fatal here.
               }
             }
           } catch (e) {
@@ -371,6 +383,14 @@ export default function Console() {
     // don't cap at a single triage page.
     try {
       setAllCounts(await getCounts());
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) handleSessionExpired();
+    }
+  }, [handleSessionExpired]);
+
+  const refreshConnections = useCallback(async () => {
+    try {
+      setConnections(await listConnections());
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) handleSessionExpired();
     }
@@ -451,6 +471,27 @@ export default function Console() {
     }
   }, []);
 
+  // Disconnecting deletes the account's synced mail server-side (cascade), so
+  // the whole mailbox — not just the accounts list — needs to refresh after.
+  const handleDisconnect = useCallback(
+    async (connectionId: string) => {
+      try {
+        await deleteConnection(connectionId);
+        toast.success("gmail account disconnected");
+      } catch (e) {
+        toast.error((e as Error).message ?? "disconnect failed");
+        return;
+      }
+      await Promise.all([refreshConnections(), refreshAll()]);
+      try {
+        setRefreshedHealth(await getSyncHealth());
+      } catch {
+        // The normal health poll will retry if this immediate refresh fails.
+      }
+    },
+    [refreshConnections, refreshAll],
+  );
+
   // What to say when mail isn't flowing. Ranked by what the operator can
   // actually do about it: reconnecting beats knowing the mailbox is behind,
   // and both beat "the scheduler is down" (which only we can fix).
@@ -467,11 +508,16 @@ export default function Console() {
       };
     }
     if (activeHealth?.reason === "reauth_required") {
-      return {
-        label: "reconnect gmail",
-        detail: "Gmail access was revoked — reconnect the account to resume syncing",
-        actionable: true,
-      };
+      // With more than one connected account, name which one needs a
+      // reconnect instead of leaving the operator to guess.
+      const affected = (activeHealth.accounts ?? [])
+        .filter((a) => a.reason === "reauth_required")
+        .map((a) => a.email_address);
+      const detail =
+        (activeHealth.accounts?.length ?? 0) > 1 && affected.length > 0
+          ? `Gmail access was revoked for ${affected.join(", ")} — reconnect to resume syncing`
+          : "Gmail access was revoked — reconnect the account to resume syncing";
+      return { label: "reconnect gmail", detail, actionable: true };
     }
     if (activeHealth?.stale) {
       // A run being in flight softens the wording but never silences it: a
@@ -514,7 +560,8 @@ export default function Console() {
     if (!user) return;
     refreshOverview();
     refreshCounts();
-  }, [user, refreshOverview, refreshCounts]);
+    refreshConnections();
+  }, [user, refreshOverview, refreshCounts, refreshConnections]);
 
   // thread detail
   useEffect(() => {
@@ -785,7 +832,7 @@ export default function Console() {
     const t = thread?.thread;
     if (!t || t.id !== selectedId) return;
     if (t.provider !== "gmail" || !t.provider_thread_id) return;
-    window.open(gmailThreadUrl(t.provider_thread_id), "_blank", "noopener");
+    window.open(gmailThreadUrl(t.provider_thread_id, t.account_email), "_blank", "noopener");
   }, [thread, selectedId]);
 
   // Shared tail for every queued worker job (ingest / backfill / classify):
@@ -825,36 +872,43 @@ export default function Console() {
     async (opts: IngestOptions) => {
       setIngesting(true);
       try {
-        const intendedMode = opts.refreshExisting ? "refresh" : "manual";
-        let r = await ingestGmail(opts.maxResults, opts.classify, opts.refreshExisting);
-        let final = r;
-        let retried = false;
-        for (;;) {
-          if (r.deduplicated) {
-            toast("another sync is already running — waiting for it");
-          }
-          final = r.ready ? r : await waitForSyncRun(r.run_id);
-          if (!final.ready) {
-            toast.message("ingest still running in the background — showing what's landed so far");
-            await refreshAll({ quiet: true });
-            return;
-          }
-          if (!r.deduplicated || r.mode === intendedMode) break;
-          if (retried) {
-            toast("another sync took precedence again — please try again");
-            return;
-          }
-          retried = true;
-          r = await ingestGmail(opts.maxResults, opts.classify, opts.refreshExisting);
+        // One run per connected account now. Zero runs means nothing's
+        // connected — not a failure, just nothing to do until the operator
+        // connects a Gmail account.
+        const runs = await ingestGmail(opts.maxResults, opts.classify, opts.refreshExisting);
+        if (runs.length === 0) {
+          toast.error("no Gmail account connected", {
+            description: "connect one to start syncing",
+            action: { label: "connect", onClick: handleConnectGmail },
+          });
+          return;
         }
-        if (final.status === "failed" || final.result?.status === "error") {
-          throw new Error(final.result?.detail ?? final.error ?? "ingest failed");
+        // Every run landing deduplicated means some other caller (another
+        // tab, auto-sync) already had every account covered — nothing new
+        // was queued here, so this isn't "ingest complete".
+        if (allRunsDeduplicated(runs)) {
+          toast("another sync is already running — waiting for it");
         }
-        const res = final.result ?? {};
-        toast.success(
-          `ingest complete · ${res.threads_upserted ?? r.new_threads ?? 0} threads · ` +
-            `${res.messages_upserted ?? 0} msgs`,
-        );
+        const settled = await waitForSyncRuns(runs);
+        const finals: SyncRunStatus[] = [];
+        const failures: string[] = [];
+        for (const s of settled) {
+          if (s.status === "fulfilled") finals.push(s.value);
+          else failures.push((s.reason as Error)?.message ?? "ingest failed");
+        }
+        for (const f of finals) {
+          if (f.status === "failed" || f.result?.status === "error") {
+            failures.push(f.result?.detail ?? f.error ?? "ingest failed");
+          }
+        }
+        if (failures.length > 0) throw new Error(failures[0]);
+        if (finals.some((f) => !f.ready)) {
+          toast.message("ingest still running in the background — showing what's landed so far");
+          await refreshAll({ quiet: true });
+          return;
+        }
+        const { threads, messages } = sumIngestResults(finals);
+        toast.success(`ingest complete · ${threads} threads · ${messages} msgs`);
         await refreshAll();
         if (user) broadcastSyncComplete(user.id);
         // A deliberate pull acknowledges everything it just surfaced.
@@ -865,7 +919,7 @@ export default function Console() {
         setIngesting(false);
       }
     },
-    [refreshAll, clearNew, user],
+    [refreshAll, clearNew, user, handleConnectGmail],
   );
 
   const doBackfill = useCallback(
@@ -1211,6 +1265,10 @@ export default function Console() {
         ? "conf ↑"
         : "conf ↓";
 
+  // Account badges only earn their keep once there's something to
+  // disambiguate — a single-account mailbox doesn't need them.
+  const multiAccount = connections.length > 1;
+
   const sidebarPane = (
     <BucketSidebar
       active={bucket}
@@ -1376,6 +1434,7 @@ export default function Console() {
               if (isNarrow) setNarrowPane("reading");
             }}
             showLabel={searchMode || bucket === "all" || bucket === "done"}
+            showAccount={multiAccount}
             narrow={isNarrow}
             loading={listLoading || searching}
             error={listError}
@@ -1396,6 +1455,7 @@ export default function Console() {
       onCollapse={isNarrow ? undefined : () => togglePanel("detail")}
       onDone={focusedItem ? () => doDone(focusedItem.thread_id) : undefined}
       onDelete={focusedItem ? () => doDelete(focusedItem.thread_id) : undefined}
+      showAccountBadge={multiAccount}
       side={arrangement.reading}
       predictionOpen={panels.prediction}
       onTogglePrediction={() => togglePanel("prediction")}
@@ -1427,6 +1487,12 @@ export default function Console() {
           onTheme={setTheme}
           autoSync={autoSync}
           onAutoSync={setAutoSync}
+          connections={connections}
+          health={activeHealth}
+          accountsOpen={accountsOpen}
+          onAccountsOpenChange={setAccountsOpen}
+          onConnectGmail={handleConnectGmail}
+          onDisconnect={handleDisconnect}
           onLogout={async () => {
             // Revoke server-side first, so the token is dead even if someone has
             // a copy of it. If that call fails we still clear locally — leaving

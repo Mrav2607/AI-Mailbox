@@ -42,6 +42,8 @@ export interface TriageItem {
   latest_message_snippet: string | null;
   latest_message_sender: string | null;
   classification: Classification;
+  // Which connected Gmail account this thread belongs to.
+  account_email: string;
 }
 
 export interface TriageResponse {
@@ -100,8 +102,20 @@ export interface ThreadDetail {
     provider_thread_id: string | null;
     last_message_at: string | null;
     done: boolean;
+    // Which connected Gmail account this thread belongs to.
+    account_email: string;
   };
   messages: ThreadMessage[];
+}
+
+// A connected Gmail account (GET /auth/connections). `reauth_required` means
+// the refresh token is dead — nothing but reconnecting fixes it.
+export interface Connection {
+  id: string;
+  provider: string;
+  email_address: string;
+  created_at: string;
+  reauth_required: boolean;
 }
 
 export interface Overview {

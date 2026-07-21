@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { emailDocument, sanitizeEmailHtml } from "@/lib/email-html";
 import { LABEL_META, confidenceColor, confidenceText } from "@/lib/labels";
+import { emailLocalPart } from "@/lib/sender";
 import { absTime } from "@/lib/time";
 import type { Classification, Label, ThreadDetail, ThreadMessage } from "@/lib/types";
 import { ALL_LABELS } from "@/lib/types";
@@ -101,6 +102,9 @@ interface Props {
   onCollapse?: () => void;
   onDone?: () => void;
   onDelete?: () => void;
+  // Only worth showing once there's more than one connected account to
+  // disambiguate — a single-account mailbox doesn't need it.
+  showAccountBadge?: boolean;
   side?: ReadingSide;
   predictionOpen?: boolean;
   onTogglePrediction?: () => void;
@@ -116,6 +120,7 @@ export function ThreadDetailPane({
   onCollapse,
   onDone,
   onDelete,
+  showAccountBadge,
   side = "right",
   predictionOpen = true,
   onTogglePrediction,
@@ -216,10 +221,18 @@ export function ThreadDetailPane({
           <div className="flex-1 min-w-0 text-[11px] text-muted-foreground font-mono lowercase truncate">
             {data.thread.provider} · {absTime(data.thread.last_message_at)}
           </div>
+          {showAccountBadge && (
+            <span
+              className="shrink-0 font-mono text-[10px] text-muted-foreground/60 px-1 py-0.5 rounded border border-border/50 truncate max-w-[110px]"
+              title={data.thread.account_email}
+            >
+              {emailLocalPart(data.thread.account_email)}
+            </span>
+          )}
           <PaneDragHandle source="detail" />
           {data.thread.provider === "gmail" && data.thread.provider_thread_id && (
             <a
-              href={gmailThreadUrl(data.thread.provider_thread_id)}
+              href={gmailThreadUrl(data.thread.provider_thread_id, data.thread.account_email)}
               target="_blank"
               rel="noopener noreferrer"
               aria-label="Open in Gmail"

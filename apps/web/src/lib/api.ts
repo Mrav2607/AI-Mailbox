@@ -3,6 +3,7 @@ import type {
   BackfillResult,
   BucketKey,
   Classification,
+  Connection,
   CountsResponse,
   Label,
   Overview,
@@ -15,8 +16,10 @@ import {
   mockApplyLabel,
   mockBackfill,
   mockCounts,
+  mockDeleteConnection,
   mockDeleteThread,
   mockIngest,
+  mockListConnections,
   mockOverview,
   mockSearch,
   mockSetDone,
@@ -257,6 +260,29 @@ export async function googleConnectCallback(
   );
 }
 
+// Every Gmail account the operator has connected, for the accounts menu.
+export async function listConnections(): Promise<Connection[]> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 100));
+    return mockListConnections();
+  }
+  const res = await request<{ connections: Connection[] }>("/auth/connections");
+  return res.connections;
+}
+
+// Disconnects a Gmail account and deletes everything it synced (server-side
+// cascade). 404s if the id isn't a live connection of this user's.
+export async function deleteConnection(id: string): Promise<void> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 120));
+    if (!mockDeleteConnection(id)) throw new ApiError(404, "Not Found");
+    return;
+  }
+  await request<void>(`/auth/connections/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
 export async function getTriage(
   bucket: BucketKey,
   limit = 100,
@@ -344,40 +370,52 @@ export async function getOverview(): Promise<Overview> {
   return request<Overview>("/analytics/overview");
 }
 
-// Queues a Gmail pull on the worker. `max_results` is a THREAD count now, so N
-// gives you N threads (and all their messages), not N messages. With
-// `refreshExisting` the pull re-fetches threads already in the DB (the upsert
-// refreshes their bodies) instead of skipping ahead to new ones. `newOnly`
-// (auto-sync) pulls just mail newer than the newest known thread — no
-// backfill of older history. The real API returns a task_id to poll; the
-// mock resolves as if already done.
+// Queues a Gmail pull on the worker, one run per connected non-paused
+// account. `max_results` is a THREAD count now, so N gives you N threads (and
+// all their messages) PER ACCOUNT, not N messages. With `refreshExisting` the
+// pull re-fetches threads already in the DB (the upsert refreshes their
+// bodies) instead of skipping ahead to new ones. `newOnly` (auto-sync) pulls
+// just mail newer than the newest known thread per account — no backfill of
+// older history. The real API returns 202 with one run per account (empty
+// when nothing's connected); the mock resolves as if already done.
 export async function ingestGmail(
   max_results = 50,
   classify = true,
   refreshExisting = false,
   newOnly = false,
-): Promise<SyncRunStatus & { new_threads?: number }> {
+): Promise<SyncRunStatus[]> {
   if (USE_MOCK) {
     await new Promise((r) => setTimeout(r, 150));
     const newThreads = mockIngest();
     // The mock "inbox" actually receives mail on each pull, so auto-sync and
-    // the new-mail pill are demoable (and testable) offline.
-    return {
-      run_id: "mock-run",
+    // the new-mail pill are demoable (and testable) offline. All of it lands
+    // attributed to the first mock account; the rest report an empty, still-
+    // successful run, same as a real account with nothing new to pull.
+    return mockListConnections().map((acct, i) => ({
+      run_id: `mock-run-${acct.id}`,
       task_id: undefined,
       mode: newOnly ? "auto" : "manual",
       status: "succeeded",
       ready: true,
       deduplicated: false,
-      result: { status: "ok", threads_upserted: newThreads, new_threads: newThreads },
-      new_threads: newThreads,
-    };
+      provider_account_id: acct.id,
+      result:
+        i === 0
+          ? {
+              status: "ok",
+              threads_upserted: newThreads,
+              messages_upserted: newThreads * 3,
+              new_threads: newThreads,
+            }
+          : { status: "ok", threads_upserted: 0, messages_upserted: 0, new_threads: 0 },
+    }));
   }
-  return request<SyncRunStatus>(
+  const res = await request<{ runs: SyncRunStatus[] }>(
     `/mail/ingest/gmail?max_results=${max_results}&classify=${classify}` +
       `&skip_existing=${!refreshExisting}&new_only=${newOnly}`,
     { method: "POST" },
   );
+  return res.runs;
 }
 
 // Result payload a worker task reports back through the status endpoint.
@@ -410,14 +448,33 @@ export interface SyncRunStatus {
   deduplicated: boolean;
   result?: TaskResult | null;
   error?: string | null;
+  // Which Gmail account this run is pulling from. Null on legacy rows a
+  // migration couldn't attribute to a single account.
+  provider_account_id: string | null;
 }
 
-export async function getActiveSync(signal?: AbortSignal): Promise<SyncRunStatus | null> {
-  if (USE_MOCK) return null;
-  return request<SyncRunStatus | null>("/mail/sync/active", { signal });
+// Multi-account fan-out: one run per connected account, [] when idle/none.
+export async function getActiveSync(signal?: AbortSignal): Promise<SyncRunStatus[]> {
+  if (USE_MOCK) return [];
+  const res = await request<{ runs: SyncRunStatus[] }>("/mail/sync/active", { signal });
+  return res.runs;
+}
+
+export interface AccountSyncHealth {
+  provider_account_id: string;
+  email_address: string;
+  last_succeeded_at: string | null;
+  stale: boolean;
+  sync_in_progress: boolean;
+  // null | never_synced | reauth_required | <sync_pause_reason> — the pause
+  // reason is whatever the server recorded when it paused the account, so
+  // this stays open rather than pinned to a fixed union.
+  reason: string | null;
 }
 
 export interface SyncHealth {
+  // Worst-of aggregate across every connected account, so the console's
+  // existing pill logic keeps working unchanged.
   last_succeeded_at: string | null;
   // Is the mail itself behind?
   stale: boolean;
@@ -428,20 +485,54 @@ export interface SyncHealth {
   scheduler_alive: boolean;
   threshold_seconds: number;
   reason: "never_synced" | "reauth_required" | "not_connected" | null;
+  // Per-account breakdown of the same fields, for the accounts menu.
+  accounts: AccountSyncHealth[];
 }
 
 export async function getSyncHealth(signal?: AbortSignal): Promise<SyncHealth> {
   if (USE_MOCK) {
+    const accounts = mockListConnections();
+    const now = new Date().toISOString();
     return {
-      last_succeeded_at: new Date().toISOString(),
+      last_succeeded_at: accounts.length ? now : null,
       stale: false,
       sync_in_progress: false,
       scheduler_alive: true,
       threshold_seconds: 1800,
-      reason: null,
+      reason: accounts.length ? null : "not_connected",
+      accounts: accounts.map((a) => ({
+        provider_account_id: a.id,
+        email_address: a.email_address,
+        last_succeeded_at: now,
+        stale: false,
+        sync_in_progress: false,
+        reason: null,
+      })),
     };
   }
   return request<SyncHealth>("/mail/sync/health", { signal });
+}
+
+// Does every run in this ingest batch represent a sync some other caller
+// already started? If so the batch didn't do fresh work — the UI should say
+// "waiting for it", not "ingest complete".
+export function allRunsDeduplicated(runs: SyncRunStatus[]): boolean {
+  return runs.length > 0 && runs.every((r) => r.deduplicated);
+}
+
+// Sums a finished batch's per-account upsert counts into the one aggregate
+// toast a multi-account ingest gets.
+export function sumIngestResults(finals: SyncRunStatus[]): {
+  threads: number;
+  messages: number;
+} {
+  return finals.reduce(
+    (acc, f) => ({
+      threads: acc.threads + (f.result?.threads_upserted ?? f.result?.new_threads ?? 0),
+      messages: acc.messages + (f.result?.messages_upserted ?? 0),
+    }),
+    { threads: 0, messages: 0 },
+  );
 }
 
 export async function getSyncRun(
@@ -455,6 +546,7 @@ export async function getSyncRun(
       status: "succeeded",
       ready: true,
       deduplicated: false,
+      provider_account_id: null,
       result: { status: "ok" },
     };
   }
@@ -493,6 +585,18 @@ export async function waitForSyncRun(
     if (Date.now() - started >= timeoutMs) return run;
     await abortableDelay(Date.now() - started < 60_000 ? 2000 : 10_000, signal);
   }
+}
+
+// A multi-account ingest queues one run per account; this waits out every
+// run in parallel (already-ready ones resolve immediately) instead of
+// serially polling each account's task one after another.
+export function waitForSyncRuns(
+  runs: SyncRunStatus[],
+  opts?: { signal?: AbortSignal; timeoutMs?: number },
+): Promise<PromiseSettledResult<SyncRunStatus>[]> {
+  return Promise.allSettled(
+    runs.map((r) => (r.ready ? Promise.resolve(r) : waitForSyncRun(r.run_id, opts))),
+  );
 }
 
 export interface TaskStatus {

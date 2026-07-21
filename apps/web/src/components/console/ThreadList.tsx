@@ -1,6 +1,6 @@
 import { Inbox } from "lucide-react";
 import { LABEL_META, confidenceColor, confidenceText } from "@/lib/labels";
-import { senderName } from "@/lib/sender";
+import { emailLocalPart, senderName } from "@/lib/sender";
 import type { TriageItem } from "@/lib/types";
 import { relTime } from "@/lib/time";
 
@@ -9,9 +9,23 @@ interface Props {
   selectedId: string | null;
   onSelect: (id: string) => void;
   showLabel: boolean;
+  // Only worth showing once there's more than one connected account to
+  // disambiguate — a single-account mailbox doesn't need it.
+  showAccount?: boolean;
   narrow?: boolean;
   loading?: boolean;
   error?: string | null;
+}
+
+function AccountBadge({ email }: { email: string }) {
+  return (
+    <span
+      className="shrink-0 font-mono text-[10px] text-muted-foreground/60 px-1 py-0.5 rounded border border-border/50 truncate max-w-[64px]"
+      title={email}
+    >
+      {emailLocalPart(email)}
+    </span>
+  );
 }
 
 export function ThreadList({
@@ -19,6 +33,7 @@ export function ThreadList({
   selectedId,
   onSelect,
   showLabel,
+  showAccount,
   narrow,
   loading,
   error,
@@ -123,6 +138,7 @@ export function ThreadList({
                   >
                     {confPct == null ? "—" : `${confPct}%`}
                   </span>
+                  {showAccount && <AccountBadge email={it.account_email} />}
                   <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground font-mono">
                     {relTime(it.last_message_at)}
                   </span>
@@ -216,6 +232,8 @@ export function ThreadList({
                   {it.latest_message_snippet ?? ""}
                 </span>
               </div>
+
+              {showAccount && <AccountBadge email={it.account_email} />}
 
               <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground font-mono w-9 text-right">
                 {relTime(it.last_message_at)}

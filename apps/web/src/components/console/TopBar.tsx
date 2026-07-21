@@ -16,15 +16,18 @@ import { Mark } from "./Mark";
 import { Popover } from "./Popover";
 import { LayoutPicker } from "./LayoutPicker";
 import { bucketLabel } from "@/lib/labels";
+import { cn } from "@/lib/utils";
 import { BUCKETS } from "@/lib/types";
 import type { Arrangement } from "@/lib/layout";
 import { THEME_PREFS } from "@/lib/theme";
 import type { ThemePref } from "@/lib/theme";
 import { AUTO_SYNC_CHOICES } from "@/lib/use-auto-sync";
+import type { AccountSyncHealth, SyncHealth } from "@/lib/api";
 import type {
   BackfillOptions,
   BucketKey,
   ClassifierBackend,
+  Connection,
   IngestOptions,
   Overview,
   User,
@@ -51,6 +54,12 @@ interface Props {
   onTheme: (t: ThemePref) => void;
   autoSync: number;
   onAutoSync: (s: number) => void;
+  connections: Connection[];
+  health: SyncHealth | null;
+  accountsOpen: boolean;
+  onAccountsOpenChange: (v: boolean) => void;
+  onConnectGmail: () => void;
+  onDisconnect: (connectionId: string) => void;
 }
 
 const THEME_ICONS: Record<ThemePref, typeof Sun> = {
@@ -278,6 +287,133 @@ function BackfillForm({
   );
 }
 
+type AccountStatus = "ok" | "amber" | "red";
+
+const ACCOUNT_STATUS_DOT: Record<AccountStatus, string> = {
+  ok: "bg-emerald-500",
+  amber: "bg-amber-500",
+  red: "bg-destructive",
+};
+
+const ACCOUNT_STATUS_LABEL: Record<AccountStatus, string> = {
+  ok: "syncing fine",
+  amber: "stale or syncing",
+  red: "reauth required",
+};
+
+function accountStatus(
+  connection: Connection,
+  accounts: AccountSyncHealth[],
+): AccountStatus {
+  const match = accounts.find((a) => a.provider_account_id === connection.id);
+  if (connection.reauth_required || match?.reason === "reauth_required") return "red";
+  if (!match || match.stale || match.sync_in_progress) return "amber";
+  return "ok";
+}
+
+function AccountsMenu({
+  connections,
+  health,
+  onDisconnect,
+  onConnectGmail,
+}: {
+  connections: Connection[];
+  health: SyncHealth | null;
+  onDisconnect: (connectionId: string) => void;
+  onConnectGmail: () => void;
+}) {
+  // Two-step confirm: first click arms it, second fires. Armed state lives
+  // here (not lifted) so it resets for free whenever the popover closes.
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  const accounts = health?.accounts ?? [];
+  return (
+    <div className="space-y-2.5">
+      <div className={fieldLabel}>connected accounts</div>
+      {connections.length === 0 ? (
+        <p className="text-[11px] text-muted-foreground font-mono">
+          no accounts connected
+        </p>
+      ) : (
+        <ul
+          className="space-y-1.5"
+          // Escape hatch: a click anywhere else in the list disarms an armed
+          // confirm. The disconnect button stops its own click from bubbling
+          // here, so arming/confirming a row doesn't immediately undo itself.
+          onClick={() => setConfirmingId(null)}
+        >
+          {connections.map((c) => {
+            const status = accountStatus(c, accounts);
+            const confirming = confirmingId === c.id;
+            return (
+              <li
+                key={c.id}
+                className="rounded border border-border px-2 py-1.5 space-y-1"
+              >
+                <div className="flex items-center gap-2">
+                  <span
+                    className={cn("h-1.5 w-1.5 rounded-full shrink-0", ACCOUNT_STATUS_DOT[status])}
+                    title={ACCOUNT_STATUS_LABEL[status]}
+                  />
+                  <span
+                    className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground/90"
+                    title={c.email_address}
+                  >
+                    {c.email_address}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      // Don't let this reach the list's onClick, which
+                      // disarms on any click outside the button itself.
+                      e.stopPropagation();
+                      if (confirming) {
+                        setConfirmingId(null);
+                        onDisconnect(c.id);
+                      } else {
+                        // Arming a different account's confirm disarms this
+                        // one — there's only ever one confirmingId.
+                        setConfirmingId(c.id);
+                      }
+                    }}
+                    title={
+                      confirming
+                        ? "disconnect — deletes its synced mail; reconnecting resyncs from scratch"
+                        : "disconnect this account"
+                    }
+                    className={cn(
+                      "shrink-0 font-mono text-[10.5px] px-1.5 py-0.5 rounded border cursor-pointer transition-colors",
+                      confirming
+                        ? "border-destructive/60 bg-destructive/15 text-destructive"
+                        : "border-border text-muted-foreground hover:text-destructive hover:border-destructive/40",
+                    )}
+                  >
+                    {confirming ? "confirm" : "disconnect"}
+                  </button>
+                </div>
+                {/* Visible, not just a hover title — a touch device (or anyone
+                    who doesn't hover) still has to see this before a
+                    mail-deleting confirm. */}
+                {confirming && (
+                  <p className="pl-3.5 text-[10.5px] font-mono text-destructive leading-snug">
+                    deletes this account&apos;s synced mail — reconnecting resyncs from scratch
+                  </p>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      <button
+        type="button"
+        onClick={onConnectGmail}
+        className="w-full h-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
+      >
+        connect another gmail
+      </button>
+    </div>
+  );
+}
+
 export function TopBar({
   user,
   overview,
@@ -299,6 +435,12 @@ export function TopBar({
   onTheme,
   autoSync,
   onAutoSync,
+  connections,
+  health,
+  accountsOpen,
+  onAccountsOpenChange,
+  onConnectGmail,
+  onDisconnect,
 }: Props) {
   const s = overview?.summary;
   const ThemeIcon = THEME_ICONS[theme];
@@ -424,9 +566,29 @@ export function TopBar({
 
       <div className="hidden md:block mx-1 h-5 w-px bg-border" />
 
-      <span className="hidden md:inline text-[11.5px] font-mono text-muted-foreground truncate max-w-[180px]">
-        {user?.email ?? "—"}
-      </span>
+      <div className="hidden md:block">
+        <Popover
+          open={accountsOpen}
+          onOpenChange={onAccountsOpenChange}
+          trigger={
+            <button
+              onClick={() => onAccountsOpenChange(!accountsOpen)}
+              aria-expanded={accountsOpen}
+              aria-label="Gmail accounts"
+              className="h-7 px-2 rounded border border-transparent hover:border-border hover:bg-accent text-[11.5px] font-mono text-muted-foreground hover:text-foreground truncate max-w-[180px] cursor-pointer transition-colors"
+            >
+              {user?.email ?? "—"}
+            </button>
+          }
+        >
+          <AccountsMenu
+            connections={connections}
+            health={health}
+            onDisconnect={onDisconnect}
+            onConnectGmail={onConnectGmail}
+          />
+        </Popover>
+      </div>
       <button
         onClick={onLogout}
         // "everywhere" because this revokes the session server-side, not just in

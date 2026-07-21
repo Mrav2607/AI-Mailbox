@@ -6,8 +6,9 @@ import {
   getSyncHealth,
   getTriage,
   ingestGmail,
-  waitForSyncRun,
+  waitForSyncRuns,
   type SyncHealth,
+  type SyncRunStatus,
 } from "./api";
 
 // The server pulls mail on its own schedule now, so this only has to be often
@@ -319,15 +320,28 @@ export function useAutoSync({
       runningRef.current = true;
       try {
         // new-only: pull everything that arrived after the newest known
-        // thread and nothing else — background cycles never backfill.
+        // thread and nothing else — background cycles never backfill. One
+        // run per connected account; nothing connected means nothing to do.
         const queued = await ingestGmail(100, true, false, true);
-        const final = queued.ready
-          ? queued
-          : await waitForSyncRun(queued.run_id, { signal: controller.signal });
-        if (final.status === "failed" || final.result?.status === "error") {
-          throw new Error(final.result?.detail ?? final.error ?? "sync failed");
+        if (queued.length === 0) {
+          failStreakRef.current = 0;
+          setSyncFailed(false);
+          return;
         }
-        const changed = !final.ready || (final.result?.threads_upserted ?? 0) > 0;
+        const settled = await waitForSyncRuns(queued, { signal: controller.signal });
+        const finals: SyncRunStatus[] = [];
+        for (const s of settled) {
+          if (s.status === "fulfilled") finals.push(s.value);
+          else throw s.reason;
+        }
+        for (const f of finals) {
+          if (f.status === "failed" || f.result?.status === "error") {
+            throw new Error(f.result?.detail ?? f.error ?? "sync failed");
+          }
+        }
+        const changed =
+          finals.some((f) => !f.ready) ||
+          finals.some((f) => (f.result?.threads_upserted ?? 0) > 0);
         if (cancelled) return;
         failStreakRef.current = 0;
         setSyncFailed(false);
@@ -366,12 +380,16 @@ export function useAutoSync({
       });
     };
 
-    // Reattach to work orphaned by a reload before starting a new cadence.
+    // Reattach to work orphaned by a reload before starting a new cadence —
+    // one run per account may have been in flight when the tab went away.
     void getActiveSync(controller.signal)
       .then(async (active) => {
-        if (!active || cancelled) return;
-        const final = await waitForSyncRun(active.run_id, { signal: controller.signal });
-        if (!cancelled && final.status === "succeeded") {
+        if (active.length === 0 || cancelled) return;
+        const settled = await waitForSyncRuns(active, { signal: controller.signal });
+        const anySucceeded = settled.some(
+          (s) => s.status === "fulfilled" && s.value.status === "succeeded",
+        );
+        if (!cancelled && anySucceeded) {
           await Promise.all([onSyncedRef.current(), checkNew()]);
           channelRef.current?.postMessage({ type: "sync-complete" });
         }

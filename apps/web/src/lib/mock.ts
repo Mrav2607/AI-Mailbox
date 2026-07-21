@@ -2,6 +2,7 @@ import type {
   BackfillOptions,
   BackfillResult,
   BucketKey,
+  Connection,
   Label,
   Overview,
   ThreadDetail,
@@ -11,6 +12,26 @@ import type {
 } from "./types";
 import { ALL_LABELS } from "./types";
 import { ApiError } from "./api";
+
+// Two connected Gmail accounts, so preview mode can demo the unified inbox
+// and the accounts menu without a live API. Mutable (deleteConnection needs
+// to remove one) — same store pattern as ALL/DONE below.
+let CONNECTIONS: Connection[] = [
+  {
+    id: "mock-acct-1",
+    provider: "gmail",
+    email_address: "operator@gmail.com",
+    created_at: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+    reauth_required: false,
+  },
+  {
+    id: "mock-acct-2",
+    provider: "gmail",
+    email_address: "ops-archive@gmail.com",
+    created_at: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+    reauth_required: false,
+  },
+];
 
 
 const SENDERS = [
@@ -80,6 +101,7 @@ function makeItems(count: number): TriageItem[] {
               : "gemini-1.5-flash"
           : null,
       },
+      account_email: CONNECTIONS[i % CONNECTIONS.length].email_address,
     });
   }
   return out;
@@ -95,6 +117,22 @@ const DONE = new Set<string>();
 
 export function mockUser(): User {
   return { id: "u_local", email: "operator@local.dev", display_name: "Operator" };
+}
+
+export function mockListConnections(): Connection[] {
+  return CONNECTIONS.map((c) => ({ ...c }));
+}
+
+// Mirrors the server: dropping a connection takes its synced mail with it.
+// Returns false (so the caller can 404) when the id isn't a live connection.
+export function mockDeleteConnection(id: string): boolean {
+  const removed = CONNECTIONS.find((c) => c.id === id);
+  if (!removed) return false;
+  CONNECTIONS = CONNECTIONS.filter((c) => c.id !== id);
+  for (let i = ALL.length - 1; i >= 0; i--) {
+    if (ALL[i].account_email === removed.email_address) ALL.splice(i, 1);
+  }
+  return true;
 }
 
 export function mockOverview(): Overview {
@@ -161,6 +199,7 @@ export function mockIngest(): number {
         confidence: 0.9,
         model_version: "heuristic-v1",
       },
+      account_email: CONNECTIONS[(ingestSeq - 1) % CONNECTIONS.length].email_address,
     });
   }
   return 2;
@@ -201,6 +240,7 @@ export function mockThread(id: string): ThreadDetail {
       provider_thread_id: id.replace(/-/g, ""),
       last_message_at: item.last_message_at,
       done: DONE.has(id),
+      account_email: item.account_email,
     },
     messages,
   };
