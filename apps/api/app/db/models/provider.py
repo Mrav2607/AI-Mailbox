@@ -28,7 +28,8 @@ class ProviderAccount(Base):
         CheckConstraint("provider IN ('gmail','outlook')", name="provider_check"),
         # external_user_id is in the key on purpose: connecting a second Google
         # account is a supported flow, so this pins "one row per connected
-        # account" without banning it.
+        # account" without banning it. Users can also connect more than one
+        # Gmail account -- there's no cap on (user_id, provider) rows anymore.
         UniqueConstraint(
             "user_id",
             "provider",
@@ -39,9 +40,6 @@ class ProviderAccount(Base):
             "provider",
             "external_user_id",
             name="uq_provider_account_provider_external_user",
-        ),
-        UniqueConstraint(
-            "user_id", "provider", name="uq_provider_account_user_provider"
         ),
     )
 
