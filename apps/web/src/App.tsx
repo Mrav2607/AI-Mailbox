@@ -1149,6 +1149,12 @@ export default function Console() {
   );
 
   // ---- render --------------------------------------------------------------
+  // Every branch must render <Toaster> as the fragment's second child: sonner
+  // drops toasts fired while no Toaster is mounted (it never replays them), and
+  // keeping the same tree position preserves one instance across branch swaps.
+  // The OAuth callback outcome toasts fire while the "checking session…" branch
+  // is on screen, so losing it there made connect failures look like silent
+  // bounces back to the console.
   if (pathname === "/auth/verify-email") {
     return (
       <>
@@ -1177,9 +1183,12 @@ export default function Console() {
   }
   if (!authChecked) {
     return (
-      <div className="min-h-screen flex items-center justify-center text-muted-foreground font-mono text-sm">
-        checking session…
-      </div>
+      <>
+        <div className="min-h-screen flex items-center justify-center text-muted-foreground font-mono text-sm">
+          checking session…
+        </div>
+        <Toaster theme={resolvedTheme} />
+      </>
     );
   }
   if (!user) {
@@ -1394,108 +1403,110 @@ export default function Console() {
   );
 
   return (
-    // overflow-clip: no descendant (however hostile an email's CSS) may ever
-    // grow the page a scrollbar — panes own all scrolling.
-    <div className="h-screen flex flex-col overflow-clip bg-background text-foreground">
-      <TopBar
-        user={user}
-        overview={overview}
-        ingesting={ingesting}
-        backfilling={backfilling}
-        currentBucket={bucket}
-        onIngest={doIngest}
-        onBackfill={doBackfill}
-        ingestOpen={ingestOpen}
-        onIngestOpenChange={setIngestOpen}
-        backfillOpen={backfillOpen}
-        onBackfillOpenChange={setBackfillOpen}
-        layoutOpen={layoutOpen}
-        onLayoutOpenChange={setLayoutOpen}
-        arrangement={arrangement}
-        onArrangement={setArrangement}
-        theme={theme}
-        onTheme={setTheme}
-        autoSync={autoSync}
-        onAutoSync={setAutoSync}
-        onLogout={async () => {
-          // Revoke server-side first, so the token is dead even if someone has
-          // a copy of it. If that call fails we still clear locally — leaving
-          // the user stuck in a session they asked to leave would be worse —
-          // but we say so, because the token is still live out there.
-          try {
-            await revokeAllTokens();
-          } catch {
-            toast.error("signed out here, but couldn't revoke the session server-side");
-          } finally {
-            setToken(null);
-            setUser(null);
-          }
-        }}
-      />
-
-      {isNarrow ? (
-        <NarrowShell
-          pane={narrowPane}
-          onPaneChange={setNarrowPane}
-          buckets={sidebarPane}
-          list={listPane}
-          reading={detailPane}
-        />
-      ) : (
-        <ConsoleLayout
+    <>
+      {/* overflow-clip: no descendant (however hostile an email's CSS) may ever
+          grow the page a scrollbar — panes own all scrolling. */}
+      <div className="h-screen flex flex-col overflow-clip bg-background text-foreground">
+        <TopBar
+          user={user}
+          overview={overview}
+          ingesting={ingesting}
+          backfilling={backfilling}
+          currentBucket={bucket}
+          onIngest={doIngest}
+          onBackfill={doBackfill}
+          ingestOpen={ingestOpen}
+          onIngestOpenChange={setIngestOpen}
+          backfillOpen={backfillOpen}
+          onBackfillOpenChange={setBackfillOpen}
+          layoutOpen={layoutOpen}
+          onLayoutOpenChange={setLayoutOpen}
           arrangement={arrangement}
-          onArrangementChange={setArrangement}
-          sidebarVisible={panels.sidebar}
-          detailVisible={panels.detail}
-          onExpandSidebar={() => togglePanel("sidebar")}
-          paneSizes={paneSizes}
-          onPaneSizesChange={handlePaneSizes}
-          sidebar={sidebarPane}
-          list={listPane}
-          detail={detailPane}
+          onArrangement={setArrangement}
+          theme={theme}
+          onTheme={setTheme}
+          autoSync={autoSync}
+          onAutoSync={setAutoSync}
+          onLogout={async () => {
+            // Revoke server-side first, so the token is dead even if someone has
+            // a copy of it. If that call fails we still clear locally — leaving
+            // the user stuck in a session they asked to leave would be worse —
+            // but we say so, because the token is still live out there.
+            try {
+              await revokeAllTokens();
+            } catch {
+              toast.error("signed out here, but couldn't revoke the session server-side");
+            } finally {
+              setToken(null);
+              setUser(null);
+            }
+          }}
         />
-      )}
 
-      <CommandPalette
-        open={paletteOpen}
-        onOpenChange={setPaletteOpen}
-        onBucket={(b) => setBucket(b)}
-        onIngest={() => setIngestOpen(true)}
-        onBackfill={() => setBackfillOpen(true)}
-        onQueue={doQueue}
-        onReclassify={doReclassify}
-        hasFocusedThread={!!focusedItem}
-        onToggleSidebar={() => togglePanel("sidebar")}
-        onToggleDetail={() => togglePanel("detail")}
-        onTogglePrediction={() => togglePanel("prediction")}
-        onTheme={setTheme}
-        onAutoSync={setAutoSync}
-        onArrangement={(patch) => setArrangement((a) => ({ ...a, ...patch }))}
-        onFocusSearch={() =>
-          setTimeout(() => searchInputRef.current?.focus(), 60)
-        }
-        onDone={() => doDone()}
-        inDoneBucket={bucket === "done"}
-        onOpenGmail={openInGmail}
-        onDelete={() => doDelete()}
-        onRestartTour={restartTour}
-      />
-      <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
-      {!isNarrow && (tourActive || tourVersion < TOUR_VERSION) && (
-        <Suspense fallback={null}>
-          <OnboardingTour
-            run={tourActive}
-            stepIndex={tourStepIndex}
-            targetResolution={tourTargetResolution}
-            emptyThreadList={visibleItems.length === 0}
-            emptyDetail={!thread}
-            onStepChange={goToTourStep}
-            onFinish={finishTour}
-            onSkip={skipTour}
+        {isNarrow ? (
+          <NarrowShell
+            pane={narrowPane}
+            onPaneChange={setNarrowPane}
+            buckets={sidebarPane}
+            list={listPane}
+            reading={detailPane}
           />
-        </Suspense>
-      )}
+        ) : (
+          <ConsoleLayout
+            arrangement={arrangement}
+            onArrangementChange={setArrangement}
+            sidebarVisible={panels.sidebar}
+            detailVisible={panels.detail}
+            onExpandSidebar={() => togglePanel("sidebar")}
+            paneSizes={paneSizes}
+            onPaneSizesChange={handlePaneSizes}
+            sidebar={sidebarPane}
+            list={listPane}
+            detail={detailPane}
+          />
+        )}
+
+        <CommandPalette
+          open={paletteOpen}
+          onOpenChange={setPaletteOpen}
+          onBucket={(b) => setBucket(b)}
+          onIngest={() => setIngestOpen(true)}
+          onBackfill={() => setBackfillOpen(true)}
+          onQueue={doQueue}
+          onReclassify={doReclassify}
+          hasFocusedThread={!!focusedItem}
+          onToggleSidebar={() => togglePanel("sidebar")}
+          onToggleDetail={() => togglePanel("detail")}
+          onTogglePrediction={() => togglePanel("prediction")}
+          onTheme={setTheme}
+          onAutoSync={setAutoSync}
+          onArrangement={(patch) => setArrangement((a) => ({ ...a, ...patch }))}
+          onFocusSearch={() =>
+            setTimeout(() => searchInputRef.current?.focus(), 60)
+          }
+          onDone={() => doDone()}
+          inDoneBucket={bucket === "done"}
+          onOpenGmail={openInGmail}
+          onDelete={() => doDelete()}
+          onRestartTour={restartTour}
+        />
+        <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+        {!isNarrow && (tourActive || tourVersion < TOUR_VERSION) && (
+          <Suspense fallback={null}>
+            <OnboardingTour
+              run={tourActive}
+              stepIndex={tourStepIndex}
+              targetResolution={tourTargetResolution}
+              emptyThreadList={visibleItems.length === 0}
+              emptyDetail={!thread}
+              onStepChange={goToTourStep}
+              onFinish={finishTour}
+              onSkip={skipTour}
+            />
+          </Suspense>
+        )}
+      </div>
       <Toaster theme={resolvedTheme} />
-    </div>
+    </>
   );
 }
