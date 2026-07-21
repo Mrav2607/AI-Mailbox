@@ -18,6 +18,9 @@ class TriageItem(Response):
     latest_message_snippet: str | None
     latest_message_sender: str | None
     classification: ClassificationOut
+    # Which connected Gmail account this thread belongs to, so a multi-account
+    # console can label rows instead of blending every mailbox into one list.
+    account_email: str
 
 
 class Triage(Response):
@@ -45,6 +48,8 @@ class ThreadSummary(Response):
     provider_thread_id: str | None
     last_message_at: datetime | None
     done: bool
+    # Which connected Gmail account this thread belongs to.
+    account_email: str
 
 
 class ThreadMessage(Response):
@@ -83,6 +88,25 @@ class SyncRun(Response):
     # ingest, created/scanned for backfill), so it stays a free-form object.
     result: dict[str, Any] | None
     error: str | None
+    # Which Gmail account this run is pulling from. Null on legacy rows a
+    # migration couldn't attribute to a single account.
+    provider_account_id: str | None
+
+
+class SyncRunList(Response):
+    """Multi-account fan-out: one entry per account a call touched."""
+
+    runs: list[SyncRun]
+
+
+class AccountSyncHealth(Response):
+    provider_account_id: str
+    email_address: str
+    last_succeeded_at: datetime | None
+    stale: bool
+    sync_in_progress: bool
+    # null | never_synced | reauth_required | <sync_pause_reason>
+    reason: str | None
 
 
 class SyncHealth(Response):
@@ -91,6 +115,10 @@ class SyncHealth(Response):
     `scheduler_alive` is about the MACHINERY (is the dispatcher still checking
     in). A dead scheduler with the browser fallback still working is stale=false,
     scheduler_alive=false.
+
+    The top-level fields are the aggregate across every connected Gmail
+    account (worst-of, so the console's existing pill logic still parses this
+    unchanged); `accounts` breaks that aggregate down per account.
     """
 
     last_succeeded_at: datetime | None
@@ -100,6 +128,7 @@ class SyncHealth(Response):
     threshold_seconds: int
     # null | never_synced | reauth_required | not_connected
     reason: str | None
+    accounts: list[AccountSyncHealth]
 
 
 class TaskStatus(Response):

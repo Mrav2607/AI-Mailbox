@@ -42,6 +42,8 @@ class ConnectionOut(Response):
     id: UUID
     provider: str
     created_at: datetime
+    email_address: str
+    reauth_required: bool
 
 
 class Connections(Response):

@@ -384,29 +384,10 @@ def test_same_address_reconnect_unpauses_when_google_returns_refresh_token(monke
     assert existing.sync_pause_reason is None
 
 
-@pytest.mark.parametrize(
-    ("users", "accounts", "expected"),
-    [
-        (lambda user: [_user("gmail@example.com")], lambda user: [], "different account"),
-        (
-            lambda user: [],
-            lambda user: [
-                ProviderAccount(
-                    user_id=user.id,
-                    provider="gmail",
-                    external_user_id="other@gmail.example",
-                    access_token="access",
-                )
-            ],
-            "different Gmail account",
-        ),
-    ],
-)
-def test_connect_conflict_rules(monkeypatch, users, accounts, expected):
+def test_connect_conflict_rejects_mailbox_owned_by_a_different_account(monkeypatch):
     user = _user()
     db = _DB()
-    db.users.extend(users(user))
-    db.accounts.extend(accounts(user))
+    db.users.append(_user("gmail@example.com"))
     monkeypatch.setattr(
         auth_google,
         "_consume_state",
@@ -416,7 +397,36 @@ def test_connect_conflict_rules(monkeypatch, users, accounts, expected):
 
     error = _status(lambda: auth_google.gmail_connect_callback("code", "state", user, db))
     assert error.status_code == 409
-    assert expected in error.detail
+    assert "different account" in error.detail
+
+
+def test_second_gmail_account_connects_successfully(monkeypatch):
+    """Multi-account is a supported flow now: connecting a second, different
+    Gmail address inserts a second row instead of the old single-account 409."""
+    user = _user()
+    db = _DB()
+    db.accounts.append(
+        ProviderAccount(
+            user_id=user.id,
+            provider="gmail",
+            external_user_id="other@gmail.example",
+            access_token="access",
+        )
+    )
+    monkeypatch.setattr(
+        auth_google,
+        "_consume_state",
+        lambda state: {"mode": "connect", "user_id": str(user.id), "pkce_verifier": "v"},
+    )
+    monkeypatch.setattr(auth_google, "_exchange_code", lambda *args: _exchange())
+
+    response = auth_google.gmail_connect_callback("code", "state", user, db)
+
+    assert response == {"status": "connected", "provider_email": "gmail@example.com"}
+    assert {a.external_user_id for a in db.accounts} == {
+        "other@gmail.example",
+        "gmail@example.com",
+    }
 
 
 def test_connect_integrity_error_rechecks_a_conflict(monkeypatch):

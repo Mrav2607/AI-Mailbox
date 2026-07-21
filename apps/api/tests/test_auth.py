@@ -7,7 +7,11 @@ test database and is a follow-up once test-DB fixtures exist.
 """
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+from uuid import uuid4
 
+import httpx
 import jwt
 import pytest
 from fastapi.testclient import TestClient
@@ -19,7 +23,9 @@ from app.core.security import (
     create_access_token,
     decode_access_token,
 )
+from app.deps import get_current_user, get_db
 from app.main import app
+from app.routes import auth as auth_routes
 
 client = TestClient(app)
 
@@ -112,3 +118,104 @@ def test_demo_login_is_hidden_in_production(monkeypatch, env):
     monkeypatch.setattr(settings, "app_env", env)
     resp = client.post("/api/v1/auth/demo-login", json={"email": "a@example.com"})
     assert resp.status_code == 404
+
+
+USER_ID = uuid4()
+CONNECTIONS_URL = "/api/v1/auth/connections"
+
+
+def _connection(**overrides):
+    defaults = dict(
+        id=uuid4(),
+        user_id=USER_ID,
+        provider="gmail",
+        created_at=datetime.now(timezone.utc),
+        external_user_id="user@gmail.example",
+        sync_paused_at=None,
+        refresh_token="a-refresh-token",
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+@pytest.fixture
+def auth_client():
+    user = SimpleNamespace(id=USER_ID)
+    db = MagicMock()
+    app.dependency_overrides[get_current_user] = lambda: user
+    app.dependency_overrides[get_db] = lambda: db
+    yield TestClient(app), db
+    app.dependency_overrides.clear()
+
+
+def test_connections_list_carries_email_address_and_reauth_flag(auth_client):
+    api_client, db = auth_client
+    healthy = _connection()
+    paused = _connection(sync_paused_at=datetime.now(timezone.utc))
+    db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+        healthy,
+        paused,
+    ]
+
+    body = api_client.get(CONNECTIONS_URL).json()
+
+    assert body["connections"][0]["email_address"] == healthy.external_user_id
+    assert body["connections"][0]["reauth_required"] is False
+    assert body["connections"][1]["email_address"] == paused.external_user_id
+    assert body["connections"][1]["reauth_required"] is True
+
+
+def test_delete_connection_returns_204_for_own_account(auth_client, monkeypatch):
+    api_client, db = auth_client
+    connection = _connection()
+    db.get.return_value = connection
+    monkeypatch.setattr(auth_routes, "_revoke_google_token", lambda token: None)
+
+    resp = api_client.delete(f"{CONNECTIONS_URL}/{connection.id}")
+
+    assert resp.status_code == 204
+    db.delete.assert_called_once_with(connection)
+    db.commit.assert_called_once()
+
+
+def test_delete_connection_404s_for_an_unknown_id(auth_client):
+    api_client, db = auth_client
+    db.get.return_value = None
+
+    resp = api_client.delete(f"{CONNECTIONS_URL}/{uuid4()}")
+
+    assert resp.status_code == 404
+    db.delete.assert_not_called()
+
+
+def test_delete_connection_404s_for_another_users_account(auth_client):
+    # 404, not 403 -- same pattern as delete_thread, so we don't confirm to
+    # the caller that a connection with this id exists at all.
+    api_client, db = auth_client
+    someone_elses = _connection(user_id=uuid4())
+    db.get.return_value = someone_elses
+
+    resp = api_client.delete(f"{CONNECTIONS_URL}/{someone_elses.id}")
+
+    assert resp.status_code == 404
+    db.delete.assert_not_called()
+
+
+def test_delete_connection_still_succeeds_when_google_revocation_fails(
+    auth_client, monkeypatch
+):
+    # Revocation is best-effort; a dead network to Google must never block the
+    # delete of our own row.
+    api_client, db = auth_client
+    connection = _connection()
+    db.get.return_value = connection
+
+    def exploding_post(*args, **kwargs):
+        raise httpx.ConnectTimeout("timed out")
+
+    monkeypatch.setattr(auth_routes.httpx, "post", exploding_post)
+
+    resp = api_client.delete(f"{CONNECTIONS_URL}/{connection.id}")
+
+    assert resp.status_code == 204
+    db.delete.assert_called_once_with(connection)

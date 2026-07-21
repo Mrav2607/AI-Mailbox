@@ -19,6 +19,7 @@ from app.db.schemas.mailbox import (
     Search,
     SyncHealth,
     SyncRun,
+    SyncRunList,
     TaskStatus,
     ThreadDetail,
     ThreadDone,
@@ -43,7 +44,14 @@ from app.services.nlp.backfill import (
 )
 from app.services.nlp.classifier import LABELS
 from app.services.nlp.persistence import upsert_classification
-from app.services.sync_runs import active_sync, now_utc, start_sync_run, sync_payload
+from app.services.sync_runs import (
+    ACTIVE_SYNC_STATUSES,
+    active_syncs,
+    expire_stale_sync,
+    now_utc,
+    start_sync_run,
+    sync_payload,
+)
 
 router = APIRouter(prefix="/mail")
 
@@ -110,6 +118,21 @@ def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]
         if cls.message_id not in classifications_by_msg:
             classifications_by_msg[cls.message_id] = cls
 
+    # One lookup for every account these threads belong to, instead of a
+    # query per thread -- a thread's account always exists (FK cascade).
+    account_ids = {t.provider_account_id for t in threads}
+    account_emails = (
+        dict(
+            db.execute(
+                select(ProviderAccount.id, ProviderAccount.external_user_id).where(
+                    ProviderAccount.id.in_(account_ids)
+                )
+            ).all()
+        )
+        if account_ids
+        else {}
+    )
+
     items = []
     for thread in threads:
         latest_message = latest_message_by_thread.get(thread.id)
@@ -126,6 +149,7 @@ def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]
                     "confidence": float(classification.confidence) if classification and classification.confidence is not None else None,
                     "model_version": classification.model_version if classification else None,
                 },
+                "account_email": account_emails.get(thread.provider_account_id),
             }
         )
     return items
@@ -231,6 +255,12 @@ def get_thread(
     # 404 (not 403) for another user's thread so we don't leak that it exists.
     if not thread or thread.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Thread not found")
+    # A thread's account always exists (FK cascade guarantees it).
+    account_email = db.execute(
+        select(ProviderAccount.external_user_id).where(
+            ProviderAccount.id == thread.provider_account_id
+        )
+    ).scalar_one()
     messages = (
         db.execute(
             select(MailMessage)
@@ -250,6 +280,7 @@ def get_thread(
             "provider_thread_id": thread.provider_thread_id,
             "last_message_at": thread.last_message_at,
             "done": thread.done_at is not None,
+            "account_email": account_email,
         },
         "messages": [
             {
@@ -439,9 +470,10 @@ def delete_thread(
 
 @router.post(
     "/ingest/gmail",
-    response_model=SyncRun,
+    response_model=SyncRunList,
     status_code=202,
-    # Each call queues up to 500 Gmail fetches of Celery work; keep it rare.
+    # Each call queues up to 500 Gmail fetches of Celery work per account; keep
+    # it rare.
     dependencies=[Depends(user_rate_limit("ingest-gmail", 5, 60))],
 )
 def ingest_gmail(
@@ -454,34 +486,48 @@ def ingest_gmail(
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Queue a Gmail pull for the worker instead of running it inline.
+    """Queue a Gmail pull per connected account instead of running it inline.
 
     A full ingest is up to 500 serial Gmail fetches plus classification --
-    way too slow to hold a request open for, so we hand it to Celery and
-    return 202 with the task id.
+    way too slow to hold a request open for, so we hand each account to
+    Celery and return 202 with one run per account. Paused accounts (a dead
+    refresh token) are skipped -- nothing but a reconnect fixes those, so
+    queuing them just burns quota. Zero connected/eligible accounts isn't an
+    error; it just means nothing to sync yet.
     """
-    run, deduplicated = start_sync_run(
-        db,
-        current_user.id,
-        mode="auto" if new_only else ("refresh" if not skip_existing else "manual"),
-        options={
-            "max_results": max_results,
-            "skip_existing": skip_existing,
-            "classify_messages": classify,
-            "new_only": new_only,
-        },
+    accounts = (
+        db.execute(
+            select(ProviderAccount).where(
+                ProviderAccount.user_id == current_user.id,
+                ProviderAccount.provider == "gmail",
+                ProviderAccount.sync_paused_at.is_(None),
+            )
+        )
+        .scalars()
+        .all()
     )
-    return sync_payload(run, deduplicated=deduplicated)
+    mode = "auto" if new_only else ("refresh" if not skip_existing else "manual")
+    options = {
+        "max_results": max_results,
+        "skip_existing": skip_existing,
+        "classify_messages": classify,
+        "new_only": new_only,
+    }
+    runs = []
+    for account in accounts:
+        run, deduplicated = start_sync_run(
+            db, current_user.id, account.id, mode=mode, options=options
+        )
+        runs.append(sync_payload(run, deduplicated=deduplicated))
+    return {"runs": runs}
 
 
-# Optional: no active run is a legitimate answer, and the SPA branches on null.
-@router.get("/sync/active", response_model=SyncRun | None)
+@router.get("/sync/active", response_model=SyncRunList)
 def get_active_sync(
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> dict | None:
-    run = active_sync(db, current_user.id)
-    return sync_payload(run) if run else None
+) -> dict:
+    return {"runs": [sync_payload(r) for r in active_syncs(db, current_user.id)]}
 
 
 # Must precede /sync/{run_id}: that route types run_id as a UUID, so a literal
@@ -492,26 +538,47 @@ def get_sync_health(
     db: Session = Depends(get_db),
 ) -> dict:
     """Whether this mailbox is actually current, and why not if it isn't.
-    Deliberately its own endpoint. /sync/active returns null when idle.
+    Deliberately its own endpoint. /sync/active returns no runs when idle.
+
+    Multi-account aware: the top-level fields are a worst-of aggregate across
+    every connected Gmail account (so the console's existing pill logic keeps
+    working unchanged), and `accounts` breaks that down per account.
     """
-    provider = (
+    expire_stale_sync(db, current_user.id)
+
+    accounts = (
         db.execute(
-            select(ProviderAccount)
-            .where(
+            select(ProviderAccount).where(
                 ProviderAccount.user_id == current_user.id,
                 ProviderAccount.provider == "gmail",
             )
-            .order_by(ProviderAccount.created_at)
         )
         .scalars()
-        .first()
+        .all()
     )
-    last_succeeded_at = db.scalar(
-        select(func.max(MailSyncRun.completed_at)).where(
-            MailSyncRun.user_id == current_user.id,
-            MailSyncRun.status == "succeeded",
+    last_success_by_account = dict(
+        db.execute(
+            select(MailSyncRun.provider_account_id, func.max(MailSyncRun.completed_at))
+            .where(
+                MailSyncRun.user_id == current_user.id,
+                MailSyncRun.status == "succeeded",
+            )
+            .group_by(MailSyncRun.provider_account_id)
+        ).all()
+    )
+    active_account_ids = set(
+        db.execute(
+            select(MailSyncRun.provider_account_id)
+            .where(
+                MailSyncRun.user_id == current_user.id,
+                MailSyncRun.status.in_(ACTIVE_SYNC_STATUSES),
+            )
+            .group_by(MailSyncRun.provider_account_id)
         )
+        .scalars()
+        .all()
     )
+
     # When scheduling is switched off (interval 0), no heartbeat is ever
     # written and the browser fallback carries sync by design -- so "no
     # heartbeat" is the expected state, not a dead scheduler. Report alive so
@@ -519,35 +586,74 @@ def get_sync_health(
     scheduling_enabled = settings.scheduled_sync_interval_seconds > 0
     heartbeat = read_dispatcher_heartbeat() if scheduling_enabled else None
     scheduler_alive = not scheduling_enabled or heartbeat is not None
-    sync_in_progress = active_sync(db, current_user.id) is not None
     threshold = settings.sync_stale_after_seconds
+    now = now_utc()
 
-    reason: str | None = None
-    stale = False
-    if not provider or not provider.refresh_token:
-        reason = "not_connected"
-    elif provider.sync_paused_at is not None:
-        # Nothing but a reconnect fixes this, so say so instead of reporting a
-        # staleness the user can't act on.
-        reason = provider.sync_pause_reason or "reauth_required"
-    elif last_succeeded_at is None:
-        reason = "never_synced"
+    account_entries: list[dict] = []
+    for account in accounts:
+        last_succeeded_at = last_success_by_account.get(account.id)
+        reason: str | None = None
+        stale = False
+        if account.sync_paused_at is not None or not account.refresh_token:
+            # Nothing but a reconnect fixes this, so say so instead of
+            # reporting a staleness the user can't act on. A missing refresh
+            # token (Google sometimes omits it on a login-path insert) is the
+            # same dead end as an explicit pause -- the dispatcher can't sync
+            # without one either way, and only a re-consent mints a new one.
+            reason = account.sync_pause_reason or "reauth_required"
+        elif last_succeeded_at is None:
+            reason = "never_synced"
+        else:
+            # Purely a fact about the data: an in-flight run does NOT make old
+            # mail fresh. Letting it suppress this would hide the exact
+            # failure this endpoint exists for -- a run that keeps retrying,
+            # or sits queued against a dead worker for its 2h lease, is "in
+            # progress" the whole time the mailbox rots. Callers that want to
+            # soften the wording have sync_in_progress right there.
+            stale = last_succeeded_at < now - timedelta(seconds=threshold)
+        account_entries.append(
+            {
+                "provider_account_id": str(account.id),
+                "email_address": account.external_user_id,
+                "last_succeeded_at": last_succeeded_at,
+                "stale": stale,
+                "sync_in_progress": account.id in active_account_ids,
+                "reason": reason,
+            }
+        )
+
+    # Worst-of across accounts: a caller reconnecting one broken mailbox
+    # shouldn't have another account's staleness go quiet, and vice versa.
+    if not accounts:
+        top_reason = "not_connected"
+    elif any(
+        account.sync_paused_at is not None or not account.refresh_token
+        for account in accounts
+    ):
+        top_reason = "reauth_required"
+    elif any(entry["reason"] == "never_synced" for entry in account_entries):
+        top_reason = "never_synced"
     else:
-        # Purely a fact about the data: an in-flight run does NOT make old mail
-        # fresh. Letting it suppress this would hide the exact failure this
-        # endpoint exists for -- a run that keeps retrying, or sits queued
-        # against a dead worker for its 2h lease, is "in progress" the whole
-        # time the mailbox rots. Callers that want to soften the wording have
-        # sync_in_progress right there.
-        stale = last_succeeded_at < now_utc() - timedelta(seconds=threshold)
+        top_reason = None
+
+    successes = [
+        entry["last_succeeded_at"]
+        for entry in account_entries
+        if entry["last_succeeded_at"] is not None
+    ]
+    # The oldest success across accounts -- an honest "mailbox behind since"
+    # rather than letting one healthy account hide another's staleness. Null
+    # only when NO account has ever succeeded.
+    top_last_succeeded_at = min(successes) if successes else None
 
     return {
-        "last_succeeded_at": last_succeeded_at,
-        "stale": stale,
-        "sync_in_progress": sync_in_progress,
+        "last_succeeded_at": top_last_succeeded_at,
+        "stale": any(entry["stale"] for entry in account_entries),
+        "sync_in_progress": bool(active_account_ids),
         "scheduler_alive": scheduler_alive,
         "threshold_seconds": threshold,
-        "reason": reason,
+        "reason": top_reason,
+        "accounts": account_entries,
     }
 
 

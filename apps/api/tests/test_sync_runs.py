@@ -5,7 +5,7 @@ from uuid import uuid4
 import pytest
 
 from app.db.models import MailSyncRun
-from app.services.sync_runs import renew_sync, sync_payload
+from app.services.sync_runs import expire_stale_sync, renew_sync, sync_payload
 
 
 _OPTIONS = {
@@ -42,6 +42,24 @@ def test_renew_sync_updates_heartbeat_and_lease():
     assert run.lease_expires_at > run.heartbeat_at
 
 
+def test_expire_stale_sync_expires_every_stale_run_not_just_one():
+    # A user with two Gmail accounts can have two stale active runs at once --
+    # stopping at the first would leave the second wedged until its own lease
+    # expired on its own.
+    stale_a = MagicMock(status="running")
+    stale_b = MagicMock(status="queued")
+    db = MagicMock()
+    db.scalars.return_value.all.return_value = [stale_a, stale_b]
+
+    expire_stale_sync(db, uuid4())
+
+    for run in (stale_a, stale_b):
+        assert run.status == "failed"
+        assert run.error == "sync lease expired"
+        assert run.completed_at is not None
+    db.commit.assert_called_once()
+
+
 def _start_run(monkeypatch, *, delay, commit_fails_after):
     """Drive start_sync_run with a stubbed broker and a commit that can fail.
 
@@ -50,7 +68,7 @@ def _start_run(monkeypatch, *, delay, commit_fails_after):
     """
     from app.services import sync_runs
 
-    monkeypatch.setattr(sync_runs, "active_sync", lambda _db, _uid: None)
+    monkeypatch.setattr(sync_runs, "active_sync", lambda _db, _uid, _account_id: None)
     task_module = MagicMock()
     task_module.ingest_gmail_for_user.delay = delay
     monkeypatch.setitem(
@@ -82,7 +100,7 @@ def test_a_failed_enqueue_releases_the_users_sync_slot(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="broker down"):
-        sync_runs.start_sync_run(db, uuid4(), mode="scheduled", options=_OPTIONS)
+        sync_runs.start_sync_run(db, uuid4(), uuid4(), mode="scheduled", options=_OPTIONS)
 
     assert run.status == "failed"
     assert run.error == "failed to enqueue sync"
@@ -102,9 +120,41 @@ def test_a_queued_task_is_never_marked_failed_just_because_its_id_didnt_save(
     )
 
     with pytest.raises(RuntimeError, match="db went away"):
-        sync_runs.start_sync_run(db, uuid4(), mode="scheduled", options=_OPTIONS)
+        sync_runs.start_sync_run(db, uuid4(), uuid4(), mode="scheduled", options=_OPTIONS)
 
     assert run.status == "queued"
     assert run.error is None
     assert run.completed_at is None
     db.rollback.assert_called()
+
+
+def test_an_active_run_on_one_account_does_not_block_a_sibling_account(monkeypatch):
+    # active_sync is scoped by provider_account_id now -- account B must get
+    # its own run even while account A is mid-sync for the same user.
+    from app.services import sync_runs
+
+    account_a = uuid4()
+    account_b = uuid4()
+
+    def scoped_active_sync(_db, _uid, account_id):
+        return MagicMock() if account_id == account_a else None
+
+    monkeypatch.setattr(sync_runs, "active_sync", scoped_active_sync)
+    task_module = MagicMock()
+    task_module.ingest_gmail_for_user.delay = MagicMock(
+        return_value=MagicMock(id="task-1")
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules, "app.workers.tasks_ingest", task_module
+    )
+
+    run = MagicMock(id=uuid4(), status="queued", error=None, completed_at=None)
+    db = MagicMock()
+    monkeypatch.setattr(sync_runs, "MailSyncRun", lambda **kwargs: run)
+
+    result_run, deduplicated = sync_runs.start_sync_run(
+        db, uuid4(), account_b, mode="scheduled", options=_OPTIONS
+    )
+
+    assert deduplicated is False
+    assert result_run is run

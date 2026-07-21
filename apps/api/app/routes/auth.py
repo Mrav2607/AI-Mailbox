@@ -1,16 +1,23 @@
-from fastapi import APIRouter, Depends, HTTPException
+from uuid import UUID
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.ratelimit import rate_limit
+from app.core.logging import logger
+from app.core.ratelimit import rate_limit, user_rate_limit
 from app.core.security import create_access_token
 from app.deps import get_db, get_current_user
 from app.db.models import AppUser, ProviderAccount
 from app.db.schemas.auth import Connections, Providers, RevokeOut, TokenOut, UserOut
 
 router = APIRouter()
+
+GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+_REVOKE_TIMEOUT_SECONDS = 5
 
 
 class DemoLoginRequest(BaseModel):
@@ -111,7 +118,56 @@ def list_connections(
                 "id": str(conn.id),
                 "provider": conn.provider,
                 "created_at": conn.created_at,
+                "email_address": conn.external_user_id,
+                "reauth_required": conn.sync_paused_at is not None,
             }
             for conn in connections
         ]
     }
+
+
+def _revoke_google_token(refresh_token: str) -> None:
+    """Best-effort: tell Google we're done with this token. A failure here
+    never blocks the delete -- the row (and the local ability to use the
+    token) is gone either way, so the worst case is a token that lingers on
+    Google's side until it expires on its own."""
+    try:
+        response = httpx.post(
+            GOOGLE_REVOKE_URL,
+            data={"token": refresh_token},
+            timeout=_REVOKE_TIMEOUT_SECONDS,
+        )
+        if response.status_code >= 400:
+            logger.warning("Google token revocation failed (%s)", response.status_code)
+    except httpx.HTTPError as exc:
+        logger.warning("Google token revocation errored: %s", type(exc).__name__)
+
+
+# response_model=None: a 204 carries no body, so there is nothing to validate
+# and declaring a model here would be a lie in the OpenAPI schema.
+@router.delete(
+    "/connections/{connection_id}",
+    status_code=204,
+    response_model=None,
+    dependencies=[Depends(user_rate_limit("disconnect", 10, 600))],
+)
+def delete_connection(
+    connection_id: UUID,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Disconnect a provider account and everything hanging off it.
+
+    The mail_thread -> provider_account and mail_sync_run -> provider_account
+    foreign keys are ON DELETE CASCADE, so dropping this row takes the
+    account's threads, messages, classifications, and sync runs with it.
+    """
+    account = db.get(ProviderAccount, connection_id)
+    # 404 (not 403) for another user's connection so we don't leak that it exists.
+    if not account or account.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if account.refresh_token:
+        _revoke_google_token(account.refresh_token)
+    db.delete(account)
+    db.commit()
+    return Response(status_code=204)

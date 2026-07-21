@@ -328,15 +328,6 @@ def _gmail_belongs_to_other_user(db: Session, user: AppUser, email: str) -> bool
     return owner is not None and owner.id != user.id
 
 
-def _has_different_gmail_account(db: Session, user: AppUser, external_user_id: str) -> bool:
-    account = (
-        db.query(ProviderAccount)
-        .filter(ProviderAccount.user_id == user.id, ProviderAccount.provider == "gmail")
-        .first()
-    )
-    return account is not None and account.external_user_id != external_user_id
-
-
 def _gmail_account_belongs_to_other_user(
     db: Session, user: AppUser, external_user_id: str
 ) -> bool:
@@ -360,10 +351,6 @@ def _connect_conflict(db: Session, user: AppUser, email: str) -> HTTPException |
             detail=(
                 "That Gmail account belongs to a different account — sign in with Google instead."
             ),
-        )
-    if _has_different_gmail_account(db, user, email):
-        return HTTPException(
-            status_code=409, detail="A different Gmail account is already connected."
         )
     return None
 
@@ -442,10 +429,17 @@ def gmail_connect_callback(
         conflict = _connect_conflict(db, current_user, external_user_id)
         if conflict:
             raise conflict
-        # A concurrent insert can be invisible to a lightweight test double;
-        # it is still one of the two provider uniqueness constraints in the DB.
+        # Multiple Gmail accounts per user are allowed now, so the only
+        # uniqueness constraint an insert can still lose the race on is
+        # cross-user (uq_provider_account_provider_external_user). A
+        # concurrent winner can be invisible to a lightweight test double, so
+        # report the cross-user conflict even if the recheck above came up
+        # empty.
         raise HTTPException(
-            status_code=409, detail="A different Gmail account is already connected."
+            status_code=409,
+            detail=(
+                "That Gmail account belongs to a different account — sign in with Google instead."
+            ),
         )
 
     return {"status": "connected", "provider_email": external_user_id}
