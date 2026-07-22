@@ -480,7 +480,7 @@ export async function getOverview(): Promise<Overview> {
 // accounts instead of every connected one. The real API returns 202 with one
 // run per account (empty when nothing's connected); the mock resolves as if
 // already done.
-export async function ingestGmail(
+export async function ingestMail(
   max_results = 50,
   classify = true,
   refreshExisting = false,

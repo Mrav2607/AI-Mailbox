@@ -215,7 +215,7 @@ describe("listAuthProviders", () => {
   });
 });
 
-describe("ingestGmail", () => {
+describe("ingestMail", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
@@ -224,7 +224,7 @@ describe("ingestGmail", () => {
   it("posts to the renamed /mail/ingest route (not the old /mail/ingest/gmail)", async () => {
     const api = await importLiveApi();
     const fetchMock = stubFetch({ runs: [] });
-    await api.ingestGmail();
+    await api.ingestMail();
     const [url, opts] = fetchMock.mock.calls[0];
     expect(new URL(url as string).pathname).toBe("/api/v1/mail/ingest");
     expect((opts as RequestInit).method).toBe("POST");

@@ -24,7 +24,7 @@ import {
   getOverview,
   getThread,
   getTriage,
-  ingestGmail,
+  ingestMail,
   listAuthProviders,
   listConnections,
   microsoftAuthCallback,
@@ -1194,7 +1194,7 @@ export default function Console() {
         // One run per connected account now. Zero runs means nothing's
         // connected — not a failure, just nothing to do until the operator
         // connects a mail account.
-        const runs = await ingestGmail(
+        const runs = await ingestMail(
           opts.maxResults,
           opts.classify,
           opts.refreshExisting,
