@@ -64,7 +64,7 @@ GET /api/v1/auth/me
   - GET  /api/v1/auth/me           -> validate stored token / restore session
   - GET  /api/v1/mail/triage       -> primary list, refetch on bucket change
   - GET  /api/v1/mail/thread/{id}  -> detail pane on row focus/open
-  - POST /api/v1/mail/ingest/gmail?max_results={1..500}      -> pulls new mail (long-running; show progress/toast)
+  - POST /api/v1/mail/ingest?max_results={1..500}      -> pulls new mail (long-running; show progress/toast)
   - POST /api/v1/mail/classify/backfill?limit={1..500}&force={bool}  -> classify unlabeled (or force re-label)
   - POST /api/v1/mail/classify/queue?limit={1..500}&force={bool}     -> enqueue async classify -> { "status": "queued", "task_id": string }
   - GET  /api/v1/analytics/overview -> header stat counters
@@ -176,7 +176,7 @@ Current user — GET /auth/me:
   POST /auth/demo-login   {"email": "..."}       -> { access_token, token_type:"bearer", user } ; store token, then route to console
   GET  /mail/triage?bucket=&limit=               -> reload list whenever the active bucket changes
   GET  /mail/thread/{id}                          -> load into the detail pane when a thread is opened
-  POST /mail/ingest/gmail?max_results=<1..500>    -> "Ingest" button; show busy state, then refresh list + counters
+  POST /mail/ingest?max_results=<1..500>    -> "Ingest" button; show busy state, then refresh list + counters
   POST /mail/classify/backfill?limit=<1..500>&force=<bool> -> "Backfill" button; classify unlabeled (force = re-label all)
   POST /mail/classify/queue?limit=<1..500>&force=<bool>    -> async variant -> { status:"queued", task_id }
   GET  /analytics/overview                         -> top-bar stat counters
