@@ -68,7 +68,12 @@ class Settings(BaseSettings):
     # filtered delta walk silently truncates at OUTLOOK_DELTA_CAP messages
     # rather than erroring, so the ingest layer narrows this on detected caps --
     # see outlook_ingest.py's baseline/cap-detection logic.
-    outlook_backfill_days: int = Field(default=90, alias="OUTLOOK_BACKFILL_DAYS")
+    # gt=0: a zero/negative window would put the initial delta filter at or
+    # past "now", which completes an empty baseline and permanently skips the
+    # account's existing mail -- better to fail at startup.
+    outlook_backfill_days: int = Field(
+        default=90, gt=0, alias="OUTLOOK_BACKFILL_DAYS"
+    )
     resend_api_key: str | None = Field(default=None, alias="RESEND_API_KEY")
     email_from: str = Field(
         default="CortexMail <hello@cortexmail.dev>", alias="EMAIL_FROM"
