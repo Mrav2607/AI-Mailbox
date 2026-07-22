@@ -356,23 +356,36 @@ def microsoft_auth_callback(
     for attempt in range(2):
         # A tid:oid match to an already-connected account is authoritative --
         # its owner logs in even if their outlook mail differs from the
-        # account's original login email. Only fall back to matching by
-        # display email when no such row exists yet.
+        # account's original login email; the email is never consulted once
+        # the identity is linked.
         existing_account = _find_outlook_account(db, external_user_id)
         if existing_account is not None:
             user = db.query(AppUser).filter(AppUser.id == existing_account.user_id).first()
             if user is None:  # pragma: no cover - FK guarantees this can't happen
                 logger.warning("Outlook account referenced a missing user")
                 raise HTTPException(status_code=400, detail="Microsoft sign-in failed; try again.")
-            created_user = False
         else:
-            user = _find_user_by_email(db, display_email)
-            created_user = user is None
-            if user is None:
-                user = AppUser(email=display_email)
-                db.add(user)
-        if user.email_verified_at is None:
-            user.email_verified_at = datetime.now(timezone.utc)
+            # Graph's mail/userPrincipalName claim is tenant-admin-controlled
+            # and unverified -- Microsoft documents it as mutable, and an
+            # attacker who controls their own Entra tenant can set it to any
+            # address (the "nOAuth" account-takeover class). An unlinked
+            # identity must never log into -- or silently link -- an existing
+            # account on the strength of that claim; the authenticated
+            # /connect flow is the only way to attach Outlook to one.
+            if _find_user_by_email(db, display_email) is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "An account with that email already exists. Sign in with your "
+                        "existing method, then connect Outlook from the accounts menu."
+                    ),
+                )
+            user = AppUser(email=display_email)
+            db.add(user)
+            # Deliberately left unverified: unlike Google's email claim,
+            # Microsoft's mail/UPN claim isn't authoritative, so a fresh
+            # outlook-login account starts exactly as unverified as any other
+            # signup without a proven address.
         try:
             _upsert_outlook_account(
                 db,
@@ -389,13 +402,13 @@ def microsoft_auth_callback(
         except IntegrityError as exc:
             db.rollback()
             logger.warning("Microsoft account upsert failed: %s", type(exc).__name__)
-            # A case-insensitive AppUser insert can race another login. After a
-            # rollback, requery once and use that winner; provider races remain
-            # deliberately generic to avoid exposing linkage details.
-            if created_user and attempt == 0:
-                raced_user = _find_user_by_email(db, display_email)
-                if raced_user is not None:
-                    continue
+            # Retry once, but only if the identity itself won a genuine
+            # same-login race (a concurrent request for this exact tid:oid
+            # already committed its own user+account pair) -- never fall
+            # back to linking an existing user by email here, which is
+            # exactly the hole this flow guards against.
+            if attempt == 0 and _find_outlook_account(db, external_user_id) is not None:
+                continue
             raise HTTPException(status_code=400, detail="Microsoft sign-in failed; try again.")
     else:  # pragma: no cover - the loop either commits or raises above.
         raise HTTPException(status_code=400, detail="Microsoft sign-in failed; try again.")

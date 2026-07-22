@@ -429,6 +429,47 @@ def test_callback_logs_into_existing_account_owner_without_duplicate_user(monkey
     assert len(db.users) == 1
     assert existing.access_token == "access"
     assert existing.refresh_token == "new-refresh"
+    # The linked identity is authoritative; nothing here should trust Graph's
+    # unverified mail claim enough to touch the owner's verification state.
+    assert owner.email_verified_at is None
+
+
+def test_callback_existing_link_wins_even_when_graph_mail_matches_another_user(monkeypatch):
+    """The nOAuth guard rail: once tid:oid is linked, a changed (or spoofed)
+    Graph mail claim pointing at a totally different registered user must be
+    ignored -- the identity link always wins, never the email."""
+    _configure_microsoft(monkeypatch)
+    owner = _user("owner@example.com")
+    other_user = _user("victim@example.com")
+    existing = ProviderAccount(
+        user_id=owner.id,
+        provider="outlook",
+        external_user_id="tenant-1:object-1",
+        access_token="old-access",
+        refresh_token="old-refresh",
+    )
+    db = _DB()
+    db.users.extend([owner, other_user])
+    db.accounts.append(existing)
+
+    monkeypatch.setattr(
+        auth_microsoft,
+        "_consume_state",
+        lambda state: {"mode": "login", "pkce_verifier": "v"},
+    )
+    monkeypatch.setattr(
+        auth_microsoft,
+        "_exchange_code",
+        lambda *args: _exchange(
+            external_user_id="tenant-1:object-1", display_email="victim@example.com"
+        ),
+    )
+
+    response = auth_microsoft.microsoft_auth_callback("code", "state", db)
+
+    assert response["user"]["id"] == str(owner.id)
+    assert len(db.users) == 2
+    assert other_user.email_verified_at is None
 
 
 def test_callback_creates_user_by_display_email_when_no_existing_account(monkeypatch):
@@ -451,6 +492,42 @@ def test_callback_creates_user_by_display_email_when_no_existing_account(monkeyp
     assert len(db.users) == 1
     assert db.accounts[0].external_user_id == "tenant-1:object-1"
     assert db.accounts[0].provider == "outlook"
+    # Microsoft's mail/UPN claim isn't verified the way Google's is (nOAuth) --
+    # a fresh outlook-login account must not come out pre-verified from it.
+    assert db.users[0].email_verified_at is None
+
+
+def test_callback_refuses_unlinked_identity_matching_an_existing_users_email(monkeypatch):
+    """The nOAuth guard rail: an unlinked Microsoft identity whose Graph mail
+    happens to match an existing user's login email must be refused outright
+    -- honoring it would let anyone who controls their own Entra tenant set
+    `mail` to a victim's address and take over that victim's account."""
+    _configure_microsoft(monkeypatch)
+    victim = _user("victim@example.com")
+    db = _DB()
+    db.users.append(victim)
+    monkeypatch.setattr(
+        auth_microsoft,
+        "_consume_state",
+        lambda state: {"mode": "login", "pkce_verifier": "v"},
+    )
+    monkeypatch.setattr(
+        auth_microsoft,
+        "_exchange_code",
+        lambda *args: _exchange(
+            external_user_id="attacker-tenant:attacker-object",
+            display_email="victim@example.com",
+        ),
+    )
+
+    error = _status(lambda: auth_microsoft.microsoft_auth_callback("code", "state", db))
+
+    assert error.status_code == 409
+    # No JWT was minted, no provider link was created, and the victim's row
+    # was never touched.
+    assert db.accounts == []
+    assert len(db.users) == 1
+    assert victim.email_verified_at is None
 
 
 def test_login_provider_failure_rolls_back_new_user(monkeypatch):
