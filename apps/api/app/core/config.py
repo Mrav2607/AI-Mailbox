@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     google_redirect_uri: str | None = Field(default=None, alias="GOOGLE_REDIRECT_URI")
     resend_api_key: str | None = Field(default=None, alias="RESEND_API_KEY")
     email_from: str = Field(
-        default="CortexMail <onboarding@resend.dev>", alias="EMAIL_FROM"
+        default="CortexMail <hello@cortexmail.dev>", alias="EMAIL_FROM"
     )
     frontend_base_url: str = Field(
         default="http://localhost:5173", alias="FRONTEND_BASE_URL"
