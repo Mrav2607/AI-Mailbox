@@ -714,6 +714,20 @@ export default function Console() {
           .map((a) => a.provider_account_id),
       );
       const broken = connections.filter((c) => brokenIds.has(c.id));
+      // `connections` and the health poll are independent fetches — on a
+      // fresh load, health can report reauth_required before `connections`
+      // has resolved, joining to nothing here. Rendering this as actionable
+      // would fall through to a fallback that assumes Gmail, which can
+      // launch the wrong provider's OAuth flow for what's actually a broken
+      // Outlook account. Stay inert until the join has something to act on;
+      // the per-connection pills take over as soon as connections lands.
+      if (broken.length === 0) {
+        return {
+          label: "reconnect required",
+          detail: "An account needs reauthorization — reconnect to resume syncing.",
+          actionable: false,
+        };
+      }
       const affected = broken.map((c) => c.email_address);
       const providerWord = (p: string) => (p === "outlook" ? "Outlook" : "Gmail");
       const providersInvolved = new Set(broken.map((c) => c.provider));
