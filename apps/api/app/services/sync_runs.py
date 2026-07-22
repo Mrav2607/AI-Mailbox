@@ -21,47 +21,84 @@ def now_utc() -> datetime:
 
 
 def expire_stale_sync(db: Session, user_id: UUID) -> None:
+    """Fail every one of the user's active runs whose lease has expired.
+
+    A user with multiple Gmail accounts can have several active runs at once,
+    so this has to sweep all of them -- stopping at the first would leave the
+    rest wedged (holding their account's slot) until their own leases expire.
+    """
     now = now_utc()
-    stale = db.scalar(
+    stale_runs = db.scalars(
         select(MailSyncRun).where(
             MailSyncRun.user_id == user_id,
             MailSyncRun.status.in_(ACTIVE_SYNC_STATUSES),
             MailSyncRun.lease_expires_at < now,
         )
-    )
-    if stale:
+    ).all()
+    if not stale_runs:
+        return
+    for stale in stale_runs:
         stale.status = "failed"
         stale.error = "sync lease expired"
         stale.completed_at = now
-        db.commit()
+    db.commit()
 
 
-def active_sync(db: Session, user_id: UUID) -> MailSyncRun | None:
+def active_sync(
+    db: Session, user_id: UUID, provider_account_id: UUID | None = None
+) -> MailSyncRun | None:
+    """The user's most recent active run, optionally scoped to one account.
+
+    `provider_account_id=None` keeps the old cross-account behavior (most
+    recent active run for the user, whichever account it belongs to) --
+    callers that only care whether *something* is syncing still get that.
+    """
     expire_stale_sync(db, user_id)
-    return db.scalar(
-        select(MailSyncRun)
-        .where(
-            MailSyncRun.user_id == user_id,
-            MailSyncRun.status.in_(ACTIVE_SYNC_STATUSES),
+    stmt = select(MailSyncRun).where(
+        MailSyncRun.user_id == user_id,
+        MailSyncRun.status.in_(ACTIVE_SYNC_STATUSES),
+    )
+    if provider_account_id is not None:
+        stmt = stmt.where(MailSyncRun.provider_account_id == provider_account_id)
+    return db.scalar(stmt.order_by(MailSyncRun.requested_at.desc()))
+
+
+def active_syncs(db: Session, user_id: UUID) -> list[MailSyncRun]:
+    """Every active run across all of the user's accounts, newest first."""
+    expire_stale_sync(db, user_id)
+    return list(
+        db.scalars(
+            select(MailSyncRun)
+            .where(
+                MailSyncRun.user_id == user_id,
+                MailSyncRun.status.in_(ACTIVE_SYNC_STATUSES),
+            )
+            .order_by(MailSyncRun.requested_at.desc())
         )
-        .order_by(MailSyncRun.requested_at.desc())
     )
 
 
 def start_sync_run(
-    db: Session, user_id: UUID, *, mode: str, options: dict
+    db: Session,
+    user_id: UUID,
+    provider_account_id: UUID,
+    *,
+    mode: str,
+    options: dict,
 ) -> tuple[MailSyncRun, bool]:
-    """Claim the user's single sync slot and enqueue the work.
+    """Claim the account's single sync slot and enqueue the work.
 
     Returns (run, deduplicated). A truthy `deduplicated` means someone else
     already owns the slot and `run` is their run, not a new one.
 
     Both the ingest route and the scheduler come through here so there is one
-    implementation of the single-flight dance -- the `uq_mail_sync_run_active_user`
+    implementation of the single-flight dance -- the `uq_mail_sync_run_active_account`
     partial index is the referee, and the IntegrityError branch is what makes a
-    lost race return the winner instead of a 500.
+    lost race return the winner instead of a 500. The slot is per account now,
+    not per user: one Gmail account mid-sync must never block a sibling
+    account's own run.
     """
-    existing = active_sync(db, user_id)
+    existing = active_sync(db, user_id, provider_account_id)
     if existing:
         return existing, True
 
@@ -69,6 +106,7 @@ def start_sync_run(
     run = MailSyncRun(
         id=uuid4(),
         user_id=user_id,
+        provider_account_id=provider_account_id,
         mode=mode,
         status="queued",
         options=options,
@@ -79,7 +117,7 @@ def start_sync_run(
         db.commit()
     except IntegrityError:
         db.rollback()
-        winner = active_sync(db, user_id)
+        winner = active_sync(db, user_id, provider_account_id)
         if winner:
             return winner, True
         raise
@@ -95,6 +133,7 @@ def start_sync_run(
         task = cast(Any, ingest_gmail_for_user).delay(
             run_id=str(run.id),
             user_id=str(user_id),
+            provider_account_id=str(provider_account_id),
             max_results=options["max_results"],
             skip_existing=options["skip_existing"],
             classify_messages=options["classify_messages"],
@@ -146,4 +185,7 @@ def sync_payload(run: MailSyncRun, *, deduplicated: bool = False) -> dict:
         "deduplicated": deduplicated,
         "result": run.result,
         "error": run.error,
+        "provider_account_id": (
+            str(run.provider_account_id) if run.provider_account_id else None
+        ),
     }

@@ -7,7 +7,9 @@ function stripSurroundingQuotes(value: string): string {
   return value;
 }
 
-function emailLocalPart(value: string): string {
+// Exported for the multi-account badges (ThreadList / ThreadDetailPane),
+// which show just the local part of an account's address, not a full sender.
+export function emailLocalPart(value: string): string {
   return value.split("@", 1)[0]?.trim() ?? "";
 }
 

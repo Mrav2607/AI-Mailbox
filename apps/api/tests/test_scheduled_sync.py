@@ -37,8 +37,10 @@ def _dispatch_with(monkeypatch, fake_redis, *, candidates, start=None):
     monkeypatch.setattr(tasks_ingest, "_log_stale_mailboxes", lambda _db, _ids: None)
     calls: list[dict] = []
 
-    def default_start(_db, user_id, *, mode, options):
-        calls.append({"user_id": user_id, "mode": mode, "options": options})
+    def default_start(_db, user_id, account_id, *, mode, options):
+        calls.append(
+            {"user_id": user_id, "account_id": account_id, "mode": mode, "options": options}
+        )
         return SimpleNamespace(id=uuid4()), False
 
     monkeypatch.setattr(tasks_ingest, "start_sync_run", start or default_start)
@@ -60,10 +62,29 @@ def test_dispatch_creates_a_scheduled_new_only_run(monkeypatch, fake_redis):
     assert calls[0]["options"]["skip_existing"] is True
 
 
+def test_dispatch_enqueues_one_run_per_eligible_account(monkeypatch, fake_redis):
+    # Multi-account support means one candidate row per account, not per user
+    # -- both of this user's accounts must get their own run.
+    user_id = uuid4()
+    account_a = uuid4()
+    account_b = uuid4()
+
+    result, calls = _dispatch_with(
+        monkeypatch,
+        fake_redis,
+        candidates=[(user_id, account_a), (user_id, account_b)],
+    )
+
+    assert result == {"dispatched": 2, "skipped": 0, "failed": 0}
+    assert {call["account_id"] for call in calls} == {account_a, account_b}
+    assert all(call["user_id"] == user_id for call in calls)
+
+
 def test_dispatch_defers_to_an_already_active_run(monkeypatch, fake_redis):
-    # Cooperating with uq_mail_sync_run_active_user rather than fighting it:
-    # a manual run (or the browser fallback) already holds the slot.
-    def deduping_start(_db, _user_id, *, mode, options):
+    # Cooperating with uq_mail_sync_run_active_account rather than fighting
+    # it: a manual run (or the browser fallback) already holds this account's
+    # slot.
+    def deduping_start(_db, _user_id, _account_id, *, mode, options):
         return SimpleNamespace(id=uuid4()), True
 
     result, _ = _dispatch_with(
@@ -76,12 +97,51 @@ def test_dispatch_defers_to_an_already_active_run(monkeypatch, fake_redis):
     assert result == {"dispatched": 0, "skipped": 1, "failed": 0}
 
 
+def test_a_paused_account_being_skipped_does_not_block_its_sibling(monkeypatch, fake_redis):
+    # _eligible_provider_rows is what actually filters out paused accounts;
+    # here we simulate its output (the paused account already excluded) and
+    # confirm dispatch still processes the healthy sibling on the same user.
+    user_id = uuid4()
+    healthy_account = uuid4()
+
+    result, calls = _dispatch_with(
+        monkeypatch, fake_redis, candidates=[(user_id, healthy_account)]
+    )
+
+    assert result == {"dispatched": 1, "skipped": 0, "failed": 0}
+    assert calls[0]["account_id"] == healthy_account
+
+
+def test_eligible_provider_rows_has_no_per_user_collapse():
+    # The old query collapsed to one (oldest) account per user via a
+    # DISTINCT ON subquery -- multi-account support means every eligible
+    # account has to survive that query untouched. A MagicMock db can't
+    # evaluate a WHERE clause, so check the query shape instead.
+    from sqlalchemy.dialects import postgresql
+
+    captured = {}
+    db = MagicMock()
+
+    def execute(stmt):
+        captured["sql"] = str(stmt.compile(dialect=postgresql.dialect())).upper()
+        return MagicMock(all=lambda: [])
+
+    db.execute.side_effect = execute
+    rows = tasks_ingest._eligible_provider_rows(db)
+
+    assert rows == []
+    sql = captured["sql"]
+    assert "DISTINCT ON" not in sql
+    assert "SYNC_PAUSED_AT IS NULL" in sql
+    assert "REFRESH_TOKEN IS NOT NULL" in sql
+
+
 def test_one_users_failure_does_not_stop_the_rest(monkeypatch, fake_redis):
     good = uuid4()
     bad = uuid4()
     seen = []
 
-    def flaky_start(_db, user_id, *, mode, options):
+    def flaky_start(_db, user_id, _account_id, *, mode, options):
         if user_id == bad:
             raise RuntimeError("gmail exploded")
         seen.append(user_id)
@@ -102,7 +162,7 @@ def test_dispatch_checks_in_before_doing_any_work(monkeypatch, fake_redis):
     # The heartbeat is the dead-man's switch. If it only landed after a
     # successful pass, one bad user would look like a dead scheduler and the
     # beat container would restart-loop for no reason.
-    def exploding_start(_db, _user_id, *, mode, options):
+    def exploding_start(_db, _user_id, _account_id, *, mode, options):
         raise RuntimeError("boom")
 
     _dispatch_with(

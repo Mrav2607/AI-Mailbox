@@ -19,6 +19,9 @@ PROD_OK = dict(
     GOOGLE_CLIENT_SECRET="sec",
     GOOGLE_REDIRECT_URI="https://app.example.com/callback",
     TOKEN_ENCRYPTION_KEY=Fernet.generate_key().decode(),
+    RESEND_API_KEY="re_test_key",
+    FRONTEND_BASE_URL="https://app.example.com",
+    EMAIL_FROM="AI Mailbox <hello@example.com>",
 )
 
 
@@ -31,6 +34,11 @@ def test_dev_allows_insecure_defaults():
 def test_valid_production_config_passes():
     s = Settings(**PROD_OK)
     assert s.is_production is True
+
+
+def test_frontend_base_url_trailing_slash_is_stripped():
+    s = Settings(_env_file=None, FRONTEND_BASE_URL="https://app.example.com/")
+    assert s.frontend_base_url == "https://app.example.com"
 
 
 def test_production_rejects_default_secret():
@@ -55,6 +63,26 @@ def test_production_requires_token_encryption_key():
     cfg = PROD_OK | {"TOKEN_ENCRYPTION_KEY": None}
     with pytest.raises(ValidationError, match="TOKEN_ENCRYPTION_KEY"):
         Settings(**cfg)
+
+
+def test_production_requires_resend_and_a_safe_frontend_url():
+    with pytest.raises(ValidationError, match="RESEND_API_KEY"):
+        Settings(**(PROD_OK | {"RESEND_API_KEY": None}))
+    with pytest.raises(ValidationError, match="FRONTEND_BASE_URL"):
+        Settings(**(PROD_OK | {"FRONTEND_BASE_URL": "http://app.example.com"}))
+
+
+def test_production_requires_email_from_to_be_explicitly_set():
+    # Drop EMAIL_FROM entirely so Settings falls back to the class default --
+    # exactly the unverified-sender-domain case the check exists to catch.
+    cfg = {k: v for k, v in PROD_OK.items() if k != "EMAIL_FROM"}
+    with pytest.raises(ValidationError, match="EMAIL_FROM"):
+        Settings(**cfg)
+
+
+def test_production_accepts_explicit_email_from():
+    s = Settings(**PROD_OK)
+    assert s.email_from == "AI Mailbox <hello@example.com>"
 
 
 def test_malformed_token_encryption_key_rejected_in_any_env():

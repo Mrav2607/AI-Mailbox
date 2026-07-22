@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { emailDocument, sanitizeEmailHtml } from "@/lib/email-html";
 import { LABEL_META, confidenceColor, confidenceText } from "@/lib/labels";
+import { emailLocalPart } from "@/lib/sender";
 import { absTime } from "@/lib/time";
 import type { Classification, Label, ThreadDetail, ThreadMessage } from "@/lib/types";
 import { ALL_LABELS } from "@/lib/types";
@@ -40,14 +41,14 @@ function BackToList({ onBack }: { onBack: () => void }) {
   );
 }
 
-function MessageBody({ m }: { m: ThreadMessage }) {
+function MessageBody({ m, fill }: { m: ThreadMessage; fill?: boolean }) {
   const [showRemote, setShowRemote] = useState(false);
   const sanitized = useMemo(
     () => (m.body_html ? sanitizeEmailHtml(m.body_html, showRemote) : null),
     [m.body_html, showRemote],
   );
   if (sanitized?.html) {
-    return (
+    const frame = (
       <>
         {sanitized.blocked && !showRemote && (
           <button
@@ -66,8 +67,9 @@ function MessageBody({ m }: { m: ThreadMessage }) {
 
           Deliberately NOT here: allow-scripts and allow-same-origin. Either one
           hands back the origin this exists to take away. That also rules out
-          auto-sizing the frame to its content (nothing can measure it), hence
-          the fixed height and internal scroll. allow-popups + escape-sandbox
+          auto-sizing the frame to its content (nothing can measure it), so the
+          height is derived from the viewport/pane rather than the content, and
+          internal scroll handles overflow. allow-popups + escape-sandbox
           are needed or every link in the email dies silently — the sanitizer
           gives them all target="_blank".
 
@@ -79,10 +81,18 @@ function MessageBody({ m }: { m: ThreadMessage }) {
           sandbox="allow-popups allow-popups-to-escape-sandbox"
           referrerPolicy="no-referrer"
           srcDoc={emailDocument(sanitized.html, showRemote)}
-          className="w-full h-[min(70vh,32rem)] rounded border border-border bg-white"
+          className={
+            fill
+              ? "w-full flex-1 min-h-[20rem] rounded border border-border bg-white"
+              : "w-full h-[70vh] rounded border border-border bg-white"
+          }
         />
       </>
     );
+    if (fill) {
+      return <div className="flex-1 min-h-0 flex flex-col">{frame}</div>;
+    }
+    return frame;
   }
   return (
     <pre className="whitespace-pre-wrap font-sans text-[13px] leading-relaxed text-foreground/85">
@@ -101,6 +111,9 @@ interface Props {
   onCollapse?: () => void;
   onDone?: () => void;
   onDelete?: () => void;
+  // Only worth showing once there's more than one connected account to
+  // disambiguate — a single-account mailbox doesn't need it.
+  showAccountBadge?: boolean;
   side?: ReadingSide;
   predictionOpen?: boolean;
   onTogglePrediction?: () => void;
@@ -116,6 +129,7 @@ export function ThreadDetailPane({
   onCollapse,
   onDone,
   onDelete,
+  showAccountBadge,
   side = "right",
   predictionOpen = true,
   onTogglePrediction,
@@ -207,6 +221,9 @@ export function ThreadDetailPane({
   const conf = classification?.confidence ?? null;
   const confPct = conf == null ? null : Math.round(conf * 100);
   const meta = classification?.label ? LABEL_META[classification.label] : null;
+  // A single HTML message is the common case the fill layout targets — with
+  // more than one message there's no single body to stretch to the pane.
+  const fillBody = data.messages.length === 1 && !!data.messages[0]?.body_html;
 
   return (
     <div data-tour="detail-pane" className="h-full flex flex-col">
@@ -216,10 +233,18 @@ export function ThreadDetailPane({
           <div className="flex-1 min-w-0 text-[11px] text-muted-foreground font-mono lowercase truncate">
             {data.thread.provider} · {absTime(data.thread.last_message_at)}
           </div>
+          {showAccountBadge && (
+            <span
+              className="shrink-0 font-mono text-[10px] text-muted-foreground/60 px-1 py-0.5 rounded border border-border/50 truncate max-w-[110px]"
+              title={data.thread.account_email}
+            >
+              {emailLocalPart(data.thread.account_email)}
+            </span>
+          )}
           <PaneDragHandle source="detail" />
           {data.thread.provider === "gmail" && data.thread.provider_thread_id && (
             <a
-              href={gmailThreadUrl(data.thread.provider_thread_id)}
+              href={gmailThreadUrl(data.thread.provider_thread_id, data.thread.account_email)}
               target="_blank"
               rel="noopener noreferrer"
               aria-label="Open in Gmail"
@@ -345,13 +370,16 @@ export function ThreadDetailPane({
       </section>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto scrollbar-thin">
+      <div className="flex-1 overflow-y-auto scrollbar-thin flex flex-col">
         {data.messages.map((m) => (
           <article
             key={m.id}
-            className="px-4 py-3 border-b border-border last:border-b-0"
+            className={[
+              "px-4 py-3 border-b border-border last:border-b-0",
+              fillBody ? "flex-1 min-h-0 flex flex-col" : "shrink-0",
+            ].join(" ")}
           >
-            <header className="flex items-baseline justify-between gap-2 mb-1.5">
+            <header className={["flex items-baseline justify-between gap-2 mb-1.5", fillBody ? "shrink-0" : ""].join(" ")}>
               <span className="font-mono text-[12px] text-foreground/90 truncate">
                 {m.sender ?? "(unknown sender)"}
               </span>
@@ -359,7 +387,7 @@ export function ThreadDetailPane({
                 {absTime(m.sent_at)}
               </span>
             </header>
-            <MessageBody m={m} />
+            <MessageBody m={m} fill={fillBody} />
           </article>
         ))}
       </div>

@@ -7,7 +7,6 @@ from uuid import UUID
 
 import redis
 from sqlalchemy import delete, func, or_, select
-from sqlalchemy.orm import aliased
 from sqlalchemy.engine import CursorResult
 
 from .celery_app import celery_app
@@ -38,6 +37,7 @@ def ingest_gmail_for_user(
     self,
     run_id: str,
     user_id: str,
+    provider_account_id: str | None = None,
     max_results: int = 25,
     skip_existing: bool = True,
     classify_messages: bool = True,
@@ -82,6 +82,7 @@ def ingest_gmail_for_user(
         return {
             "status": "error",
             "user_id": user_id,
+            "provider_account_id": provider_account_id,
             "detail": "sync run is no longer active",
         }
     last_heartbeat = monotonic()
@@ -103,6 +104,7 @@ def ingest_gmail_for_user(
             result = ingest_gmail_messages(
                 db=db,
                 user_id=user_id,
+                provider_account_id=provider_account_id,
                 max_results=max_results,
                 skip_existing=skip_existing,
                 classify_messages=classify_messages,
@@ -110,7 +112,12 @@ def ingest_gmail_for_user(
                 progress=heartbeat,
             )
     except ValueError as exc:
-        payload = {"status": "error", "user_id": user_id, "detail": str(exc)}
+        payload = {
+            "status": "error",
+            "user_id": user_id,
+            "provider_account_id": provider_account_id,
+            "detail": str(exc),
+        }
         set_state("failed", error=str(exc), result=payload)
         return payload
     except Exception as exc:
@@ -120,7 +127,12 @@ def ingest_gmail_for_user(
         set_state("failed", error="sync failed after retries")
         raise
 
-    payload = {"status": "ok", "user_id": user_id, **result}
+    payload = {
+        "status": "ok",
+        "user_id": user_id,
+        "provider_account_id": provider_account_id,
+        **result,
+    }
     set_state("succeeded", result=payload)
     return payload
 
@@ -189,7 +201,7 @@ def read_dispatcher_heartbeat() -> datetime | None:
 
 
 def _eligible_provider_rows(db) -> list[tuple[UUID, UUID]]:
-    """(user_id, provider_id) for every Gmail account the scheduler should pull.
+    """(user_id, provider_account_id) for every Gmail account the scheduler should pull.
 
     Eligible means: connected, has a refresh token, not paused for reauth, and
     past the first-ingest baseline. That baseline is a history cursor OR a known
@@ -197,38 +209,22 @@ def _eligible_provider_rows(db) -> list[tuple[UUID, UUID]]:
     found an empty mailbox still has one, and requiring a thread would strand it
     forever (no threads -> no new-only pull -> no first thread).
 
-    Judged against each user's OLDEST Gmail account, because that's the one
-    ingest_gmail_messages actually loads. Filtering first and deduping after
-    would let a user with a paused oldest account and a healthy newer one look
-    eligible via the newer row, while every run ingest actually started picked
-    the paused one and died -- a doomed sync every cycle, forever. Until runs
-    carry an account identity, dispatcher and ingest have to agree on which
-    account they mean.
+    Every eligible account gets its own row now, not just a user's oldest one.
+    Runs carry their provider_account_id straight through to
+    ingest_gmail_messages, so a paused account can no longer hide a healthy
+    sibling (or vice versa) behind a single ambiguous per-user slot.
     """
-    oldest_per_user = (
-        select(ProviderAccount)
-        .where(ProviderAccount.provider == "gmail")
-        .distinct(ProviderAccount.user_id)
-        .order_by(ProviderAccount.user_id, ProviderAccount.created_at)
-        .subquery()
-    )
-    account = aliased(ProviderAccount, oldest_per_user)
-    # Correlated to the alias, not ProviderAccount -- the bare table isn't in
-    # this query any more, so correlating to it would compare against the wrong
-    # row (or nothing at all).
     has_thread = (
         select(MailThread.id)
-        .where(
-            MailThread.user_id == account.user_id,
-            MailThread.provider == "gmail",
-        )
+        .where(MailThread.provider_account_id == ProviderAccount.id)
         .exists()
     )
     rows = db.execute(
-        select(account.user_id, account.id).where(
-            account.refresh_token.is_not(None),
-            account.sync_paused_at.is_(None),
-            or_(account.gmail_history_id.is_not(None), has_thread),
+        select(ProviderAccount.user_id, ProviderAccount.id).where(
+            ProviderAccount.provider == "gmail",
+            ProviderAccount.refresh_token.is_not(None),
+            ProviderAccount.sync_paused_at.is_(None),
+            or_(ProviderAccount.gmail_history_id.is_not(None), has_thread),
         )
     ).all()
     return [(user_id, provider_id) for user_id, provider_id in rows]
@@ -251,11 +247,12 @@ def dispatch_scheduled_syncs() -> dict:
     failed = 0
     with SessionLocal() as db:
         candidates = _eligible_provider_rows(db)
-        for user_id, _provider_id in candidates:
+        for user_id, account_id in candidates:
             try:
                 run, deduplicated = start_sync_run(
                     db,
                     user_id,
+                    account_id,
                     mode="scheduled",
                     options={
                         "max_results": settings.scheduled_sync_max_results,
@@ -265,47 +262,59 @@ def dispatch_scheduled_syncs() -> dict:
                     },
                 )
                 if deduplicated:
-                    # Someone already holds the slot (a manual run, or the
-                    # browser fallback). Nothing to do -- next tick is minutes
-                    # away.
+                    # Someone already holds this account's slot (a manual run,
+                    # or the browser fallback). Nothing to do -- next tick is
+                    # minutes away.
                     skipped += 1
                 else:
                     dispatched += 1
             except Exception:
-                # One user's bad state must never stop the others from syncing.
-                # An unhandled commit error (a connection blip, not the handled
-                # IntegrityError) leaves the shared session in an aborted
-                # transaction, so every later user this tick would fail with
-                # PendingRollbackError -- roll back to clear it.
+                # One account's bad state must never stop the others from
+                # syncing. An unhandled commit error (a connection blip, not
+                # the handled IntegrityError) leaves the shared session in an
+                # aborted transaction, so every later account this tick would
+                # fail with PendingRollbackError -- roll back to clear it.
                 db.rollback()
                 failed += 1
-                logger.exception("scheduled sync dispatch failed for user %s", user_id)
+                logger.exception(
+                    "scheduled sync dispatch failed for user %s account %s",
+                    user_id,
+                    account_id,
+                )
 
-        _log_stale_mailboxes(db, [user_id for user_id, _ in candidates])
+        _log_stale_mailboxes(db, candidates)
 
     return {"dispatched": dispatched, "skipped": skipped, "failed": failed}
 
 
-def _log_stale_mailboxes(db, user_ids: list[UUID]) -> None:
+def _log_stale_mailboxes(db, candidates: list[tuple[UUID, UUID]]) -> None:
     """Shout if a mailbox hasn't had a successful sync in too long.
+
+    Anchored per provider_account_id, not per user: a healthy account must
+    never hide a stale sibling connected to the same user.
     """
-    if not user_ids:
+    if not candidates:
         return
+    account_ids = [account_id for _, account_id in candidates]
     cutoff = datetime.now(timezone.utc) - timedelta(
         seconds=settings.sync_stale_after_seconds
     )
     rows = db.execute(
-        select(MailSyncRun.user_id, func.max(MailSyncRun.completed_at))
-        .where(MailSyncRun.user_id.in_(user_ids), MailSyncRun.status == "succeeded")
-        .group_by(MailSyncRun.user_id)
+        select(MailSyncRun.provider_account_id, func.max(MailSyncRun.completed_at))
+        .where(
+            MailSyncRun.provider_account_id.in_(account_ids),
+            MailSyncRun.status == "succeeded",
+        )
+        .group_by(MailSyncRun.provider_account_id)
     ).all()
-    newest = {user_id: completed for user_id, completed in rows}
-    for user_id in user_ids:
-        last = newest.get(user_id)
+    newest = {account_id: completed for account_id, completed in rows}
+    for user_id, account_id in candidates:
+        last = newest.get(account_id)
         if last is not None and last < cutoff:
             logger.error(
-                "mailbox stale: no successful sync for user %s since %s",
+                "mailbox stale: no successful sync for user %s account %s since %s",
                 user_id,
+                account_id,
                 last.isoformat(),
             )
 
@@ -314,21 +323,29 @@ def _log_stale_mailboxes(db, user_ids: list[UUID]) -> None:
 def prune_sync_runs() -> dict:
     """Drop old finished runs. Hourly, not per dispatch.
 
-    Keeps each user's newest successful run whatever its age: it's what
-    last_succeeded_at reads, so pruning it would create a stale mailbox.
+    Keeps each account's newest successful run whatever its age: it's what
+    last_succeeded_at reads, so pruning it would create a stale mailbox. Runs
+    predating the account_id migration have a NULL provider_account_id and
+    can't anchor anything -- they're always fair game for the age-based
+    delete below.
     """
     cutoff = datetime.now(timezone.utc) - _RUN_RETENTION
-    # Each user's newest successful run, resolved inside the same statement as
-    # the delete so there's no window where the anchor is computed but not yet
-    # protected.
+    # Each account's newest successful run, resolved inside the same statement
+    # as the delete so there's no window where the anchor is computed but not
+    # yet protected.
     anchors = (
         select(MailSyncRun.id)
-        .distinct(MailSyncRun.user_id)
-        .where(MailSyncRun.status == "succeeded")
+        .distinct(MailSyncRun.provider_account_id)
+        .where(
+            MailSyncRun.status == "succeeded",
+            MailSyncRun.provider_account_id.is_not(None),
+        )
         # nullslast: a succeeded row shouldn't have a null completed_at, but if
         # one ever did, NULLS FIRST (Postgres' default for DESC) would make it
         # the "anchor" and expose the real newest success to pruning.
-        .order_by(MailSyncRun.user_id, MailSyncRun.completed_at.desc().nullslast())
+        .order_by(
+            MailSyncRun.provider_account_id, MailSyncRun.completed_at.desc().nullslast()
+        )
         .scalar_subquery()
     )
     with SessionLocal() as db:

@@ -17,8 +17,13 @@ class MailThread(Base):
 
     __tablename__ = "mail_thread"
     __table_args__ = (
+        # provider_account_id (not user_id) is the identity boundary now: a
+        # user can have multiple Gmail accounts, and each account's threads
+        # are keyed independently.
         UniqueConstraint(
-            "user_id", "provider", "provider_thread_id", name="uq_thread_provider"
+            "provider_account_id",
+            "provider_thread_id",
+            name="uq_thread_provider_account",
         ),
         # Serves the triage list: WHERE user_id = ? ORDER BY recency.
         Index(
@@ -37,6 +42,11 @@ class MailThread(Base):
     )
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("app_user.id", ondelete="CASCADE")
+    )
+    provider_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("provider_account.id", ondelete="CASCADE"),
+        nullable=False,
     )
     provider: Mapped[str] = mapped_column(Text, nullable=False)
     provider_thread_id: Mapped[str] = mapped_column(Text, nullable=False)

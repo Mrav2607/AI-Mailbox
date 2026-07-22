@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .core.config import settings
 from .core.logging import configure_logging
 from .core.errors import register_exception_handlers
-from .routes import health, auth, mailbox, analytics, auth_google
+from .routes import health, auth, auth_password, mailbox, analytics, auth_google
 import uvicorn
 
 # Configure logging at import, not in lifespan: by the time lifespan runs uvicorn
@@ -49,6 +49,7 @@ app.add_middleware(
 
 app.include_router(health.router, prefix="/api/v1")
 app.include_router(auth.router, prefix="/api/v1/auth")
+app.include_router(auth_password.router, prefix="/api/v1/auth")
 app.include_router(auth_google.router, prefix="/api/v1/auth/google")
 app.include_router(mailbox.router, prefix="/api/v1")
 app.include_router(analytics.router, prefix="/api/v1")
@@ -57,4 +58,3 @@ app.include_router(analytics.router, prefix="/api/v1")
 if __name__ == "__main__":  # pragma: no cover
     # Allow running via `python -m app.main` for local dev
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
-

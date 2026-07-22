@@ -127,6 +127,7 @@ def _refresh_access_token(provider: ProviderAccount) -> tuple[str | None, dateti
 def ingest_gmail_messages(
     db: Session,
     user_id: str,
+    provider_account_id: str | None = None,
     max_results: int = 50,
     skip_existing: bool = True,
     max_pages: int = 20,
@@ -139,19 +140,38 @@ def ingest_gmail_messages(
     new_only: bool = False,
     progress: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    provider = (
-        db.execute(
-            select(ProviderAccount)
-            .where(
-                ProviderAccount.user_id == user_id, ProviderAccount.provider == "gmail"
+    if provider_account_id is not None:
+        # The caller knows exactly which account this run is for. Loading it
+        # by (id, user_id) is also the disconnect-race guard: if the account
+        # got deleted after the run was queued, it just won't be here, and we
+        # take the same terminal exit as "never connected" -- retrying a run
+        # for an account that no longer exists would just spin forever.
+        provider = (
+            db.execute(
+                select(ProviderAccount).where(
+                    ProviderAccount.id == provider_account_id,
+                    ProviderAccount.user_id == user_id,
+                )
             )
-            # A user may have more than one Gmail account connected, 
-            # and "whichever row came back first" is not a rule.
-            .order_by(ProviderAccount.created_at)
+            .scalars()
+            .first()
         )
-        .scalars()
-        .first()
-    )
+    else:
+        # Fallback for Celery messages already queued (with no account id)
+        # when this deploy landed. Once those drain, every call carries an
+        # explicit id and this branch goes cold -- kept only so in-flight
+        # pre-deploy runs don't error out instead of finishing normally.
+        provider = (
+            db.execute(
+                select(ProviderAccount)
+                .where(
+                    ProviderAccount.user_id == user_id, ProviderAccount.provider == "gmail"
+                )
+                .order_by(ProviderAccount.created_at)
+            )
+            .scalars()
+            .first()
+        )
     if not provider or not provider.access_token:
         raise ValueError("Gmail provider account not connected.")
 
@@ -174,8 +194,7 @@ def ingest_gmail_messages(
         existing_thread_ids = set(
             db.execute(
                 select(MailThread.provider_thread_id).where(
-                    MailThread.user_id == user_id,
-                    MailThread.provider == "gmail",
+                    MailThread.provider_account_id == provider.id,
                 )
             )
             .scalars()
@@ -384,13 +403,14 @@ def ingest_gmail_messages(
             insert(MailThread)
             .values(
                 user_id=user_id,
+                provider_account_id=provider.id,
                 provider="gmail",
                 provider_thread_id=tid,
                 subject=latest.get("subject"),
                 last_message_at=latest.get("sent_at") or datetime.now(timezone.utc),
             )
             .on_conflict_do_update(
-                index_elements=["user_id", "provider", "provider_thread_id"],
+                index_elements=["provider_account_id", "provider_thread_id"],
                 set_=update_cols,
             )
             .returning(MailThread.id)

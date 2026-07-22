@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Integer, Text
+from sqlalchemy import DateTime, Integer, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -24,6 +25,10 @@ class AppUser(Base):
     )
     email: Mapped[str] = mapped_column(Text, unique=True, nullable=False, index=True)
     display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    email_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Bump this to invalidate every token this user holds. Each JWT carries the
     # version it was minted against, and auth rejects any token whose version

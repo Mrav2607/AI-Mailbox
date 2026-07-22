@@ -42,6 +42,8 @@ export interface TriageItem {
   latest_message_snippet: string | null;
   latest_message_sender: string | null;
   classification: Classification;
+  // Which connected Gmail account this thread belongs to.
+  account_email: string;
 }
 
 export interface TriageResponse {
@@ -67,7 +69,14 @@ export interface IngestOptions {
   classify: boolean;
   // Re-pull threads that are already in the DB (refreshes their bodies).
   refreshExisting: boolean;
+  // Which connected accounts to pull from; omitted (or every eligible
+  // account checked) means all of them, same as before targeted ingest existed.
+  accountIds?: string[];
 }
+
+// "recency" is the triage list's default (and only) order today; "account"
+// groups threads by connected account, stable across pages, server-side.
+export type TriageSort = "recency" | "account";
 
 export interface BackfillOptions {
   limit: number;
@@ -100,8 +109,20 @@ export interface ThreadDetail {
     provider_thread_id: string | null;
     last_message_at: string | null;
     done: boolean;
+    // Which connected Gmail account this thread belongs to.
+    account_email: string;
   };
   messages: ThreadMessage[];
+}
+
+// A connected Gmail account (GET /auth/connections). `reauth_required` means
+// the refresh token is dead — nothing but reconnecting fixes it.
+export interface Connection {
+  id: string;
+  provider: string;
+  email_address: string;
+  created_at: string;
+  reauth_required: boolean;
 }
 
 export interface Overview {

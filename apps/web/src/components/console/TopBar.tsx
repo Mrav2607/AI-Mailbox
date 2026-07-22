@@ -16,15 +16,18 @@ import { Mark } from "./Mark";
 import { Popover } from "./Popover";
 import { LayoutPicker } from "./LayoutPicker";
 import { bucketLabel } from "@/lib/labels";
+import { cn } from "@/lib/utils";
 import { BUCKETS } from "@/lib/types";
 import type { Arrangement } from "@/lib/layout";
 import { THEME_PREFS } from "@/lib/theme";
 import type { ThemePref } from "@/lib/theme";
 import { AUTO_SYNC_CHOICES } from "@/lib/use-auto-sync";
+import type { AccountSyncHealth, SyncHealth } from "@/lib/api";
 import type {
   BackfillOptions,
   BucketKey,
   ClassifierBackend,
+  Connection,
   IngestOptions,
   Overview,
   User,
@@ -51,6 +54,12 @@ interface Props {
   onTheme: (t: ThemePref) => void;
   autoSync: number;
   onAutoSync: (s: number) => void;
+  connections: Connection[];
+  health: SyncHealth | null;
+  accountsOpen: boolean;
+  onAccountsOpenChange: (v: boolean) => void;
+  onConnectGmail: () => void;
+  onDisconnect: (connectionId: string) => void;
 }
 
 const THEME_ICONS: Record<ThemePref, typeof Sun> = {
@@ -97,26 +106,50 @@ function IngestForm({
   onSubmit,
   autoSync,
   onAutoSync,
+  connections,
 }: {
   busy: boolean;
   onSubmit: (o: IngestOptions) => void;
   autoSync: number;
   onAutoSync: (s: number) => void;
+  connections: Connection[];
 }) {
   // String state so a mid-edit (cleared) field never becomes NaN; we parse
   // and clamp on submit instead.
   const [count, setCount] = useState("100");
   const [classify, setClassify] = useState(true);
   const [refreshExisting, setRefreshExisting] = useState(false);
+  // null = "all eligible accounts" — an account connected after this dialog
+  // was last touched stays included by default instead of silently skipped.
+  const [checked, setChecked] = useState<Set<string> | null>(null);
+
+  const eligible = connections.filter((c) => !c.reauth_required);
+  const effective = checked ?? new Set(eligible.map((c) => c.id));
+  const showPicker = connections.length > 1;
+  const noneSelected = showPicker && effective.size === 0;
+
+  const toggleAccount = (id: string) => {
+    setChecked((prev) => {
+      const next = new Set(prev ?? eligible.map((c) => c.id));
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
   return (
     <form
       onSubmit={(e) => {
         e.preventDefault();
         const n = parseInt(count, 10);
+        const allEligibleSelected = eligible.every((c) => effective.has(c.id));
         onSubmit({
           maxResults: clamp(Number.isNaN(n) ? 100 : n, 1, 500),
           classify,
           refreshExisting,
+          // Selecting every eligible account is the same as not filtering —
+          // omit the param so the request shape matches the common case.
+          accountIds: showPicker && !allEligibleSelected ? [...effective] : undefined,
         });
       }}
       className="space-y-2.5"
@@ -151,9 +184,39 @@ function IngestForm({
         />
         re-fetch existing threads
       </label>
+      {showPicker && (
+        <div className="space-y-1 pt-2 border-t border-border">
+          <span className={fieldLabel}>accounts</span>
+          {connections.map((c) => (
+            <label
+              key={c.id}
+              className={cn(
+                "flex items-center gap-2 text-[12px] font-mono",
+                c.reauth_required
+                  ? "text-muted-foreground/50 cursor-not-allowed"
+                  : "text-foreground/85 cursor-pointer",
+              )}
+            >
+              <input
+                type="checkbox"
+                checked={!c.reauth_required && effective.has(c.id)}
+                disabled={c.reauth_required}
+                onChange={() => toggleAccount(c.id)}
+                className="accent-primary"
+              />
+              <span className="truncate">{c.email_address}</span>
+            </label>
+          ))}
+          {connections.some((c) => c.reauth_required) && (
+            <p className="text-[10.5px] text-muted-foreground font-mono leading-snug">
+              reauth required — reconnect to sync
+            </p>
+          )}
+        </div>
+      )}
       <button
         type="submit"
-        disabled={busy}
+        disabled={busy || noneSelected}
         className="w-full h-7 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
       >
         run ingest
@@ -278,6 +341,133 @@ function BackfillForm({
   );
 }
 
+type AccountStatus = "ok" | "amber" | "red";
+
+const ACCOUNT_STATUS_DOT: Record<AccountStatus, string> = {
+  ok: "bg-emerald-500",
+  amber: "bg-amber-500",
+  red: "bg-destructive",
+};
+
+const ACCOUNT_STATUS_LABEL: Record<AccountStatus, string> = {
+  ok: "syncing fine",
+  amber: "stale or syncing",
+  red: "reauth required",
+};
+
+function accountStatus(
+  connection: Connection,
+  accounts: AccountSyncHealth[],
+): AccountStatus {
+  const match = accounts.find((a) => a.provider_account_id === connection.id);
+  if (connection.reauth_required || match?.reason === "reauth_required") return "red";
+  if (!match || match.stale || match.sync_in_progress) return "amber";
+  return "ok";
+}
+
+function AccountsMenu({
+  connections,
+  health,
+  onDisconnect,
+  onConnectGmail,
+}: {
+  connections: Connection[];
+  health: SyncHealth | null;
+  onDisconnect: (connectionId: string) => void;
+  onConnectGmail: () => void;
+}) {
+  // Two-step confirm: first click arms it, second fires. Armed state lives
+  // here (not lifted) so it resets for free whenever the popover closes.
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  const accounts = health?.accounts ?? [];
+  return (
+    <div className="space-y-2.5">
+      <div className={fieldLabel}>connected accounts</div>
+      {connections.length === 0 ? (
+        <p className="text-[11px] text-muted-foreground font-mono">
+          no accounts connected
+        </p>
+      ) : (
+        <ul
+          className="space-y-1.5"
+          // Escape hatch: a click anywhere else in the list disarms an armed
+          // confirm. The disconnect button stops its own click from bubbling
+          // here, so arming/confirming a row doesn't immediately undo itself.
+          onClick={() => setConfirmingId(null)}
+        >
+          {connections.map((c) => {
+            const status = accountStatus(c, accounts);
+            const confirming = confirmingId === c.id;
+            return (
+              <li
+                key={c.id}
+                className="rounded border border-border px-2 py-1.5 space-y-1"
+              >
+                <div className="flex items-center gap-2">
+                  <span
+                    className={cn("h-1.5 w-1.5 rounded-full shrink-0", ACCOUNT_STATUS_DOT[status])}
+                    title={ACCOUNT_STATUS_LABEL[status]}
+                  />
+                  <span
+                    className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground/90"
+                    title={c.email_address}
+                  >
+                    {c.email_address}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      // Don't let this reach the list's onClick, which
+                      // disarms on any click outside the button itself.
+                      e.stopPropagation();
+                      if (confirming) {
+                        setConfirmingId(null);
+                        onDisconnect(c.id);
+                      } else {
+                        // Arming a different account's confirm disarms this
+                        // one — there's only ever one confirmingId.
+                        setConfirmingId(c.id);
+                      }
+                    }}
+                    title={
+                      confirming
+                        ? "disconnect — deletes its synced mail; reconnecting resyncs from scratch"
+                        : "disconnect this account"
+                    }
+                    className={cn(
+                      "shrink-0 font-mono text-[10.5px] px-1.5 py-0.5 rounded border cursor-pointer transition-colors",
+                      confirming
+                        ? "border-destructive/60 bg-destructive/15 text-destructive"
+                        : "border-border text-muted-foreground hover:text-destructive hover:border-destructive/40",
+                    )}
+                  >
+                    {confirming ? "confirm" : "disconnect"}
+                  </button>
+                </div>
+                {/* Visible, not just a hover title — a touch device (or anyone
+                    who doesn't hover) still has to see this before a
+                    mail-deleting confirm. */}
+                {confirming && (
+                  <p className="pl-3.5 text-[10.5px] font-mono text-destructive leading-snug">
+                    deletes this account&apos;s synced mail — reconnecting resyncs from scratch
+                  </p>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      <button
+        type="button"
+        onClick={onConnectGmail}
+        className="w-full h-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
+      >
+        connect another gmail
+      </button>
+    </div>
+  );
+}
+
 export function TopBar({
   user,
   overview,
@@ -299,6 +489,12 @@ export function TopBar({
   onTheme,
   autoSync,
   onAutoSync,
+  connections,
+  health,
+  accountsOpen,
+  onAccountsOpenChange,
+  onConnectGmail,
+  onDisconnect,
 }: Props) {
   const s = overview?.summary;
   const ThemeIcon = THEME_ICONS[theme];
@@ -358,6 +554,7 @@ export function TopBar({
             }}
             autoSync={autoSync}
             onAutoSync={onAutoSync}
+            connections={connections}
           />
         </Popover>
 
@@ -424,9 +621,29 @@ export function TopBar({
 
       <div className="hidden md:block mx-1 h-5 w-px bg-border" />
 
-      <span className="hidden md:inline text-[11.5px] font-mono text-muted-foreground truncate max-w-[180px]">
-        {user?.email ?? "—"}
-      </span>
+      <div className="hidden md:block">
+        <Popover
+          open={accountsOpen}
+          onOpenChange={onAccountsOpenChange}
+          trigger={
+            <button
+              onClick={() => onAccountsOpenChange(!accountsOpen)}
+              aria-expanded={accountsOpen}
+              aria-label="Gmail accounts"
+              className="h-7 px-2 rounded border border-transparent hover:border-border hover:bg-accent text-[11.5px] font-mono text-muted-foreground hover:text-foreground truncate max-w-[180px] cursor-pointer transition-colors"
+            >
+              {user?.email ?? "—"}
+            </button>
+          }
+        >
+          <AccountsMenu
+            connections={connections}
+            health={health}
+            onDisconnect={onDisconnect}
+            onConnectGmail={onConnectGmail}
+          />
+        </Popover>
+      </div>
       <button
         onClick={onLogout}
         // "everywhere" because this revokes the session server-side, not just in

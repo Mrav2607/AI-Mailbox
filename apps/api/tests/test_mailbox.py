@@ -5,13 +5,15 @@ from app.db.models import MailMessage
 from app.routes import mailbox
 
 
-def test_triage_items_include_latest_message_sender(monkeypatch):
+def test_triage_items_include_latest_message_sender_and_account_email(monkeypatch):
     thread_id = uuid4()
     message_id = uuid4()
+    account_id = uuid4()
     thread = SimpleNamespace(
         id=thread_id,
         subject="Status update",
         last_message_at=None,
+        provider_account_id=account_id,
     )
     message = SimpleNamespace(
         id=message_id,
@@ -33,18 +35,26 @@ def test_triage_items_include_latest_message_sender(monkeypatch):
     )
 
     class Result:
+        def __init__(self, rows):
+            self._rows = rows
+
         def scalars(self):
             return self
 
         def all(self):
-            return []
+            return self._rows
 
     class DB:
         def execute(self, statement):
-            return Result()
+            # The classification lookup queries with no rows to return; the
+            # account-email lookup is the one that matters here.
+            if "provider_account" in str(statement):
+                return Result([(account_id, "owner@gmail.example")])
+            return Result([])
 
     [item] = mailbox._assemble_triage_items(DB(), [thread])
 
     assert captured["thread_ids"] == [thread_id]
     assert MailMessage.sender in captured["columns"]
     assert item["latest_message_sender"] == '"Ada Lovelace" <ada@example.com>'
+    assert item["account_email"] == "owner@gmail.example"

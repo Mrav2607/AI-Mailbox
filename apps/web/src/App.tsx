@@ -8,42 +8,53 @@ import {
   useState,
 } from "react";
 import {
+  allRunsDeduplicated,
   ApiError,
   classifyBackfill,
   classifyQueue,
+  deleteConnection,
   deleteThread,
   flushDeleteThread,
   getCounts,
   getMe,
+  getSyncHealth,
   googleAuthCallback,
+  googleConnectCallback,
+  googleConnectStart,
   getOverview,
   getThread,
   getTriage,
   ingestGmail,
+  listConnections,
   reclassify,
   searchThreads,
   setThreadDone,
   revokeAllTokens,
   setToken,
+  sumIngestResults,
   waitForTask,
-  waitForSyncRun,
+  waitForSyncRuns,
   WORKER_TASK_TIMEOUT_MS,
 } from "@/lib/api";
-import type { TaskResult } from "@/lib/api";
+import type { SyncHealth, SyncRunStatus, TaskResult } from "@/lib/api";
 import { BUCKET_KEYS } from "@/lib/labels";
 import { gmailThreadUrl } from "@/lib/utils";
 import type {
   BackfillOptions,
   BucketKey,
+  Connection,
   IngestOptions,
   Label,
   Overview,
   ThreadDetail,
   TriageItem,
+  TriageSort,
   User,
 } from "@/lib/types";
 import { ALL_LABELS } from "@/lib/types";
 import { toast } from "sonner";
+import { createLiveSearch, type LiveSearchController } from "@/lib/live-search";
+import { emailLocalPart } from "@/lib/sender";
 
 import { BucketSidebar } from "@/components/console/BucketSidebar";
 import { ThreadList } from "@/components/console/ThreadList";
@@ -52,6 +63,9 @@ import { TopBar } from "@/components/console/TopBar";
 import { CommandPalette } from "@/components/console/CommandPalette";
 import { Shortcuts } from "@/components/console/Shortcuts";
 import { LoginScreen } from "@/components/console/LoginScreen";
+import { VerifyEmailScreen } from "@/components/console/VerifyEmailScreen";
+import { ResetPasswordScreen } from "@/components/console/ResetPasswordScreen";
+import { GoogleMark } from "@/components/console/GoogleMark";
 import {
   shouldSuppressConsoleHotkeys,
   useHotkeys,
@@ -73,9 +87,28 @@ import {
 import { useIsNarrow } from "@/lib/use-viewport";
 import { applyTheme, resolveTheme, watchSystemTheme } from "@/lib/theme";
 import type { ThemePref } from "@/lib/theme";
+import { extractStateFromAuthUrl, saveOauthBinding, takeOauthBinding } from "@/lib/oauthBinding";
 import { PanelRightOpen, Search, X } from "lucide-react";
 
-type SortMode = "recent" | "confidence_asc" | "confidence_desc";
+type SortMode = "recent" | "confidence_asc" | "confidence_desc" | "account";
+
+const nextSortMode = (m: SortMode): SortMode =>
+  m === "recent"
+    ? "confidence_asc"
+    : m === "confidence_asc"
+      ? "confidence_desc"
+      : m === "confidence_desc"
+        ? "account"
+        : "recent";
+
+// One triage page. Infinite scroll fetches this many rows at a time; the
+// server telling us back fewer than this is how we know we've hit the end.
+const PAGE_SIZE = 200;
+
+// How long to wait after a keystroke before live search re-queries the
+// server, and how short a query can be before it's not worth searching yet.
+const LIVE_SEARCH_DEBOUNCE_MS = 300;
+const LIVE_SEARCH_MIN_LENGTH = 2;
 
 // Which chrome panels are visible (`prediction` is the collapsible bar inside
 // the detail pane). Persisted (with the pane arrangement and sizes, see
@@ -115,6 +148,9 @@ function formatSyncTime(iso: string | null): string {
 export default function Console() {
   const [user, setUser] = useState<User | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  const pathname = window.location.pathname;
+  const isEmailAuthScreen =
+    pathname === "/auth/verify-email" || pathname === "/auth/reset-password";
   const isNarrow = useIsNarrow();
   const [narrowPane, setNarrowPane] = useState<
     "buckets" | "list" | "reading"
@@ -136,8 +172,15 @@ export default function Console() {
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const [firstListLoadSettled, setFirstListLoadSettled] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Scoped to a single connected account; null means "every account".
+  const [accountFilter, setAccountFilter] = useState<string | null>(null);
 
   const [overview, setOverview] = useState<Overview | null>(null);
+  const [refreshedHealth, setRefreshedHealth] = useState<SyncHealth | null>(null);
+  const [connections, setConnections] = useState<Connection[]>([]);
+  const [accountsOpen, setAccountsOpen] = useState(false);
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [thread, setThread] = useState<ThreadDetail | null>(null);
@@ -152,6 +195,9 @@ export default function Console() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [sortMode, setSortMode] = useState<SortMode>("recent");
+  // Only "account" needs the server's cooperation (grouping is stable across
+  // pages); confidence sort stays a client-side reorder of whatever's loaded.
+  const serverSort: TriageSort = sortMode === "account" ? "account" : "recency";
 
   const [panels, setPanels] = useState<Panels>({
     sidebar: INITIAL_UI.sidebar,
@@ -199,6 +245,20 @@ export default function Console() {
   );
   const panelsRef = useRef(panels);
   panelsRef.current = panels;
+  const itemsRef = useRef<TriageItem[]>([]);
+  itemsRef.current = items;
+  const accountFilterRef = useRef(accountFilter);
+  accountFilterRef.current = accountFilter;
+  const serverSortRef = useRef(serverSort);
+  serverSortRef.current = serverSort;
+  // Raw (pre-pendingDeletes-filter) server offset to fetch next; advances by
+  // the full page length so deleted-but-still-server-side rows don't shift it.
+  const nextOffsetRef = useRef(0);
+  // Bumped on every page-0 reset so a loadMore response that resolves after a
+  // newer reset started can be told apart from the page it thinks it's for.
+  const pagingGenRef = useRef(0);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const liveSearchRef = useRef<LiveSearchController | null>(null);
 
   useEffect(() => {
     try {
@@ -275,10 +335,10 @@ export default function Console() {
 
   // ---- auth ----------------------------------------------------------------
   useEffect(() => {
+    if (isEmailAuthScreen) return;
     (async () => {
-      // If we're landing on the Google OAuth callback, exchange the `code` for a
-      // session token before the normal session check. The redirect URL is then
-      // scrubbed so a refresh doesn't replay a single-use code.
+      // The browser binding chooses the allowed callback endpoint and prevents
+      // an OAuth response from a different tab from being exchanged here.
       if (
         window.location.pathname.endsWith("/auth/google/callback") &&
         !oauthExchangeStarted
@@ -287,17 +347,47 @@ export default function Console() {
         const params = new URLSearchParams(window.location.search);
         const code = params.get("code");
         const oauthError = params.get("error");
-        try {
-          if (oauthError) {
-            toast.error(`google sign-in cancelled (${oauthError})`);
-          } else if (code) {
-            const res = await googleAuthCallback(code, params.get("state"));
-            setToken(res.access_token);
-          }
-        } catch (e) {
-          toast.error((e as Error).message || "google sign-in failed");
-        } finally {
+        const state = params.get("state");
+        const binding = takeOauthBinding();
+        if (!binding || binding.state !== state) {
           window.history.replaceState({}, "", "/");
+          toast.error("sign-in was interrupted — try again");
+        } else {
+          try {
+            if (oauthError || !code) {
+              throw new Error("google sign-in was interrupted");
+            }
+            if (binding.mode === "login") {
+              const res = await googleAuthCallback(code, state);
+              setToken(res.access_token);
+              setUser(res.user);
+            } else {
+              const res = await googleConnectCallback(code, state);
+              toast.success(`${res.provider_email} connected — syncing`);
+              try {
+                setRefreshedHealth(await getSyncHealth());
+              } catch {
+                // The normal health poll will retry if this immediate refresh fails.
+              }
+              try {
+                setConnections(await listConnections());
+              } catch {
+                // The post-auth effect refreshes connections too; not fatal here.
+              }
+            }
+          } catch (e) {
+            if (binding.mode === "connect" && e instanceof ApiError && e.status === 409) {
+              toast.error(e.message);
+            } else {
+              toast.error(
+                binding.mode === "connect"
+                  ? "gmail connection failed"
+                  : (e as Error).message || "google sign-in failed",
+              );
+            }
+          } finally {
+            window.history.replaceState({}, "", "/");
+          }
         }
       }
 
@@ -313,7 +403,7 @@ export default function Console() {
         setAuthChecked(true);
       }
     })();
-  }, []);
+  }, [isEmailAuthScreen]);
 
   const handleSessionExpired = useCallback(() => {
     setToken(null);
@@ -331,15 +421,27 @@ export default function Console() {
   }, [handleSessionExpired]);
 
   const refreshCounts = useCallback(async () => {
-    // Server aggregates counts across the whole mailbox, so the sidebar totals
-    // don't cap at a single triage page.
+    // Server aggregates counts across the whole mailbox (scoped to the active
+    // account filter, if any), so the sidebar totals don't cap at a single
+    // triage page.
     try {
-      setAllCounts(await getCounts());
+      setAllCounts(await getCounts(accountFilterRef.current));
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) handleSessionExpired();
     }
   }, [handleSessionExpired]);
 
+  const refreshConnections = useCallback(async () => {
+    try {
+      setConnections(await listConnections());
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) handleSessionExpired();
+    }
+  }, [handleSessionExpired]);
+
+  // The page-0 reset: always starts over at offset 0 under the current
+  // sort/account filter (read from refs so this callback's identity — and
+  // every effect keyed on it — doesn't change every time either one flips).
   const refreshList = useCallback(
     async (b: BucketKey, opts?: { quiet?: boolean }) => {
       const quiet = opts?.quiet ?? false;
@@ -347,12 +449,36 @@ export default function Console() {
       // touch the selection — rows may shift, but the open thread stays open.
       if (!quiet) setListLoading(true);
       setListError(null);
+      const generation = ++pagingGenRef.current;
       try {
-        const res = await getTriage(b, 200);
+        const res = await getTriage(b, PAGE_SIZE, {
+          offset: 0,
+          sort: serverSortRef.current,
+          accountId: accountFilterRef.current,
+        });
+        if (generation !== pagingGenRef.current) return; // superseded by a newer reset
+        const raw = res.items;
         // Rows mid-undo-window are already gone from the UI but not yet from
         // the server; a refresh must not resurrect them.
-        const rows = res.items.filter((i) => !pendingDeletes.current.has(i.thread_id));
-        setItems(rows);
+        const rows = raw.filter((i) => !pendingDeletes.current.has(i.thread_id));
+        if (quiet && itemsRef.current.length > PAGE_SIZE) {
+          // The operator has paged deep — a background refresh must not
+          // collapse that back to one page. Update rows the fetch still
+          // knows about in place, prepend anything genuinely new, and leave
+          // the rest of the loaded tail untouched. This fetch only covers
+          // page 0, so nextOffsetRef/hasMore must stay as they were -- setting
+          // them from `raw` here would rewind pagination to page 0 and let
+          // the load-more sentinel come back after the list was exhausted.
+          const rowsById = new Map(rows.map((r) => [r.thread_id, r]));
+          const existingIds = new Set(itemsRef.current.map((i) => i.thread_id));
+          const freshIds = rows.filter((r) => !existingIds.has(r.thread_id));
+          const updatedTail = itemsRef.current.map((i) => rowsById.get(i.thread_id) ?? i);
+          setItems([...freshIds, ...updatedTail]);
+        } else {
+          nextOffsetRef.current = raw.length;
+          setHasMore(raw.length === PAGE_SIZE);
+          setItems(rows);
+        }
         if (!quiet) {
           // ensure a valid selection
           setSelectedId((prev) => {
@@ -376,6 +502,39 @@ export default function Console() {
     [handleSessionExpired],
   );
 
+  // Infinite scroll: fetches the next page at the server offset already
+  // reached and appends it. Guarded against firing during a search, a
+  // page-0 reset already underway, or while another page is loading.
+  const loadMore = useCallback(async () => {
+    if (!hasMore || loadingMore || listLoading || searchMode) return;
+    const generation = pagingGenRef.current;
+    setLoadingMore(true);
+    try {
+      const res = await getTriage(bucket, PAGE_SIZE, {
+        offset: nextOffsetRef.current,
+        sort: serverSortRef.current,
+        accountId: accountFilterRef.current,
+      });
+      if (generation !== pagingGenRef.current) return; // a reset landed first — drop this page
+      const raw = res.items;
+      nextOffsetRef.current += raw.length;
+      setHasMore(raw.length === PAGE_SIZE);
+      const existingIds = new Set(itemsRef.current.map((i) => i.thread_id));
+      const fresh = raw.filter(
+        (i) => !pendingDeletes.current.has(i.thread_id) && !existingIds.has(i.thread_id),
+      );
+      setItems((prev) => [...prev, ...fresh]);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      toast.error((e as Error).message ?? "failed to load more");
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [hasMore, loadingMore, listLoading, searchMode, bucket, handleSessionExpired]);
+
   const refreshAll = useCallback(
     (opts?: { quiet?: boolean }) =>
       Promise.all([refreshList(bucket, opts), refreshOverview(), refreshCounts()]),
@@ -398,26 +557,81 @@ export default function Console() {
     onSynced: () => refreshAll({ quiet: true }).then(() => undefined),
   });
 
+  useEffect(() => {
+    setRefreshedHealth(null);
+  }, [health]);
+
+  const activeHealth = refreshedHealth ?? health;
+
+  const handleConnectGmail = useCallback(async () => {
+    try {
+      const { auth_url } = await googleConnectStart();
+      const state = extractStateFromAuthUrl(auth_url);
+      if (state) saveOauthBinding({ mode: "connect", state, startedAt: Date.now() });
+      window.location.href = auth_url;
+    } catch (e) {
+      toast.error((e as Error).message || "gmail connection unavailable");
+    }
+  }, []);
+
+  // Disconnecting deletes the account's synced mail server-side (cascade), so
+  // the whole mailbox — not just the accounts list — needs to refresh after.
+  const handleDisconnect = useCallback(
+    async (connectionId: string) => {
+      try {
+        await deleteConnection(connectionId);
+        toast.success("gmail account disconnected");
+      } catch (e) {
+        toast.error((e as Error).message ?? "disconnect failed");
+        return;
+      }
+      await Promise.all([refreshConnections(), refreshAll()]);
+      try {
+        setRefreshedHealth(await getSyncHealth());
+      } catch {
+        // The normal health poll will retry if this immediate refresh fails.
+      }
+    },
+    [refreshConnections, refreshAll],
+  );
+
   // What to say when mail isn't flowing. Ranked by what the operator can
   // actually do about it: reconnecting beats knowing the mailbox is behind,
   // and both beat "the scheduler is down" (which only we can fix).
-  const syncStatus = useMemo((): { label: string; detail: string } | null => {
-    if (health?.reason === "reauth_required") {
+  const syncStatus = useMemo((): {
+    label: string;
+    detail: string;
+    actionable?: boolean;
+  } | null => {
+    if (activeHealth?.reason === "not_connected") {
       return {
-        label: "reconnect gmail",
-        detail: "Gmail access was revoked — reconnect the account to resume syncing",
+        label: "connect gmail",
+        detail: "No Gmail account is connected — connect one to start syncing.",
+        actionable: true,
       };
     }
-    if (health?.stale) {
+    if (activeHealth?.reason === "reauth_required") {
+      // With more than one connected account, name which one needs a
+      // reconnect instead of leaving the operator to guess.
+      const affected = (activeHealth.accounts ?? [])
+        .filter((a) => a.reason === "reauth_required")
+        .map((a) => a.email_address);
+      const detail =
+        (activeHealth.accounts?.length ?? 0) > 1 && affected.length > 0
+          ? `Gmail access was revoked for ${affected.join(", ")} — reconnect to resume syncing`
+          : "Gmail access was revoked — reconnect the account to resume syncing";
+      return { label: "reconnect gmail", detail, actionable: true };
+    }
+    if (activeHealth?.stale) {
       // A run being in flight softens the wording but never silences it: a
       // wedged sync retries for hours, so suppressing this while one is running
       // would hide the mailbox rotting behind it.
-      const since = `no successful sync since ${formatSyncTime(health.last_succeeded_at)}`;
-      return health.sync_in_progress
+      const since = `no successful sync since ${formatSyncTime(activeHealth.last_succeeded_at)}`;
+      return activeHealth.sync_in_progress
         ? { label: "syncing — mail is behind", detail: `${since}; a sync is running now` }
         : { label: "mail may be stale", detail: since };
     }
-    if (health && !health.scheduler_alive) {
+    if (activeHealth && !activeHealth.scheduler_alive) {
       return {
         label: "scheduler down",
         detail:
@@ -432,13 +646,14 @@ export default function Console() {
       };
     }
     return null;
-  }, [health, syncFailed]);
+  }, [activeHealth, syncFailed]);
 
   // initial + bucket changes. Switching buckets also exits any active search.
   // The new-mail pill deliberately survives bucket switches: it clears only on
   // explicit acknowledgment (pill click, `r`, manual ingest).
   useEffect(() => {
     if (!user) return;
+    liveSearchRef.current?.cancel();
     setSearchMode(false);
     setSearchResults([]);
     setQuery("");
@@ -449,7 +664,60 @@ export default function Console() {
     if (!user) return;
     refreshOverview();
     refreshCounts();
-  }, [user, refreshOverview, refreshCounts]);
+    refreshConnections();
+  }, [user, refreshOverview, refreshCounts, refreshConnections]);
+
+  // Account filter change: re-issue whatever's on screen under the new scope
+  // — a live search stays a search (just re-run against the new account),
+  // otherwise it's a paging reset — and the sidebar counts always follow.
+  useEffect(() => {
+    if (!user) return;
+    if (searchMode) {
+      const q = query.trim();
+      if (q) liveSearchRef.current?.flush(q);
+    } else {
+      refreshList(bucket);
+    }
+    refreshCounts();
+    // Only the filter itself should retrigger this — refreshList/refreshCounts
+    // read the current filter via ref, and re-running on every render of
+    // bucket/searchMode/query would refetch far more than the filter changed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountFilter]);
+
+  // Server-side sort change: only "account" vs "recency" actually changes
+  // what the server returns, so this only fires crossing that boundary (a
+  // confidence_asc <-> confidence_desc flip re-sorts client-side, no refetch).
+  useEffect(() => {
+    if (!user || searchMode) return;
+    refreshList(bucket);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverSort]);
+
+  // A connection dropping out from under an active filter (disconnected mid-
+  // session) falls back to "all accounts" instead of silently showing nothing.
+  useEffect(() => {
+    if (accountFilter && !connections.some((c) => c.id === accountFilter)) {
+      setAccountFilter(null);
+    }
+  }, [connections, accountFilter]);
+
+  // Infinite scroll trigger: fires loadMore once the sentinel row scrolls
+  // near the bottom of the list's own scroll container (not the viewport).
+  useEffect(() => {
+    if (searchMode || !hasMore) return;
+    const root = listScrollRef.current;
+    const target = sentinelRef.current;
+    if (!root || !target) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) loadMore();
+      },
+      { root, rootMargin: "400px" },
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [hasMore, searchMode, loadMore]);
 
   // thread detail
   useEffect(() => {
@@ -481,8 +749,10 @@ export default function Console() {
   }, [selectedId, handleSessionExpired]);
 
   // ---- derived: sorted items ----------------------------------------------
+  // "recent" and "account" both come back already ordered from the server;
+  // only the confidence sorts need a client-side reorder of the loaded page.
   const sortedItems = useMemo(() => {
-    if (sortMode === "recent") return items;
+    if (sortMode === "recent" || sortMode === "account") return items;
     const arr = [...items];
     arr.sort((a, b) => {
       const ac = a.classification.confidence ?? -1;
@@ -492,11 +762,25 @@ export default function Console() {
     return arr;
   }, [items, sortMode]);
 
+  // /mail/search has no sort param, so "account" grouping over search
+  // results is purely a client-side reorder of whatever relevance order the
+  // server returned — stable by account email, then most-recent-first.
+  const sortedSearchResults = useMemo(() => {
+    if (sortMode !== "account") return searchResults;
+    return [...searchResults].sort((a, b) => {
+      const byAccount = a.account_email.localeCompare(b.account_email);
+      if (byAccount !== 0) return byAccount;
+      const at = a.last_message_at ? Date.parse(a.last_message_at) : 0;
+      const bt = b.last_message_at ? Date.parse(b.last_message_at) : 0;
+      return bt - at;
+    });
+  }, [searchResults, sortMode]);
+
   // What the list actually shows: whole-mailbox search results when a search is
   // running, otherwise the bucket list with the instant client-side filter
   // applied on top.
   const visibleItems = useMemo(() => {
-    if (searchMode) return searchResults;
+    if (searchMode) return sortedSearchResults;
     const q = query.trim().toLowerCase();
     if (!q) return sortedItems;
     return sortedItems.filter(
@@ -504,7 +788,7 @@ export default function Console() {
         (it.subject ?? "").toLowerCase().includes(q) ||
         (it.latest_message_snippet ?? "").toLowerCase().includes(q),
     );
-  }, [searchMode, searchResults, query, sortedItems]);
+  }, [searchMode, sortedSearchResults, query, sortedItems]);
 
   const selectedIndex = useMemo(
     () => visibleItems.findIndex((i) => i.thread_id === selectedId),
@@ -534,29 +818,58 @@ export default function Console() {
     [visibleItems, selectedIndex],
   );
 
-  // ---- search --------------------------------------------------------------
-  const runSearch = useCallback(async () => {
-    const q = query.trim();
-    if (!q) return;
-    setSearching(true);
-    try {
-      const res = await searchThreads(q, 100);
-      const rows = res.items.filter((i) => !pendingDeletes.current.has(i.thread_id));
-      setSearchResults(rows);
-      setSearchMode(true);
-      setSelectedId(rows[0]?.thread_id ?? null);
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 401) {
-        handleSessionExpired();
-        return;
+  // ---- search ----------------------------------------------------------
+  // The actual fetch behind both live typing (debounced) and Enter (flushed);
+  // createLiveSearch below owns the debounce/abort orchestration and calls
+  // this once it decides a request should go out.
+  const runLiveSearch = useCallback(
+    async (q: string, signal: AbortSignal, fromFlush: boolean) => {
+      setSearching(true);
+      try {
+        const res = await searchThreads(q, 200, { accountId: accountFilterRef.current, signal });
+        const rows = res.items.filter((i) => !pendingDeletes.current.has(i.thread_id));
+        setSearchResults(rows);
+        setSearchMode(true);
+        // Keep the current selection if it's still in the fresh results,
+        // otherwise fall back to the first row — same rule Enter uses.
+        setSelectedId((prev) =>
+          prev && rows.some((i) => i.thread_id === prev) ? prev : (rows[0]?.thread_id ?? null),
+        );
+      } catch (e) {
+        if (e instanceof DOMException && e.name === "AbortError") return; // superseded, stay quiet
+        if (e instanceof ApiError && e.status === 401) {
+          handleSessionExpired();
+          return;
+        }
+        if (e instanceof ApiError && e.status === 429) return; // rate-limited — keep showing what we have
+        if (fromFlush) toast.error((e as Error).message ?? "search failed");
+      } finally {
+        // An aborted request's finally can still run after its successor
+        // already flipped searching back on — only the request that's
+        // actually still current gets to turn the spinner off.
+        if (!signal.aborted) setSearching(false);
       }
-      toast.error((e as Error).message ?? "search failed");
-    } finally {
-      setSearching(false);
-    }
-  }, [query, handleSessionExpired]);
+    },
+    [handleSessionExpired],
+  );
+
+  useEffect(() => {
+    liveSearchRef.current = createLiveSearch({
+      debounceMs: LIVE_SEARCH_DEBOUNCE_MS,
+      minLength: LIVE_SEARCH_MIN_LENGTH,
+      run: runLiveSearch,
+      onBelowMin: () => {
+        // Below the minimum length there's nothing worth asking the server —
+        // drop back to the client-side filter over the loaded bucket.
+        setSearchMode(false);
+        setSearchResults([]);
+      },
+    });
+    return () => liveSearchRef.current?.cancel();
+  }, [runLiveSearch]);
 
   const clearSearch = useCallback(() => {
+    liveSearchRef.current?.cancel();
     setQuery("");
     setSearchMode(false);
     setSearchResults([]);
@@ -720,7 +1033,7 @@ export default function Console() {
     const t = thread?.thread;
     if (!t || t.id !== selectedId) return;
     if (t.provider !== "gmail" || !t.provider_thread_id) return;
-    window.open(gmailThreadUrl(t.provider_thread_id), "_blank", "noopener");
+    window.open(gmailThreadUrl(t.provider_thread_id, t.account_email), "_blank", "noopener");
   }, [thread, selectedId]);
 
   // Shared tail for every queued worker job (ingest / backfill / classify):
@@ -760,36 +1073,49 @@ export default function Console() {
     async (opts: IngestOptions) => {
       setIngesting(true);
       try {
-        const intendedMode = opts.refreshExisting ? "refresh" : "manual";
-        let r = await ingestGmail(opts.maxResults, opts.classify, opts.refreshExisting);
-        let final = r;
-        let retried = false;
-        for (;;) {
-          if (r.deduplicated) {
-            toast("another sync is already running — waiting for it");
-          }
-          final = r.ready ? r : await waitForSyncRun(r.run_id);
-          if (!final.ready) {
-            toast.message("ingest still running in the background — showing what's landed so far");
-            await refreshAll({ quiet: true });
-            return;
-          }
-          if (!r.deduplicated || r.mode === intendedMode) break;
-          if (retried) {
-            toast("another sync took precedence again — please try again");
-            return;
-          }
-          retried = true;
-          r = await ingestGmail(opts.maxResults, opts.classify, opts.refreshExisting);
-        }
-        if (final.status === "failed" || final.result?.status === "error") {
-          throw new Error(final.result?.detail ?? final.error ?? "ingest failed");
-        }
-        const res = final.result ?? {};
-        toast.success(
-          `ingest complete · ${res.threads_upserted ?? r.new_threads ?? 0} threads · ` +
-            `${res.messages_upserted ?? 0} msgs`,
+        // One run per connected account now. Zero runs means nothing's
+        // connected — not a failure, just nothing to do until the operator
+        // connects a Gmail account.
+        const runs = await ingestGmail(
+          opts.maxResults,
+          opts.classify,
+          opts.refreshExisting,
+          false,
+          opts.accountIds,
         );
+        if (runs.length === 0) {
+          toast.error("no Gmail account connected", {
+            description: "connect one to start syncing",
+            action: { label: "connect", onClick: handleConnectGmail },
+          });
+          return;
+        }
+        // Every run landing deduplicated means some other caller (another
+        // tab, auto-sync) already had every account covered — nothing new
+        // was queued here, so this isn't "ingest complete".
+        if (allRunsDeduplicated(runs)) {
+          toast("another sync is already running — waiting for it");
+        }
+        const settled = await waitForSyncRuns(runs);
+        const finals: SyncRunStatus[] = [];
+        const failures: string[] = [];
+        for (const s of settled) {
+          if (s.status === "fulfilled") finals.push(s.value);
+          else failures.push((s.reason as Error)?.message ?? "ingest failed");
+        }
+        for (const f of finals) {
+          if (f.status === "failed" || f.result?.status === "error") {
+            failures.push(f.result?.detail ?? f.error ?? "ingest failed");
+          }
+        }
+        if (failures.length > 0) throw new Error(failures[0]);
+        if (finals.some((f) => !f.ready)) {
+          toast.message("ingest still running in the background — showing what's landed so far");
+          await refreshAll({ quiet: true });
+          return;
+        }
+        const { threads, messages } = sumIngestResults(finals);
+        toast.success(`ingest complete · ${threads} threads · ${messages} msgs`);
         await refreshAll();
         if (user) broadcastSyncComplete(user.id);
         // A deliberate pull acknowledges everything it just surfaced.
@@ -800,7 +1126,7 @@ export default function Console() {
         setIngesting(false);
       }
     },
-    [refreshAll, clearNew, user],
+    [refreshAll, clearNew, user, handleConnectGmail],
   );
 
   const doBackfill = useCallback(
@@ -1035,13 +1361,7 @@ export default function Console() {
             ?.scrollIntoView({ block: "nearest" });
         }
       } else if (e.key === "c") {
-        setSortMode((m) =>
-          m === "confidence_asc"
-            ? "confidence_desc"
-            : m === "confidence_desc"
-              ? "recent"
-              : "confidence_asc",
-        );
+        setSortMode(nextSortMode);
       } else if (e.key === "r") {
         clearNew();
         refreshList(bucket);
@@ -1084,11 +1404,46 @@ export default function Console() {
   );
 
   // ---- render --------------------------------------------------------------
+  // Every branch must render <Toaster> as the fragment's second child: sonner
+  // drops toasts fired while no Toaster is mounted (it never replays them), and
+  // keeping the same tree position preserves one instance across branch swaps.
+  // The OAuth callback outcome toasts fire while the "checking session…" branch
+  // is on screen, so losing it there made connect failures look like silent
+  // bounces back to the console.
+  if (pathname === "/auth/verify-email") {
+    return (
+      <>
+        <VerifyEmailScreen
+          onAuthed={(u) => {
+            setUser(u);
+            setAuthChecked(true);
+          }}
+        />
+        <Toaster theme={resolvedTheme} />
+      </>
+    );
+  }
+  if (pathname === "/auth/reset-password") {
+    return (
+      <>
+        <ResetPasswordScreen
+          onAuthed={(u) => {
+            setUser(u);
+            setAuthChecked(true);
+          }}
+        />
+        <Toaster theme={resolvedTheme} />
+      </>
+    );
+  }
   if (!authChecked) {
     return (
-      <div className="min-h-screen flex items-center justify-center text-muted-foreground font-mono text-sm">
-        checking session…
-      </div>
+      <>
+        <div className="min-h-screen flex items-center justify-center text-muted-foreground font-mono text-sm">
+          checking session…
+        </div>
+        <Toaster theme={resolvedTheme} />
+      </>
     );
   }
   if (!user) {
@@ -1109,7 +1464,13 @@ export default function Console() {
       ? "recent"
       : sortMode === "confidence_asc"
         ? "conf ↑"
-        : "conf ↓";
+        : sortMode === "confidence_desc"
+          ? "conf ↓"
+          : "account";
+
+  // Account badges only earn their keep once there's something to
+  // disambiguate — a single-account mailbox doesn't need them.
+  const multiAccount = connections.length > 1;
 
   const sidebarPane = (
     <BucketSidebar
@@ -1152,16 +1513,27 @@ export default function Console() {
             {pendingNew >= NEW_MAIL_SCAN_LIMIT ? `${NEW_MAIL_SCAN_LIMIT}+` : pendingNew} new
           </button>
         )}
-        {syncStatus && (
-          <span
-            data-testid="sync-failed-dot"
-            title={syncStatus.detail}
-            className="shrink-0 flex items-center gap-1 text-[11px] text-destructive/90"
-          >
-            <span className="h-1.5 w-1.5 rounded-full bg-destructive/70" />
-            {syncStatus.label}
-          </span>
-        )}
+        {syncStatus &&
+          (syncStatus.actionable ? (
+            <button
+              data-testid="sync-failed-dot"
+              onClick={handleConnectGmail}
+              title={syncStatus.detail}
+              className="shrink-0 h-6 px-2 rounded-full border border-amber-500/40 bg-amber-500/10 text-[11px] text-amber-700 dark:text-amber-300 hover:bg-amber-500/20 cursor-pointer transition-colors flex items-center gap-1"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-500/70" />
+              {syncStatus.label}
+            </button>
+          ) : (
+            <span
+              data-testid="sync-failed-dot"
+              title={syncStatus.detail}
+              className="shrink-0 flex items-center gap-1 text-[11px] text-destructive/90"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-destructive/70" />
+              {syncStatus.label}
+            </span>
+          ))}
 
         <div className="flex-1 flex items-center min-w-0 max-w-[380px] ml-1">
           <div className="flex items-center gap-1.5 w-full rounded border border-border bg-background px-2 h-6 focus-within:border-primary transition-colors">
@@ -1172,19 +1544,21 @@ export default function Console() {
               ref={searchInputRef}
               value={query}
               onChange={(e) => {
-                setQuery(e.target.value);
-                if (searchMode) {
-                  setSearchMode(false);
-                  setSearchResults([]);
-                }
+                const v = e.target.value;
+                setQuery(v);
+                // Typing no longer exits searchMode itself — the live search
+                // controller below decides: fresh results replace what's
+                // showing, or (below minLength) onBelowMin drops back to the
+                // client-side filter.
+                liveSearchRef.current?.onInput(v);
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   e.preventDefault();
-                  runSearch();
+                  liveSearchRef.current?.flush(query);
                 }
               }}
-              placeholder="filter…  ↵ to search all buckets"
+              placeholder="search…  ↵ to search all buckets"
               className="flex-1 min-w-0 bg-transparent outline-none text-[12px] placeholder:text-muted-foreground/60"
             />
             {(query || searchMode) && (
@@ -1199,17 +1573,25 @@ export default function Console() {
           </div>
         </div>
 
+        {multiAccount && (
+          <select
+            value={accountFilter ?? ""}
+            onChange={(e) => setAccountFilter(e.target.value || null)}
+            aria-label="Filter by account"
+            className="shrink-0 px-2 py-0.5 rounded border border-border bg-transparent hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer transition-colors font-mono text-[11.5px]"
+          >
+            <option value="">all accounts</option>
+            {connections.map((c) => (
+              <option key={c.id} value={c.id}>
+                {emailLocalPart(c.email_address)}
+              </option>
+            ))}
+          </select>
+        )}
+
         <button
           data-tour="sort"
-          onClick={() =>
-            setSortMode((m) =>
-              m === "confidence_asc"
-                ? "confidence_desc"
-                : m === "confidence_desc"
-                  ? "recent"
-                  : "confidence_asc",
-            )
-          }
+          onClick={() => setSortMode(nextSortMode)}
           title="press c"
           aria-label={`Sort order: ${sortBadge}. Press c to cycle.`}
           className="shrink-0 px-2 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
@@ -1233,18 +1615,52 @@ export default function Console() {
         ref={listScrollRef}
         className="flex-1 overflow-y-auto scrollbar-thin"
       >
-        <ThreadList
-          items={visibleItems}
-          selectedId={selectedId}
-          onSelect={(id) => {
-            setSelectedId(id);
-            if (isNarrow) setNarrowPane("reading");
-          }}
-          showLabel={searchMode || bucket === "all" || bucket === "done"}
-          narrow={isNarrow}
-          loading={listLoading || searching}
-          error={listError}
-        />
+        {visibleItems.length === 0 &&
+        activeHealth?.reason === "not_connected" &&
+        !listLoading &&
+        !searching &&
+        !listError ? (
+          <div className="h-full flex items-center justify-center p-6">
+            <div className="w-full max-w-sm rounded-lg border border-border bg-[var(--color-panel)] p-6 text-center font-mono shadow-lg">
+              <div className="mx-auto mb-3 h-10 w-10 rounded bg-primary/15 border border-primary/40 flex items-center justify-center">
+                <GoogleMark />
+              </div>
+              <div className="text-[13px] font-semibold text-foreground">
+                Connect your Gmail to start triaging
+              </div>
+              <button
+                type="button"
+                onClick={handleConnectGmail}
+                className="mt-5 w-full h-9 rounded border border-border bg-background font-mono text-[13px] font-semibold flex items-center justify-center gap-2 hover:bg-accent cursor-pointer transition-colors"
+              >
+                <GoogleMark />
+                Connect Gmail
+              </button>
+            </div>
+          </div>
+        ) : (
+          <ThreadList
+            items={visibleItems}
+            selectedId={selectedId}
+            onSelect={(id) => {
+              setSelectedId(id);
+              if (isNarrow) setNarrowPane("reading");
+            }}
+            showLabel={searchMode || bucket === "all" || bucket === "done"}
+            showAccount={multiAccount}
+            narrow={isNarrow}
+            loading={listLoading || searching}
+            error={listError}
+          />
+        )}
+        {!searchMode && hasMore && (
+          <div
+            ref={sentinelRef}
+            className="h-10 flex items-center justify-center font-mono text-[11px] text-muted-foreground"
+          >
+            {loadingMore ? "loading more…" : ""}
+          </div>
+        )}
       </div>
     </section>
   );
@@ -1260,6 +1676,7 @@ export default function Console() {
       onCollapse={isNarrow ? undefined : () => togglePanel("detail")}
       onDone={focusedItem ? () => doDone(focusedItem.thread_id) : undefined}
       onDelete={focusedItem ? () => doDelete(focusedItem.thread_id) : undefined}
+      showAccountBadge={multiAccount}
       side={arrangement.reading}
       predictionOpen={panels.prediction}
       onTogglePrediction={() => togglePanel("prediction")}
@@ -1267,108 +1684,116 @@ export default function Console() {
   );
 
   return (
-    // overflow-clip: no descendant (however hostile an email's CSS) may ever
-    // grow the page a scrollbar — panes own all scrolling.
-    <div className="h-screen flex flex-col overflow-clip bg-background text-foreground">
-      <TopBar
-        user={user}
-        overview={overview}
-        ingesting={ingesting}
-        backfilling={backfilling}
-        currentBucket={bucket}
-        onIngest={doIngest}
-        onBackfill={doBackfill}
-        ingestOpen={ingestOpen}
-        onIngestOpenChange={setIngestOpen}
-        backfillOpen={backfillOpen}
-        onBackfillOpenChange={setBackfillOpen}
-        layoutOpen={layoutOpen}
-        onLayoutOpenChange={setLayoutOpen}
-        arrangement={arrangement}
-        onArrangement={setArrangement}
-        theme={theme}
-        onTheme={setTheme}
-        autoSync={autoSync}
-        onAutoSync={setAutoSync}
-        onLogout={async () => {
-          // Revoke server-side first, so the token is dead even if someone has
-          // a copy of it. If that call fails we still clear locally — leaving
-          // the user stuck in a session they asked to leave would be worse —
-          // but we say so, because the token is still live out there.
-          try {
-            await revokeAllTokens();
-          } catch {
-            toast.error("signed out here, but couldn't revoke the session server-side");
-          } finally {
-            setToken(null);
-            setUser(null);
-          }
-        }}
-      />
-
-      {isNarrow ? (
-        <NarrowShell
-          pane={narrowPane}
-          onPaneChange={setNarrowPane}
-          buckets={sidebarPane}
-          list={listPane}
-          reading={detailPane}
-        />
-      ) : (
-        <ConsoleLayout
+    <>
+      {/* overflow-clip: no descendant (however hostile an email's CSS) may ever
+          grow the page a scrollbar — panes own all scrolling. */}
+      <div className="h-screen flex flex-col overflow-clip bg-background text-foreground">
+        <TopBar
+          user={user}
+          overview={overview}
+          ingesting={ingesting}
+          backfilling={backfilling}
+          currentBucket={bucket}
+          onIngest={doIngest}
+          onBackfill={doBackfill}
+          ingestOpen={ingestOpen}
+          onIngestOpenChange={setIngestOpen}
+          backfillOpen={backfillOpen}
+          onBackfillOpenChange={setBackfillOpen}
+          layoutOpen={layoutOpen}
+          onLayoutOpenChange={setLayoutOpen}
           arrangement={arrangement}
-          onArrangementChange={setArrangement}
-          sidebarVisible={panels.sidebar}
-          detailVisible={panels.detail}
-          onExpandSidebar={() => togglePanel("sidebar")}
-          paneSizes={paneSizes}
-          onPaneSizesChange={handlePaneSizes}
-          sidebar={sidebarPane}
-          list={listPane}
-          detail={detailPane}
+          onArrangement={setArrangement}
+          theme={theme}
+          onTheme={setTheme}
+          autoSync={autoSync}
+          onAutoSync={setAutoSync}
+          connections={connections}
+          health={activeHealth}
+          accountsOpen={accountsOpen}
+          onAccountsOpenChange={setAccountsOpen}
+          onConnectGmail={handleConnectGmail}
+          onDisconnect={handleDisconnect}
+          onLogout={async () => {
+            // Revoke server-side first, so the token is dead even if someone has
+            // a copy of it. If that call fails we still clear locally — leaving
+            // the user stuck in a session they asked to leave would be worse —
+            // but we say so, because the token is still live out there.
+            try {
+              await revokeAllTokens();
+            } catch {
+              toast.error("signed out here, but couldn't revoke the session server-side");
+            } finally {
+              setToken(null);
+              setUser(null);
+            }
+          }}
         />
-      )}
 
-      <CommandPalette
-        open={paletteOpen}
-        onOpenChange={setPaletteOpen}
-        onBucket={(b) => setBucket(b)}
-        onIngest={() => setIngestOpen(true)}
-        onBackfill={() => setBackfillOpen(true)}
-        onQueue={doQueue}
-        onReclassify={doReclassify}
-        hasFocusedThread={!!focusedItem}
-        onToggleSidebar={() => togglePanel("sidebar")}
-        onToggleDetail={() => togglePanel("detail")}
-        onTogglePrediction={() => togglePanel("prediction")}
-        onTheme={setTheme}
-        onAutoSync={setAutoSync}
-        onArrangement={(patch) => setArrangement((a) => ({ ...a, ...patch }))}
-        onFocusSearch={() =>
-          setTimeout(() => searchInputRef.current?.focus(), 60)
-        }
-        onDone={() => doDone()}
-        inDoneBucket={bucket === "done"}
-        onOpenGmail={openInGmail}
-        onDelete={() => doDelete()}
-        onRestartTour={restartTour}
-      />
-      <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
-      {!isNarrow && (tourActive || tourVersion < TOUR_VERSION) && (
-        <Suspense fallback={null}>
-          <OnboardingTour
-            run={tourActive}
-            stepIndex={tourStepIndex}
-            targetResolution={tourTargetResolution}
-            emptyThreadList={visibleItems.length === 0}
-            emptyDetail={!thread}
-            onStepChange={goToTourStep}
-            onFinish={finishTour}
-            onSkip={skipTour}
+        {isNarrow ? (
+          <NarrowShell
+            pane={narrowPane}
+            onPaneChange={setNarrowPane}
+            buckets={sidebarPane}
+            list={listPane}
+            reading={detailPane}
           />
-        </Suspense>
-      )}
+        ) : (
+          <ConsoleLayout
+            arrangement={arrangement}
+            onArrangementChange={setArrangement}
+            sidebarVisible={panels.sidebar}
+            detailVisible={panels.detail}
+            onExpandSidebar={() => togglePanel("sidebar")}
+            paneSizes={paneSizes}
+            onPaneSizesChange={handlePaneSizes}
+            sidebar={sidebarPane}
+            list={listPane}
+            detail={detailPane}
+          />
+        )}
+
+        <CommandPalette
+          open={paletteOpen}
+          onOpenChange={setPaletteOpen}
+          onBucket={(b) => setBucket(b)}
+          onIngest={() => setIngestOpen(true)}
+          onBackfill={() => setBackfillOpen(true)}
+          onQueue={doQueue}
+          onReclassify={doReclassify}
+          hasFocusedThread={!!focusedItem}
+          onToggleSidebar={() => togglePanel("sidebar")}
+          onToggleDetail={() => togglePanel("detail")}
+          onTogglePrediction={() => togglePanel("prediction")}
+          onTheme={setTheme}
+          onAutoSync={setAutoSync}
+          onArrangement={(patch) => setArrangement((a) => ({ ...a, ...patch }))}
+          onFocusSearch={() =>
+            setTimeout(() => searchInputRef.current?.focus(), 60)
+          }
+          onDone={() => doDone()}
+          inDoneBucket={bucket === "done"}
+          onOpenGmail={openInGmail}
+          onDelete={() => doDelete()}
+          onRestartTour={restartTour}
+        />
+        <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+        {!isNarrow && (tourActive || tourVersion < TOUR_VERSION) && (
+          <Suspense fallback={null}>
+            <OnboardingTour
+              run={tourActive}
+              stepIndex={tourStepIndex}
+              targetResolution={tourTargetResolution}
+              emptyThreadList={visibleItems.length === 0}
+              emptyDetail={!thread}
+              onStepChange={goToTourStep}
+              onFinish={finishTour}
+              onSkip={skipTour}
+            />
+          </Suspense>
+        )}
+      </div>
       <Toaster theme={resolvedTheme} />
-    </div>
+    </>
   );
 }

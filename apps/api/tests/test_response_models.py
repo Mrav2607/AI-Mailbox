@@ -15,7 +15,10 @@ from app.db.schemas.common import Response as ResponseModel
 from app.main import app
 
 # A 204 has no body to describe. Nothing else gets a pass.
-NO_BODY = {("/api/v1/mail/thread/{thread_id}", "DELETE")}
+NO_BODY = {
+    ("/api/v1/mail/thread/{thread_id}", "DELETE"),
+    ("/api/v1/auth/connections/{connection_id}", "DELETE"),
+}
 
 
 def _routes():

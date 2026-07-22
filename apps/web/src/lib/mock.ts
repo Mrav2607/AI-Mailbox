@@ -2,15 +2,38 @@ import type {
   BackfillOptions,
   BackfillResult,
   BucketKey,
+  Connection,
   Label,
   Overview,
+  SearchResponse,
   ThreadDetail,
   TriageItem,
   TriageResponse,
+  TriageSort,
   User,
 } from "./types";
 import { ALL_LABELS } from "./types";
 import { ApiError } from "./api";
+
+// Two connected Gmail accounts, so preview mode can demo the unified inbox
+// and the accounts menu without a live API. Mutable (deleteConnection needs
+// to remove one) — same store pattern as ALL/DONE below.
+let CONNECTIONS: Connection[] = [
+  {
+    id: "mock-acct-1",
+    provider: "gmail",
+    email_address: "operator@gmail.com",
+    created_at: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+    reauth_required: false,
+  },
+  {
+    id: "mock-acct-2",
+    provider: "gmail",
+    email_address: "ops-archive@gmail.com",
+    created_at: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+    reauth_required: false,
+  },
+];
 
 
 const SENDERS = [
@@ -80,6 +103,7 @@ function makeItems(count: number): TriageItem[] {
               : "gemini-1.5-flash"
           : null,
       },
+      account_email: CONNECTIONS[i % CONNECTIONS.length].email_address,
     });
   }
   return out;
@@ -87,7 +111,9 @@ function makeItems(count: number): TriageItem[] {
 
 
 
-const ALL = makeItems(140);
+// Big enough to cover a few pages at the app's PAGE_SIZE (200), so infinite
+// scroll and offset paging have something real to page through in preview.
+const ALL = makeItems(450);
 
 // Thread ids the operator has marked done — the mock's stand-in for the
 // server's done_at column. Done threads leave every open bucket.
@@ -97,6 +123,22 @@ export function mockUser(): User {
   return { id: "u_local", email: "operator@local.dev", display_name: "Operator" };
 }
 
+export function mockListConnections(): Connection[] {
+  return CONNECTIONS.map((c) => ({ ...c }));
+}
+
+// Mirrors the server: dropping a connection takes its synced mail with it.
+// Returns false (so the caller can 404) when the id isn't a live connection.
+export function mockDeleteConnection(id: string): boolean {
+  const removed = CONNECTIONS.find((c) => c.id === id);
+  if (!removed) return false;
+  CONNECTIONS = CONNECTIONS.filter((c) => c.id !== id);
+  for (let i = ALL.length - 1; i >= 0; i--) {
+    if (ALL[i].account_email === removed.email_address) ALL.splice(i, 1);
+  }
+  return true;
+}
+
 export function mockOverview(): Overview {
   const classified = ALL.filter((i) => i.classification.label).length;
   return {
@@ -104,7 +146,20 @@ export function mockOverview(): Overview {
   };
 }
 
-export function mockTriage(bucket: BucketKey, limit: number): TriageResponse {
+// Looks up a connection's email by id. Unknown/disconnected ids resolve to
+// undefined so callers can self-scope to "empty results", never throw —
+// mirrors the server's contract for a stale provider_account_id.
+function connectionEmail(accountId: string): string | undefined {
+  return CONNECTIONS.find((c) => c.id === accountId)?.email_address;
+}
+
+export function mockTriage(
+  bucket: BucketKey,
+  limit: number,
+  offset = 0,
+  accountId?: string | null,
+  sort: TriageSort = "recency",
+): TriageResponse {
   let items: TriageItem[];
   if (bucket === "done") items = ALL.filter((i) => DONE.has(i.thread_id));
   else {
@@ -114,10 +169,19 @@ export function mockTriage(bucket: BucketKey, limit: number): TriageResponse {
       items = open.filter((i) => !i.classification.label);
     else items = open.filter((i) => i.classification.label === bucket);
   }
-  return { bucket, items: items.slice(0, limit) };
+  if (accountId) {
+    const email = connectionEmail(accountId);
+    items = email ? items.filter((i) => i.account_email === email) : [];
+  }
+  if (sort === "account") {
+    // ALL is already in recency order, and Array#sort is stable, so grouping
+    // by email alone leaves each group internally sorted by recency for free.
+    items = [...items].sort((a, b) => a.account_email.localeCompare(b.account_email));
+  }
+  return { bucket, items: items.slice(offset, offset + limit) };
 }
 
-export function mockCounts(): Record<BucketKey, number> {
+export function mockCounts(accountId?: string | null): Record<BucketKey, number> {
   const counts: Record<BucketKey, number> = {
     needs_reply: 0,
     action_required: 0,
@@ -129,7 +193,12 @@ export function mockCounts(): Record<BucketKey, number> {
     unclassified: 0,
     done: 0,
   };
+  const email = accountId ? connectionEmail(accountId) : undefined;
+  // An unknown/disconnected id self-scopes to all-zero counts rather than
+  // throwing or silently falling back to the whole mailbox.
+  if (accountId && !email) return counts;
   for (const item of ALL) {
+    if (email && item.account_email !== email) continue;
     if (DONE.has(item.thread_id)) {
       counts.done += 1;
       continue;
@@ -146,7 +215,15 @@ export function mockCounts(): Record<BucketKey, number> {
 // purpose so preview demos and headless tests can assert exact pill counts.
 let ingestSeq = 0;
 
-export function mockIngest(): number {
+// accountIds, when given, confines the new mail to those accounts (round-
+// robin among just them) instead of the whole connected set — the mock's
+// stand-in for a targeted server-side ingest.
+export function mockIngest(accountIds?: string[]): number {
+  const targets =
+    accountIds && accountIds.length > 0
+      ? CONNECTIONS.filter((c) => accountIds.includes(c.id))
+      : CONNECTIONS;
+  if (targets.length === 0) return 0;
   const now = Date.now();
   for (let n = 0; n < 2; n++) {
     ingestSeq += 1;
@@ -161,6 +238,7 @@ export function mockIngest(): number {
         confidence: 0.9,
         model_version: "heuristic-v1",
       },
+      account_email: targets[(ingestSeq - 1) % targets.length].email_address,
     });
   }
   return 2;
@@ -201,6 +279,7 @@ export function mockThread(id: string): ThreadDetail {
       provider_thread_id: id.replace(/-/g, ""),
       last_message_at: item.last_message_at,
       done: DONE.has(id),
+      account_email: item.account_email,
     },
     messages,
   };
@@ -224,14 +303,19 @@ export function mockApplyLabel(threadId: string, label: Label) {
 export function mockSearch(
   q: string,
   limit: number,
-): { query: string; items: TriageItem[] } {
+  accountId?: string | null,
+): SearchResponse {
   const needle = q.toLowerCase();
-  const items = ALL.filter(
+  let items = ALL.filter(
     (i) =>
       (i.subject ?? "").toLowerCase().includes(needle) ||
       (i.latest_message_snippet ?? "").toLowerCase().includes(needle),
-  ).slice(0, limit);
-  return { query: q, items };
+  );
+  if (accountId) {
+    const email = connectionEmail(accountId);
+    items = email ? items.filter((i) => i.account_email === email) : [];
+  }
+  return { query: q, items: items.slice(0, limit) };
 }
 
 export function mockDeleteThread(id: string) {

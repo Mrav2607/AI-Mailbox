@@ -86,6 +86,56 @@ def test_new_only_selection_drops_the_backfill_tail():
     ]
 
 
+def test_disconnect_race_missing_account_raises_terminal_error(monkeypatch):
+    # The account was deleted after the run got queued (a disconnect landing
+    # mid-flight). Loading it by id has to fail closed -- not silently fall
+    # back to some other account, and not retry forever against one that's
+    # gone.
+    db = MagicMock()
+    db.execute.return_value.scalars.return_value.first.return_value = None
+
+    with pytest.raises(ValueError, match="not connected"):
+        ingest_gmail_messages(db, "u1", provider_account_id=str(uuid4()))
+    # Pins that the explicit account lookup ran exactly once -- with a
+    # MagicMock db returning None everywhere, a buggy fallback to "oldest
+    # connected account" would raise this same ValueError, so without this
+    # count the test above can't tell the two apart.
+    assert db.execute.call_count == 1
+
+
+def test_ingest_with_an_explicit_account_scopes_existing_thread_ids_to_it(monkeypatch):
+    # A second Gmail account on the same user must not look like it already
+    # has every thread the first account pulled -- existing_thread_ids has to
+    # filter on provider_account_id, not just user_id.
+    account_id = uuid4()
+    provider = MagicMock(
+        id=account_id, access_token="tok", token_expiry=None, gmail_history_id="100"
+    )
+    captured_thread_query = {}
+
+    def execute(stmt):
+        sql = str(stmt).lower()
+        result = MagicMock()
+        if "from provider_account" in sql:
+            result.scalars.return_value.first.return_value = provider
+        elif "from mail_thread" in sql:
+            captured_thread_query["sql"] = sql
+            result.scalars.return_value.all.return_value = []
+        return result
+
+    db = MagicMock()
+    db.execute.side_effect = execute
+
+    client = MagicMock()
+    client.list_history.return_value = {"historyId": "110", "history": []}
+    monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
+
+    ingest_gmail_messages(db, "u1", provider_account_id=str(account_id), new_only=True)
+
+    assert "provider_account_id" in captured_thread_query["sql"]
+    assert "user_id" not in captured_thread_query["sql"]
+
+
 def test_new_only_with_no_baseline_at_all_returns_without_pulling():
     # No known threads AND no cursor means no baseline to define "new" against —
     # the pull must bail out before touching Gmail instead of importing the
