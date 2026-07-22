@@ -131,6 +131,7 @@ def _connection(**overrides):
         provider="gmail",
         created_at=datetime.now(timezone.utc),
         external_user_id="user@gmail.example",
+        display_email=None,
         sync_paused_at=None,
         refresh_token="a-refresh-token",
     )
@@ -163,6 +164,24 @@ def test_connections_list_carries_email_address_and_reauth_flag(auth_client):
     assert body["connections"][0]["reauth_required"] is False
     assert body["connections"][1]["email_address"] == paused.external_user_id
     assert body["connections"][1]["reauth_required"] is True
+
+
+def test_connections_list_prefers_display_email_over_external_user_id(auth_client):
+    # display_email is null for pre-Outlook rows and populated going forward --
+    # when it's set it's the human-readable address, not the tid:oid identity.
+    api_client, db = auth_client
+    connection = _connection(
+        provider="outlook",
+        external_user_id="tid-123:oid-456",
+        display_email="user@outlook.example",
+    )
+    db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+        connection
+    ]
+
+    body = api_client.get(CONNECTIONS_URL).json()
+
+    assert body["connections"][0]["email_address"] == "user@outlook.example"
 
 
 def test_delete_connection_returns_204_for_own_account(auth_client, monkeypatch):
@@ -199,6 +218,24 @@ def test_delete_connection_404s_for_another_users_account(auth_client):
 
     assert resp.status_code == 404
     db.delete.assert_not_called()
+
+
+def test_delete_connection_skips_revocation_for_outlook_accounts(
+    auth_client, monkeypatch
+):
+    # Outlook has no remote-revocation call wired up -- disconnecting must
+    # never even attempt to hit Google's revoke endpoint for these rows.
+    api_client, db = auth_client
+    connection = _connection(provider="outlook", refresh_token="a-refresh-token")
+    db.get.return_value = connection
+    revoke = MagicMock()
+    monkeypatch.setattr(auth_routes, "_revoke_google_token", revoke)
+
+    resp = api_client.delete(f"{CONNECTIONS_URL}/{connection.id}")
+
+    assert resp.status_code == 204
+    revoke.assert_not_called()
+    db.delete.assert_called_once_with(connection)
 
 
 def test_delete_connection_still_succeeds_when_google_revocation_fails(

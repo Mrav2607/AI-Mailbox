@@ -27,9 +27,13 @@ class DemoLoginRequest(BaseModel):
 
 @router.get("/providers", response_model=Providers)
 def list_providers() -> dict:
-    # Only what actually works. Outlook is in the DB check constraint and
-    # nowhere else -- advertising it here just sets callers up to fail.
-    return {"providers": ["gmail"]}
+    # Only what actually works. Outlook only shows up once its OAuth app
+    # credentials are configured -- advertising it otherwise just sets
+    # callers up to fail against a route that 503s.
+    providers = ["gmail"]
+    if settings.microsoft_oauth_enabled:
+        providers.append("outlook")
+    return {"providers": providers}
 
 
 @router.get("/me", response_model=UserOut)
@@ -118,7 +122,7 @@ def list_connections(
                 "id": str(conn.id),
                 "provider": conn.provider,
                 "created_at": conn.created_at,
-                "email_address": conn.external_user_id,
+                "email_address": conn.display_email or conn.external_user_id,
                 "reauth_required": conn.sync_paused_at is not None,
             }
             for conn in connections
@@ -166,7 +170,9 @@ def delete_connection(
     # 404 (not 403) for another user's connection so we don't leak that it exists.
     if not account or account.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Not Found")
-    if account.refresh_token:
+    # Outlook has no remote-revocation call wired up yet (documented
+    # limitation) -- deleting the row is the only cleanup for those rows.
+    if account.provider == "gmail" and account.refresh_token:
         _revoke_google_token(account.refresh_token)
     db.delete(account)
     db.commit()

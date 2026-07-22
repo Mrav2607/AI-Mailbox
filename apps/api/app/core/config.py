@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     google_client_id: str | None = Field(default=None, alias="GOOGLE_CLIENT_ID")
     google_client_secret: str | None = Field(default=None, alias="GOOGLE_CLIENT_SECRET")
     google_redirect_uri: str | None = Field(default=None, alias="GOOGLE_REDIRECT_URI")
+    microsoft_client_id: str | None = Field(default=None, alias="MICROSOFT_CLIENT_ID")
+    microsoft_client_secret: str | None = Field(default=None, alias="MICROSOFT_CLIENT_SECRET")
+    microsoft_redirect_uri: str | None = Field(default=None, alias="MICROSOFT_REDIRECT_URI")
+    microsoft_tenant: str = Field(default="common", alias="MICROSOFT_TENANT")
+    # Initial lookback window for a fresh Outlook delta baseline. Graph's
+    # filtered delta walk silently truncates at OUTLOOK_DELTA_CAP messages
+    # rather than erroring, so the ingest layer narrows this on detected caps --
+    # see outlook_ingest.py's baseline/cap-detection logic.
+    outlook_backfill_days: int = Field(default=90, alias="OUTLOOK_BACKFILL_DAYS")
     resend_api_key: str | None = Field(default=None, alias="RESEND_API_KEY")
     email_from: str = Field(
         default="CortexMail <hello@cortexmail.dev>", alias="EMAIL_FROM"
@@ -118,6 +127,17 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         """Parse CORS_ORIGINS into a clean list, dropping blanks."""
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def microsoft_oauth_enabled(self) -> bool:
+        """Whether Microsoft/Outlook OAuth is usable: unlike Google, it's
+        optional (not production-required), so every route and the providers
+        list gate on this instead of assuming it's always configured."""
+        return bool(
+            self.microsoft_client_id
+            and self.microsoft_client_secret
+            and self.microsoft_redirect_uri
+        )
 
     @property
     def effective_log_format(self) -> str:

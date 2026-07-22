@@ -75,6 +75,18 @@ class ProviderAccount(Base):
         DateTime(timezone=True), nullable=True
     )
     sync_pause_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Cursor for Outlook's incremental delta walk, keyed by folder ("inbox",
+    # "sentitems"): {folder_key: {"url", "baseline_complete", "baseline_count",
+    # "baseline_days"}}. Stored as JSON text since each folder tracks its own
+    # generation independently (unlike Gmail's single history_id).
+    outlook_delta_cursors: Mapped[str | None] = mapped_column(Text, nullable=True)
+    outlook_backfill_complete: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # Human-readable account email for display -- external_user_id is the
+    # stable tid:oid identity, not necessarily an email. Null for existing
+    # gmail rows.
+    display_email: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default="now()"
     )
