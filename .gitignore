@@ -50,7 +50,6 @@ apps/web/_shot*.mjs
 # repo so the Claude GitHub app sees it on PR checkouts.
 /.claude/*
 !/.claude/CLAUDE.md
-/AGENTS.md
 
 # Internal documentation
 /docs

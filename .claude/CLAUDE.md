@@ -1,6 +1,6 @@
 # CLAUDE.md — review calibration & project directives
 
-Structure, commands, and style live in root `AGENTS.md` — don't restate them. This file exists to make automated reviews precise: what to flag, what is deliberate, and how work flows here. One correction to AGENTS.md: the frontend DOES have a test runner now (`cd apps/web && npx vitest run`, lib-only tests).
+Structure, commands, and style live in root `AGENTS.md` — don't restate them. This file exists to make automated reviews precise: what to flag, what is deliberate, and how work flows here.
 
 ## Review standards
 
