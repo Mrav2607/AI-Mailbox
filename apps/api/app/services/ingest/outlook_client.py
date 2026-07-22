@@ -84,7 +84,13 @@ class OutlookClient:
             resp = _client().get(url, headers=request_headers, params=params)
             if resp.status_code == 429 and attempt < _MAX_ATTEMPTS:
                 retry_after = resp.headers.get("Retry-After")
-                wait = float(retry_after) if retry_after else float(2 ** (attempt - 1))
+                # Graph sends integer seconds, but Retry-After can legally be
+                # an HTTP-date (e.g. from an intermediary) -- fall back to
+                # backoff rather than crashing the run on float().
+                try:
+                    wait = float(retry_after) if retry_after else float(2 ** (attempt - 1))
+                except ValueError:
+                    wait = float(2 ** (attempt - 1))
                 logger.warning("Graph 429 for %s; retrying in %ss", url, wait)
                 time.sleep(wait)
                 continue

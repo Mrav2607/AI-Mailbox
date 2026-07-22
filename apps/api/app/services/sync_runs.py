@@ -170,12 +170,14 @@ def start_sync_run(
     # than a plain `from app.workers.tasks_ingest import ...`) is what lets
     # the task be picked dynamically by name.
     tasks_ingest = importlib.import_module("app.workers.tasks_ingest")
-    task_fn = getattr(tasks_ingest, task_name)
 
     # Enqueue and recording the task id fail for different reasons and must be
     # handled differently -- catching both together is how a run that's actually
-    # executing gets marked failed.
+    # executing gets marked failed. Task resolution lives inside the try too:
+    # if INGEST_TASKS ever names an attribute that doesn't exist, the queued
+    # row still has to release the user's sync slot.
     try:
+        task_fn = getattr(tasks_ingest, task_name)
         task = cast(Any, task_fn).delay(
             run_id=str(run.id),
             user_id=str(user_id),
