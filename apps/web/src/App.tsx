@@ -458,8 +458,6 @@ export default function Console() {
         });
         if (generation !== pagingGenRef.current) return; // superseded by a newer reset
         const raw = res.items;
-        nextOffsetRef.current = raw.length;
-        setHasMore(raw.length === PAGE_SIZE);
         // Rows mid-undo-window are already gone from the UI but not yet from
         // the server; a refresh must not resurrect them.
         const rows = raw.filter((i) => !pendingDeletes.current.has(i.thread_id));
@@ -467,13 +465,18 @@ export default function Console() {
           // The operator has paged deep — a background refresh must not
           // collapse that back to one page. Update rows the fetch still
           // knows about in place, prepend anything genuinely new, and leave
-          // the rest of the loaded tail untouched.
+          // the rest of the loaded tail untouched. This fetch only covers
+          // page 0, so nextOffsetRef/hasMore must stay as they were -- setting
+          // them from `raw` here would rewind pagination to page 0 and let
+          // the load-more sentinel come back after the list was exhausted.
           const rowsById = new Map(rows.map((r) => [r.thread_id, r]));
           const existingIds = new Set(itemsRef.current.map((i) => i.thread_id));
           const freshIds = rows.filter((r) => !existingIds.has(r.thread_id));
           const updatedTail = itemsRef.current.map((i) => rowsById.get(i.thread_id) ?? i);
           setItems([...freshIds, ...updatedTail]);
         } else {
+          nextOffsetRef.current = raw.length;
+          setHasMore(raw.length === PAGE_SIZE);
           setItems(rows);
         }
         if (!quiet) {

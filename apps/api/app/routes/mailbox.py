@@ -569,9 +569,20 @@ def ingest_gmail(
     }
     runs = []
     for account in accounts:
-        run, deduplicated = start_sync_run(
-            db, current_user.id, account.id, mode=mode, options=options
-        )
+        try:
+            run, deduplicated = start_sync_run(
+                db, current_user.id, account.id, mode=mode, options=options
+            )
+        except Exception:
+            # One account's bad state must never sink the whole request --
+            # accounts already queued above should still come back in the
+            # response. An unhandled commit error also leaves the shared
+            # session in an aborted transaction, so every later account in
+            # this loop would fail too -- roll back to clear it (same
+            # pattern as dispatch_scheduled_syncs).
+            db.rollback()
+            logger.exception("ingest fan-out failed for account %s", account.id)
+            continue
         runs.append(sync_payload(run, deduplicated=deduplicated))
     return {"runs": runs}
 

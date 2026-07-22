@@ -192,8 +192,24 @@ class Settings(BaseSettings):
         if not self.resend_api_key:
             problems.append("RESEND_API_KEY is required in production")
 
+        # email_from has a default, so unlike the checks above `not
+        # self.email_from` would never trip -- resend rejects unverified
+        # sender domains at SEND time, not at boot, so shipping the scaffold
+        # default here would boot cleanly and then fail every verification
+        # and reset email silently. model_fields_set only has fields pydantic
+        # actually saw in the env; the class default doesn't count.
+        if "email_from" not in self.model_fields_set:
+            problems.append(
+                "EMAIL_FROM must be set to a sender address on a domain "
+                "verified in Resend"
+            )
+
         frontend_url = urlparse(self.frontend_base_url)
         try:
+            # This bare access is load-bearing, not dead code: urlparse never
+            # validates the port at parse time -- it only raises ValueError
+            # for a malformed one (e.g. ":notaport") the moment .port is
+            # actually read. Reading it here is what makes such URLs rejected.
             frontend_url.port
         except ValueError:
             valid_frontend_url = False

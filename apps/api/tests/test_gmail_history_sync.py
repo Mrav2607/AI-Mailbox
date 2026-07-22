@@ -96,6 +96,11 @@ def test_disconnect_race_missing_account_raises_terminal_error(monkeypatch):
 
     with pytest.raises(ValueError, match="not connected"):
         ingest_gmail_messages(db, "u1", provider_account_id=str(uuid4()))
+    # Pins that the explicit account lookup ran exactly once -- with a
+    # MagicMock db returning None everywhere, a buggy fallback to "oldest
+    # connected account" would raise this same ValueError, so without this
+    # count the test above can't tell the two apart.
+    assert db.execute.call_count == 1
 
 
 def test_ingest_with_an_explicit_account_scopes_existing_thread_ids_to_it(monkeypatch):

@@ -137,6 +137,29 @@ def test_ingest_fans_out_to_every_eligible_account(fanout, monkeypatch):
     assert {r["deduplicated"] for r in body["runs"]} == {False}
 
 
+def test_ingest_isolates_a_per_account_failure(fanout, monkeypatch):
+    # start_sync_run blowing up for one account must not sink the others --
+    # the response should still carry the account that succeeded, and the
+    # session should be rolled back so the failure doesn't poison it for
+    # whatever runs next in the request.
+    client, db = fanout
+    account_a, account_b = _account(), _account()
+    db.execute.return_value.scalars.return_value.all.return_value = [account_a, account_b]
+
+    def fake_start_sync_run(db_arg, user_id, account_id, *, mode, options):
+        if account_id == account_a.id:
+            raise RuntimeError("boom")
+        return _run(account_id, mode), False
+
+    monkeypatch.setattr(mailbox_routes, "start_sync_run", fake_start_sync_run)
+
+    resp = client.post("/api/v1/mail/ingest/gmail")
+    assert resp.status_code == 202
+    body = resp.json()
+    assert [r["provider_account_id"] for r in body["runs"]] == [str(account_b.id)]
+    db.rollback.assert_called_once()
+
+
 def test_ingest_reports_a_deduplicated_run(fanout, monkeypatch):
     # One account already has a sync in flight -- start_sync_run hands back
     # the existing run instead of starting a second one for that account.
