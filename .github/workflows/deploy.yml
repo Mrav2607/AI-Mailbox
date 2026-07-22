@@ -8,6 +8,13 @@ name: Deploy
 on:
   push:
     branches: [main]
+    # Documentation and the Claude review workflows never change what runs on
+    # the VM -- don't rebuild the stack for them. Anything else (including this
+    # file and ci.yml) still deploys.
+    paths-ignore:
+      - "**.md"
+      - ".github/workflows/claude.yml"
+      - ".github/workflows/claude-code-review.yml"
   workflow_dispatch:
 
 concurrency:

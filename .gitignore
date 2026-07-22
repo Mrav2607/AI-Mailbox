@@ -46,8 +46,10 @@ ai-mailbox/apps/api/receipts_export.csv
 # AI-agent working files (local only)
 /.mcp.json
 apps/web/_shot*.mjs
-/.claude
-/AGENTS.md
+# Local agent state stays out, but the review-calibration guide ships with the
+# repo so the Claude GitHub app sees it on PR checkouts.
+/.claude/*
+!/.claude/CLAUDE.md
 
 # Internal documentation
 /docs
