@@ -106,26 +106,50 @@ function IngestForm({
   onSubmit,
   autoSync,
   onAutoSync,
+  connections,
 }: {
   busy: boolean;
   onSubmit: (o: IngestOptions) => void;
   autoSync: number;
   onAutoSync: (s: number) => void;
+  connections: Connection[];
 }) {
   // String state so a mid-edit (cleared) field never becomes NaN; we parse
   // and clamp on submit instead.
   const [count, setCount] = useState("100");
   const [classify, setClassify] = useState(true);
   const [refreshExisting, setRefreshExisting] = useState(false);
+  // null = "all eligible accounts" — an account connected after this dialog
+  // was last touched stays included by default instead of silently skipped.
+  const [checked, setChecked] = useState<Set<string> | null>(null);
+
+  const eligible = connections.filter((c) => !c.reauth_required);
+  const effective = checked ?? new Set(eligible.map((c) => c.id));
+  const showPicker = connections.length > 1;
+  const noneSelected = showPicker && effective.size === 0;
+
+  const toggleAccount = (id: string) => {
+    setChecked((prev) => {
+      const next = new Set(prev ?? eligible.map((c) => c.id));
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
   return (
     <form
       onSubmit={(e) => {
         e.preventDefault();
         const n = parseInt(count, 10);
+        const allEligibleSelected = eligible.every((c) => effective.has(c.id));
         onSubmit({
           maxResults: clamp(Number.isNaN(n) ? 100 : n, 1, 500),
           classify,
           refreshExisting,
+          // Selecting every eligible account is the same as not filtering —
+          // omit the param so the request shape matches the common case.
+          accountIds: showPicker && !allEligibleSelected ? [...effective] : undefined,
         });
       }}
       className="space-y-2.5"
@@ -160,9 +184,39 @@ function IngestForm({
         />
         re-fetch existing threads
       </label>
+      {showPicker && (
+        <div className="space-y-1 pt-2 border-t border-border">
+          <span className={fieldLabel}>accounts</span>
+          {connections.map((c) => (
+            <label
+              key={c.id}
+              className={cn(
+                "flex items-center gap-2 text-[12px] font-mono",
+                c.reauth_required
+                  ? "text-muted-foreground/50 cursor-not-allowed"
+                  : "text-foreground/85 cursor-pointer",
+              )}
+            >
+              <input
+                type="checkbox"
+                checked={!c.reauth_required && effective.has(c.id)}
+                disabled={c.reauth_required}
+                onChange={() => toggleAccount(c.id)}
+                className="accent-primary"
+              />
+              <span className="truncate">{c.email_address}</span>
+            </label>
+          ))}
+          {connections.some((c) => c.reauth_required) && (
+            <p className="text-[10.5px] text-muted-foreground font-mono leading-snug">
+              reauth required — reconnect to sync
+            </p>
+          )}
+        </div>
+      )}
       <button
         type="submit"
-        disabled={busy}
+        disabled={busy || noneSelected}
         className="w-full h-7 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
       >
         run ingest
@@ -500,6 +554,7 @@ export function TopBar({
             }}
             autoSync={autoSync}
             onAutoSync={onAutoSync}
+            connections={connections}
           />
         </Popover>
 

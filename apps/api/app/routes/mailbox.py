@@ -65,6 +65,8 @@ _MAX_INGEST_RESULTS = 500
 _MAX_INLINE_BACKFILL = 50
 # Valid triage filters: every classifier label plus the synthetic buckets.
 _TRIAGE_BUCKETS = frozenset(LABELS) | {"all", "unclassified", "done"}
+# Valid triage orderings: recency (default) or grouped by connected account.
+_TRIAGE_SORTS = frozenset({"recency", "account"})
 # Backfill scopes by classification state, not done-ness, so it doesn't take
 # the "done" bucket.
 _BACKFILL_BUCKETS = _TRIAGE_BUCKETS - {"done"}
@@ -82,6 +84,21 @@ class ReclassifyRequest(BaseModel):
 
 class DoneRequest(BaseModel):
     done: bool
+
+
+def _recency_order() -> tuple:
+    """Shared ORDER BY for triage and search: newest first, with an id
+    tiebreak.
+
+    created_at is transaction-stamped (server_default now()), so a bulk
+    ingest can land a whole batch of threads on the same timestamp -- the id
+    tiebreak keeps offset pagination deterministic across pages even then.
+    """
+    return (
+        MailThread.last_message_at.desc().nullslast(),
+        MailThread.created_at.desc(),
+        MailThread.id.desc(),
+    )
 
 
 def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]:
@@ -159,6 +176,9 @@ def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]
 def get_triage(
     bucket: str = "needs_reply",
     limit: int = Query(default=50, ge=1, le=_MAX_PAGE_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    provider_account_id: UUID | None = Query(default=None),
+    sort: str = Query(default="recency"),
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -169,6 +189,11 @@ def get_triage(
         raise HTTPException(
             status_code=422,
             detail=f"Invalid bucket '{bucket}'. Valid: {sorted(_TRIAGE_BUCKETS)}",
+        )
+    if sort not in _TRIAGE_SORTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid sort '{sort}'. Valid: {sorted(_TRIAGE_SORTS)}",
         )
     query = select(MailThread).where(MailThread.user_id == current_user.id)
     # Filter by bucket in SQL, before the limit, so a specific-label view returns
@@ -184,14 +209,21 @@ def get_triage(
         elif bucket != "all":
             query = query.where(latest_label_subquery() == bucket)
 
+    if provider_account_id is not None:
+        # Pure self-scoping predicate, same style as the done_at filter above --
+        # a non-owned or unknown id just yields an empty page, never a 404.
+        query = query.where(MailThread.provider_account_id == provider_account_id)
+
+    recency_order = _recency_order()
+    if sort == "account":
+        query = query.join(
+            ProviderAccount, ProviderAccount.id == MailThread.provider_account_id
+        ).order_by(ProviderAccount.external_user_id.asc(), *recency_order)
+    else:
+        query = query.order_by(*recency_order)
+
     threads = list(
-        db.execute(
-            query.order_by(
-                MailThread.last_message_at.desc().nullslast(),
-                MailThread.created_at.desc(),
-            )
-            .limit(limit)
-        )
+        db.execute(query.offset(offset).limit(limit))
         .scalars()
         .all()
     )
@@ -200,6 +232,7 @@ def get_triage(
 
 @router.get("/counts", response_model=Counts)
 def get_counts(
+    provider_account_id: UUID | None = Query(default=None),
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -207,17 +240,28 @@ def get_counts(
 
     Grouped in SQL so the counts reflect the whole mailbox rather than a single
     truncated page. Keys cover every triage bucket, including `all` (the total)
-    and `unclassified`.
+    and `unclassified`. When `provider_account_id` is given, both the open-bucket
+    grouping and the done count are scoped to that account, so `all` still equals
+    the filtered open total.
     """
     bucket_label = latest_label_subquery().label("bucket_label")
+    open_predicates = [
+        MailThread.user_id == current_user.id,
+        # Open buckets only; done threads are counted separately below.
+        MailThread.done_at.is_(None),
+    ]
+    done_predicates = [
+        MailThread.user_id == current_user.id,
+        MailThread.done_at.is_not(None),
+    ]
+    if provider_account_id is not None:
+        open_predicates.append(MailThread.provider_account_id == provider_account_id)
+        done_predicates.append(MailThread.provider_account_id == provider_account_id)
+
     grouped = (
         select(bucket_label)
         .select_from(MailThread)
-        .where(
-            MailThread.user_id == current_user.id,
-            # Open buckets only; done threads are counted separately below.
-            MailThread.done_at.is_(None),
-        )
+        .where(*open_predicates)
         .subquery()
     )
     rows = db.execute(
@@ -237,10 +281,7 @@ def get_counts(
     counts["done"] = db.execute(
         select(func.count())
         .select_from(MailThread)
-        .where(
-            MailThread.user_id == current_user.id,
-            MailThread.done_at.is_not(None),
-        )
+        .where(*done_predicates)
     ).scalar_one()
     return {"counts": counts}
 
@@ -394,16 +435,19 @@ def _escape_like(q: str) -> str:
     return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-# Generous per-user limit -- the console fires a search per keystroke, but each
-# one is an unanchored ILIKE over body_text, so cap runaway callers.
+# Generous per-user limit -- the console fires a search per keystroke, and each
+# one is an unanchored ILIKE over body_text, so cap runaway callers while still
+# keeping pace with typing.
 @router.get(
     "/search",
     response_model=Search,
-    dependencies=[Depends(user_rate_limit("search", 60, 60))],
+    dependencies=[Depends(user_rate_limit("search", 120, 60))],
 )
 def search_threads(
     q: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(default=50, ge=1, le=_MAX_PAGE_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    provider_account_id: UUID | None = Query(default=None),
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -426,17 +470,18 @@ def search_threads(
         )
         .exists()
     )
+    query = select(MailThread).where(
+        MailThread.user_id == current_user.id,
+        or_(MailThread.subject.ilike(pattern, escape="\\"), message_match),
+    )
+    if provider_account_id is not None:
+        # Same self-scoping predicate as triage -- a non-owned or unknown id
+        # just yields an empty page, never a 404.
+        query = query.where(MailThread.provider_account_id == provider_account_id)
     threads = list(
         db.execute(
-            select(MailThread)
-            .where(
-                MailThread.user_id == current_user.id,
-                or_(MailThread.subject.ilike(pattern, escape="\\"), message_match),
-            )
-            .order_by(
-                MailThread.last_message_at.desc().nullslast(),
-                MailThread.created_at.desc(),
-            )
+            query.order_by(*_recency_order())
+            .offset(offset)
             .limit(limit)
         )
         .scalars()
@@ -483,6 +528,8 @@ def ingest_gmail(
     # Pull only mail newer than the newest known thread (what auto-sync
     # wants), instead of also backfilling older history up to max_results.
     new_only: bool = False,
+    # Scope the fan-out to specific accounts instead of every connected one.
+    provider_account_ids: list[UUID] | None = Query(default=None),
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -494,15 +541,22 @@ def ingest_gmail(
     refresh token) are skipped -- nothing but a reconnect fixes those, so
     queuing them just burns quota. Zero connected/eligible accounts isn't an
     error; it just means nothing to sync yet.
+
+    ``provider_account_ids``, when given, narrows the fan-out to just those
+    accounts -- still filtered through the same user-owned, gmail, not-paused
+    predicates, so an unknown or another user's id is silently dropped rather
+    than erroring, and a paused account in the list stays skipped. Omit it to
+    get today's all-accounts behavior.
     """
+    predicates = [
+        ProviderAccount.user_id == current_user.id,
+        ProviderAccount.provider == "gmail",
+        ProviderAccount.sync_paused_at.is_(None),
+    ]
+    if provider_account_ids is not None:
+        predicates.append(ProviderAccount.id.in_(provider_account_ids))
     accounts = (
-        db.execute(
-            select(ProviderAccount).where(
-                ProviderAccount.user_id == current_user.id,
-                ProviderAccount.provider == "gmail",
-                ProviderAccount.sync_paused_at.is_(None),
-            )
-        )
+        db.execute(select(ProviderAccount).where(*predicates))
         .scalars()
         .all()
     )

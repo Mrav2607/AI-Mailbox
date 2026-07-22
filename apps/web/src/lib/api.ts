@@ -10,6 +10,7 @@ import type {
   SearchResponse,
   ThreadDetail,
   TriageResponse,
+  TriageSort,
   User,
 } from "./types";
 import {
@@ -283,21 +284,62 @@ export async function deleteConnection(id: string): Promise<void> {
   });
 }
 
+// Query-string builders are exported (and pure) so their param-omission
+// behavior can be asserted directly, without mocking fetch: an untouched
+// offset/sort/accountId should produce the same URL shape triage always had,
+// so paging/sort/filter never show up in a request unless they're in play.
+export function buildTriageQuery(
+  bucket: BucketKey,
+  limit: number,
+  opts?: { offset?: number; sort?: TriageSort; accountId?: string | null },
+): string {
+  const qs = new URLSearchParams({ bucket, limit: String(limit) });
+  const offset = opts?.offset ?? 0;
+  if (offset > 0) qs.set("offset", String(offset));
+  const sort = opts?.sort ?? "recency";
+  if (sort !== "recency") qs.set("sort", sort);
+  if (opts?.accountId) qs.set("provider_account_id", opts.accountId);
+  return qs.toString();
+}
+
+export function buildSearchQuery(
+  q: string,
+  limit: number,
+  accountId?: string | null,
+): string {
+  const qs = new URLSearchParams({ q, limit: String(limit) });
+  if (accountId) qs.set("provider_account_id", accountId);
+  return qs.toString();
+}
+
 export async function getTriage(
   bucket: BucketKey,
   limit = 100,
+  opts?: { offset?: number; sort?: TriageSort; accountId?: string | null },
 ): Promise<TriageResponse> {
-  if (USE_MOCK) return mockTriage(bucket, limit);
-  return request<TriageResponse>(
-    `/mail/triage?bucket=${encodeURIComponent(bucket)}&limit=${limit}`,
-  );
+  if (USE_MOCK) {
+    return mockTriage(
+      bucket,
+      limit,
+      opts?.offset ?? 0,
+      opts?.accountId ?? null,
+      opts?.sort ?? "recency",
+    );
+  }
+  return request<TriageResponse>(`/mail/triage?${buildTriageQuery(bucket, limit, opts)}`);
 }
 
 // Whole-mailbox thread counts per bucket for the sidebar. Computed server-side
-// so the totals aren't capped by a single triage page.
-export async function getCounts(): Promise<Record<BucketKey, number>> {
-  if (USE_MOCK) return mockCounts();
-  const res = await request<CountsResponse>("/mail/counts");
+// so the totals aren't capped by a single triage page. Scoped to one account
+// when accountId is set — counts.all is that account's filtered open total.
+export async function getCounts(
+  accountId?: string | null,
+): Promise<Record<BucketKey, number>> {
+  if (USE_MOCK) return mockCounts(accountId ?? null);
+  const path = accountId
+    ? `/mail/counts?provider_account_id=${encodeURIComponent(accountId)}`
+    : "/mail/counts";
+  const res = await request<CountsResponse>(path);
   return res.counts;
 }
 
@@ -310,14 +352,15 @@ export async function getThread(id: string): Promise<ThreadDetail> {
 export async function searchThreads(
   q: string,
   limit = 50,
+  opts?: { accountId?: string | null; signal?: AbortSignal },
 ): Promise<SearchResponse> {
   if (USE_MOCK) {
     await new Promise((r) => setTimeout(r, 120));
-    return mockSearch(q, limit);
+    return mockSearch(q, limit, opts?.accountId ?? null);
   }
-  return request<SearchResponse>(
-    `/mail/search?q=${encodeURIComponent(q)}&limit=${limit}`,
-  );
+  return request<SearchResponse>(`/mail/search?${buildSearchQuery(q, limit, opts?.accountId)}`, {
+    signal: opts?.signal,
+  });
 }
 
 // Mark a thread done (clears it from the open triage buckets, keeps it
@@ -376,22 +419,29 @@ export async function getOverview(): Promise<Overview> {
 // pull re-fetches threads already in the DB (the upsert refreshes their
 // bodies) instead of skipping ahead to new ones. `newOnly` (auto-sync) pulls
 // just mail newer than the newest known thread per account — no backfill of
-// older history. The real API returns 202 with one run per account (empty
-// when nothing's connected); the mock resolves as if already done.
+// older history. `accountIds`, when given, scopes the pull to just those
+// accounts instead of every connected one. The real API returns 202 with one
+// run per account (empty when nothing's connected); the mock resolves as if
+// already done.
 export async function ingestGmail(
   max_results = 50,
   classify = true,
   refreshExisting = false,
   newOnly = false,
+  accountIds?: string[],
 ): Promise<SyncRunStatus[]> {
   if (USE_MOCK) {
     await new Promise((r) => setTimeout(r, 150));
-    const newThreads = mockIngest();
+    const newThreads = mockIngest(accountIds);
+    const targets =
+      accountIds && accountIds.length > 0
+        ? mockListConnections().filter((c) => accountIds.includes(c.id))
+        : mockListConnections();
     // The mock "inbox" actually receives mail on each pull, so auto-sync and
     // the new-mail pill are demoable (and testable) offline. All of it lands
-    // attributed to the first mock account; the rest report an empty, still-
-    // successful run, same as a real account with nothing new to pull.
-    return mockListConnections().map((acct, i) => ({
+    // attributed to the first targeted account; the rest report an empty,
+    // still-successful run, same as a real account with nothing new to pull.
+    return targets.map((acct, i) => ({
       run_id: `mock-run-${acct.id}`,
       task_id: undefined,
       mode: newOnly ? "auto" : "manual",
@@ -410,9 +460,15 @@ export async function ingestGmail(
           : { status: "ok", threads_upserted: 0, messages_upserted: 0, new_threads: 0 },
     }));
   }
+  const qs = new URLSearchParams({
+    max_results: String(max_results),
+    classify: String(classify),
+    skip_existing: String(!refreshExisting),
+    new_only: String(newOnly),
+  });
+  for (const id of accountIds ?? []) qs.append("provider_account_ids", id);
   const res = await request<{ runs: SyncRunStatus[] }>(
-    `/mail/ingest/gmail?max_results=${max_results}&classify=${classify}` +
-      `&skip_existing=${!refreshExisting}&new_only=${newOnly}`,
+    `/mail/ingest/gmail?${qs.toString()}`,
     { method: "POST" },
   );
   return res.runs;

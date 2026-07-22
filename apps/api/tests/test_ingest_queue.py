@@ -248,6 +248,70 @@ def test_ingest_new_only_maps_to_auto_mode(fanout, monkeypatch):
     assert captured["options"]["new_only"] is True
 
 
+def test_ingest_provider_account_ids_targets_only_listed_accounts(fanout, monkeypatch):
+    # Three connected accounts, but the caller only wants a1/a2 refreshed --
+    # the route's user/gmail/not-paused predicates already scope the SQL, so
+    # a3 simply never comes back from the (mocked) query.
+    client, db = fanout
+    account_a1, account_a2 = _account(), _account()
+    db.execute.return_value.scalars.return_value.all.return_value = [account_a1, account_a2]
+    calls = []
+
+    def fake_start_sync_run(db_arg, user_id, account_id, *, mode, options):
+        calls.append(account_id)
+        return _run(account_id, mode), False
+
+    monkeypatch.setattr(mailbox_routes, "start_sync_run", fake_start_sync_run)
+
+    resp = client.post(
+        f"/api/v1/mail/ingest/gmail?provider_account_ids={account_a1.id}&provider_account_ids={account_a2.id}"
+    )
+    assert resp.status_code == 202
+    assert calls == [account_a1.id, account_a2.id]
+
+    statement = db.execute.call_args[0][0]
+    compiled = str(statement.compile(compile_kwargs={"literal_binds": True}))
+    # literal_binds renders each UUID bind value without hyphens.
+    assert (
+        f"provider_account.id IN ('{account_a1.id.hex}', '{account_a2.id.hex}')"
+        in compiled
+    )
+
+
+def test_ingest_provider_account_ids_still_skips_paused_accounts(fanout, monkeypatch):
+    # A paused account named explicitly in provider_account_ids stays out of
+    # the eligible set -- the SQL predicate excludes it regardless of what the
+    # caller asked for.
+    client, db = fanout
+    paused = _account(paused=True)
+    # The stub DB can't actually filter, so mirror what the real WHERE clause
+    # would return: nothing, since sync_paused_at IS NULL excludes `paused`.
+    db.execute.return_value.scalars.return_value.all.return_value = []
+    calls = []
+
+    def fake_start_sync_run(db_arg, user_id, account_id, *, mode, options):
+        calls.append(account_id)
+        return _run(account_id, mode), False
+
+    monkeypatch.setattr(mailbox_routes, "start_sync_run", fake_start_sync_run)
+
+    resp = client.post(f"/api/v1/mail/ingest/gmail?provider_account_ids={paused.id}")
+    assert resp.status_code == 202
+    assert resp.json() == {"runs": []}
+    assert calls == []
+
+
+def test_ingest_unknown_provider_account_id_returns_empty_runs(fanout):
+    # An id that isn't owned by (or doesn't belong to) this user never
+    # matches the user-scoped select, so it's silently dropped rather than
+    # erroring.
+    client, db = fanout
+    db.execute.return_value.scalars.return_value.all.return_value = []
+    resp = client.post(f"/api/v1/mail/ingest/gmail?provider_account_ids={uuid4()}")
+    assert resp.status_code == 202
+    assert resp.json() == {"runs": []}
+
+
 def test_large_backfill_queues_task_and_returns_202(client, fake_backfill_delay):
     resp = client.post(
         "/api/v1/mail/classify/backfill"

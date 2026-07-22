@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   allRunsDeduplicated,
+  buildSearchQuery,
+  buildTriageQuery,
   sumIngestResults,
   waitForSyncRuns,
   type SyncRunStatus,
@@ -55,6 +57,51 @@ describe("sumIngestResults", () => {
 
   it("treats a run with no result as contributing nothing", () => {
     expect(sumIngestResults([run({ result: null })])).toEqual({ threads: 0, messages: 0 });
+  });
+});
+
+describe("buildTriageQuery", () => {
+  it("omits offset, sort, and account when they're at their defaults", () => {
+    expect(buildTriageQuery("needs_reply", 200)).toBe("bucket=needs_reply&limit=200");
+    expect(
+      buildTriageQuery("needs_reply", 200, { offset: 0, sort: "recency", accountId: null }),
+    ).toBe("bucket=needs_reply&limit=200");
+  });
+
+  it("includes offset once it's past the first page", () => {
+    expect(buildTriageQuery("all", 200, { offset: 200 })).toBe(
+      "bucket=all&limit=200&offset=200",
+    );
+  });
+
+  it("includes sort only when it's not the default recency", () => {
+    expect(buildTriageQuery("all", 200, { sort: "account" })).toBe(
+      "bucket=all&limit=200&sort=account",
+    );
+  });
+
+  it("includes provider_account_id only when an account is set", () => {
+    expect(buildTriageQuery("all", 200, { accountId: "acct-1" })).toBe(
+      "bucket=all&limit=200&provider_account_id=acct-1",
+    );
+  });
+
+  it("combines every non-default param", () => {
+    expect(
+      buildTriageQuery("all", 200, { offset: 400, sort: "account", accountId: "acct-1" }),
+    ).toBe("bucket=all&limit=200&offset=400&sort=account&provider_account_id=acct-1");
+  });
+});
+
+describe("buildSearchQuery", () => {
+  it("omits provider_account_id when unset", () => {
+    expect(buildSearchQuery("invoice", 200)).toBe("q=invoice&limit=200");
+  });
+
+  it("includes provider_account_id when an account is set", () => {
+    expect(buildSearchQuery("invoice", 200, "acct-1")).toBe(
+      "q=invoice&limit=200&provider_account_id=acct-1",
+    );
   });
 });
 

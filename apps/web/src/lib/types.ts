@@ -69,7 +69,14 @@ export interface IngestOptions {
   classify: boolean;
   // Re-pull threads that are already in the DB (refreshes their bodies).
   refreshExisting: boolean;
+  // Which connected accounts to pull from; omitted (or every eligible
+  // account checked) means all of them, same as before targeted ingest existed.
+  accountIds?: string[];
 }
+
+// "recency" is the triage list's default (and only) order today; "account"
+// groups threads by connected account, stable across pages, server-side.
+export type TriageSort = "recency" | "account";
 
 export interface BackfillOptions {
   limit: number;
