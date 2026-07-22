@@ -1,13 +1,16 @@
 import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { GoogleMark } from "./GoogleMark";
+import { MicrosoftMark } from "./MicrosoftMark";
 import { Mark } from "./Mark";
 import {
   ApiError,
   demoLogin,
   forgotPassword,
   googleAuthStart,
+  listAuthProviders,
   login,
+  microsoftAuthStart,
   resendVerification,
   setToken,
   signup,
@@ -31,9 +34,26 @@ export function LoginScreen({ onAuthed }: Props) {
   const [demoEmail, setDemoEmail] = useState("operator@local.dev");
   const [busy, setBusy] = useState(false);
   const [googleBusy, setGoogleBusy] = useState(false);
+  const [msBusy, setMsBusy] = useState(false);
+  const [providers, setProviders] = useState<string[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [resendUntil, setResendUntil] = useState<number | null>(null);
   const [resendSeconds, setResendSeconds] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    listAuthProviders()
+      .then((p) => {
+        if (!cancelled) setProviders(p);
+      })
+      .catch(() => {
+        // The Microsoft button is additive UI -- a failed providers fetch just
+        // means we render without it, not that sign-in itself is broken.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!resendUntil) return;
@@ -153,6 +173,22 @@ export function LoginScreen({ onAuthed }: Props) {
     }
   }
 
+  async function microsoft() {
+    setErr(null);
+    setMsBusy(true);
+    try {
+      const { auth_url } = await microsoftAuthStart();
+      const state = extractStateFromAuthUrl(auth_url);
+      if (state) saveOauthBinding({ mode: "login", state, startedAt: Date.now() });
+      // Leave the SPA for Microsoft's consent screen; control returns via the
+      // /auth/microsoft/callback route handled in App.
+      window.location.href = auth_url;
+    } catch (e) {
+      setErr((e as Error).message || "microsoft sign-in unavailable");
+      setMsBusy(false);
+    }
+  }
+
   const inputClass =
     "w-full h-9 px-2.5 rounded border border-border bg-background text-[13px] font-mono outline-none focus:border-primary";
   const labelClass =
@@ -200,7 +236,7 @@ export function LoginScreen({ onAuthed }: Props) {
                 <button
                   type="button"
                   onClick={google}
-                  disabled={googleBusy || busy}
+                  disabled={googleBusy || busy || msBusy}
                   className="w-full h-9 rounded border border-border bg-background font-mono text-[13px] font-semibold flex items-center justify-center gap-2 hover:bg-accent cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
                 >
                   {googleBusy ? (
@@ -210,6 +246,21 @@ export function LoginScreen({ onAuthed }: Props) {
                   )}
                   {googleBusy ? "redirecting…" : "Continue with Google"}
                 </button>
+                {providers.includes("outlook") && (
+                  <button
+                    type="button"
+                    onClick={microsoft}
+                    disabled={msBusy || busy || googleBusy}
+                    className="mt-2 w-full h-9 rounded border border-border bg-background font-mono text-[13px] font-semibold flex items-center justify-center gap-2 hover:bg-accent cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+                  >
+                    {msBusy ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <MicrosoftMark />
+                    )}
+                    {msBusy ? "redirecting…" : "Continue with Microsoft"}
+                  </button>
+                )}
               </>
             )}
 
@@ -247,7 +298,7 @@ export function LoginScreen({ onAuthed }: Props) {
               {error()}
               <button
                 type="submit"
-                disabled={busy || googleBusy}
+                disabled={busy || googleBusy || msBusy}
                 className="mt-4 w-full h-9 rounded bg-primary text-primary-foreground font-mono text-[13px] font-semibold flex items-center justify-center gap-2 cursor-pointer transition-[filter] hover:brightness-110 disabled:opacity-50 disabled:cursor-default"
               >
                 {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
@@ -293,7 +344,7 @@ export function LoginScreen({ onAuthed }: Props) {
                 />
                 <button
                   type="submit"
-                  disabled={busy || googleBusy}
+                  disabled={busy || googleBusy || msBusy}
                   className="mt-3 w-full h-9 rounded border border-border bg-background font-mono text-[13px] font-semibold flex items-center justify-center gap-2 hover:bg-accent cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
                 >
                   {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}

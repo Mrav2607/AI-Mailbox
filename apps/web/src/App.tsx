@@ -25,7 +25,11 @@ import {
   getThread,
   getTriage,
   ingestGmail,
+  listAuthProviders,
   listConnections,
+  microsoftAuthCallback,
+  microsoftConnectCallback,
+  microsoftConnectStart,
   reclassify,
   searchThreads,
   setThreadDone,
@@ -66,6 +70,7 @@ import { LoginScreen } from "@/components/console/LoginScreen";
 import { VerifyEmailScreen } from "@/components/console/VerifyEmailScreen";
 import { ResetPasswordScreen } from "@/components/console/ResetPasswordScreen";
 import { GoogleMark } from "@/components/console/GoogleMark";
+import { MicrosoftMark } from "@/components/console/MicrosoftMark";
 import {
   shouldSuppressConsoleHotkeys,
   useHotkeys,
@@ -88,7 +93,7 @@ import { useIsNarrow } from "@/lib/use-viewport";
 import { applyTheme, resolveTheme, watchSystemTheme } from "@/lib/theme";
 import type { ThemePref } from "@/lib/theme";
 import { extractStateFromAuthUrl, saveOauthBinding, takeOauthBinding } from "@/lib/oauthBinding";
-import { PanelRightOpen, Search, X } from "lucide-react";
+import { Mail, PanelRightOpen, Search, X } from "lucide-react";
 
 type SortMode = "recent" | "confidence_asc" | "confidence_desc" | "account";
 
@@ -181,6 +186,10 @@ export default function Console() {
   const [refreshedHealth, setRefreshedHealth] = useState<SyncHealth | null>(null);
   const [connections, setConnections] = useState<Connection[]>([]);
   const [accountsOpen, setAccountsOpen] = useState(false);
+  // Which OAuth providers this deployment has configured — gates "Connect
+  // Outlook" everywhere it'd otherwise show up next to Gmail.
+  const [authProviders, setAuthProviders] = useState<string[]>([]);
+  const outlookEnabled = authProviders.includes("outlook");
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [thread, setThread] = useState<ThreadDetail | null>(null);
@@ -391,6 +400,58 @@ export default function Console() {
         }
       }
 
+      if (
+        window.location.pathname.endsWith("/auth/microsoft/callback") &&
+        !oauthExchangeStarted
+      ) {
+        oauthExchangeStarted = true;
+        const params = new URLSearchParams(window.location.search);
+        const code = params.get("code");
+        const oauthError = params.get("error");
+        const state = params.get("state");
+        const binding = takeOauthBinding();
+        if (!binding || binding.state !== state) {
+          window.history.replaceState({}, "", "/");
+          toast.error("sign-in was interrupted — try again");
+        } else {
+          try {
+            if (oauthError || !code) {
+              throw new Error("microsoft sign-in was interrupted");
+            }
+            if (binding.mode === "login") {
+              const res = await microsoftAuthCallback(code, state);
+              setToken(res.access_token);
+              setUser(res.user);
+            } else {
+              const res = await microsoftConnectCallback(code, state);
+              toast.success(`${res.provider_email} connected — syncing`);
+              try {
+                setRefreshedHealth(await getSyncHealth());
+              } catch {
+                // The normal health poll will retry if this immediate refresh fails.
+              }
+              try {
+                setConnections(await listConnections());
+              } catch {
+                // The post-auth effect refreshes connections too; not fatal here.
+              }
+            }
+          } catch (e) {
+            if (binding.mode === "connect" && e instanceof ApiError && e.status === 409) {
+              toast.error(e.message);
+            } else {
+              toast.error(
+                binding.mode === "connect"
+                  ? "outlook connection failed"
+                  : (e as Error).message || "microsoft sign-in failed",
+              );
+            }
+          } finally {
+            window.history.replaceState({}, "", "/");
+          }
+        }
+      }
+
       try {
         const me = await getMe();
         setUser(me);
@@ -574,13 +635,33 @@ export default function Console() {
     }
   }, []);
 
+  const handleConnectOutlook = useCallback(async () => {
+    try {
+      const { auth_url } = await microsoftConnectStart();
+      const state = extractStateFromAuthUrl(auth_url);
+      if (state) saveOauthBinding({ mode: "connect", state, startedAt: Date.now() });
+      window.location.href = auth_url;
+    } catch (e) {
+      toast.error((e as Error).message || "outlook connection unavailable");
+    }
+  }, []);
+
+  // Picks the right OAuth flow for a broken connection's own provider —
+  // reauth_required can hit a Gmail and an Outlook account at once, and each
+  // needs its own reconnect action rather than one button assuming Gmail.
+  const reconnectFor = useCallback(
+    (provider: string) => (provider === "outlook" ? handleConnectOutlook : handleConnectGmail),
+    [handleConnectOutlook, handleConnectGmail],
+  );
+
   // Disconnecting deletes the account's synced mail server-side (cascade), so
   // the whole mailbox — not just the accounts list — needs to refresh after.
   const handleDisconnect = useCallback(
     async (connectionId: string) => {
+      const provider = connections.find((c) => c.id === connectionId)?.provider;
       try {
         await deleteConnection(connectionId);
-        toast.success("gmail account disconnected");
+        toast.success(`${provider === "outlook" ? "outlook" : "gmail"} account disconnected`);
       } catch (e) {
         toast.error((e as Error).message ?? "disconnect failed");
         return;
@@ -592,7 +673,7 @@ export default function Console() {
         // The normal health poll will retry if this immediate refresh fails.
       }
     },
-    [refreshConnections, refreshAll],
+    [connections, refreshConnections, refreshAll],
   );
 
   // What to say when mail isn't flowing. Ranked by what the operator can
@@ -602,25 +683,56 @@ export default function Console() {
     label: string;
     detail: string;
     actionable?: boolean;
+    // Broken connections needing reauth, one per provider account — each
+    // gets its own reconnect action since a Gmail account and an Outlook
+    // account can both be broken at once, and one button can't relaunch
+    // both OAuth flows.
+    reconnectTargets?: Connection[];
+    // Zero accounts connected: which providers can start one, when more
+    // than just Gmail is available — same one-button-can't-cover-both-flows
+    // reasoning as reconnectTargets, just before any account exists yet.
+    connectProviders?: ("gmail" | "outlook")[];
   } | null => {
     if (activeHealth?.reason === "not_connected") {
-      return {
-        label: "connect gmail",
-        detail: "No Gmail account is connected — connect one to start syncing.",
-        actionable: true,
-      };
+      return outlookEnabled
+        ? {
+            label: "connect an account",
+            detail: "No mail account is connected — connect Gmail or Outlook to start syncing.",
+            actionable: true,
+            connectProviders: ["gmail", "outlook"],
+          }
+        : {
+            label: "connect gmail",
+            detail: "No Gmail account is connected — connect one to start syncing.",
+            actionable: true,
+          };
     }
     if (activeHealth?.reason === "reauth_required") {
+      const brokenIds = new Set(
+        (activeHealth.accounts ?? [])
+          .filter((a) => a.reason === "reauth_required")
+          .map((a) => a.provider_account_id),
+      );
+      const broken = connections.filter((c) => brokenIds.has(c.id));
+      const affected = broken.map((c) => c.email_address);
+      const providerWord = (p: string) => (p === "outlook" ? "Outlook" : "Gmail");
+      const providersInvolved = new Set(broken.map((c) => c.provider));
+      // Mixed Gmail+Outlook breakage doesn't get to claim a single provider's
+      // name in the summary line — the per-connection pills below already
+      // say which is which.
+      const subject = providersInvolved.size === 1 ? providerWord([...providersInvolved][0]) : "Account";
       // With more than one connected account, name which one needs a
       // reconnect instead of leaving the operator to guess.
-      const affected = (activeHealth.accounts ?? [])
-        .filter((a) => a.reason === "reauth_required")
-        .map((a) => a.email_address);
       const detail =
         (activeHealth.accounts?.length ?? 0) > 1 && affected.length > 0
-          ? `Gmail access was revoked for ${affected.join(", ")} — reconnect to resume syncing`
-          : "Gmail access was revoked — reconnect the account to resume syncing";
-      return { label: "reconnect gmail", detail, actionable: true };
+          ? `${subject} access was revoked for ${affected.join(", ")} — reconnect to resume syncing`
+          : `${subject} access was revoked — reconnect the account to resume syncing`;
+      return {
+        label: broken.length > 1 ? "reconnect accounts" : `reconnect ${subject.toLowerCase()}`,
+        detail,
+        actionable: true,
+        reconnectTargets: broken,
+      };
     }
     if (activeHealth?.stale) {
       // A run being in flight softens the wording but never silences it: a
@@ -646,7 +758,7 @@ export default function Console() {
       };
     }
     return null;
-  }, [activeHealth, syncFailed]);
+  }, [activeHealth, syncFailed, connections, outlookEnabled]);
 
   // initial + bucket changes. Switching buckets also exits any active search.
   // The new-mail pill deliberately survives bucket switches: it clears only on
@@ -665,6 +777,12 @@ export default function Console() {
     refreshOverview();
     refreshCounts();
     refreshConnections();
+    listAuthProviders()
+      .then(setAuthProviders)
+      .catch(() => {
+        // Connect Outlook is additive UI; a failed providers fetch just means
+        // it stays hidden, not that the console itself is broken.
+      });
   }, [user, refreshOverview, refreshCounts, refreshConnections]);
 
   // Account filter change: re-issue whatever's on screen under the new scope
@@ -1075,7 +1193,7 @@ export default function Console() {
       try {
         // One run per connected account now. Zero runs means nothing's
         // connected — not a failure, just nothing to do until the operator
-        // connects a Gmail account.
+        // connects a mail account.
         const runs = await ingestGmail(
           opts.maxResults,
           opts.classify,
@@ -1084,9 +1202,14 @@ export default function Console() {
           opts.accountIds,
         );
         if (runs.length === 0) {
-          toast.error("no Gmail account connected", {
-            description: "connect one to start syncing",
-            action: { label: "connect", onClick: handleConnectGmail },
+          toast.error(outlookEnabled ? "no email account connected" : "no Gmail account connected", {
+            description: outlookEnabled
+              ? "connect a Gmail or Outlook account to start syncing"
+              : "connect one to start syncing",
+            action: { label: "connect gmail", onClick: handleConnectGmail },
+            ...(outlookEnabled
+              ? { cancel: { label: "connect outlook", onClick: handleConnectOutlook } }
+              : {}),
           });
           return;
         }
@@ -1126,7 +1249,7 @@ export default function Console() {
         setIngesting(false);
       }
     },
-    [refreshAll, clearNew, user, handleConnectGmail],
+    [refreshAll, clearNew, user, handleConnectGmail, handleConnectOutlook, outlookEnabled],
   );
 
   const doBackfill = useCallback(
@@ -1514,7 +1637,39 @@ export default function Console() {
           </button>
         )}
         {syncStatus &&
-          (syncStatus.actionable ? (
+          (syncStatus.reconnectTargets && syncStatus.reconnectTargets.length > 0 ? (
+            // One pill per broken connection — a Gmail account and an
+            // Outlook account can both need reauth at once, and each has to
+            // relaunch its own provider's OAuth flow.
+            syncStatus.reconnectTargets.map((c) => (
+              <button
+                key={c.id}
+                data-testid="sync-failed-dot"
+                onClick={reconnectFor(c.provider)}
+                title={`${c.provider === "outlook" ? "Outlook" : "Gmail"} access was revoked for ${c.email_address} — reconnect to resume syncing`}
+                className="shrink-0 h-6 px-2 rounded-full border border-amber-500/40 bg-amber-500/10 text-[11px] text-amber-700 dark:text-amber-300 hover:bg-amber-500/20 cursor-pointer transition-colors flex items-center gap-1"
+              >
+                <span className="h-1.5 w-1.5 rounded-full bg-amber-500/70" />
+                reconnect {emailLocalPart(c.email_address)}
+              </button>
+            ))
+          ) : syncStatus.connectProviders && syncStatus.connectProviders.length > 0 ? (
+            // Zero accounts connected and more than one provider is
+            // configured — one pill per provider, same reasoning as the
+            // reconnect pills above (one button can't launch two OAuth flows).
+            syncStatus.connectProviders.map((p) => (
+              <button
+                key={p}
+                data-testid="sync-failed-dot"
+                onClick={p === "outlook" ? handleConnectOutlook : handleConnectGmail}
+                title={syncStatus.detail}
+                className="shrink-0 h-6 px-2 rounded-full border border-amber-500/40 bg-amber-500/10 text-[11px] text-amber-700 dark:text-amber-300 hover:bg-amber-500/20 cursor-pointer transition-colors flex items-center gap-1"
+              >
+                <span className="h-1.5 w-1.5 rounded-full bg-amber-500/70" />
+                connect {p}
+              </button>
+            ))
+          ) : syncStatus.actionable ? (
             <button
               data-testid="sync-failed-dot"
               onClick={handleConnectGmail}
@@ -1623,10 +1778,12 @@ export default function Console() {
           <div className="h-full flex items-center justify-center p-6">
             <div className="w-full max-w-sm rounded-lg border border-border bg-[var(--color-panel)] p-6 text-center font-mono shadow-lg">
               <div className="mx-auto mb-3 h-10 w-10 rounded bg-primary/15 border border-primary/40 flex items-center justify-center">
-                <GoogleMark />
+                {outlookEnabled ? <Mail className="h-4 w-4 text-primary" /> : <GoogleMark />}
               </div>
               <div className="text-[13px] font-semibold text-foreground">
-                Connect your Gmail to start triaging
+                {outlookEnabled
+                  ? "Connect an account to start triaging"
+                  : "Connect your Gmail to start triaging"}
               </div>
               <button
                 type="button"
@@ -1636,6 +1793,16 @@ export default function Console() {
                 <GoogleMark />
                 Connect Gmail
               </button>
+              {outlookEnabled && (
+                <button
+                  type="button"
+                  onClick={handleConnectOutlook}
+                  className="mt-2 w-full h-9 rounded border border-border bg-background font-mono text-[13px] font-semibold flex items-center justify-center gap-2 hover:bg-accent cursor-pointer transition-colors"
+                >
+                  <MicrosoftMark />
+                  Connect Outlook
+                </button>
+              )}
             </div>
           </div>
         ) : (
@@ -1713,6 +1880,7 @@ export default function Console() {
           accountsOpen={accountsOpen}
           onAccountsOpenChange={setAccountsOpen}
           onConnectGmail={handleConnectGmail}
+          onConnectOutlook={outlookEnabled ? handleConnectOutlook : undefined}
           onDisconnect={handleDisconnect}
           onLogout={async () => {
             // Revoke server-side first, so the token is dead even if someone has

@@ -146,8 +146,8 @@ export function CommandPalette({
               >
                 restart tour
               </CommandItem>
-              <CommandItem onSelect={() => run(onIngest)} value="ingest gmail">
-                ingest gmail…
+              <CommandItem onSelect={() => run(onIngest)} value="ingest mail gmail outlook">
+                ingest mail…
               </CommandItem>
               <CommandItem
                 onSelect={() => run(onBackfill)}

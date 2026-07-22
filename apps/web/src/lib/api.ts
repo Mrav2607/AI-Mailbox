@@ -146,6 +146,32 @@ export async function googleAuthCallback(
   );
 }
 
+// --- Microsoft OAuth ---------------------------------------------------------
+// Same shape as the Google flow above: `start` returns the Microsoft consent
+// URL, the SPA's /auth/microsoft/callback redirect target hands the resulting
+// `code` to `callback` to mint a session token. Only rendered once
+// listAuthProviders() says "outlook" is configured server-side.
+export async function microsoftAuthStart(): Promise<{ auth_url: string }> {
+  if (USE_MOCK) {
+    throw new ApiError(0, "Microsoft sign-in needs a live API (set VITE_API_BASE_URL)");
+  }
+  return request<{ auth_url: string }>("/auth/microsoft/start");
+}
+
+export async function microsoftAuthCallback(
+  code: string,
+  state?: string | null,
+): Promise<{ access_token: string; token_type: string; user: User }> {
+  if (USE_MOCK) {
+    throw new ApiError(0, "Microsoft sign-in needs a live API (set VITE_API_BASE_URL)");
+  }
+  const qs = new URLSearchParams({ code });
+  if (state) qs.set("state", state);
+  return request<{ access_token: string; token_type: string; user: User }>(
+    `/auth/microsoft/callback?${qs.toString()}`,
+  );
+}
+
 export async function demoLogin(
   email: string,
 ): Promise<{ access_token: string; token_type: string; user: User }> {
@@ -259,6 +285,36 @@ export async function googleConnectCallback(
   return request<{ status: string; provider_email: string }>(
     `/auth/google/connect/callback?${qs.toString()}`,
   );
+}
+
+export async function microsoftConnectStart(): Promise<{ auth_url: string }> {
+  if (USE_MOCK) {
+    throw new ApiError(0, "Microsoft sign-in needs a live API (set VITE_API_BASE_URL)");
+  }
+  return request<{ auth_url: string }>("/auth/microsoft/connect/start");
+}
+
+export async function microsoftConnectCallback(
+  code: string,
+  state: string,
+): Promise<{ status: string; provider_email: string }> {
+  if (USE_MOCK) {
+    throw new ApiError(0, "Microsoft sign-in needs a live API (set VITE_API_BASE_URL)");
+  }
+  const qs = new URLSearchParams({ code, state });
+  return request<{ status: string; provider_email: string }>(
+    `/auth/microsoft/connect/callback?${qs.toString()}`,
+  );
+}
+
+// Which OAuth providers this deployment has configured server-side. Always
+// includes "gmail"; "outlook" only shows up once MICROSOFT_* env vars are
+// set, which is what gates the "Sign in with Microsoft" / "Connect Outlook"
+// UI on top of this.
+export async function listAuthProviders(): Promise<string[]> {
+  if (USE_MOCK) return ["gmail"];
+  const res = await request<{ providers: string[] }>("/auth/providers");
+  return res.providers;
 }
 
 // Every Gmail account the operator has connected, for the accounts menu.
@@ -413,9 +469,10 @@ export async function getOverview(): Promise<Overview> {
   return request<Overview>("/analytics/overview");
 }
 
-// Queues a Gmail pull on the worker, one run per connected non-paused
-// account. `max_results` is a THREAD count now, so N gives you N threads (and
-// all their messages) PER ACCOUNT, not N messages. With `refreshExisting` the
+// Queues a mail pull on the worker, one run per connected non-paused account
+// of any provider (Gmail or Outlook — the name stuck around from before
+// Outlook existed). `max_results` is a THREAD count now, so N gives you N
+// threads (and all their messages) PER ACCOUNT, not N messages. With `refreshExisting` the
 // pull re-fetches threads already in the DB (the upsert refreshes their
 // bodies) instead of skipping ahead to new ones. `newOnly` (auto-sync) pulls
 // just mail newer than the newest known thread per account — no backfill of
@@ -468,7 +525,7 @@ export async function ingestGmail(
   });
   for (const id of accountIds ?? []) qs.append("provider_account_ids", id);
   const res = await request<{ runs: SyncRunStatus[] }>(
-    `/mail/ingest/gmail?${qs.toString()}`,
+    `/mail/ingest?${qs.toString()}`,
     { method: "POST" },
   );
   return res.runs;
