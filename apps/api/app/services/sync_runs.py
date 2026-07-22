@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -14,6 +15,35 @@ from app.db.models import MailSyncRun
 ACTIVE_SYNC_STATUSES = ("queued", "running", "retrying")
 SYNC_LEASE = timedelta(minutes=40)
 QUEUED_SYNC_LEASE = timedelta(hours=2)
+
+# Provider -> the Celery task in app.workers.tasks_ingest that pulls it.
+INGEST_TASKS: dict[str, str] = {
+    "gmail": "ingest_gmail_for_user",
+    "outlook": "ingest_outlook_for_user",
+}
+
+
+def _task_kwargs(provider: str, options: dict) -> dict:
+    """Task kwargs for `provider`, dropping options its task doesn't accept.
+
+    Both the ingest route and the scheduler build one generic `options` dict
+    shaped like Gmail's (max_results/skip_existing/classify_messages/
+    new_only). Outlook's ingest deliberately has no skip_existing/new_only
+    knobs -- its delta cursor already makes every bounded run a resumable
+    slice of the same walk, so a scheduled "new_only" run for an Outlook
+    account is just its normal bounded delta run, not a distinct mode.
+    """
+    if provider == "outlook":
+        return {
+            "max_results": options["max_results"],
+            "classify_messages": options["classify_messages"],
+        }
+    return {
+        "max_results": options["max_results"],
+        "skip_existing": options["skip_existing"],
+        "classify_messages": options["classify_messages"],
+        "new_only": options["new_only"],
+    }
 
 
 def now_utc() -> datetime:
@@ -85,6 +115,7 @@ def start_sync_run(
     *,
     mode: str,
     options: dict,
+    provider: str = "gmail",
 ) -> tuple[MailSyncRun, bool]:
     """Claim the account's single sync slot and enqueue the work.
 
@@ -97,7 +128,19 @@ def start_sync_run(
     lost race return the winner instead of a 500. The slot is per account now,
     not per user: one Gmail account mid-sync must never block a sibling
     account's own run.
+
+    `provider` selects which Celery task actually does the pull (see
+    `INGEST_TASKS`) and which of that task's kwargs `options` gets narrowed to
+    (see `_task_kwargs`); it defaults to "gmail" for callers that predate
+    multi-provider dispatch.
     """
+    task_name = INGEST_TASKS.get(provider)
+    if task_name is None:
+        # Fail before claiming the account's slot -- an unknown provider must
+        # never leave a committed 'queued' row with nothing enqueued to
+        # release it.
+        raise ValueError(f"no ingest task registered for provider {provider!r}")
+
     existing = active_sync(db, user_id, provider_account_id)
     if existing:
         return existing, True
@@ -123,21 +166,21 @@ def start_sync_run(
         raise
 
     # Imported here, not at module scope: app.workers.tasks_ingest imports this
-    # module, so a top-level import would close the cycle.
-    from app.workers.tasks_ingest import ingest_gmail_for_user
+    # module, so a top-level import would close the cycle. importlib (rather
+    # than a plain `from app.workers.tasks_ingest import ...`) is what lets
+    # the task be picked dynamically by name.
+    tasks_ingest = importlib.import_module("app.workers.tasks_ingest")
+    task_fn = getattr(tasks_ingest, task_name)
 
     # Enqueue and recording the task id fail for different reasons and must be
     # handled differently -- catching both together is how a run that's actually
     # executing gets marked failed.
     try:
-        task = cast(Any, ingest_gmail_for_user).delay(
+        task = cast(Any, task_fn).delay(
             run_id=str(run.id),
             user_id=str(user_id),
             provider_account_id=str(provider_account_id),
-            max_results=options["max_results"],
-            skip_existing=options["skip_existing"],
-            classify_messages=options["classify_messages"],
-            new_only=options["new_only"],
+            **_task_kwargs(provider, options),
         )
     except Exception:
         # Nothing is running, and the committed row holds the user's only sync

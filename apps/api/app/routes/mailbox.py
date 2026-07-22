@@ -137,15 +137,20 @@ def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]
 
     # One lookup for every account these threads belong to, instead of a
     # query per thread -- a thread's account always exists (FK cascade).
+    # display_email is the human-readable address; external_user_id is the
+    # stable identity (Outlook's tid:oid isn't one), so it's only the fallback.
     account_ids = {t.provider_account_id for t in threads}
     account_emails = (
-        dict(
-            db.execute(
-                select(ProviderAccount.id, ProviderAccount.external_user_id).where(
-                    ProviderAccount.id.in_(account_ids)
-                )
+        {
+            account_id: display_email or external_user_id
+            for account_id, display_email, external_user_id in db.execute(
+                select(
+                    ProviderAccount.id,
+                    ProviderAccount.display_email,
+                    ProviderAccount.external_user_id,
+                ).where(ProviderAccount.id.in_(account_ids))
             ).all()
-        )
+        }
         if account_ids
         else {}
     )
@@ -218,7 +223,12 @@ def get_triage(
     if sort == "account":
         query = query.join(
             ProviderAccount, ProviderAccount.id == MailThread.provider_account_id
-        ).order_by(ProviderAccount.external_user_id.asc(), *recency_order)
+        ).order_by(
+            func.coalesce(
+                ProviderAccount.display_email, ProviderAccount.external_user_id
+            ).asc(),
+            *recency_order,
+        )
     else:
         query = query.order_by(*recency_order)
 
@@ -297,11 +307,12 @@ def get_thread(
     if not thread or thread.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Thread not found")
     # A thread's account always exists (FK cascade guarantees it).
-    account_email = db.execute(
-        select(ProviderAccount.external_user_id).where(
-            ProviderAccount.id == thread.provider_account_id
-        )
-    ).scalar_one()
+    account_row = db.execute(
+        select(
+            ProviderAccount.display_email, ProviderAccount.external_user_id
+        ).where(ProviderAccount.id == thread.provider_account_id)
+    ).one()
+    account_email = account_row.display_email or account_row.external_user_id
     messages = (
         db.execute(
             select(MailMessage)
@@ -514,14 +525,14 @@ def delete_thread(
 
 
 @router.post(
-    "/ingest/gmail",
+    "/ingest",
     response_model=SyncRunList,
     status_code=202,
-    # Each call queues up to 500 Gmail fetches of Celery work per account; keep
-    # it rare.
-    dependencies=[Depends(user_rate_limit("ingest-gmail", 5, 60))],
+    # Each call queues up to 500 fetches of Celery work per account; keep it
+    # rare.
+    dependencies=[Depends(user_rate_limit("ingest-mail", 5, 60))],
 )
-def ingest_gmail(
+def ingest_mail(
     max_results: int = Query(default=25, ge=1, le=_MAX_INGEST_RESULTS),
     skip_existing: bool = True,
     classify: bool = True,
@@ -533,24 +544,25 @@ def ingest_gmail(
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Queue a Gmail pull per connected account instead of running it inline.
+    """Queue a mail pull per connected account instead of running it inline.
 
-    A full ingest is up to 500 serial Gmail fetches plus classification --
-    way too slow to hold a request open for, so we hand each account to
-    Celery and return 202 with one run per account. Paused accounts (a dead
-    refresh token) are skipped -- nothing but a reconnect fixes those, so
-    queuing them just burns quota. Zero connected/eligible accounts isn't an
-    error; it just means nothing to sync yet.
+    A full ingest is up to 500 serial fetches plus classification -- way too
+    slow to hold a request open for, so we hand each account to Celery and
+    return 202 with one run per account. Every non-paused connected account
+    is fanned out to, whatever its provider -- start_sync_run picks the right
+    ingest task per account. Paused accounts (a dead refresh token) are
+    skipped -- nothing but a reconnect fixes those, so queuing them just
+    burns quota. Zero connected/eligible accounts isn't an error; it just
+    means nothing to sync yet.
 
     ``provider_account_ids``, when given, narrows the fan-out to just those
-    accounts -- still filtered through the same user-owned, gmail, not-paused
+    accounts -- still filtered through the same user-owned, not-paused
     predicates, so an unknown or another user's id is silently dropped rather
     than erroring, and a paused account in the list stays skipped. Omit it to
     get today's all-accounts behavior.
     """
     predicates = [
         ProviderAccount.user_id == current_user.id,
-        ProviderAccount.provider == "gmail",
         ProviderAccount.sync_paused_at.is_(None),
     ]
     if provider_account_ids is not None:
@@ -571,7 +583,12 @@ def ingest_gmail(
     for account in accounts:
         try:
             run, deduplicated = start_sync_run(
-                db, current_user.id, account.id, mode=mode, options=options
+                db,
+                current_user.id,
+                account.id,
+                mode=mode,
+                options=options,
+                provider=account.provider,
             )
         except Exception:
             # One account's bad state must never sink the whole request --
@@ -605,9 +622,10 @@ def get_sync_health(
     """Whether this mailbox is actually current, and why not if it isn't.
     Deliberately its own endpoint. /sync/active returns no runs when idle.
 
-    Multi-account aware: the top-level fields are a worst-of aggregate across
-    every connected Gmail account (so the console's existing pill logic keeps
-    working unchanged), and `accounts` breaks that down per account.
+    Multi-account, multi-provider aware: the top-level fields are a worst-of
+    aggregate across every connected account (so the console's existing pill
+    logic keeps working unchanged), and `accounts` breaks that down per
+    account.
     """
     expire_stale_sync(db, current_user.id)
 
@@ -615,7 +633,6 @@ def get_sync_health(
         db.execute(
             select(ProviderAccount).where(
                 ProviderAccount.user_id == current_user.id,
-                ProviderAccount.provider == "gmail",
             )
         )
         .scalars()
@@ -679,7 +696,7 @@ def get_sync_health(
         account_entries.append(
             {
                 "provider_account_id": str(account.id),
-                "email_address": account.external_user_id,
+                "email_address": account.display_email or account.external_user_id,
                 "last_succeeded_at": last_succeeded_at,
                 "stale": stale,
                 "sync_in_progress": account.id in active_account_ids,

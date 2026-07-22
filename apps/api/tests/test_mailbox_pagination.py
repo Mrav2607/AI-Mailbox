@@ -101,13 +101,18 @@ def test_triage_default_sort_carries_id_tiebreak(client):
     assert "mail_thread.id DESC" in order_by_clause
 
 
-def test_triage_sort_account_joins_provider_account_and_orders_by_external_user_id(client):
+def test_triage_sort_account_joins_provider_account_and_orders_by_display_email_fallback(client):
     c, db = client
     c.get("/api/v1/mail/triage?sort=account")
     compiled = _compiled(_last_statement(db))
     assert "JOIN provider_account" in compiled
     order_by_clause = compiled.split("ORDER BY", 1)[1]
-    assert "provider_account.external_user_id" in order_by_clause
+    # display_email (human-readable) sorts first; external_user_id (Outlook's
+    # stable tid:oid, not necessarily an email) is only the fallback.
+    assert (
+        "coalesce(provider_account.display_email, provider_account.external_user_id)"
+        in order_by_clause
+    )
     # Recency (and its id tiebreak) still applies after the account grouping.
     assert "mail_thread.id DESC" in order_by_clause
 
