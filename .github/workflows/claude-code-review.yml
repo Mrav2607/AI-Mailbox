@@ -2,29 +2,30 @@ name: Claude Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
+    types: [opened, ready_for_review, reopened]
+    # No `synchronize`: follow-up pushes aren't auto-re-reviewed (CodeRabbit
+    # covers incremental passes, and @claude in a comment re-reviews on demand).
+    # Add it back here if every push should get a fresh Claude review.
+
+# A newer trigger for the same PR supersedes an in-flight review.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
-
+    # Drafts are reviewed on demand (@claude comment) rather than automatically,
+    # and auto-review only runs for PR authors with push access (public repo).
+    if: |
+      github.event.pull_request.draft == false &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
       issues: read
       id-token: write
-
+      actions: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,7 +39,10 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
-
+          prompt: |
+            /code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+            Calibrate every finding against REVIEW.md at the repo root before
+            reporting it: skip anything REVIEW.md lists as a deliberate design,
+            and prioritize anything it says should be flagged.
+          claude_args: |
+            --allowedTools "Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh api repos/*/pulls/*/comments*)"
