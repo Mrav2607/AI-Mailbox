@@ -6,6 +6,7 @@ const ROWS: [string, string][] = [
   ["↵", "open focused thread"],
   ["g g / G", "jump to top / bottom"],
   ["e", "mark done (restore, in the done bucket)"],
+  ["x", "select thread (e / # / l act on the selection)"],
   ["l then 1 – 6", "relabel focused thread"],
   ["o", "open focused thread in Gmail (Gmail accounts only)"],
   ["/", "search threads (↵ = all buckets)"],

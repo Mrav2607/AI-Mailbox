@@ -1,8 +1,12 @@
-import { Inbox } from "lucide-react";
+import { Fragment } from "react";
+import type { ReactNode } from "react";
+import { Check, Inbox } from "lucide-react";
 import { LABEL_META, confidenceColor, confidenceText } from "@/lib/labels";
 import { emailLocalPart, senderName } from "@/lib/sender";
 import type { TriageItem } from "@/lib/types";
-import { relTime } from "@/lib/time";
+import { dateGroup, relTime } from "@/lib/time";
+import type { DateGroup } from "@/lib/time";
+import type { Density } from "@/lib/layout";
 
 interface Props {
   items: TriageItem[];
@@ -15,6 +19,22 @@ interface Props {
   narrow?: boolean;
   loading?: boolean;
   error?: string | null;
+  density?: Density;
+  grouped?: boolean;
+  isUnseen?: (item: TriageItem) => boolean;
+  bulkIds?: ReadonlySet<string>;
+  onToggleBulk?: (id: string) => void;
+}
+
+function GroupHeader({ label }: { label: DateGroup }) {
+  return (
+    <li
+      aria-hidden="true"
+      className="sticky top-0 z-10 bg-background px-3 py-1 text-[10.5px] font-mono uppercase tracking-wide text-muted-foreground"
+    >
+      {label}
+    </li>
+  );
 }
 
 function AccountBadge({ email }: { email: string }) {
@@ -37,7 +57,13 @@ export function ThreadList({
   narrow,
   loading,
   error,
+  density = "comfortable",
+  grouped = false,
+  isUnseen,
+  bulkIds,
+  onToggleBulk,
 }: Props) {
+  const rowPadY = density === "compact" ? "py-[3px]" : "py-[7px]";
   if (error) {
     return (
       <div role="alert" className="p-6 text-sm text-destructive font-mono">
@@ -51,7 +77,7 @@ export function ThreadList({
         {Array.from({ length: 12 }).map((_, i) => (
           <li
             key={i}
-            className="px-3 py-[7px] flex items-center gap-2.5 border-l-2 border-transparent"
+            className={`px-3 ${rowPadY} flex items-center gap-2.5 border-l-2 border-transparent`}
           >
             <span className="shrink-0 w-[92px] flex items-center gap-1.5">
               <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/25 animate-pulse" />
@@ -76,6 +102,7 @@ export function ThreadList({
       </div>
     );
   }
+  let prevGroup: DateGroup | null = null;
   return (
     <ul className="divide-y divide-border" aria-label="threads">
       {items.map((it) => {
@@ -86,160 +113,205 @@ export function ThreadList({
         const conf = it.classification.confidence;
         const confPct = conf == null ? null : Math.round(conf * 100);
         const sender = senderName(it.latest_message_sender);
+        const unseen = isUnseen ? isUnseen(it) : false;
+        let header: ReactNode = null;
+        if (grouped) {
+          const group = dateGroup(it.last_message_at);
+          if (group !== prevGroup) {
+            header = <GroupHeader key={`group-${group}-${it.thread_id}`} label={group} />;
+            prevGroup = group;
+          }
+        }
         if (narrow) {
           return (
-            <li key={it.thread_id}>
+            <Fragment key={it.thread_id}>
+              {header}
+              <li>
+                <button
+                  data-thread-row={it.thread_id}
+                  onClick={() => onSelect(it.thread_id)}
+                  aria-current={isSel ? "true" : undefined}
+                  className={[
+                    "group relative w-full min-h-14 text-left px-3 py-2.5 flex flex-col justify-center gap-1 text-[12.5px] cursor-pointer",
+                    "border-l-2 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset focus-visible:bg-[var(--color-panel-hi)]",
+                    isSel
+                      ? "border-primary bg-[var(--color-panel-hi)]"
+                      : "border-transparent hover:bg-[var(--color-panel-hi)]/45",
+                  ].join(" ")}
+                >
+                  <span className="w-full min-w-0 flex items-center gap-2">
+                    {showLabel ? (
+                      <span
+                        className="min-w-0 flex-1 flex items-center gap-1.5 font-mono"
+                        title={it.classification.label ?? "unclassified"}
+                      >
+                        <span
+                          className={[
+                            "h-1.5 w-1.5 rounded-full shrink-0",
+                            meta ? meta.dot : "bg-muted-foreground/40",
+                          ].join(" ")}
+                        />
+                        <span
+                          className={[
+                            "truncate text-[12px]",
+                            meta ? meta.text : "text-muted-foreground",
+                          ].join(" ")}
+                        >
+                          {meta ? meta.name : "unclass"}
+                        </span>
+                      </span>
+                    ) : (
+                      <span
+                        className={[
+                          "min-w-0 flex-1 font-mono text-[12px] truncate",
+                          sender ? "text-foreground" : "text-muted-foreground",
+                        ].join(" ")}
+                        title={it.latest_message_sender ?? undefined}
+                      >
+                        {sender ?? "—"}
+                      </span>
+                    )}
+                    <span
+                      className={`shrink-0 text-[10.5px] font-mono tabular-nums ${confidenceText(conf)}`}
+                    >
+                      {confPct == null ? "—" : `${confPct}%`}
+                    </span>
+                    {showAccount && <AccountBadge email={it.account_email} />}
+                    <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground font-mono">
+                      {relTime(it.last_message_at)}
+                    </span>
+                  </span>
+                  <span className="w-full min-w-0 flex items-baseline gap-2 overflow-hidden">
+                    <span
+                      className={[
+                        "truncate",
+                        unseen ? "font-semibold text-foreground" : "text-foreground/90 font-medium",
+                      ].join(" ")}
+                    >
+                      {it.subject ?? "(no subject)"}
+                    </span>
+                    <span className="truncate text-muted-foreground text-[12px]">
+                      {it.latest_message_snippet ?? ""}
+                    </span>
+                  </span>
+                </button>
+              </li>
+            </Fragment>
+          );
+        }
+        const isBulkSelected = bulkIds?.has(it.thread_id) ?? false;
+        return (
+          <Fragment key={it.thread_id}>
+            {header}
+            <li>
               <button
                 data-thread-row={it.thread_id}
                 onClick={() => onSelect(it.thread_id)}
                 aria-current={isSel ? "true" : undefined}
                 className={[
-                  "group relative w-full min-h-14 text-left px-3 py-2.5 flex flex-col justify-center gap-1 text-[12.5px] cursor-pointer",
+                  "group relative w-full text-left pl-3 pr-3 flex items-center gap-2.5 text-[12.5px] cursor-pointer",
+                  rowPadY,
                   "border-l-2 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset focus-visible:bg-[var(--color-panel-hi)]",
                   isSel
                     ? "border-primary bg-[var(--color-panel-hi)]"
                     : "border-transparent hover:bg-[var(--color-panel-hi)]/45",
+                  isBulkSelected ? "bg-primary/10" : "",
                 ].join(" ")}
               >
-                <span className="w-full min-w-0 flex items-center gap-2">
-                  {showLabel ? (
-                    <span
-                      className="min-w-0 flex-1 flex items-center gap-1.5 font-mono"
-                      title={it.classification.label ?? "unclassified"}
-                    >
-                      <span
-                        className={[
-                          "h-1.5 w-1.5 rounded-full shrink-0",
-                          meta ? meta.dot : "bg-muted-foreground/40",
-                        ].join(" ")}
-                      />
-                      <span
-                        className={[
-                          "truncate text-[12px]",
-                          meta ? meta.text : "text-muted-foreground",
-                        ].join(" ")}
-                      >
-                        {meta ? meta.name : "unclass"}
-                      </span>
-                    </span>
-                  ) : (
+                {onToggleBulk && (
+                  <span
+                    role="checkbox"
+                    aria-checked={isBulkSelected}
+                    aria-label="select thread"
+                    tabIndex={-1}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onToggleBulk(it.thread_id);
+                    }}
+                    className={[
+                      "shrink-0 h-3.5 w-3.5 rounded-sm border flex items-center justify-center cursor-pointer transition-opacity",
+                      isBulkSelected
+                        ? "opacity-100 bg-primary border-primary"
+                        : "opacity-0 group-hover:opacity-100 border-border",
+                    ].join(" ")}
+                  >
+                    {isBulkSelected && <Check className="h-2.5 w-2.5 text-primary-foreground" />}
+                  </span>
+                )}
+
+                {showLabel ? (
+                  <span
+                    className="shrink-0 w-[92px] flex items-center gap-1.5 font-mono"
+                    title={it.classification.label ?? "unclassified"}
+                  >
                     <span
                       className={[
-                        "min-w-0 flex-1 font-mono text-[12px] truncate",
-                        sender ? "text-foreground" : "text-muted-foreground",
+                        "h-1.5 w-1.5 rounded-full shrink-0",
+                        meta ? meta.dot : "bg-muted-foreground/40",
                       ].join(" ")}
-                      title={it.latest_message_sender ?? undefined}
+                    />
+                    <span
+                      className={[
+                        "truncate text-[11px]",
+                        meta ? meta.text : "text-muted-foreground",
+                      ].join(" ")}
                     >
-                      {sender ?? "—"}
+                      {meta ? meta.name : "unclass"}
                     </span>
-                  )}
+                  </span>
+                ) : (
                   <span
-                    className={`shrink-0 text-[10.5px] font-mono tabular-nums ${confidenceText(conf)}`}
+                    className={[
+                      "shrink-0 w-[110px] font-mono text-[11px] truncate",
+                      sender ? "text-foreground" : "text-muted-foreground",
+                    ].join(" ")}
+                    title={it.latest_message_sender ?? undefined}
+                  >
+                    {sender ?? "—"}
+                  </span>
+                )}
+
+                {/* confidence: hairline track + mono percent */}
+                <div className="shrink-0 flex items-center gap-1.5 w-[70px]">
+                  <div className="h-[2px] w-11 bg-border overflow-hidden">
+                    <div
+                      className={`h-full ${confidenceColor(conf)}`}
+                      style={{ width: `${confPct ?? 0}%` }}
+                    />
+                  </div>
+                  <span
+                    className={`text-[10.5px] font-mono tabular-nums w-8 text-right ${confidenceText(conf)}`}
                   >
                     {confPct == null ? "—" : `${confPct}%`}
                   </span>
-                  {showAccount && <AccountBadge email={it.account_email} />}
-                  <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground font-mono">
-                    {relTime(it.last_message_at)}
-                  </span>
-                </span>
-                <span className="w-full min-w-0 flex items-baseline gap-2 overflow-hidden">
-                  <span className="truncate text-foreground/90 font-medium">
+                </div>
+
+                {/* subject + snippet */}
+                <div className="min-w-0 flex-1 flex items-baseline gap-2 overflow-hidden">
+                  <span
+                    className={[
+                      "truncate",
+                      isSel || unseen
+                        ? "text-foreground font-semibold"
+                        : "text-foreground/90 font-medium",
+                    ].join(" ")}
+                  >
                     {it.subject ?? "(no subject)"}
                   </span>
                   <span className="truncate text-muted-foreground text-[12px]">
                     {it.latest_message_snippet ?? ""}
                   </span>
+                </div>
+
+                {showAccount && <AccountBadge email={it.account_email} />}
+
+                <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground font-mono w-9 text-right">
+                  {relTime(it.last_message_at)}
                 </span>
               </button>
             </li>
-          );
-        }
-        return (
-          <li key={it.thread_id}>
-            <button
-              data-thread-row={it.thread_id}
-              onClick={() => onSelect(it.thread_id)}
-              aria-current={isSel ? "true" : undefined}
-              className={[
-                "group relative w-full text-left pl-3 pr-3 py-[7px] flex items-center gap-2.5 text-[12.5px] cursor-pointer",
-                "border-l-2 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset focus-visible:bg-[var(--color-panel-hi)]",
-                isSel
-                  ? "border-primary bg-[var(--color-panel-hi)]"
-                  : "border-transparent hover:bg-[var(--color-panel-hi)]/45",
-              ].join(" ")}
-            >
-              {showLabel ? (
-                <span
-                  className="shrink-0 w-[92px] flex items-center gap-1.5 font-mono"
-                  title={it.classification.label ?? "unclassified"}
-                >
-                  <span
-                    className={[
-                      "h-1.5 w-1.5 rounded-full shrink-0",
-                      meta ? meta.dot : "bg-muted-foreground/40",
-                    ].join(" ")}
-                  />
-                  <span
-                    className={[
-                      "truncate text-[11px]",
-                      meta ? meta.text : "text-muted-foreground",
-                    ].join(" ")}
-                  >
-                    {meta ? meta.name : "unclass"}
-                  </span>
-                </span>
-              ) : (
-                <span
-                  className={[
-                    "shrink-0 w-[110px] font-mono text-[11px] truncate",
-                    sender ? "text-foreground" : "text-muted-foreground",
-                  ].join(" ")}
-                  title={it.latest_message_sender ?? undefined}
-                >
-                  {sender ?? "—"}
-                </span>
-              )}
-
-              {/* confidence: hairline track + mono percent */}
-              <div className="shrink-0 flex items-center gap-1.5 w-[70px]">
-                <div className="h-[2px] w-11 bg-border overflow-hidden">
-                  <div
-                    className={`h-full ${confidenceColor(conf)}`}
-                    style={{ width: `${confPct ?? 0}%` }}
-                  />
-                </div>
-                <span
-                  className={`text-[10.5px] font-mono tabular-nums w-8 text-right ${confidenceText(conf)}`}
-                >
-                  {confPct == null ? "—" : `${confPct}%`}
-                </span>
-              </div>
-
-              {/* subject + snippet */}
-              <div className="min-w-0 flex-1 flex items-baseline gap-2 overflow-hidden">
-                <span
-                  className={[
-                    "truncate",
-                    isSel
-                      ? "text-foreground font-semibold"
-                      : "text-foreground/90 font-medium",
-                  ].join(" ")}
-                >
-                  {it.subject ?? "(no subject)"}
-                </span>
-                <span className="truncate text-muted-foreground text-[12px]">
-                  {it.latest_message_snippet ?? ""}
-                </span>
-              </div>
-
-              {showAccount && <AccountBadge email={it.account_email} />}
-
-              <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground font-mono w-9 text-right">
-                {relTime(it.last_message_at)}
-              </span>
-            </button>
-          </li>
+          </Fragment>
         );
       })}
     </ul>
