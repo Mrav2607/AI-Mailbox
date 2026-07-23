@@ -16,6 +16,10 @@ export type PaneLayout = Record<string, number>;
 // remembered separately per orientation).
 export type PaneSizes = Record<string, PaneLayout>;
 
+// Row density and text scale, both list-local view prefs (feature 10).
+export type Density = "comfortable" | "compact";
+export const FONT_SCALE_CHOICES = [0.9, 1, 1.1] as const;
+
 export type DragSource = "sidebar" | "detail";
 export type DropZone =
   | { kind: "sidebar"; side: SidebarSide }
@@ -92,6 +96,8 @@ export type UiState = {
   paneSizes: PaneSizes;
   autoSync: number; // seconds between background syncs, 0 = off
   tourVersion: number; // 0 = never completed; N = completed tour version N
+  density: Density; // wide ThreadList row spacing
+  fontScale: number; // CSS zoom applied to the console root; 1 = today's size
 };
 
 export const UI_KEY = "ai_mailbox_ui";
@@ -106,6 +112,8 @@ export const DEFAULT_UI: UiState = {
   paneSizes: {},
   autoSync: 180,
   tourVersion: 0,
+  density: "comfortable",
+  fontScale: 1,
 };
 
 function isPaneLayout(v: unknown): v is PaneLayout {
@@ -171,5 +179,16 @@ export function loadUi(): UiState {
       o.tourVersion >= 0
         ? o.tourVersion
         : DEFAULT_UI.tourVersion,
+    density:
+      o.density === "comfortable" || o.density === "compact"
+        ? o.density
+        : DEFAULT_UI.density,
+    fontScale:
+      typeof o.fontScale === "number" &&
+      Number.isFinite(o.fontScale) &&
+      o.fontScale >= 0.75 &&
+      o.fontScale <= 1.5
+        ? o.fontScale
+        : DEFAULT_UI.fontScale,
   };
 }
