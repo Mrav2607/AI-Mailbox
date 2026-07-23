@@ -65,6 +65,10 @@ interface Props {
   // "Connect Outlook" instead of offering a flow that'd just 503.
   onConnectOutlook?: () => void;
   onDisconnect: (connectionId: string) => void;
+  // Set while the tour is anchored to the matching popover — user-originated
+  // closes are ignored until the tour itself moves on.
+  ingestLocked?: boolean;
+  accountsLocked?: boolean;
 }
 
 const THEME_ICONS: Record<ThemePref, typeof Sun> = {
@@ -515,11 +519,23 @@ export function TopBar({
   onConnectGmail,
   onConnectOutlook,
   onDisconnect,
+  ingestLocked,
+  accountsLocked,
 }: Props) {
   const s = overview?.summary;
   const ThemeIcon = THEME_ICONS[theme];
   const nextTheme =
     THEME_PREFS[(THEME_PREFS.indexOf(theme) + 1) % THEME_PREFS.length];
+  // User-originated closes are ignored while the tour anchors to this popover;
+  // the tour itself closes it through App's raw setters, which bypass this.
+  const guardedIngestOpenChange = (v: boolean) => {
+    if (ingestLocked && !v) return;
+    onIngestOpenChange(v);
+  };
+  const guardedAccountsOpenChange = (v: boolean) => {
+    if (accountsLocked && !v) return;
+    onAccountsOpenChange(v);
+  };
   return (
     <header className="h-11 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center gap-3 px-3">
       <div className="flex items-center gap-2 mr-1">
@@ -547,11 +563,12 @@ export function TopBar({
       <div data-tour="topbar-sync" className="flex items-center gap-3">
         <Popover
           open={ingestOpen}
-          onOpenChange={onIngestOpenChange}
+          onOpenChange={guardedIngestOpenChange}
           panelTour="ingest-panel"
+          lockOpen={ingestLocked}
           trigger={
             <button
-              onClick={() => onIngestOpenChange(!ingestOpen)}
+              onClick={() => guardedIngestOpenChange(!ingestOpen)}
               disabled={ingesting}
               aria-expanded={ingestOpen}
               aria-label="Ingest mail"
@@ -569,7 +586,7 @@ export function TopBar({
           <IngestForm
             busy={ingesting}
             onSubmit={(o) => {
-              onIngestOpenChange(false);
+              guardedIngestOpenChange(false);
               onIngest(o);
             }}
             autoSync={autoSync}
@@ -644,10 +661,13 @@ export function TopBar({
       <div className="hidden md:block">
         <Popover
           open={accountsOpen}
-          onOpenChange={onAccountsOpenChange}
+          onOpenChange={guardedAccountsOpenChange}
+          panelTour="accounts-panel"
+          lockOpen={accountsLocked}
           trigger={
             <button
-              onClick={() => onAccountsOpenChange(!accountsOpen)}
+              data-tour="accounts"
+              onClick={() => guardedAccountsOpenChange(!accountsOpen)}
               aria-expanded={accountsOpen}
               aria-label="Mail accounts"
               className="h-7 px-2 rounded border border-transparent hover:border-border hover:bg-accent text-[11.5px] font-mono text-muted-foreground hover:text-foreground truncate max-w-[180px] cursor-pointer transition-colors"
