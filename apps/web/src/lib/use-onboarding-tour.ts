@@ -5,6 +5,7 @@ import { TOUR_VERSION } from "@/lib/layout";
 import type { BucketKey } from "@/lib/types";
 import {
   resolveTourTarget,
+  tourLockedPopover,
   TOUR_STEPS,
   type TourPrecondition,
   type TourTargetResolution,
@@ -15,7 +16,8 @@ type PanelKey = keyof Panels;
 export interface TourDeps {
   showPanel: (panel: PanelKey) => void;
   setBucket: (slug: BucketKey) => void;
-  openIngestDialog: () => void;
+  setIngestOpen: (open: boolean) => void;
+  setAccountsOpen: (open: boolean) => void;
   snapshotPanels: () => Panels;
   restorePanels: (snapshot: Panels) => void;
 }
@@ -47,6 +49,11 @@ export function enforceTourPreconditions(
   preconditions: TourPrecondition[],
   deps: TourDeps,
 ): void {
+  // Tour-managed popovers are declarative per step: close whatever this step
+  // doesn't ask for before opening what it does, so leaving a step (in either
+  // direction) never strands its popover on screen.
+  if (!preconditions.includes("open-ingest")) deps.setIngestOpen(false);
+  if (!preconditions.includes("open-accounts")) deps.setAccountsOpen(false);
   for (const precondition of preconditions) {
     switch (precondition) {
       case "show-sidebar":
@@ -62,7 +69,10 @@ export function enforceTourPreconditions(
         deps.showPanel("prediction");
         break;
       case "open-ingest":
-        deps.openIngestDialog();
+        deps.setIngestOpen(true);
+        break;
+      case "open-accounts":
+        deps.setAccountsOpen(true);
         break;
     }
   }
@@ -91,22 +101,43 @@ export function useOnboardingTour({
     panelSnapshot.current = null;
   }, [deps]);
 
-  const endTour = useCallback(() => {
-    restorePanelSnapshot();
-    setTourVersion(TOUR_VERSION);
-    setTourActive(false);
-    setTargetResolution(null);
-  }, [restorePanelSnapshot, setTourVersion]);
+  // finish keeps the ingest panel open as the v1 CTA; skip (and any other
+  // terminal path) closes it — declining shouldn't leave a form in the
+  // user's face. Either way the accounts popover always closes: it's a
+  // transient disclosure with no "leave it open" story.
+  const completeTour = useCallback(
+    (opts: { keepIngestOpen: boolean }) => {
+      restorePanelSnapshot();
+      deps.setAccountsOpen(false);
+      if (!opts.keepIngestOpen) deps.setIngestOpen(false);
+      setTourVersion(TOUR_VERSION);
+      setTourActive(false);
+      setTargetResolution(null);
+    },
+    [deps, restorePanelSnapshot, setTourVersion],
+  );
 
-  // Unlike endTour this doesn't touch tourVersion: a viewport shrink pauses
-  // the tour rather than completing it, and clearing the latch lets the
-  // auto-start effect pick it back up when the window widens again.
+  const finishTour = useCallback(
+    () => completeTour({ keepIngestOpen: true }),
+    [completeTour],
+  );
+
+  const skipTour = useCallback(
+    () => completeTour({ keepIngestOpen: false }),
+    [completeTour],
+  );
+
+  // Unlike completeTour this doesn't touch tourVersion: a viewport shrink
+  // pauses the tour rather than completing it, and clearing the latch lets
+  // the auto-start effect pick it back up when the window widens again.
   const deferTour = useCallback(() => {
     restorePanelSnapshot();
+    deps.setIngestOpen(false);
+    deps.setAccountsOpen(false);
     autoStartLatched.current = false;
     setTourActive(false);
     setTargetResolution(null);
-  }, [restorePanelSnapshot]);
+  }, [deps, restorePanelSnapshot]);
 
   const restartTour = useCallback(() => {
     autoStartLatched.current = true;
@@ -150,7 +181,7 @@ export function useOnboardingTour({
     if (!tourActive) return;
     const step = TOUR_STEPS[stepIndex];
     if (!step) {
-      endTour();
+      finishTour();
       return;
     }
 
@@ -171,14 +202,14 @@ export function useOnboardingTour({
       if (nextIndex < 0) {
         goToStep(0, 1);
       } else if (nextIndex >= TOUR_STEPS.length) {
-        endTour();
+        finishTour();
       } else {
         goToStep(nextIndex, direction.current);
       }
     });
 
     return () => window.cancelAnimationFrame(frame);
-  }, [deps, endTour, goToStep, stepIndex, tourActive]);
+  }, [deps, finishTour, goToStep, stepIndex, tourActive]);
 
   return {
     tourActive,
@@ -186,8 +217,9 @@ export function useOnboardingTour({
     targetResolution,
     restartTour,
     deferTour,
-    skipTour: endTour,
-    finishTour: endTour,
+    skipTour,
+    finishTour,
     goToStep,
+    lockedPopover: tourLockedPopover(tourActive, stepIndex),
   };
 }

@@ -10,6 +10,10 @@ interface Props {
   // Optional data-tour tag for the panel, so a walkthrough step can spotlight
   // the whole popover instead of cropping to its inner content.
   panelTour?: string;
+  // Tour steps that anchor to this popover set lockOpen so a stray outside
+  // click or Escape can't dismiss the panel the walkthrough points at; the
+  // tour closes it itself on step exit.
+  lockOpen?: boolean;
   children: ReactNode;
 }
 
@@ -21,12 +25,13 @@ export function Popover({
   trigger,
   align = "end",
   panelTour,
+  lockOpen,
   children,
 }: Props) {
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || lockOpen) return;
     const onDown = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) {
         onOpenChange(false);
@@ -41,7 +46,7 @@ export function Popover({
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
     };
-  }, [open, onOpenChange]);
+  }, [open, onOpenChange, lockOpen]);
 
   return (
     <div ref={ref} className="relative">
