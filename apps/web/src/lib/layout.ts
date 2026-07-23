@@ -101,7 +101,7 @@ export type UiState = {
 };
 
 export const UI_KEY = "ai_mailbox_ui";
-export const TOUR_VERSION = 1;
+export const TOUR_VERSION = 2;
 
 export const DEFAULT_UI: UiState = {
   sidebar: true,

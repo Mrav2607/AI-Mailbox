@@ -3,7 +3,8 @@ export type TourPrecondition =
   | "select-needs-reply"
   | "show-detail"
   | "show-prediction"
-  | "open-ingest";
+  | "open-ingest"
+  | "open-accounts";
 
 export type TourFallback =
   | { kind: "center" }
@@ -31,7 +32,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
   {
     slug: "welcome",
     title: "Welcome to CortexMail",
-    body: "Ingest brings in Gmail threads, while sync keeps an existing mailbox current. This walkthrough shows where everything lands.",
+    body: "Ingest brings in mail from your connected accounts, while sync keeps every mailbox current. This walkthrough shows where everything lands.",
     target: '[data-tour="topbar-sync"]',
     preconditions: [],
     fallback: { kind: "center" },
@@ -63,7 +64,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
     slug: "threads",
     title: "Your threads",
     body: "Threads in the selected bucket appear here. Move through them with j and k, then press Enter to open the focused conversation.",
-    emptyBody: "Once you ingest Gmail, threads in the selected bucket land here. You can move through them with j and k.",
+    emptyBody: "Once you ingest mail, threads in the selected bucket land here. You can move through them with j and k.",
     target: '[data-tour="thread-list"]',
     preconditions: [],
     fallback: { kind: "center" },
@@ -72,7 +73,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
   {
     slug: "search",
     title: "Search & filter",
-    body: "Typing filters the loaded bucket immediately. Press Enter to search the whole mailbox across every bucket.",
+    body: "Typing filters the loaded bucket immediately, then searches every bucket after a short pause. Press Enter to search now — across all accounts, or only the one you've filtered to.",
     target: '[data-tour="search"]',
     preconditions: [],
     fallback: { kind: "skip" },
@@ -81,7 +82,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
   {
     slug: "sort",
     title: "Sort",
-    body: "Cycle between recent-first and confidence order here, or press c while the console has focus.",
+    body: "Cycle between recent-first, confidence, and by-account order here, or press c while the console has focus.",
     target: '[data-tour="sort"]',
     preconditions: [],
     fallback: { kind: "skip" },
@@ -125,9 +126,19 @@ export const TOUR_STEPS: TourStepDefinition[] = [
     placement: "auto",
   },
   {
+    slug: "accounts",
+    title: "Mail accounts",
+    body: "Your connected accounts live behind your email up here — add Gmail and Outlook inboxes side by side, watch each one's sync health, and disconnect any you no longer want. With more than one connected, the thread list gains an account filter and badges.",
+    target: '[data-tour="accounts"]',
+    preferredTarget: '[data-tour="accounts-panel"]',
+    preconditions: ["open-accounts"],
+    fallback: { kind: "center" },
+    placement: "auto",
+  },
+  {
     slug: "ingest",
     title: "Ingest your mail",
-    body: "Choose how many Gmail threads to bring in and whether to classify them immediately. This is the starting point for a new mailbox.",
+    body: "Choose how many threads to pull from each connected account and whether to classify them immediately. This is the starting point for a new mailbox.",
     target: '[data-tour="topbar-sync"]',
     preferredTarget: '[data-tour="ingest-panel"]',
     preconditions: ["open-ingest"],
@@ -155,4 +166,20 @@ export function resolveTourTarget(
   }
 
   return { kind: step.fallback.kind };
+}
+
+export type TourPopover = "ingest" | "accounts";
+
+// Which popover a step owns, derived straight from its preconditions so the
+// lockOpen wiring in TopBar/Popover can't drift from the step map.
+export function tourLockedPopover(
+  tourActive: boolean,
+  stepIndex: number,
+): TourPopover | null {
+  if (!tourActive) return null;
+  const step = TOUR_STEPS[stepIndex];
+  if (!step) return null;
+  if (step.preconditions.includes("open-ingest")) return "ingest";
+  if (step.preconditions.includes("open-accounts")) return "accounts";
+  return null;
 }

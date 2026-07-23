@@ -313,7 +313,8 @@ export default function Console() {
     () => ({
       showPanel,
       setBucket,
-      openIngestDialog: () => setIngestOpen(true),
+      setIngestOpen,
+      setAccountsOpen,
       snapshotPanels,
       restorePanels,
     }),
@@ -329,6 +330,7 @@ export default function Console() {
     skipTour,
     finishTour,
     goToStep: goToTourStep,
+    lockedPopover,
   } = useOnboardingTour({
     authChecked,
     hasUser: Boolean(user),
@@ -2328,6 +2330,8 @@ export default function Console() {
           onConnectGmail={handleConnectGmail}
           onConnectOutlook={outlookEnabled ? handleConnectOutlook : undefined}
           onDisconnect={handleDisconnect}
+          ingestLocked={lockedPopover === "ingest"}
+          accountsLocked={lockedPopover === "accounts"}
           onLogout={async () => {
             // Revoke server-side first, so the token is dead even if someone has
             // a copy of it. If that call fails we still clear locally — leaving
