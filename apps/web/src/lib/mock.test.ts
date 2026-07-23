@@ -38,6 +38,15 @@ describe("mock accounts", () => {
     expect(ids.size).toBe(concatenated.length);
   });
 
+  it("keeps triage in recency order — date headers and account sort rely on it", () => {
+    const { items } = mockTriage("all", 10_000);
+    expect(items.length).toBeGreaterThan(0);
+    for (let i = 1; i < items.length; i++) {
+      // ISO-8601 strings compare correctly as strings
+      expect(items[i].last_message_at! <= items[i - 1].last_message_at!).toBe(true);
+    }
+  });
+
   it("scopes triage, search, and counts to one account, keeping counts.all consistent", () => {
     const [acct] = mockListConnections();
     const { items } = mockTriage("all", 500, 0, acct.id);
