@@ -6,7 +6,7 @@ from typing import Any, cast
 from uuid import UUID
 
 import redis
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.engine import CursorResult
 
 from .celery_app import celery_app
@@ -15,6 +15,7 @@ from app.core.logging import logger
 from app.db.base import SessionLocal
 from app.db.models import MailSyncRun, MailThread, ProviderAccount
 from app.services.ingest.gmail_ingest import ingest_gmail_messages
+from app.services.ingest.outlook_ingest import ingest_outlook_messages
 from app.services.sync_runs import renew_sync, start_sync_run
 
 
@@ -137,6 +138,111 @@ def ingest_gmail_for_user(
     return payload
 
 
+# Same 30-minute backstop as ingest_gmail_for_user -- a delta walk capped at
+# max_pages is bounded, but a wedged Graph/DB call must not pin the worker
+# forever either.
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    time_limit=1800,
+    soft_time_limit=1740,
+)
+def ingest_outlook_for_user(
+    self,
+    run_id: str,
+    user_id: str,
+    provider_account_id: str | None = None,
+    max_results: int = 50,
+    max_pages: int = 20,
+    classify_messages: bool = True,
+) -> dict:
+    """Pull the user's Outlook messages in the background.
+
+    Mirrors ingest_gmail_for_user's run-lifecycle handling (progress-driven
+    lease renewal, terminal-state guards, retry-with-backoff) but calls
+    ingest_outlook_messages, whose signature has no skip_existing/new_only
+    knobs -- Graph's delta cursor already makes every bounded run a resumable
+    slice of the same walk, so there's no separate "new stuff only" mode to
+    ask for (see outlook_ingest.py's module docstring).
+    """
+    run_uuid = UUID(run_id)
+
+    def set_state(
+        status: str, *, error: str | None = None, result: dict | None = None
+    ) -> bool:
+        with SessionLocal() as state_db:
+            run = state_db.get(MailSyncRun, run_uuid)
+            if not run:
+                return False
+            if (
+                status in ("running", "retrying")
+                and run.status in ("succeeded", "failed")
+            ):
+                return False
+            renew_sync(state_db, run, status)
+            if run.started_at is None:
+                run.started_at = datetime.now(timezone.utc)
+            run.error = error
+            run.result = result
+            if status in ("succeeded", "failed"):
+                run.completed_at = datetime.now(timezone.utc)
+            state_db.commit()
+            return True
+
+    if not set_state("running"):
+        return {
+            "status": "error",
+            "user_id": user_id,
+            "provider_account_id": provider_account_id,
+            "detail": "sync run is no longer active",
+        }
+    last_heartbeat = monotonic()
+
+    def heartbeat() -> None:
+        nonlocal last_heartbeat
+        now = monotonic()
+        if now - last_heartbeat < _HEARTBEAT_INTERVAL_SECONDS:
+            return
+        last_heartbeat = now
+        set_state("running")
+
+    try:
+        with SessionLocal() as db:
+            result = ingest_outlook_messages(
+                db=db,
+                user_id=user_id,
+                provider_account_id=provider_account_id,
+                max_results=max_results,
+                max_pages=max_pages,
+                classify_messages=classify_messages,
+                progress=heartbeat,
+            )
+    except ValueError as exc:
+        payload = {
+            "status": "error",
+            "user_id": user_id,
+            "provider_account_id": provider_account_id,
+            "detail": str(exc),
+        }
+        set_state("failed", error=str(exc), result=payload)
+        return payload
+    except Exception as exc:
+        if self.request.retries < self.max_retries:
+            set_state("retrying", error="transient sync failure")
+            raise self.retry(exc=exc, countdown=2 ** self.request.retries) from exc
+        set_state("failed", error="sync failed after retries")
+        raise
+
+    payload = {
+        "status": "ok",
+        "user_id": user_id,
+        "provider_account_id": provider_account_id,
+        **result,
+    }
+    set_state("succeeded", result=payload)
+    return payload
+
+
 # Redis key holding the dispatcher's last check-in. Liveness has to be measured
 # by "did the scheduler run", not "did a scheduled sync succeed": the dispatcher
 # correctly skips users who already have a run in flight, and with the browser
@@ -200,34 +306,54 @@ def read_dispatcher_heartbeat() -> datetime | None:
         return None
 
 
-def _eligible_provider_rows(db) -> list[tuple[UUID, UUID]]:
-    """(user_id, provider_account_id) for every Gmail account the scheduler should pull.
+def _eligible_provider_rows(db) -> list[tuple[UUID, UUID, str]]:
+    """(user_id, provider_account_id, provider) for every account the scheduler
+    should pull, across both providers.
 
-    Eligible means: connected, has a refresh token, not paused for reauth, and
-    past the first-ingest baseline. That baseline is a history cursor OR a known
-    Gmail thread -- cursor alone counts, because an account whose first ingest
-    found an empty mailbox still has one, and requiring a thread would strand it
-    forever (no threads -> no new-only pull -> no first thread).
+    Eligible means: connected, has a refresh token, not paused for reauth. Gmail
+    additionally requires being past the first-ingest baseline -- a history
+    cursor OR a known Gmail thread (cursor alone counts, because an account
+    whose first ingest found an empty mailbox still has one, and requiring a
+    thread would strand it forever: no threads -> no new-only pull -> no first
+    thread). Outlook has no such gate: its delta cursor is established by the
+    first sync run itself, so a fresh cursor-null account (or one that walked
+    an empty mailbox and still has zero threads) must be scheduled too, not
+    stranded waiting on a signal that Gmail's model needs but Outlook's doesn't.
 
     Every eligible account gets its own row now, not just a user's oldest one.
-    Runs carry their provider_account_id straight through to
-    ingest_gmail_messages, so a paused account can no longer hide a healthy
-    sibling (or vice versa) behind a single ambiguous per-user slot.
+    Runs carry their provider_account_id straight through to the matching
+    ingest task, so a paused account can no longer hide a healthy sibling (or
+    vice versa) behind a single ambiguous per-user slot.
     """
     has_thread = (
         select(MailThread.id)
         .where(MailThread.provider_account_id == ProviderAccount.id)
         .exists()
     )
-    rows = db.execute(
-        select(ProviderAccount.user_id, ProviderAccount.id).where(
-            ProviderAccount.provider == "gmail",
-            ProviderAccount.refresh_token.is_not(None),
-            ProviderAccount.sync_paused_at.is_(None),
-            or_(ProviderAccount.gmail_history_id.is_not(None), has_thread),
+    columns = (ProviderAccount.user_id, ProviderAccount.id, ProviderAccount.provider)
+    gmail_rows = db.execute(
+        select(*columns).where(
+            and_(
+                ProviderAccount.provider == "gmail",
+                ProviderAccount.refresh_token.is_not(None),
+                ProviderAccount.sync_paused_at.is_(None),
+                or_(ProviderAccount.gmail_history_id.is_not(None), has_thread),
+            )
         )
     ).all()
-    return [(user_id, provider_id) for user_id, provider_id in rows]
+    outlook_rows = db.execute(
+        select(*columns).where(
+            and_(
+                ProviderAccount.provider == "outlook",
+                ProviderAccount.refresh_token.is_not(None),
+                ProviderAccount.sync_paused_at.is_(None),
+            )
+        )
+    ).all()
+    return [
+        (user_id, provider_id, provider)
+        for user_id, provider_id, provider in [*gmail_rows, *outlook_rows]
+    ]
 
 
 @celery_app.task(ignore_result=True, time_limit=120)
@@ -247,7 +373,7 @@ def dispatch_scheduled_syncs() -> dict:
     failed = 0
     with SessionLocal() as db:
         candidates = _eligible_provider_rows(db)
-        for user_id, account_id in candidates:
+        for user_id, account_id, provider in candidates:
             try:
                 run, deduplicated = start_sync_run(
                     db,
@@ -260,6 +386,7 @@ def dispatch_scheduled_syncs() -> dict:
                         "classify_messages": True,
                         "new_only": True,
                     },
+                    provider=provider,
                 )
                 if deduplicated:
                     # Someone already holds this account's slot (a manual run,
@@ -287,7 +414,7 @@ def dispatch_scheduled_syncs() -> dict:
     return {"dispatched": dispatched, "skipped": skipped, "failed": failed}
 
 
-def _log_stale_mailboxes(db, candidates: list[tuple[UUID, UUID]]) -> None:
+def _log_stale_mailboxes(db, candidates: list[tuple[UUID, UUID, str]]) -> None:
     """Shout if a mailbox hasn't had a successful sync in too long.
 
     Anchored per provider_account_id, not per user: a healthy account must
@@ -295,7 +422,7 @@ def _log_stale_mailboxes(db, candidates: list[tuple[UUID, UUID]]) -> None:
     """
     if not candidates:
         return
-    account_ids = [account_id for _, account_id in candidates]
+    account_ids = [account_id for _, account_id, _ in candidates]
     cutoff = datetime.now(timezone.utc) - timedelta(
         seconds=settings.sync_stale_after_seconds
     )
@@ -308,7 +435,7 @@ def _log_stale_mailboxes(db, candidates: list[tuple[UUID, UUID]]) -> None:
         .group_by(MailSyncRun.provider_account_id)
     ).all()
     newest = {account_id: completed for account_id, completed in rows}
-    for user_id, account_id in candidates:
+    for user_id, account_id, _provider in candidates:
         last = newest.get(account_id)
         if last is not None and last < cutoff:
             logger.error(

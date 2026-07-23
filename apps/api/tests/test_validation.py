@@ -33,8 +33,8 @@ def client():
     [
         "/api/v1/mail/triage?limit=0",
         "/api/v1/mail/triage?limit=99999",
-        "/api/v1/mail/ingest/gmail?max_results=0",
-        "/api/v1/mail/ingest/gmail?max_results=10000",
+        "/api/v1/mail/ingest?max_results=0",
+        "/api/v1/mail/ingest?max_results=10000",
         "/api/v1/mail/classify/backfill?limit=99999",
         "/api/v1/mail/classify/queue?limit=99999",
     ],

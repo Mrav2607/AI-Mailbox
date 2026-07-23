@@ -5,10 +5,10 @@ between "the pipeline is wedged" and "the user was asleep". It answers the data
 question (`stale`) and the machinery question (`scheduler_alive`) separately, so
 neither can hide the other.
 
-Multi-account aware: the top-level fields are a worst-of aggregate across
-every connected Gmail account (so the console's existing pill logic keeps
-parsing this unchanged), and `accounts` breaks that aggregate down per
-account.
+Multi-account, multi-provider aware: the top-level fields are a worst-of
+aggregate across every connected account (so the console's existing pill
+logic keeps parsing this unchanged), and `accounts` breaks that aggregate
+down per account.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -26,10 +26,18 @@ USER_ID = uuid4()
 URL = "/api/v1/mail/sync/health"
 
 
-def _account(email="user@gmail.example", *, paused=False, pause_reason=None, refresh_token="rt"):
+def _account(
+    email="user@gmail.example",
+    *,
+    paused=False,
+    pause_reason=None,
+    refresh_token="rt",
+    display_email=None,
+):
     return SimpleNamespace(
         id=uuid4(),
         external_user_id=email,
+        display_email=display_email,
         sync_paused_at=datetime.now(timezone.utc) if paused else None,
         sync_pause_reason=pause_reason,
         refresh_token=refresh_token,
@@ -169,6 +177,14 @@ def test_never_synced_mix(health):
     # The synced account's timestamp is the only one there is -- a never-synced
     # sibling account surfaces through `reason`, not by blanking this out.
     assert body["last_succeeded_at"] == now
+
+
+def test_email_address_prefers_display_email_over_external_user_id(health):
+    # Outlook's external_user_id is a stable tid:oid, not an email -- when a
+    # display_email is on file it must win over the identity fallback.
+    account = _account(display_email="user@outlook.example")
+    body = health(accounts=[account], successes={account.id: datetime.now(timezone.utc)})
+    assert body["accounts"][0]["email_address"] == "user@outlook.example"
 
 
 def test_a_missing_refresh_token_asks_for_reconnect_not_never_synced(health):

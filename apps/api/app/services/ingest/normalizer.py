@@ -102,3 +102,77 @@ def normalize_message(raw: dict[str, Any]) -> dict[str, Any]:
         # when deciding whether a new message is inbound.
         "label_ids": raw.get("labelIds", []),
     }
+
+
+def _format_recipient(entry: dict[str, Any]) -> str | None:
+    address = (entry.get("emailAddress") or {}).get("address")
+    name = (entry.get("emailAddress") or {}).get("name")
+    if name and address:
+        return f"{name} <{address}>"
+    return address or None
+
+
+def _format_recipients(entries: list[dict[str, Any]] | None) -> list[str] | None:
+    formatted = [r for e in (entries or []) if (r := _format_recipient(e))]
+    return formatted or None
+
+
+def _parse_graph_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def normalize_outlook_message(msg: dict[str, Any], folder_key: str) -> dict[str, Any]:
+    """Normalize a Graph message into the same shape as normalize_message.
+
+    `folder_key` drives the synthetic label set ("sentitems" -> SENT,
+    "inbox" -> INBOX) since Graph messages don't carry Gmail-style labels;
+    `_should_reopen_thread` (gmail_ingest.py:60) keys off exactly this.
+    Thread identity is Graph's `conversationId` -- there's no separate
+    thread-list call to normalize against, unlike Gmail's threadId.
+    """
+    sender = _format_recipient({"emailAddress": (msg.get("from") or {}).get("emailAddress", {})})
+    body = msg.get("body") or {}
+    content_type = (body.get("contentType") or "").lower()
+    content = body.get("content")
+    if content_type == "html":
+        body_html = content
+        body_text = _html_to_text(content) if content else None
+    elif content_type == "text":
+        body_text = content
+        body_html = None
+    else:
+        body_text = None
+        body_html = None
+
+    sent_at = _parse_graph_datetime(msg.get("sentDateTime")) or _parse_graph_datetime(
+        msg.get("receivedDateTime")
+    )
+
+    headers: dict[str, str] = {}
+    if msg.get("subject"):
+        headers["Subject"] = msg["subject"]
+    if sender:
+        headers["From"] = sender
+    if msg.get("internetMessageId"):
+        headers["Message-ID"] = msg["internetMessageId"]
+
+    return {
+        "provider_message_id": msg.get("id"),
+        "provider_thread_id": msg.get("conversationId"),
+        "snippet": msg.get("bodyPreview"),
+        "subject": msg.get("subject"),
+        "sender": sender,
+        "recipient": _format_recipients(msg.get("toRecipients")),
+        "cc": _format_recipients(msg.get("ccRecipients")),
+        "bcc": None,
+        "sent_at": sent_at,
+        "body_text": body_text,
+        "body_html": body_html,
+        "headers": headers,
+        "label_ids": ["SENT"] if folder_key == "sentitems" else ["INBOX"],
+    }

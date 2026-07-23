@@ -12,6 +12,8 @@ import {
   Moon,
   Sun,
 } from "lucide-react";
+import { GoogleMark } from "./GoogleMark";
+import { MicrosoftMark } from "./MicrosoftMark";
 import { Mark } from "./Mark";
 import { Popover } from "./Popover";
 import { LayoutPicker } from "./LayoutPicker";
@@ -59,6 +61,9 @@ interface Props {
   accountsOpen: boolean;
   onAccountsOpenChange: (v: boolean) => void;
   onConnectGmail: () => void;
+  // Undefined when the deployment has no Microsoft OAuth configured — hides
+  // "Connect Outlook" instead of offering a flow that'd just 503.
+  onConnectOutlook?: () => void;
   onDisconnect: (connectionId: string) => void;
 }
 
@@ -154,7 +159,7 @@ function IngestForm({
       }}
       className="space-y-2.5"
     >
-      <div className={fieldLabel}>ingest gmail</div>
+      <div className={fieldLabel}>ingest mail</div>
       <label className="block space-y-1">
         <span className={fieldLabel}>how many threads (1–500)</span>
         <input
@@ -370,11 +375,13 @@ function AccountsMenu({
   health,
   onDisconnect,
   onConnectGmail,
+  onConnectOutlook,
 }: {
   connections: Connection[];
   health: SyncHealth | null;
   onDisconnect: (connectionId: string) => void;
   onConnectGmail: () => void;
+  onConnectOutlook?: () => void;
 }) {
   // Two-step confirm: first click arms it, second fires. Armed state lives
   // here (not lifted) so it resets for free whenever the popover closes.
@@ -408,6 +415,9 @@ function AccountsMenu({
                     className={cn("h-1.5 w-1.5 rounded-full shrink-0", ACCOUNT_STATUS_DOT[status])}
                     title={ACCOUNT_STATUS_LABEL[status]}
                   />
+                  <span className="shrink-0 flex items-center" title={c.provider}>
+                    {c.provider === "outlook" ? <MicrosoftMark /> : <GoogleMark />}
+                  </span>
                   <span
                     className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground/90"
                     title={c.email_address}
@@ -464,6 +474,15 @@ function AccountsMenu({
       >
         connect another gmail
       </button>
+      {onConnectOutlook && (
+        <button
+          type="button"
+          onClick={onConnectOutlook}
+          className="w-full h-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
+        >
+          connect outlook
+        </button>
+      )}
     </div>
   );
 }
@@ -494,6 +513,7 @@ export function TopBar({
   accountsOpen,
   onAccountsOpenChange,
   onConnectGmail,
+  onConnectOutlook,
   onDisconnect,
 }: Props) {
   const s = overview?.summary;
@@ -534,7 +554,7 @@ export function TopBar({
               onClick={() => onIngestOpenChange(!ingestOpen)}
               disabled={ingesting}
               aria-expanded={ingestOpen}
-              aria-label="Ingest gmail"
+              aria-label="Ingest mail"
               className="h-7 max-md:h-10 px-2.5 max-md:w-10 max-md:px-0 max-md:justify-center rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
               {ingesting ? (
@@ -629,7 +649,7 @@ export function TopBar({
             <button
               onClick={() => onAccountsOpenChange(!accountsOpen)}
               aria-expanded={accountsOpen}
-              aria-label="Gmail accounts"
+              aria-label="Mail accounts"
               className="h-7 px-2 rounded border border-transparent hover:border-border hover:bg-accent text-[11.5px] font-mono text-muted-foreground hover:text-foreground truncate max-w-[180px] cursor-pointer transition-colors"
             >
               {user?.email ?? "—"}
@@ -641,6 +661,7 @@ export function TopBar({
             health={health}
             onDisconnect={onDisconnect}
             onConnectGmail={onConnectGmail}
+            onConnectOutlook={onConnectOutlook}
           />
         </Popover>
       </div>

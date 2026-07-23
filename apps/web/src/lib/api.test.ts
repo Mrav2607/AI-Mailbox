@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   allRunsDeduplicated,
@@ -8,6 +8,33 @@ import {
   waitForSyncRuns,
   type SyncRunStatus,
 } from "./api";
+
+// Everything below this point in the file needs USE_MOCK=false (the live
+// fetch branch) to exercise the request paths, but api.ts decides that once,
+// from VITE_API_BASE_URL, at module load time. A dev .env sets that var
+// locally but CI has none, so relying on the ambient env would make these
+// tests pass or fail depending on who's running them. Stubbing the env and
+// re-importing the module (vi.resetModules forces a fresh transform, which
+// re-reads import.meta.env) pins USE_MOCK=false everywhere, regardless.
+async function importLiveApi() {
+  vi.resetModules();
+  vi.stubEnv("VITE_API_BASE_URL", "http://localhost:8000/api/v1");
+  return import("./api");
+}
+
+function stubFetch(body: unknown, status = 200) {
+  const fetchMock = vi.fn().mockResolvedValue({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+function requestedUrl(fetchMock: ReturnType<typeof vi.fn>): URL {
+  return new URL(fetchMock.mock.calls[0][0] as string);
+}
 
 function run(patch: Partial<SyncRunStatus>): SyncRunStatus {
   return {
@@ -113,5 +140,93 @@ describe("waitForSyncRuns", () => {
     expect(settled.every((s) => s.status === "fulfilled")).toBe(true);
     const values = settled.map((s) => (s as PromiseFulfilledResult<SyncRunStatus>).value);
     expect(values.map((v) => v.run_id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("microsoft oauth", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("microsoftAuthStart requests /auth/microsoft/start", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ auth_url: "https://login.microsoftonline.com/consent" });
+    const res = await api.microsoftAuthStart();
+    expect(res.auth_url).toBe("https://login.microsoftonline.com/consent");
+    expect(requestedUrl(fetchMock).pathname).toBe("/api/v1/auth/microsoft/start");
+  });
+
+  it("microsoftAuthCallback sends code and state to /auth/microsoft/callback", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({
+      access_token: "tok",
+      token_type: "bearer",
+      user: { id: "u1", email: "a@b.com" },
+    });
+    await api.microsoftAuthCallback("code-1", "state-1");
+    const url = requestedUrl(fetchMock);
+    expect(url.pathname).toBe("/api/v1/auth/microsoft/callback");
+    expect(url.searchParams.get("code")).toBe("code-1");
+    expect(url.searchParams.get("state")).toBe("state-1");
+  });
+
+  it("microsoftAuthCallback omits state when it isn't given", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({
+      access_token: "tok",
+      token_type: "bearer",
+      user: { id: "u1", email: "a@b.com" },
+    });
+    await api.microsoftAuthCallback("code-1");
+    expect(requestedUrl(fetchMock).searchParams.has("state")).toBe(false);
+  });
+
+  it("microsoftConnectStart requests /auth/microsoft/connect/start", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ auth_url: "https://login.microsoftonline.com/connect" });
+    await api.microsoftConnectStart();
+    expect(requestedUrl(fetchMock).pathname).toBe("/api/v1/auth/microsoft/connect/start");
+  });
+
+  it("microsoftConnectCallback sends code and state to /auth/microsoft/connect/callback", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ status: "connected", provider_email: "a@b.com" });
+    await api.microsoftConnectCallback("code-1", "state-1");
+    const url = requestedUrl(fetchMock);
+    expect(url.pathname).toBe("/api/v1/auth/microsoft/connect/callback");
+    expect(url.searchParams.get("code")).toBe("code-1");
+    expect(url.searchParams.get("state")).toBe("state-1");
+  });
+});
+
+describe("listAuthProviders", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("requests /auth/providers and returns the provider list", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ providers: ["gmail", "outlook"] });
+    const providers = await api.listAuthProviders();
+    expect(providers).toEqual(["gmail", "outlook"]);
+    expect(requestedUrl(fetchMock).pathname).toBe("/api/v1/auth/providers");
+  });
+});
+
+describe("ingestMail", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("posts to the renamed /mail/ingest route (not the old /mail/ingest/gmail)", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ runs: [] });
+    await api.ingestMail();
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(new URL(url as string).pathname).toBe("/api/v1/mail/ingest");
+    expect((opts as RequestInit).method).toBe("POST");
   });
 });

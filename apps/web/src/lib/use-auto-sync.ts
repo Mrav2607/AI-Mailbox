@@ -5,7 +5,7 @@ import {
   getActiveSync,
   getSyncHealth,
   getTriage,
-  ingestGmail,
+  ingestMail,
   waitForSyncRuns,
   type SyncHealth,
   type SyncRunStatus,
@@ -322,7 +322,7 @@ export function useAutoSync({
         // new-only: pull everything that arrived after the newest known
         // thread and nothing else — background cycles never backfill. One
         // run per connected account; nothing connected means nothing to do.
-        const queued = await ingestGmail(100, true, false, true);
+        const queued = await ingestMail(100, true, false, true);
         if (queued.length === 0) {
           failStreakRef.current = 0;
           setSyncFailed(false);

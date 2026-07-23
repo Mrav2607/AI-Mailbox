@@ -47,9 +47,11 @@ def test_triage_items_include_latest_message_sender_and_account_email(monkeypatc
     class DB:
         def execute(self, statement):
             # The classification lookup queries with no rows to return; the
-            # account-email lookup is the one that matters here.
+            # account-email lookup is the one that matters here. Row shape is
+            # (id, display_email, external_user_id) -- display_email wins
+            # when set.
             if "provider_account" in str(statement):
-                return Result([(account_id, "owner@gmail.example")])
+                return Result([(account_id, None, "owner@gmail.example")])
             return Result([])
 
     [item] = mailbox._assemble_triage_items(DB(), [thread])
@@ -58,3 +60,39 @@ def test_triage_items_include_latest_message_sender_and_account_email(monkeypatc
     assert MailMessage.sender in captured["columns"]
     assert item["latest_message_sender"] == '"Ada Lovelace" <ada@example.com>'
     assert item["account_email"] == "owner@gmail.example"
+
+
+def test_triage_account_email_prefers_display_email_over_external_user_id(monkeypatch):
+    # Outlook's external_user_id is a stable tid:oid, not an email -- when a
+    # display_email is on file it must win over the identity fallback.
+    thread_id = uuid4()
+    account_id = uuid4()
+    thread = SimpleNamespace(
+        id=thread_id,
+        subject="Status update",
+        last_message_at=None,
+        provider_account_id=account_id,
+    )
+    monkeypatch.setattr(
+        mailbox, "latest_messages_by_thread", lambda db, thread_ids, columns: {}
+    )
+
+    class Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+    class DB:
+        def execute(self, statement):
+            if "provider_account" in str(statement):
+                return Result([(account_id, "user@outlook.example", "tid:oid")])
+            return Result([])
+
+    [item] = mailbox._assemble_triage_items(DB(), [thread])
+
+    assert item["account_email"] == "user@outlook.example"

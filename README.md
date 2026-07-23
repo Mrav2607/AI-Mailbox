@@ -168,7 +168,7 @@ A browser frontend must be served from an origin listed in `CORS_ORIGINS`
 ### Gmail ingest (dev)
 All calls below require the `Authorization: Bearer <token>` header.
 1. Ensure Gmail OAuth is connected for the signed-in user.
-2. Trigger ingest: `POST /api/v1/mail/ingest/gmail?max_results=25`.
+2. Trigger ingest: `POST /api/v1/mail/ingest?max_results=25`.
 3. Fetch triage: `GET /api/v1/mail/triage`.
 4. If some threads are missing classifications, run backfill:
    `POST /api/v1/mail/classify/backfill?limit=100`.
