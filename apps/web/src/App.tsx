@@ -1361,15 +1361,15 @@ export default function Console() {
         [...bucketSnapshot.entries()].map(([id, idx]) => [id, items[idx]]),
       );
 
-      // In search mode done threads remain searchable, so rows stay put (and
-      // so does the selection) — same rule as single doDone.
-      if (!searchMode) {
-        if (selectedId && idSet.has(selectedId)) {
-          const remaining = visibleItems.filter((i) => !idSet.has(i.thread_id));
-          setSelectedId(remaining[0]?.thread_id ?? null);
-        }
-        setItems((prev) => prev.filter((i) => !idSet.has(i.thread_id)));
+      // The bucket cache always drops done threads, search or not — search
+      // mode just renders searchResults instead (doDoneBatch never touches
+      // that list, so those rows stay put). Only the selection is
+      // search-gated: it must not jump while browsing search results.
+      if (!searchMode && selectedId && idSet.has(selectedId)) {
+        const remaining = visibleItems.filter((i) => !idSet.has(i.thread_id));
+        setSelectedId(remaining[0]?.thread_id ?? null);
       }
+      setItems((prev) => prev.filter((i) => !idSet.has(i.thread_id)));
       setBulkIds(new Set());
 
       const restoreRows = (targetIds: string[]) => {
@@ -1402,7 +1402,7 @@ export default function Console() {
         const failedIds = ids.filter((_, i) => settled[i].status === "rejected");
 
         if (failedIds.length > 0) {
-          if (!searchMode) restoreRows(failedIds);
+          restoreRows(failedIds);
           toast.error(`${failedIds.length} of ${ids.length} failed`);
         }
         applyDoneState(succeededIds, marking);
@@ -1419,7 +1419,7 @@ export default function Console() {
                   const restoredIds = succeededIds.filter((_, i) => undone[i].status === "fulfilled");
                   const undoFailedIds = succeededIds.filter((_, i) => undone[i].status === "rejected");
                   applyDoneState(restoredIds, !marking);
-                  if (!searchMode) restoreRows(restoredIds);
+                  restoreRows(restoredIds);
                   if (undoFailedIds.length > 0) {
                     toast.error(
                       `undo failed for ${undoFailedIds.length} thread${undoFailedIds.length === 1 ? "" : "s"}`,
