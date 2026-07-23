@@ -2294,10 +2294,17 @@ export default function Console() {
       {/* overflow-clip: no descendant (however hostile an email's CSS) may ever
           grow the page a scrollbar — panes own all scrolling. zoom (not
           root font-size) scales spacing along with text since row typography
-          uses arbitrary-value px classes root font-size can't reach. */}
+          uses arbitrary-value px classes root font-size can't reach. Viewport
+          units aren't zoom-compensated like auto/percentage sizes are, so the
+          100vh height must be counter-divided or the console renders short
+          (scale < 1) or overflows the screen (scale > 1). */}
       <div
         className="h-screen flex flex-col overflow-clip bg-background text-foreground"
-        style={fontScale !== 1 ? { zoom: fontScale } : undefined}
+        style={
+          fontScale !== 1
+            ? { zoom: fontScale, height: `calc(100vh / ${fontScale})` }
+            : undefined
+        }
       >
         <TopBar
           user={user}
