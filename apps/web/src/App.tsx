@@ -84,7 +84,8 @@ import { Toaster } from "@/components/ui/sonner";
 import { ConsoleLayout } from "@/components/console/ConsoleLayout";
 import { NarrowShell } from "@/components/console/NarrowShell";
 import { TOUR_VERSION, UI_KEY, loadUi } from "@/lib/layout";
-import type { Arrangement, PaneLayout, PaneSizes } from "@/lib/layout";
+import type { Arrangement, Density, PaneLayout, PaneSizes } from "@/lib/layout";
+import { isUnseen, loadSeen, markSeen } from "@/lib/seen";
 import {
   useOnboardingTour,
   type TourDeps,
@@ -207,6 +208,8 @@ export default function Console() {
   // Only "account" needs the server's cooperation (grouping is stable across
   // pages); confidence sort stays a client-side reorder of whatever's loaded.
   const serverSort: TriageSort = sortMode === "account" ? "account" : "recency";
+  // Wide-layout-only multi-thread selection for batch triage (feature 8).
+  const [bulkIds, setBulkIds] = useState<ReadonlySet<string>>(new Set());
 
   const [panels, setPanels] = useState<Panels>({
     sidebar: INITIAL_UI.sidebar,
@@ -221,6 +224,8 @@ export default function Console() {
   const [theme, setTheme] = useState<ThemePref>(INITIAL_UI.theme);
   const [autoSync, setAutoSync] = useState<number>(INITIAL_UI.autoSync);
   const [tourVersion, setTourVersion] = useState<number>(INITIAL_UI.tourVersion);
+  const [density, setDensity] = useState<Density>(INITIAL_UI.density);
+  const [fontScale, setFontScale] = useState<number>(INITIAL_UI.fontScale);
   // Resolved dark/light, tracked as state so theme-aware children (the
   // toaster) re-render when a "system" preference follows an OS flip.
   const [resolvedTheme, setResolvedTheme] = useState<"dark" | "light">(() =>
@@ -280,12 +285,14 @@ export default function Console() {
           theme,
           autoSync,
           tourVersion,
+          density,
+          fontScale,
         }),
       );
     } catch {
       /* storage unavailable; layout just won't persist */
     }
-  }, [panels, arrangement, paneSizes, theme, autoSync, tourVersion]);
+  }, [panels, arrangement, paneSizes, theme, autoSync, tourVersion, density, fontScale]);
 
   const togglePanel = useCallback((key: keyof Panels) => {
     setPanels((p) => ({ ...p, [key]: !p[key] }));
@@ -471,6 +478,22 @@ export default function Console() {
     setUser(null);
     toast.error("session expired — please sign in again");
   }, []);
+
+  // ---- seen/unread (feature 9) ----------------------------------------------
+  // In-memory per-user map; `seenVersion` is the render trigger since mutating
+  // the ref itself doesn't re-render anything that reads it.
+  const seenRef = useRef<Map<string, string>>(new Map());
+  const [seenVersion, setSeenVersion] = useState(0);
+
+  useEffect(() => {
+    // Login/logout don't remount Console, so the map has to reload in place —
+    // keyed on the id specifically (not the whole `user` object, which gets a
+    // fresh reference on every getMe()) so this doesn't refire on unrelated
+    // user refreshes.
+    seenRef.current = user ? loadSeen(user.id) : new Map();
+    setSeenVersion((v) => v + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
 
   // ---- data fetching -------------------------------------------------------
   const refreshOverview = useCallback(async () => {
@@ -834,6 +857,16 @@ export default function Console() {
     }
   }, [connections, accountFilter]);
 
+  // Bulk selection is scoped to the current view — switching what's on
+  // screen leaves a stale selection dangling otherwise.
+  useEffect(() => {
+    setBulkIds(new Set());
+  }, [bucket, accountFilter, searchMode]);
+
+  useEffect(() => {
+    if (isNarrow) setBulkIds(new Set());
+  }, [isNarrow]);
+
   // Infinite scroll trigger: fires loadMore once the sentinel row scrolls
   // near the bottom of the list's own scroll container (not the viewport).
   useEffect(() => {
@@ -929,7 +962,55 @@ export default function Console() {
 
   const focusedItem = selectedIndex >= 0 ? visibleItems[selectedIndex] : null;
 
+  // A selected-but-no-longer-visible row (a quiet background refresh replaced
+  // it, or the client-side filter dropped it) must not stay batch-actionable.
+  // Only writes when the intersection actually shrinks, so this can't loop.
+  useEffect(() => {
+    if (bulkIds.size === 0) return;
+    const visibleIds = new Set(visibleItems.map((i) => i.thread_id));
+    const pruned = new Set([...bulkIds].filter((id) => visibleIds.has(id)));
+    if (pruned.size < bulkIds.size) setBulkIds(pruned);
+  }, [visibleItems, bulkIds]);
+
   // ---- actions -------------------------------------------------------------
+  const toggleBulk = useCallback((id: string) => {
+    setBulkIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  // Batch hotkeys/buttons act on the selection reduced to what's actually
+  // still on screen at the moment they fire.
+  const batchTargets = useCallback(() => {
+    const visibleIds = new Set(visibleItems.map((i) => i.thread_id));
+    return [...bulkIds].filter((id) => visibleIds.has(id));
+  }, [bulkIds, visibleItems]);
+
+  const isUnseenFor = useCallback(
+    (item: TriageItem) => isUnseen(seenRef.current, item.thread_id, item.last_message_at),
+    // seenVersion bumping is the signal that seenRef.current changed; the ref
+    // itself doesn't belong in the dep array.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [seenVersion],
+  );
+
+  // Marks a thread seen on explicit navigation only (row click, j/k, gg/G,
+  // narrow Enter) — never on the automatic first-row selection after a load.
+  const markThreadSeen = useCallback(
+    (id: string) => {
+      if (!user) return;
+      const item =
+        itemsRef.current.find((i) => i.thread_id === id) ??
+        visibleItems.find((i) => i.thread_id === id);
+      markSeen(seenRef.current, user.id, id, item?.last_message_at ?? null);
+      setSeenVersion((v) => v + 1);
+    },
+    [user, visibleItems],
+  );
+
   const moveSelection = useCallback(
     (delta: number) => {
       if (visibleItems.length === 0) return;
@@ -937,6 +1018,7 @@ export default function Console() {
       const next = Math.max(0, Math.min(visibleItems.length - 1, cur + delta));
       const target = visibleItems[next];
       setSelectedId(target.thread_id);
+      markThreadSeen(target.thread_id);
       // scroll into view
       requestAnimationFrame(() => {
         const el = document.querySelector(
@@ -947,7 +1029,7 @@ export default function Console() {
         }
       });
     },
-    [visibleItems, selectedIndex],
+    [visibleItems, selectedIndex, markThreadSeen],
   );
 
   // ---- search ----------------------------------------------------------
@@ -1087,6 +1169,106 @@ export default function Console() {
     return () => window.removeEventListener("pagehide", flush);
   }, []);
 
+  // Batch delete: mirrors doDelete's optimistic-remove + undo-window model,
+  // just fanned out over every selected id under one shared timer (so the
+  // pagehide flush above covers the whole batch for free).
+  const doDeleteBatch = useCallback(
+    (ids: string[]) => {
+      if (ids.length === 0) return;
+      const idSet = new Set(ids);
+
+      const bucketSnapshot = new Map(
+        ids
+          .map((id) => [id, items.findIndex((i) => i.thread_id === id)] as const)
+          .filter(([, idx]) => idx >= 0),
+      );
+      const removedFromBucket = new Map(
+        [...bucketSnapshot.entries()].map(([id, idx]) => [id, items[idx]]),
+      );
+      const resultSnapshot = new Map(
+        ids
+          .map((id) => [id, searchResults.findIndex((i) => i.thread_id === id)] as const)
+          .filter(([, idx]) => idx >= 0),
+      );
+      const removedFromResults = new Map(
+        [...resultSnapshot.entries()].map(([id, idx]) => [id, searchResults[idx]]),
+      );
+
+      const prevSelectedId = selectedId;
+      if (prevSelectedId && idSet.has(prevSelectedId)) {
+        const remaining = visibleItems.filter((i) => !idSet.has(i.thread_id));
+        setSelectedId(remaining[0]?.thread_id ?? null);
+      }
+      setItems((prev) => prev.filter((i) => !idSet.has(i.thread_id)));
+      setSearchResults((prev) => prev.filter((i) => !idSet.has(i.thread_id)));
+      setBulkIds(new Set());
+
+      // Ascending index order so each splice doesn't shift a later insert.
+      const restoreRows = (targetIds: string[]) => {
+        const bucketOrder = targetIds
+          .filter((id) => bucketSnapshot.has(id))
+          .sort((a, b) => bucketSnapshot.get(a)! - bucketSnapshot.get(b)!);
+        if (bucketOrder.length > 0) {
+          setItems((prev) => {
+            const copy = [...prev];
+            for (const id of bucketOrder) {
+              copy.splice(Math.min(bucketSnapshot.get(id)!, copy.length), 0, removedFromBucket.get(id)!);
+            }
+            return copy;
+          });
+        }
+        const resultOrder = targetIds
+          .filter((id) => resultSnapshot.has(id))
+          .sort((a, b) => resultSnapshot.get(a)! - resultSnapshot.get(b)!);
+        if (resultOrder.length > 0) {
+          setSearchResults((prev) => {
+            const copy = [...prev];
+            for (const id of resultOrder) {
+              copy.splice(Math.min(resultSnapshot.get(id)!, copy.length), 0, removedFromResults.get(id)!);
+            }
+            return copy;
+          });
+        }
+      };
+
+      const undo = () => {
+        const timer = pendingDeletes.current.get(ids[0]);
+        if (timer) clearTimeout(timer);
+        for (const id of ids) pendingDeletes.current.delete(id);
+        restoreRows(ids);
+        if (prevSelectedId && idSet.has(prevSelectedId)) setSelectedId(prevSelectedId);
+      };
+
+      const timer = setTimeout(async () => {
+        // A quiet background refresh racing this fan-out must keep masking
+        // these ids until every delete call has actually settled — removing
+        // them from pendingDeletes any earlier would let that refresh
+        // resurrect a row mid-flight.
+        const settled = await Promise.allSettled(ids.map((id) => deleteThread(id)));
+        const failedIds = ids.filter((_, i) => settled[i].status === "rejected");
+        for (const id of ids) pendingDeletes.current.delete(id);
+        if (failedIds.length > 0) {
+          restoreRows(failedIds);
+          if (prevSelectedId && failedIds.includes(prevSelectedId)) {
+            setSelectedId(prevSelectedId);
+          }
+          toast.error(`${failedIds.length} of ${ids.length} failed`);
+        }
+        refreshAll({ quiet: true });
+      }, UNDO_MS);
+      // Same timer under every id — the pagehide flush above walks
+      // pendingDeletes entry-by-entry, so this covers the batch unchanged.
+      for (const id of ids) pendingDeletes.current.set(id, timer);
+
+      toast(`${ids.length} threads deleted`, {
+        description: "removing in a few seconds",
+        action: { label: "undo", onClick: undo },
+        duration: UNDO_MS,
+      });
+    },
+    [items, searchResults, selectedId, visibleItems, refreshAll],
+  );
+
   // ---- done (non-destructive exit from triage; inverse action in `done`) ----
   const doDone = useCallback(
     (idArg?: string) => {
@@ -1158,6 +1340,98 @@ export default function Console() {
       })();
     },
     [selectedId, bucket, items, searchMode, visibleItems, refreshCounts],
+  );
+
+  // Batch done/restore: mirrors doDone, fanned out with per-item failure
+  // isolation — one thread rejecting the call doesn't undo the rest.
+  const doDoneBatch = useCallback(
+    (ids: string[]) => {
+      if (ids.length === 0) return;
+      const marking = bucket !== "done";
+      const idSet = new Set(ids);
+
+      const bucketSnapshot = new Map(
+        ids
+          .map((id) => [id, items.findIndex((i) => i.thread_id === id)] as const)
+          .filter(([, idx]) => idx >= 0),
+      );
+      const removedFromBucket = new Map(
+        [...bucketSnapshot.entries()].map(([id, idx]) => [id, items[idx]]),
+      );
+
+      // In search mode done threads remain searchable, so rows stay put (and
+      // so does the selection) — same rule as single doDone.
+      if (!searchMode) {
+        if (selectedId && idSet.has(selectedId)) {
+          const remaining = visibleItems.filter((i) => !idSet.has(i.thread_id));
+          setSelectedId(remaining[0]?.thread_id ?? null);
+        }
+        setItems((prev) => prev.filter((i) => !idSet.has(i.thread_id)));
+      }
+      setBulkIds(new Set());
+
+      const restoreRows = (targetIds: string[]) => {
+        const order = targetIds
+          .filter((id) => bucketSnapshot.has(id))
+          .sort((a, b) => bucketSnapshot.get(a)! - bucketSnapshot.get(b)!);
+        if (order.length === 0) return;
+        setItems((prev) => {
+          const copy = [...prev];
+          for (const id of order) {
+            copy.splice(Math.min(bucketSnapshot.get(id)!, copy.length), 0, removedFromBucket.get(id)!);
+          }
+          return copy;
+        });
+      };
+
+      const applyDoneState = (targetIds: string[], done: boolean) => {
+        if (targetIds.length === 0) return;
+        const targetSet = new Set(targetIds);
+        setThread((prev) =>
+          prev && targetSet.has(prev.thread.id)
+            ? { ...prev, thread: { ...prev.thread, done } }
+            : prev,
+        );
+      };
+
+      void (async () => {
+        const settled = await Promise.allSettled(ids.map((id) => setThreadDone(id, marking)));
+        const succeededIds = ids.filter((_, i) => settled[i].status === "fulfilled");
+        const failedIds = ids.filter((_, i) => settled[i].status === "rejected");
+
+        if (failedIds.length > 0) {
+          if (!searchMode) restoreRows(failedIds);
+          toast.error(`${failedIds.length} of ${ids.length} failed`);
+        }
+        applyDoneState(succeededIds, marking);
+        refreshCounts();
+
+        if (succeededIds.length > 0) {
+          toast(`${succeededIds.length} threads ${marking ? "done" : "restored"}`, {
+            action: {
+              label: "undo",
+              onClick: () => {
+                void Promise.allSettled(
+                  succeededIds.map((id) => setThreadDone(id, !marking)),
+                ).then((undone) => {
+                  const restoredIds = succeededIds.filter((_, i) => undone[i].status === "fulfilled");
+                  const undoFailedIds = succeededIds.filter((_, i) => undone[i].status === "rejected");
+                  applyDoneState(restoredIds, !marking);
+                  if (!searchMode) restoreRows(restoredIds);
+                  if (undoFailedIds.length > 0) {
+                    toast.error(
+                      `undo failed for ${undoFailedIds.length} thread${undoFailedIds.length === 1 ? "" : "s"}`,
+                    );
+                  }
+                  refreshCounts();
+                });
+              },
+            },
+          });
+        }
+      })();
+    },
+    [bucket, items, searchMode, selectedId, visibleItems, refreshCounts],
   );
 
   // Jump to the thread in the Gmail web UI (default signed-in account).
@@ -1383,6 +1657,89 @@ export default function Console() {
     [selectedId, bucket, items, searchMode, visibleItems, refreshCounts],
   );
 
+  // Batch reclassify: same optimistic-override-then-roll-back-on-failure
+  // shape as doReclassify, `leavesBucket` computed once (it only depends on
+  // bucket/label/searchMode, not on which thread).
+  const doReclassifyBatch = useCallback(
+    async (ids: string[], label: Label) => {
+      if (ids.length === 0) return;
+      const idSet = new Set(ids);
+      const leavesBucket =
+        !searchMode &&
+        (bucket === "unclassified" ||
+          (bucket !== "all" && bucket !== "done" && bucket !== label));
+
+      const bucketSnapshot = new Map(
+        ids
+          .map((id) => [id, items.findIndex((i) => i.thread_id === id)] as const)
+          .filter(([, idx]) => idx >= 0),
+      );
+
+      const prevSelectedId = selectedId;
+      if (leavesBucket && prevSelectedId && idSet.has(prevSelectedId)) {
+        const remaining = visibleItems.filter((i) => !idSet.has(i.thread_id));
+        setSelectedId(remaining[0]?.thread_id ?? null);
+      }
+
+      // Snapshots captured from the updaters' live state (map runs inside the
+      // setState updater), same idiom as the single-thread version above.
+      const prevItems = new Map<string, TriageItem>();
+      const prevResults = new Map<string, TriageItem>();
+      const applyOverride = (it: TriageItem, capture: Map<string, TriageItem>): TriageItem => {
+        if (!idSet.has(it.thread_id)) return it;
+        capture.set(it.thread_id, it);
+        return {
+          ...it,
+          classification: { label, confidence: 1, model_version: "user-override" },
+        };
+      };
+      setItems((prev) => {
+        const mapped = prev.map((it) => applyOverride(it, prevItems));
+        return leavesBucket ? mapped.filter((it) => !idSet.has(it.thread_id)) : mapped;
+      });
+      setSearchResults((prev) => prev.map((it) => applyOverride(it, prevResults)));
+      setBulkIds(new Set());
+
+      const settled = await Promise.allSettled(ids.map((id) => reclassify(id, label)));
+      const succeededIds = ids.filter((_, i) => settled[i].status === "fulfilled");
+      const failedIds = ids.filter((_, i) => settled[i].status === "rejected");
+
+      if (failedIds.length > 0) {
+        const failedSet = new Set(failedIds);
+        if (leavesBucket) {
+          const order = failedIds
+            .filter((id) => bucketSnapshot.has(id))
+            .sort((a, b) => bucketSnapshot.get(a)! - bucketSnapshot.get(b)!);
+          if (order.length > 0) {
+            setItems((prev) => {
+              const copy = [...prev];
+              for (const id of order) {
+                copy.splice(Math.min(bucketSnapshot.get(id)!, copy.length), 0, prevItems.get(id)!);
+              }
+              return copy;
+            });
+          }
+        } else {
+          setItems((prev) =>
+            prev.map((it) => (failedSet.has(it.thread_id) ? (prevItems.get(it.thread_id) ?? it) : it)),
+          );
+        }
+        setSearchResults((prev) =>
+          prev.map((it) => (failedSet.has(it.thread_id) ? (prevResults.get(it.thread_id) ?? it) : it)),
+        );
+        if (leavesBucket && prevSelectedId && failedSet.has(prevSelectedId)) {
+          setSelectedId(prevSelectedId);
+        }
+        toast.error(`${failedIds.length} of ${ids.length} failed`);
+      }
+      if (succeededIds.length > 0) {
+        toast.success(`${succeededIds.length} → ${label}`);
+      }
+      refreshCounts();
+    },
+    [selectedId, bucket, items, searchMode, visibleItems, refreshCounts],
+  );
+
   // ---- hotkeys -------------------------------------------------------------
   useHotkeys(
     (e) => {
@@ -1399,9 +1756,15 @@ export default function Console() {
         return;
       }
 
-      // Escape clears an active search (works even while the search box has
-      // focus, since useHotkeys lets Escape through).
+      // Escape priority: overlay/tour handling above already returned; a live
+      // bulk selection is next, then search clears (works even while the
+      // search box has focus, since useHotkeys lets Escape through).
       if (e.key === "Escape") {
+        if (bulkIds.size > 0) {
+          e.preventDefault();
+          setBulkIds(new Set());
+          return;
+        }
         if (searchMode || query) {
           e.preventDefault();
           clearSearch();
@@ -1438,17 +1801,26 @@ export default function Console() {
       }
       if (e.key === "#") {
         e.preventDefault();
-        doDelete();
+        if (!isNarrow && bulkIds.size > 0) doDeleteBatch(batchTargets());
+        else doDelete();
         return;
       }
       if (e.key === "e") {
         e.preventDefault();
-        doDone();
+        if (!isNarrow && bulkIds.size > 0) doDoneBatch(batchTargets());
+        else doDone();
         return;
       }
       if (e.key === "o") {
         e.preventDefault();
         openInGmail();
+        return;
+      }
+      // Toggles bulk-select on the focused row — wide layout only, mirrors
+      // Gmail's `x` (no auto-advance). Collides with nothing else here.
+      if (e.key === "x" && !isNarrow) {
+        e.preventDefault();
+        if (focusedItem) toggleBulk(focusedItem.thread_id);
         return;
       }
       if (e.key === "l") {
@@ -1460,7 +1832,9 @@ export default function Console() {
       if (Date.now() - lPressedAt.current < 800 && /^[1-6]$/.test(e.key)) {
         e.preventDefault();
         lPressedAt.current = 0;
-        doReclassify(ALL_LABELS[Number(e.key) - 1]);
+        const label = ALL_LABELS[Number(e.key) - 1];
+        if (!isNarrow && bulkIds.size > 0) doReclassifyBatch(batchTargets(), label);
+        else doReclassify(label);
         return;
       }
       // bucket switching 1-9
@@ -1479,12 +1853,19 @@ export default function Console() {
         moveSelection(-1);
       } else if (e.key === "G") {
         e.preventDefault();
-        if (visibleItems.length)
-          setSelectedId(visibleItems[visibleItems.length - 1].thread_id);
+        if (visibleItems.length) {
+          const target = visibleItems[visibleItems.length - 1];
+          setSelectedId(target.thread_id);
+          markThreadSeen(target.thread_id);
+        }
       } else if (e.key === "g") {
         const now = Date.now();
         if (now - gPressedAt.current < 400) {
-          if (visibleItems.length) setSelectedId(visibleItems[0].thread_id);
+          if (visibleItems.length) {
+            const target = visibleItems[0];
+            setSelectedId(target.thread_id);
+            markThreadSeen(target.thread_id);
+          }
           gPressedAt.current = 0;
         } else {
           gPressedAt.current = now;
@@ -1492,7 +1873,10 @@ export default function Console() {
       } else if (e.key === "Enter") {
         // already selected; this is a no-op besides ensuring scroll
         if (focusedItem) {
-          if (isNarrow) setNarrowPane("reading");
+          if (isNarrow) {
+            setNarrowPane("reading");
+            markThreadSeen(focusedItem.thread_id);
+          }
           document
             .querySelector(`[data-thread-row="${focusedItem.thread_id}"]`)
             ?.scrollIntoView({ block: "nearest" });
@@ -1523,12 +1907,19 @@ export default function Console() {
       focusedItem,
       isNarrow,
       bucket,
+      bulkIds,
+      batchTargets,
+      toggleBulk,
       moveSelection,
+      markThreadSeen,
       clearSearch,
       togglePanel,
       doDelete,
+      doDeleteBatch,
       doDone,
+      doDoneBatch,
       doReclassify,
+      doReclassifyBatch,
       openInGmail,
       refreshList,
       refreshOverview,
@@ -1629,12 +2020,38 @@ export default function Console() {
         <span className="text-primary font-semibold tracking-tight shrink-0">
           {searchMode ? "search" : bucket.replace("_", " ")}
         </span>
-        <span className="text-muted-foreground tabular-nums shrink-0">
-          {visibleItems.length}
-          {searchMode ? " match" : " thread"}
-          {visibleItems.length === 1 ? "" : "s"}
-          {searchMode ? " · all buckets" : ""}
-        </span>
+        {!isNarrow && bulkIds.size > 0 ? (
+          <>
+            <span className="text-muted-foreground tabular-nums shrink-0">
+              {bulkIds.size} selected
+            </span>
+            <button
+              onClick={() => doDoneBatch(batchTargets())}
+              className="shrink-0 px-2 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+            >
+              done
+            </button>
+            <button
+              onClick={() => doDeleteBatch(batchTargets())}
+              className="shrink-0 px-2 py-0.5 rounded border border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/20 cursor-pointer transition-colors"
+            >
+              delete
+            </button>
+            <button
+              onClick={() => setBulkIds(new Set())}
+              className="shrink-0 px-2 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+            >
+              clear
+            </button>
+          </>
+        ) : (
+          <span className="text-muted-foreground tabular-nums shrink-0">
+            {visibleItems.length}
+            {searchMode ? " match" : " thread"}
+            {visibleItems.length === 1 ? "" : "s"}
+            {searchMode ? " · all buckets" : ""}
+          </span>
+        )}
 
         {pendingNew > 0 && (
           <button
@@ -1825,6 +2242,7 @@ export default function Console() {
             selectedId={selectedId}
             onSelect={(id) => {
               setSelectedId(id);
+              markThreadSeen(id);
               if (isNarrow) setNarrowPane("reading");
             }}
             showLabel={searchMode || bucket === "all" || bucket === "done"}
@@ -1832,6 +2250,11 @@ export default function Console() {
             narrow={isNarrow}
             loading={listLoading || searching}
             error={listError}
+            density={density}
+            grouped={!searchMode && sortMode === "recent"}
+            isUnseen={isUnseenFor}
+            bulkIds={isNarrow ? undefined : bulkIds}
+            onToggleBulk={isNarrow ? undefined : toggleBulk}
           />
         )}
         {!searchMode && hasMore && (
@@ -1867,8 +2290,13 @@ export default function Console() {
   return (
     <>
       {/* overflow-clip: no descendant (however hostile an email's CSS) may ever
-          grow the page a scrollbar — panes own all scrolling. */}
-      <div className="h-screen flex flex-col overflow-clip bg-background text-foreground">
+          grow the page a scrollbar — panes own all scrolling. zoom (not
+          root font-size) scales spacing along with text since row typography
+          uses arbitrary-value px classes root font-size can't reach. */}
+      <div
+        className="h-screen flex flex-col overflow-clip bg-background text-foreground"
+        style={fontScale !== 1 ? { zoom: fontScale } : undefined}
+      >
         <TopBar
           user={user}
           overview={overview}
@@ -1885,6 +2313,10 @@ export default function Console() {
           onLayoutOpenChange={setLayoutOpen}
           arrangement={arrangement}
           onArrangement={setArrangement}
+          density={density}
+          onDensity={setDensity}
+          fontScale={fontScale}
+          onFontScale={setFontScale}
           theme={theme}
           onTheme={setTheme}
           autoSync={autoSync}
