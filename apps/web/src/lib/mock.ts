@@ -80,7 +80,12 @@ function rand<T>(arr: T[], i: number): T {
 function makeItems(count: number): TriageItem[] {
   const out: TriageItem[] = [];
   const now = Date.now();
+  // Gaps accumulate so the list is genuinely recency-ordered — the account
+  // sort's stable-sort trick and the date group headers both rely on that.
+  // Varied gap sizes spread ~450 items across a month or so of history.
+  let minutesAgo = 0;
   for (let i = 0; i < count; i++) {
+    minutesAgo += 3 + ((i * 13) % 200);
     const hasLabel = i % 11 !== 0;
     const label = hasLabel ? ALL_LABELS[i % ALL_LABELS.length] : null;
     const conf = hasLabel
@@ -89,7 +94,7 @@ function makeItems(count: number): TriageItem[] {
     out.push({
       thread_id: `mock-${i}-${(i * 9301 + 49297) % 233280}`,
       subject: rand(SUBJECTS, i + (i % 3)),
-      last_message_at: new Date(now - i * 1000 * 60 * (3 + (i % 47))).toISOString(),
+      last_message_at: new Date(now - minutesAgo * 60 * 1000).toISOString(),
       latest_message_snippet: rand(SNIPPETS, i),
       latest_message_sender: rand(SENDERS, i),
       classification: {
