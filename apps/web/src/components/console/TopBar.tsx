@@ -20,7 +20,7 @@ import { LayoutPicker } from "./LayoutPicker";
 import { bucketLabel } from "@/lib/labels";
 import { cn } from "@/lib/utils";
 import { BUCKETS } from "@/lib/types";
-import type { Arrangement } from "@/lib/layout";
+import type { Arrangement, Density } from "@/lib/layout";
 import { THEME_PREFS } from "@/lib/theme";
 import type { ThemePref } from "@/lib/theme";
 import { AUTO_SYNC_CHOICES } from "@/lib/use-auto-sync";
@@ -52,6 +52,10 @@ interface Props {
   onLayoutOpenChange: (v: boolean) => void;
   arrangement: Arrangement;
   onArrangement: (a: Arrangement) => void;
+  density?: Density;
+  onDensity?: (d: Density) => void;
+  fontScale?: number;
+  onFontScale?: (s: number) => void;
   theme: ThemePref;
   onTheme: (t: ThemePref) => void;
   autoSync: number;
@@ -504,6 +508,10 @@ export function TopBar({
   onLayoutOpenChange,
   arrangement,
   onArrangement,
+  density,
+  onDensity,
+  fontScale,
+  onFontScale,
   theme,
   onTheme,
   autoSync,
@@ -625,7 +633,14 @@ export function TopBar({
             </button>
           }
         >
-          <LayoutPicker arrangement={arrangement} onArrangement={onArrangement} />
+          <LayoutPicker
+            arrangement={arrangement}
+            onArrangement={onArrangement}
+            density={density}
+            onDensity={onDensity}
+            fontScale={fontScale}
+            onFontScale={onFontScale}
+          />
         </Popover>
       </div>
 
