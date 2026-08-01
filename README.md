@@ -210,7 +210,7 @@ connected Gmail and Outlook account. Mark items done with `e` or dismiss with
 
 It is **off by default**. To enable, set both in `.env`:
 
-```
+```dotenv
 ACTION_EXTRACTION_ENABLED=true
 GEMINI_API_KEY=...            # required — there is no non-LLM fallback
 ```
@@ -221,7 +221,7 @@ mail, plus a background recovery pass every 15 minutes. To extract from mail
 that arrived before you enabled it, run a backfill from the command palette
 ("extract actions"), or:
 
-```
+```http
 POST /api/v1/mail/actions/backfill?limit=100&since_days=30
 ```
 
