@@ -122,6 +122,26 @@ def test_extract_action_date_only_resolves_to_end_of_day_utc(monkeypatch):
     assert result.due_at == datetime(2024, 3, 15, 23, 59, 59, tzinfo=timezone.utc)
 
 
+def test_extract_action_missing_due_is_date_only_treated_as_false(monkeypatch):
+    # response_schema only requires has_action + confidence -- a model reply
+    # with a due_at but no due_is_date_only key must not burn the extraction
+    # attempt on a deterministic shape gap.
+    payload = {**VALID_PAYLOAD, "due_at": "2024-03-15T17:00:00Z"}
+    del payload["due_is_date_only"]
+    _install_fake_client(monkeypatch, text=json.dumps(payload))
+    result = _call_extract_action()
+    assert isinstance(result, ExtractedAction)
+    assert result.due_precision == "datetime"
+    assert result.due_at == datetime(2024, 3, 15, 17, 0, 0, tzinfo=timezone.utc)
+
+
+def test_extract_action_invalid_due_is_date_only_still_returns_none(monkeypatch):
+    # A PRESENT non-boolean value is still a malformed response.
+    payload = {**VALID_PAYLOAD, "due_is_date_only": "yes"}
+    _install_fake_client(monkeypatch, text=json.dumps(payload))
+    assert _call_extract_action() is None
+
+
 def test_extract_action_caps_title_length(monkeypatch):
     long_title = "Pay the invoice right now before it becomes overdue " * 3
     assert len(long_title) > 80

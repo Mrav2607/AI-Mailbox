@@ -760,6 +760,34 @@ def test_run_extraction_sweep_counts_a_bucket_per_message(monkeypatch):
     assert result["failed"] == 1
 
 
+def test_run_extraction_sweep_isolates_one_bad_message_and_continues(monkeypatch):
+    # Same fan-out isolation as dispatch_scheduled_syncs: a message that
+    # blows up _claim_extract_record (an exception that even its own
+    # containment couldn't fence) must not abort the rest of the sweep.
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    bad_message, good_message = uuid4(), uuid4()
+    monkeypatch.setattr(
+        extraction_run, "_message_driven_candidates",
+        lambda *a, **k: [bad_message, good_message],
+    )
+
+    def fake_claim(db, mid, force=False):
+        if mid == bad_message:
+            raise RuntimeError("boom")
+        return "extracted", uuid4()
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+    db = MagicMock()
+
+    result = extraction_run.run_extraction_sweep(db, uuid4())
+
+    assert result["processed"] == 2
+    assert result["failed"] == 1
+    assert result["extracted"] == 1
+    db.rollback.assert_called_once()
+
+
 def test_run_extraction_sweep_end_to_end_terminalizes_expired_at_cap_row(monkeypatch):
     """Not helper-only: drives run_extraction_sweep itself (not just
     terminalize_expired_pending directly) through a user whose only row is a
@@ -807,6 +835,9 @@ def test_users_with_unclaimed_actionable_messages_requires_no_existing_row():
     assert "action_item.id IS NULL" in sql
     assert "classification.label IN" in sql
     assert "mail_thread.done_at IS NULL" in sql
+    # A NULL sent_at (possible by design) must not make the message
+    # permanently invisible to the recovery pass -- coalesce to created_at.
+    assert "coalesce(mail_message.sent_at, mail_message.created_at) >=" in sql
 
 
 def test_message_driven_candidates_force_widens_existing_row_filter():
@@ -818,6 +849,21 @@ def test_message_driven_candidates_force_widens_existing_row_filter():
 
     sql = _compiled_sql(db.statements[0])
     assert "action_item.outcome != 'pending'" in sql
+
+
+def test_message_driven_candidates_coalesces_null_sent_at_for_cutoff_and_order():
+    db = _FakeDB([_FakeResult()])
+    db.execute = lambda stmt: (db.statements.append(stmt), _FakeResult())[1]
+    extraction_run._message_driven_candidates(
+        db, uuid4(), since_days=30, limit=10, force=False
+    )
+
+    sql = _compiled_sql(db.statements[0])
+    assert "coalesce(mail_message.sent_at, mail_message.created_at) >=" in sql
+    assert (
+        "ORDER BY coalesce(mail_message.sent_at, mail_message.created_at) "
+        "DESC NULLS LAST" in sql
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -914,6 +960,62 @@ def test_extraction_recovery_tick_sweeps_two_independent_user_sets(monkeypatch):
     assert ("sweep", row_user, 25, True) in calls
     assert ("sweep", message_user, 25, False) in calls
     assert result == {"status": "ok", "row_driven_users": 1, "message_driven_users": 1}
+
+
+def test_extraction_recovery_tick_isolates_one_bad_user_and_continues(monkeypatch):
+    # One user's sweep blowing up must not abort the tick for the rest --
+    # same fan-out isolation as dispatch_scheduled_syncs.
+    bad_user, good_user = uuid4(), uuid4()
+    swept = []
+    db = MagicMock()
+
+    monkeypatch.setattr(tasks_nlp, "extraction_available", lambda: True)
+    monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(db))
+    monkeypatch.setattr(tasks_nlp, "terminalize_expired_pending", lambda db: None)
+    monkeypatch.setattr(
+        tasks_nlp, "users_with_claimable_action_items", lambda db: [bad_user, good_user]
+    )
+    monkeypatch.setattr(tasks_nlp, "users_with_unclaimed_actionable_messages", lambda db: [])
+
+    def fake_sweep(db, user_id, *, limit, recovery=False, **kwargs):
+        swept.append(user_id)
+        if user_id == bad_user:
+            raise RuntimeError("boom")
+        return {"status": "ok"}
+
+    monkeypatch.setattr(tasks_nlp, "run_extraction_sweep", fake_sweep)
+
+    result = tasks_nlp.extraction_recovery_tick.run()
+
+    assert swept == [bad_user, good_user]  # bad user didn't stop the good one
+    db.rollback.assert_called_once()
+    assert result == {"status": "ok", "row_driven_users": 1, "message_driven_users": 0}
+
+
+def test_extraction_recovery_tick_returns_partial_counts_on_soft_time_limit(monkeypatch):
+    user_a, user_b = uuid4(), uuid4()
+
+    monkeypatch.setattr(tasks_nlp, "extraction_available", lambda: True)
+    monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(MagicMock()))
+    monkeypatch.setattr(tasks_nlp, "terminalize_expired_pending", lambda db: None)
+    monkeypatch.setattr(
+        tasks_nlp, "users_with_claimable_action_items", lambda db: [user_a, user_b]
+    )
+    monkeypatch.setattr(tasks_nlp, "users_with_unclaimed_actionable_messages", lambda db: [])
+
+    def fake_sweep(db, user_id, *, limit, recovery=False, **kwargs):
+        if user_id == user_b:
+            raise tasks_nlp.SoftTimeLimitExceeded()
+        return {"status": "ok"}
+
+    monkeypatch.setattr(tasks_nlp, "run_extraction_sweep", fake_sweep)
+
+    # A hard kill (time_limit=300) has no chance to fence a claim mid-flight
+    # -- the soft limit must stop the tick cleanly instead of propagating
+    # and burning the whole tick's work with an unhandled SIGKILL.
+    result = tasks_nlp.extraction_recovery_tick.run()
+
+    assert result == {"status": "timed_out", "row_driven_users": 1, "message_driven_users": 0}
 
 
 # ---------------------------------------------------------------------------

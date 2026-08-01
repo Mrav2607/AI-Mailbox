@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 from .celery_app import celery_app
+from app.core.logging import logger
 from app.db.base import SessionLocal
 from app.db.models import MailThread, MailMessage
 from app.services.nlp.backfill import run_backfill
@@ -143,7 +146,7 @@ def extract_actions_for_user(
     return {"user_id": user_id, **result}
 
 
-@celery_app.task(ignore_result=True, time_limit=300)
+@celery_app.task(ignore_result=True, time_limit=300, soft_time_limit=270)
 def extraction_recovery_tick() -> dict:
     """Beat-scheduled safety net (every 900s -- celery_app.py) so retryable
     rows don't depend on new mail arriving to get swept: a quiet sync, a
@@ -161,24 +164,68 @@ def extraction_recovery_tick() -> dict:
       hook's enqueue leaves no row behind, so the row-driven set alone can
       never see that user; this pass is what recovers them.
 
+    One bad user's sweep must never abort the tick for the rest (same
+    fan-out isolation as dispatch_scheduled_syncs): roll back and log, then
+    move on. A soft time limit backstops the hard `time_limit=300` kill --
+    a hard SIGKILL happens mid-claim with no chance to fence the row, so
+    each kill would burn a claim-time attempt for nothing; the soft limit
+    lets the tick stop cleanly instead and return partial counts, leaving
+    whatever's left for the next tick 900s later.
+
     No autoretry -- the next tick is the retry.
     """
     if not extraction_available():
         return {"status": "disabled"}
 
-    with SessionLocal() as db:
-        terminalize_expired_pending(db)
+    row_driven_swept = 0
+    message_driven_swept = 0
+    try:
+        with SessionLocal() as db:
+            terminalize_expired_pending(db)
 
-        row_driven_users = users_with_claimable_action_items(db)
-        for user_id in row_driven_users:
-            run_extraction_sweep(db, user_id, limit=_RECOVERY_SWEEP_LIMIT, recovery=True)
+            row_driven_users = users_with_claimable_action_items(db)
+            for user_id in row_driven_users:
+                try:
+                    run_extraction_sweep(
+                        db, user_id, limit=_RECOVERY_SWEEP_LIMIT, recovery=True
+                    )
+                except SoftTimeLimitExceeded:
+                    raise
+                except Exception:
+                    db.rollback()
+                    logger.exception(
+                        "action extraction recovery tick failed for "
+                        "row-driven user %s",
+                        user_id,
+                    )
+                    continue
+                row_driven_swept += 1
 
-        message_driven_users = users_with_unclaimed_actionable_messages(db)
-        for user_id in message_driven_users:
-            run_extraction_sweep(db, user_id, limit=_RECOVERY_SWEEP_LIMIT)
+            message_driven_users = users_with_unclaimed_actionable_messages(db)
+            for user_id in message_driven_users:
+                try:
+                    run_extraction_sweep(db, user_id, limit=_RECOVERY_SWEEP_LIMIT)
+                except SoftTimeLimitExceeded:
+                    raise
+                except Exception:
+                    db.rollback()
+                    logger.exception(
+                        "action extraction recovery tick failed for "
+                        "message-driven user %s",
+                        user_id,
+                    )
+                    continue
+                message_driven_swept += 1
+    except SoftTimeLimitExceeded:
+        logger.exception("action extraction recovery tick hit its soft time limit")
+        return {
+            "status": "timed_out",
+            "row_driven_users": row_driven_swept,
+            "message_driven_users": message_driven_swept,
+        }
 
     return {
         "status": "ok",
-        "row_driven_users": len(row_driven_users),
-        "message_driven_users": len(message_driven_users),
+        "row_driven_users": row_driven_swept,
+        "message_driven_users": message_driven_swept,
     }

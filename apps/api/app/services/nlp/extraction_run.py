@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -249,7 +249,13 @@ def _message_driven_candidates(
     ``since_days``, newest first. An existing row must also be claimable
     (``force``-widened) -- otherwise a settled/live-pending message would
     burn a selection slot for nothing.
+
+    Messages with a NULL ``sent_at`` are possible by design (see
+    ``backfill.py``'s ``latest_message_ordering``) -- coalescing to
+    ``created_at`` for both the cutoff filter and the ordering keeps them
+    from being permanently invisible to this sweep.
     """
+    sent_at = func.coalesce(MailMessage.sent_at, MailMessage.created_at)
     cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
     rows = (
         db.execute(
@@ -261,10 +267,10 @@ def _message_driven_candidates(
                 MailThread.user_id == user_id,
                 MailThread.done_at.is_(None),
                 Classification.label.in_(ACTION_LABELS),
-                MailMessage.sent_at >= cutoff,
+                sent_at >= cutoff,
                 or_(ActionItem.id.is_(None), claimable_predicate(force=force)),
             )
-            .order_by(MailMessage.sent_at.desc())
+            .order_by(sent_at.desc().nullslast())
             .limit(limit)
         )
         .scalars()
@@ -358,7 +364,22 @@ def run_extraction_sweep(
     counts = _empty_counts()
     for message_id in message_ids:
         counts["processed"] += 1
-        bucket, _user_id = _claim_extract_record(db, message_id, force=force)
+        try:
+            bucket, _user_id = _claim_extract_record(db, message_id, force=force)
+        except Exception:
+            # _claim_extract_record already fences its OWN pre-claim/
+            # containment failures to a `failed` row and re-raises only when
+            # even that fencing failed -- this is the outer fan-out
+            # isolation (same idiom as dispatch_scheduled_syncs): one bad
+            # message must never abort the sweep for the rest. Roll back
+            # first, or every later candidate this sweep would fail with
+            # PendingRollbackError on the shared session.
+            db.rollback()
+            logger.exception(
+                "action extraction sweep failed for message %s", message_id
+            )
+            counts["failed"] += 1
+            continue
         counts[bucket] += 1
     return {"status": "ok", **counts}
 
@@ -390,6 +411,8 @@ def users_with_unclaimed_actionable_messages(db: Session) -> list[UUID]:
     actionable message lost its enqueue owns zero ``action_item`` rows and
     is invisible to the row-driven set above, which is exactly the
     broker-failure-before-first-claim case this set exists to recover.
+    ``sent_at`` coalesces to ``created_at`` (a NULL ``sent_at`` is possible
+    by design) so a message like that isn't invisible here too.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=_DEFAULT_SINCE_DAYS)
     rows = (
@@ -401,7 +424,7 @@ def users_with_unclaimed_actionable_messages(db: Session) -> list[UUID]:
             .where(
                 MailThread.done_at.is_(None),
                 Classification.label.in_(ACTION_LABELS),
-                MailMessage.sent_at >= cutoff,
+                func.coalesce(MailMessage.sent_at, MailMessage.created_at) >= cutoff,
                 ActionItem.id.is_(None),
             )
             .distinct()

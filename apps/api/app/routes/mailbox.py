@@ -461,11 +461,18 @@ def set_thread_done(
         # the real order, closing a deadlock against the claim transaction
         # (which locks the thread first too) and a stranded-open race
         # against it without a pre-existing row.
-        db.execute(
-            select(MailThread.id).where(MailThread.id == thread_id).with_for_update()
-        )
+        #
+        # Read done_at itself under the lock, not just the row's existence:
+        # the pre-lock `db.get` snapshot above can't see a concurrent
+        # done=true request that raced ahead and already committed, and
+        # trusting that snapshot would let a second request clobber the
+        # first one's done_at with a later timestamp. Only the locked read
+        # tells us whether we actually won the race.
+        locked_done_at = db.execute(
+            select(MailThread.done_at).where(MailThread.id == thread_id).with_for_update()
+        ).scalar_one()
         now = datetime.now(timezone.utc)
-        thread.done_at = now
+        thread.done_at = now if locked_done_at is None else locked_done_at
         # Every open item on this thread resolves to done, regardless of its
         # extraction outcome -- an in-flight claim's later record must land
         # already resolved, so a still-pending row is included too. Un-done

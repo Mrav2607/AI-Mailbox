@@ -240,11 +240,14 @@ def test_reclassify_broker_failure_is_swallowed_and_response_still_succeeds(monk
 
 class _ThreadDoneDB:
     """Fake session backing set_thread_done: db.get resolves the owned
-    thread, and every db.execute() call (the FOR UPDATE lock, then the bulk
-    ActionItem update) is recorded in call order."""
+    thread, and every db.execute() call (the locked done_at re-read, then
+    the bulk ActionItem update) is recorded in call order. The locked
+    re-read defaults to None -- "no one beat us to it", the plain
+    single-request case."""
 
-    def __init__(self, thread):
+    def __init__(self, thread, *, locked_done_at=None):
         self.thread = thread
+        self.locked_done_at = locked_done_at
         self.statements = []
 
     def get(self, model, pk):
@@ -252,7 +255,9 @@ class _ThreadDoneDB:
 
     def execute(self, statement):
         self.statements.append(statement)
-        return MagicMock()
+        result = MagicMock()
+        result.scalar_one.return_value = self.locked_done_at
+        return result
 
     def commit(self):
         pass
@@ -295,6 +300,35 @@ def test_thread_done_locks_thread_before_bulk_resolving_action_items():
     assert "action_item.status = 'open'" in compiled_update
     assert "outcome" not in compiled_update
     assert "status='done'" in compiled_update.replace(" ", "")
+
+
+def test_thread_done_locked_reread_keeps_the_winners_done_at():
+    # Two concurrent done=true requests both read the thread pre-lock with
+    # done_at=None. This request loses the race for the FOR UPDATE lock --
+    # by the time it acquires it, the winner already committed a done_at.
+    # The locked re-read must see that and must NOT overwrite it with this
+    # request's own `now`.
+    user_id = uuid4()
+    thread_id = uuid4()
+    winners_done_at = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
+    thread = SimpleNamespace(id=thread_id, user_id=user_id, done_at=None)
+    db = _ThreadDoneDB(thread, locked_done_at=winners_done_at)
+    client = _thread_done_client(db, user_id)
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread_id}/done", json={"done": True}
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    lock_statement, update_statement = db.statements
+    assert "FOR UPDATE" in _compiled(lock_statement)
+    assert "mail_thread.done_at" in _compiled(lock_statement)
+    # The bulk resolve still runs (idempotent no-op against already-resolved
+    # rows), but done_at itself keeps the winner's original timestamp.
+    assert "UPDATE action_item" in _compiled(update_statement)
+    assert thread.done_at == winners_done_at
 
 
 def test_thread_done_is_idempotent_and_skips_the_bulk_update_when_already_done():

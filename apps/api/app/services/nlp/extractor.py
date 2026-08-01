@@ -132,7 +132,14 @@ def _parse_due_at(due_at_raw: object, due_is_date_only: object) -> tuple[datetim
         return None, None
     if not isinstance(due_at_raw, str):
         raise ValueError("Invalid due_at")
-    if not isinstance(due_is_date_only, bool):
+    # response_schema only requires has_action + confidence -- a model reply
+    # that includes due_at but omits due_is_date_only is a deterministic
+    # shape the retry loop can't fix, so treat missing/None as False rather
+    # than burning all 3 attempts on it. A PRESENT non-boolean value is still
+    # a malformed response and still raises.
+    if due_is_date_only is None:
+        due_is_date_only = False
+    elif not isinstance(due_is_date_only, bool):
         raise ValueError("Invalid due_is_date_only")
 
     try:
