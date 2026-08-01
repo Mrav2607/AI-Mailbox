@@ -36,6 +36,8 @@ interface Props {
   onOpenGmail: () => void;
   onDelete: () => void;
   onRestartTour: () => void;
+  onOpenAgenda: () => void;
+  onBackfillActions: () => void;
 }
 
 export function CommandPalette({
@@ -59,6 +61,8 @@ export function CommandPalette({
   onOpenGmail,
   onDelete,
   onRestartTour,
+  onOpenAgenda,
+  onBackfillActions,
 }: Props) {
   const run = (fn: () => void) => {
     onOpenChange(false);
@@ -87,6 +91,12 @@ export function CommandPalette({
               ))}
             </CommandGroup>
             <CommandGroup heading="view">
+              <CommandItem
+                onSelect={() => run(onOpenAgenda)}
+                value="open agenda deadlines actions"
+              >
+                open agenda
+              </CommandItem>
               <CommandItem
                 onSelect={() => run(onFocusSearch)}
                 value="search threads find"
@@ -160,6 +170,12 @@ export function CommandPalette({
                 value="queue classification"
               >
                 queue classification (async)
+              </CommandItem>
+              <CommandItem
+                onSelect={() => run(onBackfillActions)}
+                value="extract actions backfill agenda"
+              >
+                extract actions (backfill)
               </CommandItem>
               {AUTO_SYNC_CHOICES.map((c) => (
                 <CommandItem

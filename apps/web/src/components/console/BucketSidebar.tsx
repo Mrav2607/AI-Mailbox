@@ -1,17 +1,21 @@
 import { LABEL_META, bucketLabel } from "@/lib/labels";
-import type { BucketKey, Label } from "@/lib/types";
+import type { ActionCounts, BucketKey, Label } from "@/lib/types";
 import { ALL_LABELS, BUCKETS } from "@/lib/types";
 import type { SidebarSide } from "@/lib/layout";
 import { PaneDragHandle } from "./ConsoleLayout";
-import { Inbox, PanelLeftClose, PanelRightClose } from "lucide-react";
+import { Inbox, ListTodo, PanelLeftClose, PanelRightClose } from "lucide-react";
 
 interface Props {
-  active: BucketKey;
+  active: BucketKey | "agenda";
   counts: Record<BucketKey, number>;
-  onSelect: (b: BucketKey) => void;
+  onSelect: (b: BucketKey | "agenda") => void;
   onCollapse: () => void;
   side: SidebarSide;
   narrow?: boolean;
+  // Agenda open/overdue tally for the pinned entry's badge — undefined
+  // (not zeroed) when the server's action-extraction feature is off, same
+  // "feature isn't there" convention as the counts response it comes from.
+  actionCounts?: ActionCounts;
 }
 
 export function BucketSidebar({
@@ -21,8 +25,11 @@ export function BucketSidebar({
   onCollapse,
   side,
   narrow,
+  actionCounts,
 }: Props) {
   const CollapseIcon = side === "left" ? PanelLeftClose : PanelRightClose;
+  const agendaActive = active === "agenda";
+  const overdue = actionCounts?.overdue ?? 0;
   return (
     // Width and the dividing border belong to the layout's Panel/Separator now.
     <aside
@@ -44,6 +51,28 @@ export function BucketSidebar({
           </button>
         )}
       </div>
+      {actionCounts !== undefined && (
+        <div className="px-1 pt-1 border-b border-border">
+          <button
+            data-tour="agenda-entry"
+            onClick={() => onSelect("agenda")}
+            aria-current={agendaActive ? "true" : undefined}
+            className={[
+              "relative w-full text-left pl-3 pr-3 py-1.5 mb-1 flex items-center gap-2 rounded font-mono text-[12.5px] transition-colors duration-150 border cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+              agendaActive
+                ? "border-primary bg-[var(--color-panel-hi)] text-foreground"
+                : overdue > 0
+                  ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20"
+                  : "border-border text-muted-foreground hover:bg-[var(--color-panel-hi)]/60 hover:text-foreground",
+            ].join(" ")}
+          >
+            <span className="kbd">0</span>
+            <ListTodo className="h-3.5 w-3.5 shrink-0" />
+            <span className="flex-1 truncate">agenda</span>
+            <span className="text-[11px] tabular-nums">{actionCounts.open}</span>
+          </button>
+        </div>
+      )}
       <nav className="flex-1 overflow-y-auto scrollbar-thin py-1">
         {BUCKETS.map((b, i) => {
           const isActive = b === active;
