@@ -197,6 +197,38 @@ one, train it with the pipeline in `ml/` (`python ml/train_classifier.py ...`)
 and point `CLASSIFIER_MODEL_PATH` at the output directory. Until then, run with
 `CLASSIFIER_BACKEND=heuristic` (zero deps) or `gemini` (with an API key).
 
+## Agenda (action extraction)
+
+An optional second stage on top of classification: messages labeled
+`needs_reply` or `action_required` get one extra Gemini call that pulls out the
+concrete obligation — what to do, what kind of task it is (reply, payment,
+signature, form, RSVP, deadline, other), the due date, and any amount. Results
+land in the **Agenda** view (press `0` in the console): one deadline-ordered
+board — Overdue / Today / This week / Later / No deadline — across every
+connected Gmail and Outlook account. Mark items done with `e` or dismiss with
+`x`; resolving a thread as done resolves its items too.
+
+It is **off by default**. To enable, set both in `.env`:
+
+```
+ACTION_EXTRACTION_ENABLED=true
+GEMINI_API_KEY=...            # required — there is no non-LLM fallback
+```
+
+With the flag off (or no key) nothing runs and nothing is billed. When
+enabled, extraction happens automatically after each ingest that brings in new
+mail, plus a background recovery pass every 15 minutes. To extract from mail
+that arrived before you enabled it, run a backfill from the command palette
+("extract actions"), or:
+
+```
+POST /api/v1/mail/actions/backfill?limit=100&since_days=30
+```
+
+Cost stays bounded: only already-classified action mail is considered, each
+message is extracted at most once per classification verdict (retried at most
+3 times on failure), and sweeps are capped per run.
+
 ## Notes for local API usage
 
 - Use `/api/v1/auth/demo-login` to create a dev user and get an `access_token`.
