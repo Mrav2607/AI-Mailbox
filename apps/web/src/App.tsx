@@ -563,7 +563,8 @@ export default function Console() {
       if (!quiet) setActionsLoading(true);
       setActionsError(null);
       try {
-        const res = await getActions("open", 200);
+        // 500 is the API's `le` cap for this param -- request it explicitly.
+        const res = await getActions("open", 500);
         setActions(res.items);
         if (!quiet) {
           setSelectedActionId((prev) =>
@@ -1054,14 +1055,28 @@ export default function Console() {
   // ---- derived: agenda groups ----------------------------------------------
   // Grouping reads "now" internally, so a memo keyed only on `actions` goes
   // stale across local midnight -- items sit in yesterday's bucket until the
-  // next actions refetch. Keying on the local calendar day forces a regroup
-  // on any render after the day rolls over, with no extra fetch.
-  const localDayKey = new Date().toDateString();
+  // next actions refetch. dayKey is state (not computed at render time), so
+  // an idle tab still regroups once the scheduled-midnight effect below fires.
+  const [dayKey, setDayKey] = useState(() => new Date().toDateString());
+  useEffect(() => {
+    const now = new Date();
+    const nextMidnight = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + 1,
+      0,
+      0,
+      1, // small buffer past midnight so `new Date()` has actually rolled over
+    );
+    const delay = Math.max(1000, nextMidnight.getTime() - now.getTime());
+    const timer = setTimeout(() => setDayKey(new Date().toDateString()), delay);
+    return () => clearTimeout(timer);
+  }, [dayKey]);
   const agendaGroups = useMemo(
     () => groupActions(actions, new Date()),
-    // localDayKey is a deliberate re-run trigger, not something the memo body reads.
+    // dayKey is a deliberate re-run trigger, not something the memo body reads.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [actions, localDayKey],
+    [actions, dayKey],
   );
   // The flattened row order j/k walk over — same order the groups render in.
   const flattenedAgenda = useMemo(
