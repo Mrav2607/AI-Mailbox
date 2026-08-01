@@ -358,6 +358,11 @@ export function mockDeleteConnection(id: string): boolean {
   for (let i = ALL.length - 1; i >= 0; i--) {
     if (ALL[i].account_email === removed.email_address) ALL.splice(i, 1);
   }
+  // Agenda rows are keyed off the same account_email — leaving them behind
+  // would show obligations for a thread that no longer exists.
+  for (let i = ACTIONS.length - 1; i >= 0; i--) {
+    if (ACTIONS[i].account_email === removed.email_address) ACTIONS.splice(i, 1);
+  }
   return true;
 }
 

@@ -1052,7 +1052,17 @@ export default function Console() {
   const focusedItem = selectedIndex >= 0 ? visibleItems[selectedIndex] : null;
 
   // ---- derived: agenda groups ----------------------------------------------
-  const agendaGroups = useMemo(() => groupActions(actions, new Date()), [actions]);
+  // Grouping reads "now" internally, so a memo keyed only on `actions` goes
+  // stale across local midnight -- items sit in yesterday's bucket until the
+  // next actions refetch. Keying on the local calendar day forces a regroup
+  // on any render after the day rolls over, with no extra fetch.
+  const localDayKey = new Date().toDateString();
+  const agendaGroups = useMemo(
+    () => groupActions(actions, new Date()),
+    // localDayKey is a deliberate re-run trigger, not something the memo body reads.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [actions, localDayKey],
+  );
   // The flattened row order j/k walk over — same order the groups render in.
   const flattenedAgenda = useMemo(
     () => agendaGroups.flatMap((g) => g.items),
@@ -1998,6 +2008,7 @@ export default function Console() {
           e.preventDefault();
           if (focusedAction) {
             setSelectedId(focusedAction.thread_id);
+            markThreadSeen(focusedAction.thread_id);
             if (isNarrow) setNarrowPane("reading");
           }
         } else if (e.key === "e") {
@@ -2255,7 +2266,9 @@ export default function Console() {
       <div className="h-10 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center px-3 gap-2.5 font-mono text-[11.5px]">
         <span className="text-primary font-semibold tracking-tight shrink-0">agenda</span>
         <span className="text-muted-foreground tabular-nums shrink-0">
-          {flattenedAgenda.length} open
+          {/* The fetched list caps at the 200-row limit; the aggregate from
+              actionCounts is the real total once loaded. */}
+          {actionCounts?.open ?? flattenedAgenda.length} open
           {actionCounts && actionCounts.overdue > 0 ? ` · ${actionCounts.overdue} overdue` : ""}
         </span>
         <div className="flex-1" />
@@ -2283,6 +2296,7 @@ export default function Console() {
           onSelect={(item) => {
             setSelectedActionId(item.id);
             setSelectedId(item.thread_id);
+            markThreadSeen(item.thread_id);
             if (isNarrow) setNarrowPane("reading");
           }}
           onStatusChange={doActionStatus}

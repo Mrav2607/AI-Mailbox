@@ -58,9 +58,10 @@ export interface SearchResponse {
 
 export interface CountsResponse {
   counts: Record<BucketKey, number>;
-  // Agenda counts (open/overdue), cross-account, always present once the
-  // server's action-extraction feature is on — absent (not zeroed) when the
-  // feature is off, same "feature isn't there" convention as listAuthProviders.
+  // The API always sends this (zeroed, not omitted, when nothing's been
+  // extracted) — optional only so an older API deployment or a stale
+  // cached response can still parse. Presence here says nothing about
+  // whether action extraction is enabled server-side.
   actions?: ActionCounts;
 }
 

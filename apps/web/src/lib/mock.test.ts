@@ -103,26 +103,6 @@ describe("mock accounts", () => {
     expect(after.slice(0, 2).every((i) => i.account_email === acct.email_address)).toBe(true);
   });
 
-  it("round-trips listConnections/deleteConnection, cascading the removed account's mail", () => {
-    const before = mockListConnections();
-    expect(before.length).toBeGreaterThanOrEqual(2);
-    const target = before[0];
-
-    expect(mockDeleteConnection(target.id)).toBe(true);
-
-    const after = mockListConnections();
-    expect(after.length).toBe(before.length - 1);
-    expect(after.some((c) => c.id === target.id)).toBe(false);
-
-    // Mirrors the server: dropping a connection takes its synced mail with it.
-    const { items } = mockTriage("all", 500);
-    expect(items.every((i) => i.account_email !== target.email_address)).toBe(true);
-
-    // Re-deleting the same id (or one that never existed) is a no-op 404, not
-    // a crash — the caller (api.ts) turns a `false` here into an ApiError.
-    expect(mockDeleteConnection(target.id)).toBe(false);
-    expect(mockDeleteConnection("not-a-real-id")).toBe(false);
-  });
 });
 
 describe("mock agenda", () => {
@@ -193,5 +173,39 @@ describe("mock agenda", () => {
     const result = mockBackfillActions();
     expect(result.status).toBe("queued");
     expect(result.task_id).toMatch(/^mock-actions-task-/);
+  });
+});
+
+// Deletes a connection for real — must run last, after every test above that
+// relies on the full seed data (both accounts' mail AND agenda rows).
+describe("mock delete connection", () => {
+  it("round-trips listConnections/deleteConnection, cascading the removed account's mail and agenda rows", () => {
+    const before = mockListConnections();
+    expect(before.length).toBeGreaterThanOrEqual(2);
+    const target = before[0];
+    const actionsForTarget = mockActions("open", 500).items.filter(
+      (a) => a.account_email === target.email_address,
+    );
+    expect(actionsForTarget.length).toBeGreaterThan(0);
+
+    expect(mockDeleteConnection(target.id)).toBe(true);
+
+    const after = mockListConnections();
+    expect(after.length).toBe(before.length - 1);
+    expect(after.some((c) => c.id === target.id)).toBe(false);
+
+    // Mirrors the server: dropping a connection takes its synced mail with it.
+    const { items } = mockTriage("all", 500);
+    expect(items.every((i) => i.account_email !== target.email_address)).toBe(true);
+
+    // ...and its agenda rows too — otherwise the board shows obligations for
+    // an account (and threads) that no longer exist.
+    const remainingActions = mockActions("open", 500).items;
+    expect(remainingActions.every((a) => a.account_email !== target.email_address)).toBe(true);
+
+    // Re-deleting the same id (or one that never existed) is a no-op 404, not
+    // a crash — the caller (api.ts) turns a `false` here into an ApiError.
+    expect(mockDeleteConnection(target.id)).toBe(false);
+    expect(mockDeleteConnection("not-a-real-id")).toBe(false);
   });
 });
