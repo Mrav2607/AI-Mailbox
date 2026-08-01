@@ -10,13 +10,31 @@ from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.engine import CursorResult
 
 from .celery_app import celery_app
+from .tasks_nlp import extract_actions_for_user
 from app.core.config import settings
 from app.core.logging import logger
 from app.db.base import SessionLocal
 from app.db.models import MailSyncRun, MailThread, ProviderAccount
 from app.services.ingest.gmail_ingest import ingest_gmail_messages
 from app.services.ingest.outlook_ingest import ingest_outlook_messages
+from app.services.nlp.extraction_run import extraction_available
 from app.services.sync_runs import renew_sync, start_sync_run
+
+
+def _enqueue_action_extraction(user_id: str, result: dict) -> None:
+    """Fire-and-forget action-extraction sweep after a successful ingest that
+    upserted at least one message. Gated on extraction_available() so a
+    disabled feature never enqueues a useless job; wrapped so a broker
+    failure here can never fail (or retry) an ingest that already succeeded.
+    """
+    if not extraction_available() or result.get("messages_upserted", 0) <= 0:
+        return
+    try:
+        extract_actions_for_user.delay(user_id, limit=50)
+    except Exception:
+        logger.exception(
+            "failed to enqueue action extraction after ingest for user %s", user_id
+        )
 
 
 _HEARTBEAT_INTERVAL_SECONDS = 60
@@ -128,6 +146,8 @@ def ingest_gmail_for_user(
         set_state("failed", error="sync failed after retries")
         raise
 
+    _enqueue_action_extraction(user_id, result)
+
     payload = {
         "status": "ok",
         "user_id": user_id,
@@ -232,6 +252,8 @@ def ingest_outlook_for_user(
             raise self.retry(exc=exc, countdown=2 ** self.request.retries) from exc
         set_state("failed", error="sync failed after retries")
         raise
+
+    _enqueue_action_extraction(user_id, result)
 
     payload = {
         "status": "ok",

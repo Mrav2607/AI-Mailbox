@@ -38,6 +38,14 @@ celery_app.conf.beat_schedule = {
         "schedule": 3600.0,
         "options": {"expires": 3600},
     },
+    # Fixed cadence, independent of SCHEDULED_SYNC_INTERVAL_SECONDS: retryable
+    # extraction rows must not depend on new mail arriving, on ingests that
+    # upsert nothing, or on sync scheduling being enabled at all.
+    "extraction-recovery-tick": {
+        "task": "app.workers.tasks_nlp.extraction_recovery_tick",
+        "schedule": 900.0,
+        "options": {"expires": 900},
+    },
 }
 
 if settings.scheduled_sync_interval_seconds > 0:
