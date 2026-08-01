@@ -58,6 +58,60 @@ export interface SearchResponse {
 
 export interface CountsResponse {
   counts: Record<BucketKey, number>;
+  // The API always sends this (zeroed, not omitted, when nothing's been
+  // extracted) — optional only so an older API deployment or a stale
+  // cached response can still parse. Presence here says nothing about
+  // whether action extraction is enabled server-side.
+  actions?: ActionCounts;
+}
+
+// Mirrors ACTION_KINDS / ACTION_LABELS / ACTIONSTATUSES in the API's
+// db/schemas/actions.py -- kept in sync by hand, same convention as that
+// module's own comment about the extractor contract.
+export type ActionKind =
+  | "reply"
+  | "payment"
+  | "signature"
+  | "form"
+  | "rsvp"
+  | "deadline"
+  | "other";
+
+export type ActionStatus = "open" | "done" | "dismissed";
+
+export type DuePrecision = "date" | "datetime";
+
+// One agenda row -- an extracted action item joined against its source
+// thread/message, mirroring ActionOut in the API.
+export interface ActionItem {
+  id: string;
+  thread_id: string;
+  message_id: string;
+  kind: ActionKind | null;
+  title: string | null;
+  due_at: string | null;
+  due_precision: DuePrecision | null;
+  due_raw: string | null;
+  amount: number | null;
+  currency: string | null;
+  source_confidence: number | null;
+  status: ActionStatus;
+  created_at: string;
+  thread_subject: string | null;
+  sender: string | null;
+  provider: string;
+  account_email: string;
+  label: string | null;
+}
+
+export interface ActionCounts {
+  open: number;
+  overdue: number;
+}
+
+export interface ActionsResponse {
+  items: ActionItem[];
+  counts: ActionCounts;
 }
 
 // Classifier backends an operator can pick per run. "local" = fine-tuned

@@ -10,11 +10,13 @@ import {
 import {
   allRunsDeduplicated,
   ApiError,
+  backfillActions,
   classifyBackfill,
   classifyQueue,
   deleteConnection,
   deleteThread,
   flushDeleteThread,
+  getActions,
   getCounts,
   getMe,
   getSyncHealth,
@@ -32,6 +34,7 @@ import {
   microsoftConnectStart,
   reclassify,
   searchThreads,
+  setActionStatus,
   setThreadDone,
   revokeAllTokens,
   setToken,
@@ -41,9 +44,13 @@ import {
   WORKER_TASK_TIMEOUT_MS,
 } from "@/lib/api";
 import type { SyncHealth, SyncRunStatus, TaskResult } from "@/lib/api";
+import { groupActions } from "@/lib/agenda";
 import { BUCKET_KEYS } from "@/lib/labels";
 import { gmailThreadUrl } from "@/lib/utils";
 import type {
+  ActionCounts,
+  ActionItem,
+  ActionStatus,
   BackfillOptions,
   BucketKey,
   Connection,
@@ -60,6 +67,7 @@ import { toast } from "sonner";
 import { createLiveSearch, type LiveSearchController } from "@/lib/live-search";
 import { emailLocalPart } from "@/lib/sender";
 
+import { AgendaList } from "@/components/console/AgendaList";
 import { BucketSidebar } from "@/components/console/BucketSidebar";
 import { ThreadList } from "@/components/console/ThreadList";
 import { ThreadDetailPane } from "@/components/console/ThreadDetailPane";
@@ -162,6 +170,10 @@ export default function Console() {
     "buckets" | "list" | "reading"
   >("list");
 
+  // "buckets" vs "agenda" is separate from `bucket` on purpose: `bucket`
+  // keeps the last bucket selection so it's right there when the operator
+  // switches back.
+  const [view, setView] = useState<"buckets" | "agenda">("buckets");
   const [bucket, setBucket] = useState<BucketKey>("needs_reply");
   const [items, setItems] = useState<TriageItem[]>([]);
   const [allCounts, setAllCounts] = useState<Record<BucketKey, number>>({
@@ -175,6 +187,18 @@ export default function Console() {
     unclassified: 0,
     done: 0,
   });
+  // Agenda's own data — always cross-account, never paginated (the API caps
+  // at 500 and cursor pagination is a deferred follow-up).
+  const [actions, setActions] = useState<ActionItem[]>([]);
+  const [actionsLoading, setActionsLoading] = useState(false);
+  const [actionsError, setActionsError] = useState<string | null>(null);
+  // undefined (not zeroed) means the server hasn't told us about the feature
+  // yet, or it's off — mirrors CountsResponse.actions itself.
+  const [actionCounts, setActionCounts] = useState<ActionCounts | undefined>(undefined);
+  // The agenda's keyboard cursor, keyed by ActionItem.id (not thread_id —
+  // two rows can share a thread). Enter copies its thread_id into
+  // `selectedId` below to actually open it in the detail pane.
+  const [selectedActionId, setSelectedActionId] = useState<string | null>(null);
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const [firstListLoadSettled, setFirstListLoadSettled] = useState(false);
@@ -265,6 +289,10 @@ export default function Console() {
   accountFilterRef.current = accountFilter;
   const serverSortRef = useRef(serverSort);
   serverSortRef.current = serverSort;
+  // Belt-and-braces guard for the accountFilter effect below, which must
+  // never refetch a bucket-scoped screen mid-agenda.
+  const viewRef = useRef(view);
+  viewRef.current = view;
   // Raw (pre-pendingDeletes-filter) server offset to fetch next; advances by
   // the full page length so deleted-but-still-server-side rows don't shift it.
   const nextOffsetRef = useRef(0);
@@ -303,6 +331,13 @@ export default function Console() {
       current[key] ? current : { ...current, [key]: true },
     );
   }, []);
+
+  // A row's second click of a double-click toggles the detail pane, same
+  // path as `]`. Narrow layout already navigates to the reading pane on a
+  // single tap, so this is only ever wired up on desktop (see below).
+  const handleRowDoubleClick = useCallback(() => {
+    togglePanel("detail");
+  }, [togglePanel]);
 
   const snapshotPanels = useCallback((): Panels => ({ ...panelsRef.current }), []);
   const restorePanels = useCallback((snapshot: Panels) => {
@@ -509,13 +544,45 @@ export default function Console() {
   const refreshCounts = useCallback(async () => {
     // Server aggregates counts across the whole mailbox (scoped to the active
     // account filter, if any), so the sidebar totals don't cap at a single
-    // triage page.
+    // triage page. `actions` never takes the account filter — the agenda is
+    // always cross-account.
     try {
-      setAllCounts(await getCounts(accountFilterRef.current));
+      const res = await getCounts(accountFilterRef.current);
+      setAllCounts(res.counts);
+      setActionCounts(res.actions);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) handleSessionExpired();
     }
   }, [handleSessionExpired]);
+
+  // The agenda's own fetch, parallel to refreshList but with no paging (the
+  // API caps at 500 items, and there's no offset param to page through).
+  const refreshActions = useCallback(
+    async (opts?: { quiet?: boolean }) => {
+      const quiet = opts?.quiet ?? false;
+      if (!quiet) setActionsLoading(true);
+      setActionsError(null);
+      try {
+        // 500 is the API's `le` cap for this param -- request it explicitly.
+        const res = await getActions("open", 500);
+        setActions(res.items);
+        if (!quiet) {
+          setSelectedActionId((prev) =>
+            prev && res.items.some((a) => a.id === prev) ? prev : (res.items[0]?.id ?? null),
+          );
+        }
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) {
+          handleSessionExpired();
+          return;
+        }
+        setActionsError((e as Error).message ?? "failed to load");
+      } finally {
+        if (!quiet) setActionsLoading(false);
+      }
+    },
+    [handleSessionExpired],
+  );
 
   const refreshConnections = useCallback(async () => {
     try {
@@ -621,10 +688,16 @@ export default function Console() {
     }
   }, [hasMore, loadingMore, listLoading, searchMode, bucket, handleSessionExpired]);
 
+  // Every path that refreshes "the whole screen" (sync, ingest, backfill,
+  // undo settling) has to fetch whichever data view is actually on screen —
+  // there's no separate agenda polling loop, so this is the only place its
+  // list gets a background refresh.
   const refreshAll = useCallback(
     (opts?: { quiet?: boolean }) =>
-      Promise.all([refreshList(bucket, opts), refreshOverview(), refreshCounts()]),
-    [bucket, refreshList, refreshOverview, refreshCounts],
+      view === "agenda"
+        ? Promise.all([refreshActions(opts), refreshOverview(), refreshCounts()])
+        : Promise.all([refreshList(bucket, opts), refreshOverview(), refreshCounts()]),
+    [view, bucket, refreshList, refreshOverview, refreshCounts, refreshActions],
   );
 
   // Background sync is quiet periodic new-only ingest. After any sync that
@@ -801,15 +874,25 @@ export default function Console() {
 
   // initial + bucket changes. Switching buckets also exits any active search.
   // The new-mail pill deliberately survives bucket switches: it clears only on
-  // explicit acknowledgment (pill click, `r`, manual ingest).
+  // explicit acknowledgment (pill click, `r`, manual ingest). Gated on
+  // view === "buckets" so this doesn't fire while the agenda is on screen —
+  // it also re-fires on the way BACK from the agenda (view itself is a dep),
+  // refreshing whatever bucket was left behind.
   useEffect(() => {
-    if (!user) return;
+    if (!user || view !== "buckets") return;
     liveSearchRef.current?.cancel();
     setSearchMode(false);
     setSearchResults([]);
     setQuery("");
     refreshList(bucket);
-  }, [user, bucket, refreshList]);
+  }, [user, bucket, view, refreshList]);
+
+  // Agenda fetch: lazy, only when the view is actually switched to it — no
+  // independent polling loop, this is the one place it's loaded from scratch.
+  useEffect(() => {
+    if (!user || view !== "agenda") return;
+    refreshActions();
+  }, [user, view, refreshActions]);
 
   useEffect(() => {
     if (!user) return;
@@ -827,8 +910,11 @@ export default function Console() {
   // Account filter change: re-issue whatever's on screen under the new scope
   // — a live search stays a search (just re-run against the new account),
   // otherwise it's a paging reset — and the sidebar counts always follow.
+  // The account selector itself is hidden in agenda view (getActions/action
+  // counts never take the filter), but this guards anyway — belt and braces
+  // against the effect refetching a bucket-scoped screen mid-agenda.
   useEffect(() => {
-    if (!user) return;
+    if (!user || viewRef.current === "agenda") return;
     if (searchMode) {
       const q = query.trim();
       if (q) liveSearchRef.current?.flush(q);
@@ -845,8 +931,9 @@ export default function Console() {
   // Server-side sort change: only "account" vs "recency" actually changes
   // what the server returns, so this only fires crossing that boundary (a
   // confidence_asc <-> confidence_desc flip re-sorts client-side, no refetch).
+  // Sorting only applies to the bucket list — the agenda orders by deadline.
   useEffect(() => {
-    if (!user || searchMode) return;
+    if (!user || searchMode || view !== "buckets") return;
     refreshList(bucket);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serverSort]);
@@ -860,10 +947,11 @@ export default function Console() {
   }, [connections, accountFilter]);
 
   // Bulk selection is scoped to the current view — switching what's on
-  // screen leaves a stale selection dangling otherwise.
+  // screen leaves a stale selection dangling otherwise. The agenda has no
+  // bulk selection of its own, so leaving it (or entering it) clears one too.
   useEffect(() => {
     setBulkIds(new Set());
-  }, [bucket, accountFilter, searchMode]);
+  }, [bucket, accountFilter, searchMode, view]);
 
   useEffect(() => {
     if (isNarrow) setBulkIds(new Set());
@@ -964,6 +1052,44 @@ export default function Console() {
 
   const focusedItem = selectedIndex >= 0 ? visibleItems[selectedIndex] : null;
 
+  // ---- derived: agenda groups ----------------------------------------------
+  // Grouping reads "now" internally, so a memo keyed only on `actions` goes
+  // stale across local midnight -- items sit in yesterday's bucket until the
+  // next actions refetch. dayKey is state (not computed at render time), so
+  // an idle tab still regroups once the scheduled-midnight effect below fires.
+  const [dayKey, setDayKey] = useState(() => new Date().toDateString());
+  useEffect(() => {
+    const now = new Date();
+    const nextMidnight = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + 1,
+      0,
+      0,
+      1, // small buffer past midnight so `new Date()` has actually rolled over
+    );
+    const delay = Math.max(1000, nextMidnight.getTime() - now.getTime());
+    const timer = setTimeout(() => setDayKey(new Date().toDateString()), delay);
+    return () => clearTimeout(timer);
+  }, [dayKey]);
+  const agendaGroups = useMemo(
+    () => groupActions(actions, new Date()),
+    // dayKey is a deliberate re-run trigger, not something the memo body reads.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [actions, dayKey],
+  );
+  // The flattened row order j/k walk over — same order the groups render in.
+  const flattenedAgenda = useMemo(
+    () => agendaGroups.flatMap((g) => g.items),
+    [agendaGroups],
+  );
+  const selectedActionIndex = useMemo(
+    () => flattenedAgenda.findIndex((a) => a.id === selectedActionId),
+    [flattenedAgenda, selectedActionId],
+  );
+  const focusedAction =
+    selectedActionIndex >= 0 ? flattenedAgenda[selectedActionIndex] : null;
+
   // A selected-but-no-longer-visible row (a quiet background refresh replaced
   // it, or the client-side filter dropped it) must not stay batch-actionable.
   // Only writes when the intersection actually shrinks, so this can't loop.
@@ -1032,6 +1158,77 @@ export default function Console() {
       });
     },
     [visibleItems, selectedIndex, markThreadSeen],
+  );
+
+  // Agenda's j/k cursor — only moves focus. Unlike moveSelection it does NOT
+  // also open the thread in the detail pane; Enter does that separately (the
+  // frozen keyboard contract keeps browsing rows and opening one distinct).
+  const moveAgendaSelection = useCallback(
+    (delta: number) => {
+      if (flattenedAgenda.length === 0) return;
+      const cur = selectedActionIndex < 0 ? 0 : selectedActionIndex;
+      const next = Math.max(0, Math.min(flattenedAgenda.length - 1, cur + delta));
+      const target = flattenedAgenda[next];
+      setSelectedActionId(target.id);
+      requestAnimationFrame(() => {
+        const el = document.querySelector(`[data-action-row="${target.id}"]`);
+        if (el && "scrollIntoView" in el) {
+          (el as HTMLElement).scrollIntoView({ block: "nearest" });
+        }
+      });
+    },
+    [flattenedAgenda, selectedActionIndex],
+  );
+
+  // Marks an action item done/dismissed (or, via its undo toast, reopens it)
+  // — clones doDone's optimistic-remove-then-roll-back-on-failure shape below,
+  // just over the agenda's own list instead of the bucket's.
+  const doActionStatus = useCallback(
+    (id: string, status: ActionStatus) => {
+      const idx = actions.findIndex((a) => a.id === id);
+      if (idx < 0) return;
+      const removed = actions[idx];
+
+      if (selectedActionId === id) {
+        const flatIdx = flattenedAgenda.findIndex((a) => a.id === id);
+        const next = flattenedAgenda[flatIdx + 1] ?? flattenedAgenda[flatIdx - 1] ?? null;
+        setSelectedActionId(next?.id ?? null);
+      }
+      setActions((prev) => prev.filter((a) => a.id !== id));
+
+      const restore = () => {
+        setActions((prev) => {
+          const copy = [...prev];
+          copy.splice(Math.min(idx, copy.length), 0, removed);
+          return copy;
+        });
+        setSelectedActionId(id);
+      };
+
+      void (async () => {
+        try {
+          await setActionStatus(id, status);
+          refreshCounts();
+          toast(status === "done" ? "action done" : "action dismissed", {
+            action: {
+              label: "undo",
+              onClick: () => {
+                setActionStatus(id, "open")
+                  .then(() => {
+                    restore();
+                    refreshCounts();
+                  })
+                  .catch((e) => toast.error((e as Error).message ?? "undo failed"));
+              },
+            },
+          });
+        } catch (e) {
+          restore();
+          toast.error((e as Error).message ?? "action update failed");
+        }
+      })();
+    },
+    [actions, selectedActionId, flattenedAgenda, refreshCounts],
   );
 
   // ---- search ----------------------------------------------------------
@@ -1584,6 +1781,25 @@ export default function Console() {
     }
   }, [trackTask]);
 
+  // Queues an action-extraction sweep off the request path — same
+  // wait-for-the-worker tail every other queued job uses.
+  const doBackfillActions = useCallback(async () => {
+    try {
+      const r = await backfillActions();
+      await trackTask(
+        r.task_id,
+        "extract actions",
+        (res) => `action extraction complete · ${res.processed ?? 0} processed`,
+      );
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        toast.error("action extraction is disabled for this deployment");
+        return;
+      }
+      toast.error((e as Error).message ?? "action extraction failed");
+    }
+  }, [trackTask]);
+
   const doReclassify = useCallback(
     async (label: Label) => {
       const id = selectedId;
@@ -1785,6 +2001,40 @@ export default function Console() {
         setShortcutsOpen(true);
         return;
       }
+      // Toggles the agenda open/closed — works from either view, unlike the
+      // bucket digits below (unbound until now, so nothing collides).
+      if (e.key === "0") {
+        e.preventDefault();
+        setView((v) => (v === "agenda" ? "buckets" : "agenda"));
+        return;
+      }
+      // Agenda view early-return: its j/k/Enter/e/x mean something different
+      // here (rows, not threads) than the bucket bindings below, so this has
+      // to take over completely rather than let e.g. the thread-done `e` or
+      // the bulk-select `x` fall through and act on stale bucket state.
+      if (view === "agenda") {
+        if (e.key === "j") {
+          e.preventDefault();
+          moveAgendaSelection(1);
+        } else if (e.key === "k") {
+          e.preventDefault();
+          moveAgendaSelection(-1);
+        } else if (e.key === "Enter") {
+          e.preventDefault();
+          if (focusedAction) {
+            setSelectedId(focusedAction.thread_id);
+            markThreadSeen(focusedAction.thread_id);
+            if (isNarrow) setNarrowPane("reading");
+          }
+        } else if (e.key === "e") {
+          e.preventDefault();
+          if (focusedAction) doActionStatus(focusedAction.id, "done");
+        } else if (e.key === "x") {
+          e.preventDefault();
+          if (focusedAction) doActionStatus(focusedAction.id, "dismissed");
+        }
+        return;
+      }
       // panels + search + delete
       if (e.key === "/") {
         e.preventDefault();
@@ -1909,6 +2159,10 @@ export default function Console() {
       focusedItem,
       isNarrow,
       bucket,
+      view,
+      focusedAction,
+      moveAgendaSelection,
+      doActionStatus,
       bulkIds,
       batchTargets,
       toggleBulk,
@@ -2004,10 +2258,16 @@ export default function Console() {
 
   const sidebarPane = (
     <BucketSidebar
-      active={bucket}
+      active={view === "agenda" ? "agenda" : bucket}
       counts={allCounts}
+      actionCounts={actionCounts}
       onSelect={(b) => {
-        setBucket(b);
+        if (b === "agenda") {
+          setView("agenda");
+        } else {
+          setView("buckets");
+          setBucket(b);
+        }
         if (isNarrow) setNarrowPane("list");
       }}
       onCollapse={() => togglePanel("sidebar")}
@@ -2016,7 +2276,55 @@ export default function Console() {
     />
   );
 
-  const listPane = (
+  const agendaListPane = (
+    <section className="flex-1 min-w-0 min-h-0 flex flex-col">
+      <div className="h-10 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center px-3 gap-2.5 font-mono text-[11.5px]">
+        <span className="text-primary font-semibold tracking-tight shrink-0">agenda</span>
+        <span className="text-muted-foreground tabular-nums shrink-0">
+          {/* The fetched list caps at the 200-row limit; the aggregate from
+              actionCounts is the real total once loaded. */}
+          {actionCounts?.open ?? flattenedAgenda.length} open
+          {actionCounts && actionCounts.overdue > 0 ? ` · ${actionCounts.overdue} overdue` : ""}
+        </span>
+        <div className="flex-1" />
+        <button
+          onClick={doBackfillActions}
+          className="shrink-0 px-2 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+        >
+          extract actions
+        </button>
+        {!isNarrow && !panels.detail && (
+          <button
+            onClick={() => togglePanel("detail")}
+            aria-label="Show thread detail"
+            title="Show detail ( ] )"
+            className="shrink-0 h-6 px-1.5 rounded border border-border text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer transition-colors flex items-center"
+          >
+            <PanelRightOpen className="h-3.5 w-3.5" />
+          </button>
+        )}
+      </div>
+      <div className="flex-1 overflow-y-auto scrollbar-thin">
+        <AgendaList
+          groups={agendaGroups}
+          focusedId={selectedActionId}
+          onSelect={(item) => {
+            setSelectedActionId(item.id);
+            setSelectedId(item.thread_id);
+            markThreadSeen(item.thread_id);
+            if (isNarrow) setNarrowPane("reading");
+          }}
+          onStatusChange={doActionStatus}
+          showAccount={multiAccount}
+          loading={actionsLoading}
+          error={actionsError}
+          onRowDoubleClick={isNarrow ? undefined : handleRowDoubleClick}
+        />
+      </div>
+    </section>
+  );
+
+  const listPane = view === "agenda" ? agendaListPane : (
     <section className="flex-1 min-w-0 min-h-0 flex flex-col">
       <div className="h-10 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center px-3 gap-2.5 font-mono text-[11.5px]">
         <span className="text-primary font-semibold tracking-tight shrink-0">
@@ -2257,6 +2565,7 @@ export default function Console() {
             isUnseen={isUnseenFor}
             bulkIds={isNarrow ? undefined : bulkIds}
             onToggleBulk={isNarrow ? undefined : toggleBulk}
+            onRowDoubleClick={isNarrow ? undefined : handleRowDoubleClick}
           />
         )}
         {!searchMode && hasMore && (
@@ -2381,7 +2690,10 @@ export default function Console() {
         <CommandPalette
           open={paletteOpen}
           onOpenChange={setPaletteOpen}
-          onBucket={(b) => setBucket(b)}
+          onBucket={(b) => {
+            setView("buckets");
+            setBucket(b);
+          }}
           onIngest={() => setIngestOpen(true)}
           onBackfill={() => setBackfillOpen(true)}
           onQueue={doQueue}
@@ -2401,6 +2713,8 @@ export default function Console() {
           onOpenGmail={openInGmail}
           onDelete={() => doDelete()}
           onRestartTour={restartTour}
+          onOpenAgenda={() => setView("agenda")}
+          onBackfillActions={doBackfillActions}
         />
         <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
         {!isNarrow && (tourActive || tourVersion < TOUR_VERSION) && (

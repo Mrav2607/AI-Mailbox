@@ -36,7 +36,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "mypy"]
+# ruff is pinned: the tree is verified clean against this version, and an
+# unpinned CI install broke on 0.16's changed rule behavior (247 findings in
+# untouched files). Bump deliberately, fixing what the new version flags.
+dev = ["pytest", "ruff==0.15.19", "mypy"]
 # Required only for CLASSIFIER_BACKEND=local (in-process fine-tuned encoder).
 # Omit to run with the gemini/heuristic backends and a lean image.
 local-classifier = ["torch>=2.2", "transformers>=4.40"]

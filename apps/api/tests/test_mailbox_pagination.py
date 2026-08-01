@@ -21,12 +21,13 @@ from app.main import app
 def client():
     user = MagicMock(id=uuid4())
     # Empty-result DB stub, same shape as test_validation's: enough for the
-    # triage/search scalars().all() path and the counts .all()/.scalar_one()
-    # paths.
+    # triage/search scalars().all() path, the bucket counts .all()/
+    # .scalar_one() paths, and the actions-count aggregate's .one() path.
     db = MagicMock()
     db.execute.return_value.scalars.return_value.all.return_value = []
     db.execute.return_value.all.return_value = []
     db.execute.return_value.scalar_one.return_value = 0
+    db.execute.return_value.one.return_value = (0, 0)
     app.dependency_overrides[get_current_user] = lambda: user
     app.dependency_overrides[get_db] = lambda: db
     yield TestClient(app), db
@@ -148,13 +149,16 @@ def test_counts_statements_carry_provider_account_predicate_when_set(client):
     resp = c.get(f"/api/v1/mail/counts?provider_account_id={account_id}")
     assert resp.status_code == 200
     statements = [call.args[0] for call in db.execute.call_args_list]
-    # Both the grouped open-buckets query and the done-count query must carry
-    # the predicate, so counts["all"] (from the grouped query) and
-    # counts["done"] agree on the same account scope.
-    assert len(statements) == 2
-    for statement in statements:
+    # The grouped open-buckets query and the done-count query must carry the
+    # predicate, so counts["all"] (from the grouped query) and counts["done"]
+    # agree on the same account scope; the third statement is the actions
+    # aggregate, which must NOT carry it -- the agenda is always cross-account.
+    assert len(statements) == 3
+    bucket_statements, actions_statement = statements[:2], statements[2]
+    for statement in bucket_statements:
         compiled = _compiled(statement)
         assert f"mail_thread.provider_account_id = '{account_id.hex}'" in compiled
+    assert "provider_account_id =" not in _compiled(actions_statement)
 
 
 def test_counts_statements_omit_predicate_by_default(client):

@@ -4,7 +4,7 @@ from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
-from sqlalchemy import select, desc, or_, func
+from sqlalchemy import select, desc, or_, func, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -26,6 +26,7 @@ from app.db.schemas.mailbox import (
     Triage,
 )
 from app.db.models import (
+    ActionItem,
     AppUser,
     Classification,
     MailMessage,
@@ -33,9 +34,14 @@ from app.db.models import (
     MailThread,
     ProviderAccount,
 )
+from app.routes.actions import compute_action_counts
 from app.workers.celery_app import celery_app
 from app.workers.tasks_ingest import read_dispatcher_heartbeat
-from app.workers.tasks_nlp import backfill_threads_for_user, classify_latest_threads
+from app.workers.tasks_nlp import (
+    backfill_threads_for_user,
+    classify_latest_threads,
+    extract_action_for_message,
+)
 from app.services.nlp.backfill import (
     latest_label_subquery,
     latest_message_ordering,
@@ -43,6 +49,8 @@ from app.services.nlp.backfill import (
     run_backfill,
 )
 from app.services.nlp.classifier import LABELS
+from app.services.nlp.extraction_run import extraction_available
+from app.services.nlp.extractor import ACTION_LABELS
 from app.services.nlp.persistence import upsert_classification
 from app.services.sync_runs import (
     ACTIVE_SYNC_STATUSES,
@@ -293,7 +301,13 @@ def get_counts(
         .select_from(MailThread)
         .where(*done_predicates)
     ).scalar_one()
-    return {"counts": counts}
+    # Deliberately NOT scoped by provider_account_id -- the agenda is always
+    # cross-account (see Counts.actions' docstring), so this sidebar badge
+    # must not narrow when a bucket-account filter is active.
+    return {
+        "counts": counts,
+        "actions": compute_action_counts(db, current_user.id),
+    }
 
 
 @router.get("/thread/{thread_id}", response_model=ThreadDetail)
@@ -396,7 +410,53 @@ def reclassify_thread(
         rationale="Operator override from the console.",
         model_version=_OPERATOR_MODEL_VERSION,
     )
+    if payload.label not in ACTION_LABELS:
+        # A prior extraction may have already settled this message's row as
+        # `extracted`. Settled rows are invisible to the claim machine (only
+        # `ineligible` / `failed`-under-cap / expired-`pending` are
+        # claimable), so if the label later swings back into ACTION_LABELS,
+        # the back-transition's enqueued task would find that terminal row
+        # and skip it -- silently re-showing the OLD extraction instead of
+        # re-extracting. Flip it to `ineligible` here so it's claimable again
+        # on the way back in.
+        #
+        # Only `extracted` rows: a `pending` row is a live in-flight claim
+        # whose own record_extraction path re-checks the label under the
+        # classification row's FOR UPDATE lock and lands `ineligible` itself
+        # -- writing over it here would fight that fence.
+        # `no_action`/`failed`/`ineligible` need nothing; they're already
+        # either invisible or claimable by design. Never touch
+        # status/status_at -- an operator's done/dismissed must survive the
+        # round-trip, same rule record_extraction follows on re-extraction.
+        # Not gated on extraction_available(): this is a data-consistency
+        # write, not an LLM call, so it costs nothing when the feature is off.
+        #
+        # Same transaction as the classification upsert above, written
+        # Classification -> ActionItem -- the same order the extraction
+        # record path uses, so no new lock ordering is introduced. No thread
+        # lock and no ActionItem SELECT FOR UPDATE here, just a conditional
+        # UPDATE -- the frozen MailThread -> ActionItem ordering is untouched.
+        db.execute(
+            update(ActionItem)
+            .where(
+                ActionItem.message_id == latest_message.id,
+                ActionItem.outcome == "extracted",
+            )
+            .values(outcome="ineligible")
+        )
     db.commit()
+
+    if payload.label in ACTION_LABELS and extraction_available():
+        # Strictly after the commit above, and never inline -- no LLM call on
+        # the request path. A broker failure here must never roll back the
+        # durable override or turn a successful reclassify into a 500; the
+        # extraction sweep/recovery tick will pick this message up later.
+        try:
+            cast(Any, extract_action_for_message).delay(str(latest_message.id))
+        except Exception:
+            logger.exception(
+                "action extraction enqueue failed for message %s", latest_message.id
+            )
 
     return {
         "thread_id": str(thread_id),
@@ -427,7 +487,36 @@ def set_thread_done(
         raise HTTPException(status_code=404, detail="Thread not found")
 
     if payload.done and thread.done_at is None:
-        thread.done_at = datetime.now(timezone.utc)
+        # Frozen lock order (repo-wide for these two tables): MailThread ->
+        # ActionItem. Sessions are autoflush=False, so the ORM `done_at`
+        # mutation below only flushes at COMMIT -- after the bulk UPDATE
+        # issued in between it and the commit -- and inferring lock order
+        # from code order isn't safe. This explicit FOR UPDATE establishes
+        # the real order, closing a deadlock against the claim transaction
+        # (which locks the thread first too) and a stranded-open race
+        # against it without a pre-existing row.
+        #
+        # Read done_at itself under the lock, not just the row's existence:
+        # the pre-lock `db.get` snapshot above can't see a concurrent
+        # done=true request that raced ahead and already committed, and
+        # trusting that snapshot would let a second request clobber the
+        # first one's done_at with a later timestamp. Only the locked read
+        # tells us whether we actually won the race.
+        locked_done_at = db.execute(
+            select(MailThread.done_at).where(MailThread.id == thread_id).with_for_update()
+        ).scalar_one()
+        now = datetime.now(timezone.utc)
+        thread.done_at = now if locked_done_at is None else locked_done_at
+        # Every open item on this thread resolves to done, regardless of its
+        # extraction outcome -- an in-flight claim's later record must land
+        # already resolved, so a still-pending row is included too. Un-done
+        # deliberately does NOT reverse this; items reopen individually via
+        # the status route.
+        db.execute(
+            update(ActionItem)
+            .where(ActionItem.thread_id == thread_id, ActionItem.status == "open")
+            .values(status="done", status_at=now)
+        )
     elif not payload.done:
         thread.done_at = None
     db.commit()

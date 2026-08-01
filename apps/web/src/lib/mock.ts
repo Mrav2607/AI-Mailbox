@@ -1,8 +1,13 @@
 import type {
+  ActionCounts,
+  ActionItem,
+  ActionsResponse,
+  ActionStatus,
   BackfillOptions,
   BackfillResult,
   BucketKey,
   Connection,
+  CountsResponse,
   Label,
   Overview,
   SearchResponse,
@@ -124,6 +129,218 @@ const ALL = makeItems(450);
 // server's done_at column. Done threads leave every open bucket.
 const DONE = new Set<string>();
 
+function hoursFromNow(h: number): string {
+  return new Date(Date.now() + h * 60 * 60 * 1000).toISOString();
+}
+
+function daysFromNow(d: number): string {
+  return new Date(Date.now() + d * 24 * 60 * 60 * 1000).toISOString();
+}
+
+// Demo data for the Agenda view — spans overdue / today / this week / later /
+// no-deadline, one low-confidence item (renders the "unverified" treatment),
+// and two items sourced from different messages in the SAME thread (the
+// agenda selects rows by action id, not thread id, since a thread can carry
+// more than one open obligation).
+const ACTIONS: ActionItem[] = [
+  {
+    id: "mock-action-1",
+    thread_id: "mock-action-thread-1",
+    message_id: "mock-action-msg-1",
+    kind: "payment",
+    title: "Pay invoice #4821",
+    due_at: daysFromNow(-2),
+    due_precision: "date",
+    due_raw: "due 2 days ago",
+    amount: 480,
+    currency: "USD",
+    source_confidence: 0.82,
+    status: "open",
+    created_at: daysFromNow(-5),
+    thread_subject: "Re: invoice for Q3 services",
+    sender: "alice@stripe.com",
+    provider: "gmail",
+    account_email: CONNECTIONS[0].email_address,
+    label: "action_required",
+  },
+  {
+    id: "mock-action-2",
+    thread_id: "mock-action-thread-2",
+    message_id: "mock-action-msg-2",
+    kind: "signature",
+    title: "Sign the updated contractor agreement",
+    due_at: hoursFromNow(4),
+    due_precision: "datetime",
+    due_raw: "by end of day",
+    amount: null,
+    currency: null,
+    source_confidence: 0.91,
+    status: "open",
+    created_at: daysFromNow(-1),
+    thread_subject: "Contractor agreement — please sign",
+    sender: "carol@acme.io",
+    provider: "gmail",
+    account_email: CONNECTIONS[0].email_address,
+    label: "action_required",
+  },
+  {
+    id: "mock-action-3",
+    thread_id: "mock-action-thread-3",
+    message_id: "mock-action-msg-3",
+    kind: "rsvp",
+    title: "RSVP to the design review sync",
+    due_at: daysFromNow(3),
+    due_precision: "date",
+    due_raw: "by Thursday",
+    amount: null,
+    currency: null,
+    // Below the 0.6 "unverified" threshold on purpose.
+    source_confidence: 0.55,
+    status: "open",
+    created_at: daysFromNow(-1),
+    thread_subject: "Calendar invite: design review",
+    sender: "bob@figma.com",
+    provider: "gmail",
+    account_email: CONNECTIONS[1].email_address,
+    label: "needs_reply",
+  },
+  {
+    id: "mock-action-4",
+    thread_id: "mock-action-thread-4",
+    message_id: "mock-action-msg-4",
+    kind: "form",
+    title: "Complete the vendor security questionnaire",
+    due_at: daysFromNow(20),
+    due_precision: "date",
+    due_raw: "within 3 weeks",
+    amount: null,
+    currency: null,
+    source_confidence: 0.88,
+    status: "open",
+    created_at: daysFromNow(-2),
+    thread_subject: "Vendor security review",
+    sender: "support@aws.amazon.com",
+    provider: "gmail",
+    account_email: CONNECTIONS[0].email_address,
+    label: "action_required",
+  },
+  {
+    id: "mock-action-5",
+    thread_id: "mock-action-thread-5",
+    message_id: "mock-action-msg-5",
+    kind: "other",
+    title: "Review Q3 budget notes",
+    due_at: null,
+    due_precision: null,
+    due_raw: null,
+    amount: null,
+    currency: null,
+    source_confidence: 0.7,
+    status: "open",
+    created_at: daysFromNow(-3),
+    thread_subject: "Standup notes — engineering",
+    sender: "team@linear.app",
+    provider: "gmail",
+    account_email: CONNECTIONS[0].email_address,
+    label: "needs_reply",
+  },
+  {
+    id: "mock-action-6a",
+    thread_id: "mock-action-thread-6",
+    message_id: "mock-action-msg-6a",
+    kind: "reply",
+    title: "Reply with the shipping address",
+    due_at: daysFromNow(1),
+    due_precision: "datetime",
+    due_raw: "tomorrow",
+    amount: null,
+    currency: null,
+    source_confidence: 0.93,
+    status: "open",
+    created_at: daysFromNow(-1),
+    thread_subject: "Order #29104 — a couple of questions",
+    sender: "deals@uber.com",
+    provider: "gmail",
+    account_email: CONNECTIONS[0].email_address,
+    label: "needs_reply",
+  },
+  {
+    id: "mock-action-6b",
+    thread_id: "mock-action-thread-6",
+    message_id: "mock-action-msg-6b",
+    kind: "payment",
+    title: "Confirm the payment method on file",
+    due_at: daysFromNow(2),
+    due_precision: "date",
+    due_raw: "before it ships",
+    amount: 129,
+    currency: "USD",
+    source_confidence: 0.77,
+    status: "open",
+    created_at: daysFromNow(-1),
+    thread_subject: "Order #29104 — a couple of questions",
+    sender: "deals@uber.com",
+    provider: "gmail",
+    account_email: CONNECTIONS[0].email_address,
+    label: "action_required",
+  },
+  // Already resolved — exercises the status filter/board beyond "open".
+  {
+    id: "mock-action-7",
+    thread_id: "mock-action-thread-7",
+    message_id: "mock-action-msg-7",
+    kind: "reply",
+    title: "Confirm dinner Friday",
+    due_at: daysFromNow(-1),
+    due_precision: "date",
+    due_raw: "Friday",
+    amount: null,
+    currency: null,
+    source_confidence: 0.85,
+    status: "done",
+    created_at: daysFromNow(-4),
+    thread_subject: "Re: dinner Friday?",
+    sender: "bob@figma.com",
+    provider: "gmail",
+    account_email: CONNECTIONS[0].email_address,
+    label: "needs_reply",
+  },
+];
+
+function mockActionCounts(): ActionCounts {
+  const now = Date.now();
+  let open = 0;
+  let overdue = 0;
+  for (const item of ACTIONS) {
+    if (item.status !== "open") continue;
+    open += 1;
+    if (item.due_at && new Date(item.due_at).getTime() < now) overdue += 1;
+  }
+  return { open, overdue };
+}
+
+export function mockActions(status: ActionStatus = "open", limit = 200): ActionsResponse {
+  return { items: ACTIONS.filter((a) => a.status === status).slice(0, limit), counts: mockActionCounts() };
+}
+
+export function mockSetActionStatus(
+  id: string,
+  status: ActionStatus,
+): { action_id: string; status: ActionStatus; status_at: string | null } {
+  const item = ACTIONS.find((a) => a.id === id);
+  if (!item) throw new ApiError(404, `Action item not found: ${id}`);
+  item.status = status;
+  // status_at isn't part of ActionOut/ActionItem (only the status-change
+  // response carries it), so it's computed here for the response only, not
+  // stored on the item.
+  const statusAt = status === "open" ? null : new Date().toISOString();
+  return { action_id: id, status: item.status, status_at: statusAt };
+}
+
+export function mockBackfillActions(): { status: string; task_id: string } {
+  return { status: "queued", task_id: "mock-actions-task-" + Date.now() };
+}
+
 export function mockUser(): User {
   return { id: "u_local", email: "operator@local.dev", display_name: "Operator" };
 }
@@ -140,6 +357,11 @@ export function mockDeleteConnection(id: string): boolean {
   CONNECTIONS = CONNECTIONS.filter((c) => c.id !== id);
   for (let i = ALL.length - 1; i >= 0; i--) {
     if (ALL[i].account_email === removed.email_address) ALL.splice(i, 1);
+  }
+  // Agenda rows are keyed off the same account_email — leaving them behind
+  // would show obligations for a thread that no longer exists.
+  for (let i = ACTIONS.length - 1; i >= 0; i--) {
+    if (ACTIONS[i].account_email === removed.email_address) ACTIONS.splice(i, 1);
   }
   return true;
 }
@@ -186,7 +408,10 @@ export function mockTriage(
   return { bucket, items: items.slice(offset, offset + limit) };
 }
 
-export function mockCounts(accountId?: string | null): Record<BucketKey, number> {
+// Bucket counts stay per-account (accountId scopes them, same as triage);
+// `actions` never does — the agenda is always cross-account, mirroring the
+// server's `GET /mail/counts` shape.
+export function mockCounts(accountId?: string | null): CountsResponse {
   const counts: Record<BucketKey, number> = {
     needs_reply: 0,
     action_required: 0,
@@ -201,7 +426,7 @@ export function mockCounts(accountId?: string | null): Record<BucketKey, number>
   const email = accountId ? connectionEmail(accountId) : undefined;
   // An unknown/disconnected id self-scopes to all-zero counts rather than
   // throwing or silently falling back to the whole mailbox.
-  if (accountId && !email) return counts;
+  if (accountId && !email) return { counts, actions: mockActionCounts() };
   for (const item of ALL) {
     if (email && item.account_email !== email) continue;
     if (DONE.has(item.thread_id)) {
@@ -213,7 +438,7 @@ export function mockCounts(accountId?: string | null): Record<BucketKey, number>
     if (label) counts[label] += 1;
     else counts.unclassified += 1;
   }
-  return counts;
+  return { counts, actions: mockActionCounts() };
 }
 
 // Each mock "ingest" delivers exactly two fresh threads — deterministic on

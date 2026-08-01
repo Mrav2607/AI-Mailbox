@@ -22,6 +22,15 @@ async function importLiveApi() {
   return import("./api");
 }
 
+// The mirror of importLiveApi: forces USE_MOCK=true regardless of the dev
+// .env this repo ships (see the comment above), so mock-branch assertions
+// don't depend on who's running the suite either.
+async function importMockApi() {
+  vi.resetModules();
+  vi.stubEnv("VITE_API_BASE_URL", "");
+  return import("./api");
+}
+
 function stubFetch(body: unknown, status = 200) {
   const fetchMock = vi.fn().mockResolvedValue({
     ok: status >= 200 && status < 300,
@@ -228,5 +237,157 @@ describe("ingestMail", () => {
     const [url, opts] = fetchMock.mock.calls[0];
     expect(new URL(url as string).pathname).toBe("/api/v1/mail/ingest");
     expect((opts as RequestInit).method).toBe("POST");
+  });
+});
+
+describe("getCounts", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("returns the FULL counts payload -- no longer unwraps to just res.counts", async () => {
+    const api = await importLiveApi();
+    const body = {
+      counts: { all: 5, needs_reply: 2 },
+      actions: { open: 3, overdue: 1 },
+    };
+    stubFetch(body);
+    const res = await api.getCounts();
+    expect(res).toEqual(body);
+  });
+
+  it("omits provider_account_id when no account is given, includes it otherwise", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ counts: {}, actions: { open: 0, overdue: 0 } });
+    await api.getCounts();
+    expect(requestedUrl(fetchMock).pathname).toBe("/api/v1/mail/counts");
+
+    const fetchMock2 = stubFetch({ counts: {}, actions: { open: 0, overdue: 0 } });
+    await api.getCounts("acct-1");
+    const url2 = requestedUrl(fetchMock2);
+    expect(url2.pathname).toBe("/api/v1/mail/counts");
+    expect(url2.searchParams.get("provider_account_id")).toBe("acct-1");
+  });
+
+  it("in mock mode, returns bucket counts plus the cross-account actions tally", async () => {
+    const api = await importMockApi();
+    const res = await api.getCounts();
+    expect(res.counts.all).toBeGreaterThan(0);
+    expect(res.actions).toBeDefined();
+    expect(res.actions!.open).toBeGreaterThan(0);
+  });
+});
+
+describe("getActions", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("requests /mail/actions with status and limit, defaulting to open/200", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ items: [], counts: { open: 0, overdue: 0 } });
+    await api.getActions();
+    const url = requestedUrl(fetchMock);
+    expect(url.pathname).toBe("/api/v1/mail/actions");
+    expect(url.searchParams.get("status")).toBe("open");
+    expect(url.searchParams.get("limit")).toBe("200");
+  });
+
+  it("passes a non-default status and limit through", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ items: [], counts: { open: 0, overdue: 0 } });
+    await api.getActions("dismissed", 50);
+    const url = requestedUrl(fetchMock);
+    expect(url.searchParams.get("status")).toBe("dismissed");
+    expect(url.searchParams.get("limit")).toBe("50");
+  });
+
+  it("returns the items+counts payload untouched", async () => {
+    const api = await importLiveApi();
+    const body = { items: [{ id: "a1" }], counts: { open: 1, overdue: 0 } };
+    stubFetch(body);
+    const res = await api.getActions();
+    expect(res).toEqual(body);
+  });
+
+  it("in mock mode, serves the demo agenda board", async () => {
+    const api = await importMockApi();
+    const res = await api.getActions();
+    expect(res.items.length).toBeGreaterThan(0);
+    expect(res.items.every((i) => i.status === "open")).toBe(true);
+  });
+});
+
+describe("setActionStatus", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("posts the new status to /mail/actions/{id}/status", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ action_id: "a1", status: "done", status_at: "2026-01-01T00:00:00Z" });
+    const res = await api.setActionStatus("a1", "done");
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(new URL(url as string).pathname).toBe("/api/v1/mail/actions/a1/status");
+    expect((opts as RequestInit).method).toBe("POST");
+    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({ status: "done" });
+    expect(res.status).toBe("done");
+  });
+
+  it("URL-encodes the action id", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ action_id: "a/1", status: "open", status_at: null });
+    await api.setActionStatus("a/1", "open");
+    expect(new URL(fetchMock.mock.calls[0][0] as string).pathname).toBe(
+      "/api/v1/mail/actions/a%2F1/status",
+    );
+  });
+
+  it("in mock mode, round-trips a status change against the demo board", async () => {
+    const api = await importMockApi();
+    const { items } = await api.getActions();
+    const res = await api.setActionStatus(items[0].id, "dismissed");
+    expect(res.status).toBe("dismissed");
+    expect(res.status_at).not.toBeNull();
+  });
+});
+
+describe("backfillActions", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("posts to /mail/actions/backfill with default limit/force/since_days", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ status: "queued", task_id: "task_1" });
+    const res = await api.backfillActions();
+    const url = requestedUrl(fetchMock);
+    expect(url.pathname).toBe("/api/v1/mail/actions/backfill");
+    expect(url.searchParams.get("limit")).toBe("100");
+    expect(url.searchParams.get("force")).toBe("false");
+    expect(url.searchParams.get("since_days")).toBe("30");
+    expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe("POST");
+    expect(res).toEqual({ status: "queued", task_id: "task_1" });
+  });
+
+  it("passes non-default opts through as query params", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ status: "queued", task_id: "task_2" });
+    await api.backfillActions({ limit: 10, force: true, since_days: 7 });
+    const url = requestedUrl(fetchMock);
+    expect(url.searchParams.get("limit")).toBe("10");
+    expect(url.searchParams.get("force")).toBe("true");
+    expect(url.searchParams.get("since_days")).toBe("7");
+  });
+
+  it("in mock mode, resolves a queued mock task", async () => {
+    const api = await importMockApi();
+    const res = await api.backfillActions();
+    expect(res.status).toBe("queued");
+    expect(res.task_id).toMatch(/^mock-actions-task-/);
   });
 });

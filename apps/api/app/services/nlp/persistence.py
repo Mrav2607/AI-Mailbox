@@ -1,19 +1,37 @@
-"""Persistence helpers for classification results.
+"""Persistence helpers for classification results and the action-extraction
+claim/attempt state machine.
 
-A single upsert keyed on ``message_id`` so every write path (inline ingest,
-backfill, and the Celery workers) stays race-safe and idempotent: if two
-classifiers reach the same message concurrently, the second updates the row
-instead of crashing on the unique constraint.
+`upsert_classification` is a single upsert keyed on ``message_id`` so every
+write path (inline ingest, backfill, and the Celery workers) stays race-safe
+and idempotent: if two classifiers reach the same message concurrently, the
+second updates the row instead of crashing on the unique constraint.
+
+`claim_action_item` / `record_extraction` are the same idea applied to a
+longer-lived attempt: a claim reserves ``message_id``'s row for one worker's
+extraction call, and the matching record either settles it or -- fenced on
+``claim_token`` -- no-ops if the claim has since expired and been stolen.
+Neither commits; the caller (``extraction_run``) owns the transaction
+boundary so the claim can release its lock before the (possibly slow) LLM
+call runs, mirroring ``backfill.py``'s snapshot-then-release pattern.
 """
 
 from __future__ import annotations
 
-from uuid import UUID
+from datetime import datetime, timedelta, timezone
+from uuid import UUID, uuid4
 
+from sqlalchemy import and_, case, or_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.db.models import Classification
+from app.db.models import ActionItem, Classification
+from app.services.nlp.extractor import ExtractedAction, NoAction
+
+# A claim's lease: past this age, a fresh worker may steal a still-"pending"
+# row (the one that claimed it is presumed dead -- crashed, killed, or lost
+# its Celery lease).
+PENDING_LEASE = timedelta(minutes=30)
+MAX_ATTEMPTS = 3
 
 
 def upsert_classification(
@@ -47,3 +65,205 @@ def upsert_classification(
         },
     )
     db.execute(stmt)
+
+
+def claimable_predicate(*, force: bool = False):
+    """WHERE-clause fragment: is an EXISTING ``action_item`` row a valid claim
+    target right now?
+
+    Settled rows (``extracted`` / ``no_action``) are terminal; only
+    ``ineligible`` (a reclassify-back must always be able to re-extract),
+    ``failed`` under the attempt cap, and an expired ``pending`` lease under
+    the cap remain retryable. ``force`` widens this to any non-pending row --
+    an operator backfill can re-run a settled extraction, but force must
+    never steal a claim a live worker currently holds.
+    """
+    lease_cutoff = datetime.now(timezone.utc) - PENDING_LEASE
+    base = or_(
+        ActionItem.outcome == "ineligible",
+        and_(ActionItem.outcome == "failed", ActionItem.attempts < MAX_ATTEMPTS),
+        and_(
+            ActionItem.outcome == "pending",
+            ActionItem.last_attempted_at < lease_cutoff,
+            ActionItem.attempts < MAX_ATTEMPTS,
+        ),
+    )
+    if force:
+        return or_(base, ActionItem.outcome != "pending")
+    return base
+
+
+def _done_stamp_columns(thread_done: bool, now: datetime) -> dict:
+    """Conditional status stamp shared by claim and record: a done thread
+    resolves an ``open`` row to ``done`` at write time, but must never
+    rewrite a row an operator already resolved (e.g. ``dismissed``) -- so the
+    CASE reads the row's OWN pre-write status, never a constant.
+    """
+    if not thread_done:
+        return {}
+    return {
+        "status": case((ActionItem.status == "open", "done"), else_=ActionItem.status),
+        "status_at": case(
+            (ActionItem.status == "open", now), else_=ActionItem.status_at
+        ),
+    }
+
+
+def claim_action_item(
+    db: Session,
+    *,
+    message_id: UUID,
+    thread_id: UUID,
+    user_id: UUID,
+    thread_done: bool,
+    force: bool = False,
+) -> UUID | None:
+    """Atomically claim ``message_id``'s ``action_item`` row for one
+    extraction attempt.
+
+    Returns a fresh ``claim_token`` on success, ``None`` if nothing is
+    claimable right now (a live pending claim someone else owns). Does not
+    commit. When ``thread_done`` and the row's existing ``status`` is
+    ``"open"``, additionally stamps ``status="done"`` -- a worker crash
+    between claim and record must never leave an open row on a done thread,
+    where it would surface as an obligation after an auto-reopen. A forced
+    reclaim of a dismissed row must preserve ``dismissed`` byte-for-byte.
+    """
+    now = datetime.now(timezone.utc)
+    token = uuid4()
+
+    insert_values = {
+        "message_id": message_id,
+        "thread_id": thread_id,
+        "user_id": user_id,
+        "outcome": "pending",
+        "claim_token": token,
+        "attempts": 1,
+        "last_attempted_at": now,
+    }
+    if thread_done:
+        # Fresh insert -- there is no prior status to preserve, so the
+        # unconditional stamp (not the CASE used below) is correct here.
+        insert_values["status"] = "done"
+        insert_values["status_at"] = now
+
+    insert_stmt = (
+        insert(ActionItem)
+        .values(**insert_values)
+        .on_conflict_do_nothing(constraint="uq_action_item_message")
+    )
+    if db.execute(insert_stmt).rowcount:
+        return token
+
+    # Someone already has a row for this message -- try to (re)claim it.
+    update_values = {
+        "outcome": "pending",
+        "claim_token": token,
+        "attempts": ActionItem.attempts + 1,
+        "last_attempted_at": now,
+        **_done_stamp_columns(thread_done, now),
+    }
+    claim_stmt = (
+        update(ActionItem)
+        .where(ActionItem.message_id == message_id, claimable_predicate(force=force))
+        .values(**update_values)
+    )
+    if db.execute(claim_stmt).rowcount:
+        return token
+
+    # Not claimable -- but if it's a pending claim that expired AT the
+    # attempt cap, it's not retryable either, and nothing else ever settles
+    # it without this: terminalize it to failed. Disjoint from the claim
+    # predicate above (that one requires attempts < cap), so this never
+    # steals a claim the update just above could have taken.
+    terminalize_stmt = (
+        update(ActionItem)
+        .where(
+            ActionItem.message_id == message_id,
+            ActionItem.outcome == "pending",
+            ActionItem.last_attempted_at < now - PENDING_LEASE,
+            ActionItem.attempts >= MAX_ATTEMPTS,
+        )
+        .values(outcome="failed")
+    )
+    db.execute(terminalize_stmt)
+    return None
+
+
+def record_extraction(
+    db: Session,
+    *,
+    message_id: UUID,
+    claim_token: UUID,
+    result: ExtractedAction | NoAction | None,
+    thread_done: bool,
+    label_still_actionable: bool,
+) -> bool:
+    """Fenced write of an extraction attempt's outcome.
+
+    ``UPDATE ... WHERE message_id = :m AND claim_token = :t AND
+    outcome = 'pending'`` -- a stale worker's late write (its lease expired
+    and someone else already reclaimed the row) affects zero rows and the
+    caller treats that as a logged no-op, never overwriting a newer attempt.
+    Does not commit.
+
+    Precedence: a label that left ``ACTION_LABELS`` while the call was in
+    flight always wins (records ``ineligible``, claimable, so a
+    reclassify-back can re-extract) over the call's own result. Otherwise the
+    result decides: ``ExtractedAction`` -> ``extracted``, ``NoAction`` ->
+    ``no_action`` (extraction fields cleared -- a forced re-extraction that
+    finds nothing must not leave stale fields from a prior attempt), ``None``
+    -> ``failed`` (fields untouched, transient failure).
+
+    Independent of which branch above fires: if ``thread_done`` and the
+    row's existing ``status`` is ``"open"``, this record also resolves it to
+    ``"done"`` -- an open ineligible/no_action/failed row created on a done
+    thread must not resurface after an auto-reopen. Status is never reset
+    otherwise; re-extraction must not resurrect an item an operator resolved.
+    """
+    now = datetime.now(timezone.utc)
+    values: dict = {"claim_token": None}
+
+    if not label_still_actionable:
+        values["outcome"] = "ineligible"
+    elif isinstance(result, ExtractedAction):
+        values.update(
+            outcome="extracted",
+            kind=result.kind,
+            title=result.title,
+            due_at=result.due_at,
+            due_precision=result.due_precision,
+            due_raw=result.due_raw,
+            amount=result.amount,
+            currency=result.currency,
+            source_confidence=result.confidence,
+            model_version=result.model_version,
+        )
+    elif isinstance(result, NoAction):
+        values.update(
+            outcome="no_action",
+            kind=None,
+            title=None,
+            due_at=None,
+            due_precision=None,
+            due_raw=None,
+            amount=None,
+            currency=None,
+            source_confidence=None,
+            model_version=None,
+        )
+    else:
+        values["outcome"] = "failed"
+
+    values.update(_done_stamp_columns(thread_done, now))
+
+    stmt = (
+        update(ActionItem)
+        .where(
+            ActionItem.message_id == message_id,
+            ActionItem.claim_token == claim_token,
+            ActionItem.outcome == "pending",
+        )
+        .values(**values)
+    )
+    return bool(db.execute(stmt).rowcount)

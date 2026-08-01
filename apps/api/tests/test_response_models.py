@@ -52,9 +52,9 @@ def test_output_models_forbid_extra_fields():
 def test_schemas_inherit_the_shared_base():
     """Cheap way to keep the config in one place: if a new model skips the base,
     it also skips extra='forbid' and nobody notices."""
-    from app.db.schemas import auth, mailbox
+    from app.db.schemas import actions, auth, mailbox
 
-    for module in (auth, mailbox):
+    for module in (auth, mailbox, actions):
         for name in dir(module):
             obj = getattr(module, name)
             if isinstance(obj, type) and issubclass(obj, BaseModel) and obj is not BaseModel:

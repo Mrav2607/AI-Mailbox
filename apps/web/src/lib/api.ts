@@ -1,4 +1,6 @@
 import type {
+  ActionsResponse,
+  ActionStatus,
   BackfillOptions,
   BackfillResult,
   BucketKey,
@@ -14,8 +16,10 @@ import type {
   User,
 } from "./types";
 import {
+  mockActions,
   mockApplyLabel,
   mockBackfill,
+  mockBackfillActions,
   mockCounts,
   mockDeleteConnection,
   mockDeleteThread,
@@ -23,6 +27,7 @@ import {
   mockListConnections,
   mockOverview,
   mockSearch,
+  mockSetActionStatus,
   mockSetDone,
   mockThread,
   mockTriage,
@@ -385,18 +390,18 @@ export async function getTriage(
   return request<TriageResponse>(`/mail/triage?${buildTriageQuery(bucket, limit, opts)}`);
 }
 
-// Whole-mailbox thread counts per bucket for the sidebar. Computed server-side
-// so the totals aren't capped by a single triage page. Scoped to one account
-// when accountId is set — counts.all is that account's filtered open total.
-export async function getCounts(
-  accountId?: string | null,
-): Promise<Record<BucketKey, number>> {
+// Whole-mailbox thread counts per bucket for the sidebar, plus the agenda's
+// cross-account open/overdue counts. Computed server-side so the totals
+// aren't capped by a single triage page. The bucket counts are scoped to one
+// account when accountId is set — counts.all is that account's filtered open
+// total — but `actions` never takes the account filter (the agenda is always
+// cross-account, same visibility rule the API enforces).
+export async function getCounts(accountId?: string | null): Promise<CountsResponse> {
   if (USE_MOCK) return mockCounts(accountId ?? null);
   const path = accountId
     ? `/mail/counts?provider_account_id=${encodeURIComponent(accountId)}`
     : "/mail/counts";
-  const res = await request<CountsResponse>(path);
-  return res.counts;
+  return request<CountsResponse>(path);
 }
 
 export async function getThread(id: string): Promise<ThreadDetail> {
@@ -800,6 +805,63 @@ export async function reclassify(
   return request<{ thread_id: string; classification: Classification }>(
     `/mail/thread/${threadId}/classification`,
     { method: "POST", body: JSON.stringify({ label }) },
+  );
+}
+
+// The agenda board: every visible action item across every connected
+// account, `status` defaulting to "open" like the API. `counts` in the
+// response is always the full open/overdue tally regardless of the status
+// filter, so switching status views doesn't make the badge count flicker.
+export async function getActions(
+  status: ActionStatus = "open",
+  limit = 200,
+): Promise<ActionsResponse> {
+  if (USE_MOCK) return mockActions(status, limit);
+  const qs = new URLSearchParams({ status, limit: String(limit) });
+  return request<ActionsResponse>(`/mail/actions?${qs.toString()}`);
+}
+
+export interface ActionStatusOut {
+  action_id: string;
+  status: ActionStatus;
+  status_at: string | null;
+}
+
+// Marks an action item done/dismissed, or reopens it (status: "open").
+export async function setActionStatus(
+  id: string,
+  status: ActionStatus,
+): Promise<ActionStatusOut> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 120));
+    return mockSetActionStatus(id, status);
+  }
+  return request<ActionStatusOut>(`/mail/actions/${encodeURIComponent(id)}/status`, {
+    method: "POST",
+    body: JSON.stringify({ status }),
+  });
+}
+
+// Queues a manual action-extraction sweep off the request path. 409s (as an
+// ApiError) when the feature is disabled server-side — flag off, or the flag
+// is on but no Gemini key is configured.
+export async function backfillActions(opts?: {
+  limit?: number;
+  force?: boolean;
+  since_days?: number;
+}): Promise<{ status: string; task_id: string }> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 400));
+    return mockBackfillActions();
+  }
+  const qs = new URLSearchParams({
+    limit: String(opts?.limit ?? 100),
+    force: String(opts?.force ?? false),
+    since_days: String(opts?.since_days ?? 30),
+  });
+  return request<{ status: string; task_id: string }>(
+    `/mail/actions/backfill?${qs.toString()}`,
+    { method: "POST" },
   );
 }
 

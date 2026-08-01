@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from .actions import ActionCounts
 from .common import Response
 
 
@@ -37,6 +38,12 @@ class Counts(Response):
     # One entry per bucket, plus `all` and `unclassified`. Left open rather than
     # pinned to a literal set so adding a bucket doesn't silently drop it here.
     counts: dict[str, int]
+    # Agenda counts, ALWAYS cross-account: unlike the bucket counts above,
+    # there's no per-account filter here on purpose -- the agenda's whole
+    # point is one unified board across every connected account, so a bucket
+    # view scoped to one account must not narrow it. Same visibility rule as
+    # GET /mail/actions (see routes/actions.py's module docstring).
+    actions: ActionCounts
 
 
 class ThreadSummary(Response):
