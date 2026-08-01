@@ -112,18 +112,22 @@ def test_triage_account_email_prefers_display_email_over_external_user_id(monkey
 class _ReclassifyDB:
     """Fake session backing reclassify_thread: db.get resolves the owned
     thread, db.execute resolves the latest-message lookup (and swallows
-    upsert_classification's own insert), and commit() is timestamped into
-    `events` so tests can assert the enqueue happens strictly after it."""
+    upsert_classification's own insert plus the extracted->ineligible
+    invalidation UPDATE, both recorded in `statements`), and commit() is
+    timestamped into `events` so tests can assert the enqueue happens
+    strictly after it."""
 
     def __init__(self, thread, message, events):
         self.thread = thread
         self.message = message
         self.events = events
+        self.statements = []
 
     def get(self, model, pk):
         return self.thread if pk == self.thread.id else None
 
     def execute(self, statement):
+        self.statements.append(statement)
         result = MagicMock()
         result.scalars.return_value.first.return_value = self.message
         return result
@@ -162,11 +166,11 @@ def _reclassify_setup(monkeypatch, *, extraction_available, should_raise=False):
     monkeypatch.setattr(mailbox, "extract_action_for_message", fake_task)
     app.dependency_overrides[get_current_user] = lambda: user
     app.dependency_overrides[get_db] = lambda: db
-    return TestClient(app), fake_task, events, thread_id, message_id
+    return TestClient(app), fake_task, events, thread_id, message_id, db
 
 
 def test_reclassify_enqueues_extraction_strictly_after_commit(monkeypatch):
-    client, fake_task, events, thread_id, message_id = _reclassify_setup(
+    client, fake_task, events, thread_id, message_id, _db = _reclassify_setup(
         monkeypatch, extraction_available=True
     )
     try:
@@ -183,7 +187,7 @@ def test_reclassify_enqueues_extraction_strictly_after_commit(monkeypatch):
 
 
 def test_reclassify_skips_enqueue_for_a_non_action_label(monkeypatch):
-    client, fake_task, _events, thread_id, _message_id = _reclassify_setup(
+    client, fake_task, _events, thread_id, _message_id, _db = _reclassify_setup(
         monkeypatch, extraction_available=True
     )
     try:
@@ -199,7 +203,7 @@ def test_reclassify_skips_enqueue_for_a_non_action_label(monkeypatch):
 
 
 def test_reclassify_skips_enqueue_when_extraction_unavailable(monkeypatch):
-    client, fake_task, _events, thread_id, _message_id = _reclassify_setup(
+    client, fake_task, _events, thread_id, _message_id, _db = _reclassify_setup(
         monkeypatch, extraction_available=False
     )
     try:
@@ -215,7 +219,7 @@ def test_reclassify_skips_enqueue_when_extraction_unavailable(monkeypatch):
 
 
 def test_reclassify_broker_failure_is_swallowed_and_response_still_succeeds(monkeypatch):
-    client, fake_task, events, thread_id, _message_id = _reclassify_setup(
+    client, fake_task, events, thread_id, _message_id, _db = _reclassify_setup(
         monkeypatch, extraction_available=True, should_raise=True
     )
     try:
@@ -231,6 +235,58 @@ def test_reclassify_broker_failure_is_swallowed_and_response_still_succeeds(monk
     assert resp.status_code == 200
     assert resp.json()["classification"]["label"] == "needs_reply"
     assert events == ["commit", "delay"]
+
+
+def test_reclassify_away_invalidates_a_settled_extracted_row(monkeypatch):
+    # Reclassifying AWAY from an action label must make a previously
+    # `extracted` row claimable again -- otherwise a later back-transition's
+    # enqueued task finds the terminal row and skips it, silently re-showing
+    # the stale extraction instead of re-extracting.
+    client, fake_task, _events, thread_id, message_id, db = _reclassify_setup(
+        monkeypatch, extraction_available=True
+    )
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread_id}/classification",
+            json={"label": "fyi"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    # statements: [0] latest-message select, [1] classification upsert,
+    # [2] the extracted->ineligible invalidation UPDATE.
+    assert len(db.statements) == 3
+    compiled = str(
+        db.statements[2].compile(compile_kwargs={"literal_binds": True})
+    )
+    assert "UPDATE action_item" in compiled
+    assert f"action_item.message_id = '{message_id.hex}'" in compiled
+    assert "action_item.outcome = 'extracted'" in compiled
+    assert "outcome='ineligible'" in compiled.replace(" ", "")
+    # Never touches status/status_at -- an operator's done/dismissed must
+    # survive the round-trip.
+    assert "status" not in compiled
+    assert fake_task.calls == []
+
+
+def test_reclassify_to_action_label_issues_no_invalidation_update(monkeypatch):
+    client, fake_task, _events, thread_id, message_id, db = _reclassify_setup(
+        monkeypatch, extraction_available=True
+    )
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread_id}/classification",
+            json={"label": "action_required"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    # Only the latest-message select and the classification upsert -- no
+    # third (invalidation) statement.
+    assert len(db.statements) == 2
+    assert fake_task.calls == [str(message_id)]
 
 
 # ---------------------------------------------------------------------------

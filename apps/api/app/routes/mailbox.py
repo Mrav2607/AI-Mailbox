@@ -410,6 +410,40 @@ def reclassify_thread(
         rationale="Operator override from the console.",
         model_version=_OPERATOR_MODEL_VERSION,
     )
+    if payload.label not in ACTION_LABELS:
+        # A prior extraction may have already settled this message's row as
+        # `extracted`. Settled rows are invisible to the claim machine (only
+        # `ineligible` / `failed`-under-cap / expired-`pending` are
+        # claimable), so if the label later swings back into ACTION_LABELS,
+        # the back-transition's enqueued task would find that terminal row
+        # and skip it -- silently re-showing the OLD extraction instead of
+        # re-extracting. Flip it to `ineligible` here so it's claimable again
+        # on the way back in.
+        #
+        # Only `extracted` rows: a `pending` row is a live in-flight claim
+        # whose own record_extraction path re-checks the label under the
+        # classification row's FOR UPDATE lock and lands `ineligible` itself
+        # -- writing over it here would fight that fence.
+        # `no_action`/`failed`/`ineligible` need nothing; they're already
+        # either invisible or claimable by design. Never touch
+        # status/status_at -- an operator's done/dismissed must survive the
+        # round-trip, same rule record_extraction follows on re-extraction.
+        # Not gated on extraction_available(): this is a data-consistency
+        # write, not an LLM call, so it costs nothing when the feature is off.
+        #
+        # Same transaction as the classification upsert above, written
+        # Classification -> ActionItem -- the same order the extraction
+        # record path uses, so no new lock ordering is introduced. No thread
+        # lock and no ActionItem SELECT FOR UPDATE here, just a conditional
+        # UPDATE -- the frozen MailThread -> ActionItem ordering is untouched.
+        db.execute(
+            update(ActionItem)
+            .where(
+                ActionItem.message_id == latest_message.id,
+                ActionItem.outcome == "extracted",
+            )
+            .values(outcome="ineligible")
+        )
     db.commit()
 
     if payload.label in ACTION_LABELS and extraction_available():
