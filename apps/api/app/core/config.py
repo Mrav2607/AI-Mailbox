@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     # heuristic). Local/gemini both fall back gracefully if unavailable.
     classifier_backend: str = Field(default="local", alias="CLASSIFIER_BACKEND")
     classifier_model_path: str = Field(default="models/email-classifier", alias="CLASSIFIER_MODEL_PATH")
+    # Opt-in switch for the second-stage LLM action extraction. Off by default:
+    # existing deployments already carry GEMINI_API_KEY for classification and
+    # must not silently start paying for a new workload. Even when true,
+    # extraction only runs if gemini_api_key is set (no non-LLM fallback).
+    action_extraction_enabled: bool = Field(default=False, alias="ACTION_EXTRACTION_ENABLED")
     google_client_id: str | None = Field(default=None, alias="GOOGLE_CLIENT_ID")
     google_client_secret: str | None = Field(default=None, alias="GOOGLE_CLIENT_SECRET")
     google_redirect_uri: str | None = Field(default=None, alias="GOOGLE_REDIRECT_URI")
