@@ -16,6 +16,9 @@ interface Props {
   showAccount?: boolean;
   loading?: boolean;
   error?: string | null;
+  // Double-click toggles the detail pane open/closed — the row is already
+  // selected by the first click, so this doesn't need to know which row.
+  onRowDoubleClick?: () => void;
 }
 
 const KIND_LABELS: Record<ActionKind, string> = {
@@ -61,6 +64,7 @@ function AgendaRow({
   showAccount,
   onSelect,
   onStatusChange,
+  onRowDoubleClick,
 }: {
   item: ActionItem;
   focused: boolean;
@@ -68,6 +72,7 @@ function AgendaRow({
   showAccount?: boolean;
   onSelect: (item: ActionItem) => void;
   onStatusChange: (id: string, status: ActionStatus) => void;
+  onRowDoubleClick?: () => void;
 }) {
   const due = formatDue(item);
   // A confidence below this threshold gets a muted "unverified" tag instead
@@ -80,9 +85,10 @@ function AgendaRow({
       <button
         data-action-row={item.id}
         onClick={() => onSelect(item)}
+        onDoubleClick={onRowDoubleClick}
         aria-current={focused ? "true" : undefined}
         className={[
-          "group relative w-full text-left pl-3 pr-2 py-[7px] flex items-center gap-2.5 text-[12.5px] cursor-pointer",
+          "group relative w-full text-left pl-3 pr-2 py-[7px] flex items-center gap-2.5 text-[12.5px] cursor-pointer select-none",
           "border-l-2 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset focus-visible:bg-[var(--color-panel-hi)]",
           focused
             ? "border-primary bg-[var(--color-panel-hi)]"
@@ -132,6 +138,7 @@ function AgendaRow({
               e.stopPropagation();
               onStatusChange(item.id, "done");
             }}
+            onDoubleClick={(e) => e.stopPropagation()}
             className="h-5 w-5 rounded border border-border flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer transition-colors"
           >
             <Check className="h-3 w-3" />
@@ -146,6 +153,7 @@ function AgendaRow({
               e.stopPropagation();
               onStatusChange(item.id, "dismissed");
             }}
+            onDoubleClick={(e) => e.stopPropagation()}
             className="h-5 w-5 rounded border border-border flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer transition-colors"
           >
             <X className="h-3 w-3" />
@@ -176,6 +184,7 @@ export function AgendaList({
   showAccount,
   loading,
   error,
+  onRowDoubleClick,
 }: Props) {
   if (error) {
     return (
@@ -228,6 +237,7 @@ export function AgendaList({
                 showAccount={showAccount}
                 onSelect={onSelect}
                 onStatusChange={onStatusChange}
+                onRowDoubleClick={onRowDoubleClick}
               />
             ))}
           </Fragment>

@@ -332,6 +332,13 @@ export default function Console() {
     );
   }, []);
 
+  // A row's second click of a double-click toggles the detail pane, same
+  // path as `]`. Narrow layout already navigates to the reading pane on a
+  // single tap, so this is only ever wired up on desktop (see below).
+  const handleRowDoubleClick = useCallback(() => {
+    togglePanel("detail");
+  }, [togglePanel]);
+
   const snapshotPanels = useCallback((): Panels => ({ ...panelsRef.current }), []);
   const restorePanels = useCallback((snapshot: Panels) => {
     setPanels(snapshot);
@@ -2282,6 +2289,7 @@ export default function Console() {
           showAccount={multiAccount}
           loading={actionsLoading}
           error={actionsError}
+          onRowDoubleClick={isNarrow ? undefined : handleRowDoubleClick}
         />
       </div>
     </section>
@@ -2528,6 +2536,7 @@ export default function Console() {
             isUnseen={isUnseenFor}
             bulkIds={isNarrow ? undefined : bulkIds}
             onToggleBulk={isNarrow ? undefined : toggleBulk}
+            onRowDoubleClick={isNarrow ? undefined : handleRowDoubleClick}
           />
         )}
         {!searchMode && hasMore && (

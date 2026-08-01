@@ -24,6 +24,9 @@ interface Props {
   isUnseen?: (item: TriageItem) => boolean;
   bulkIds?: ReadonlySet<string>;
   onToggleBulk?: (id: string) => void;
+  // Double-click toggles the detail pane open/closed — the row is already
+  // selected by the first click, so this doesn't need to know which row.
+  onRowDoubleClick?: () => void;
 }
 
 function GroupHeader({ label }: { label: DateGroup }) {
@@ -62,6 +65,7 @@ export function ThreadList({
   isUnseen,
   bulkIds,
   onToggleBulk,
+  onRowDoubleClick,
 }: Props) {
   const rowPadY = density === "compact" ? "py-[3px]" : "py-[7px]";
   if (error) {
@@ -130,9 +134,10 @@ export function ThreadList({
                 <button
                   data-thread-row={it.thread_id}
                   onClick={() => onSelect(it.thread_id)}
+                  onDoubleClick={onRowDoubleClick}
                   aria-current={isSel ? "true" : undefined}
                   className={[
-                    "group relative w-full min-h-14 text-left px-3 py-2.5 flex flex-col justify-center gap-1 text-[12.5px] cursor-pointer",
+                    "group relative w-full min-h-14 text-left px-3 py-2.5 flex flex-col justify-center gap-1 text-[12.5px] cursor-pointer select-none",
                     "border-l-2 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset focus-visible:bg-[var(--color-panel-hi)]",
                     isSel
                       ? "border-primary bg-[var(--color-panel-hi)]"
@@ -207,9 +212,10 @@ export function ThreadList({
               <button
                 data-thread-row={it.thread_id}
                 onClick={() => onSelect(it.thread_id)}
+                onDoubleClick={onRowDoubleClick}
                 aria-current={isSel ? "true" : undefined}
                 className={[
-                  "group relative w-full text-left pl-3 pr-3 flex items-center gap-2.5 text-[12.5px] cursor-pointer",
+                  "group relative w-full text-left pl-3 pr-3 flex items-center gap-2.5 text-[12.5px] cursor-pointer select-none",
                   rowPadY,
                   "border-l-2 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset focus-visible:bg-[var(--color-panel-hi)]",
                   isSel
