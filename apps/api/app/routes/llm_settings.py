@@ -34,6 +34,7 @@ from app.services.nlp.providers import (
     PROVIDER_PRESETS,
     DestinationRejected,
     ResolvedExtraction,
+    resolve_classification_routing,
     resolve_extraction_credential,
     resolve_preset_base_url,
     validate_custom_base_url_async,
@@ -55,14 +56,32 @@ _MAX_KEY_LEN = 512
 _MAX_MODEL_LEN = 200
 
 
-def _settings_payload(row: UserLlmCredential | None, resolved: ResolvedExtraction) -> dict:
+def _effective_backend() -> str:
+    """The SAME normalized expression `classifier.classify` dispatches on --
+    `(settings.classifier_backend or "auto").lower()`. The config value is an
+    unconstrained string, so comparing it raw would misreport e.g.
+    `CLASSIFIER_BACKEND=HEURISTIC` or an empty value as LLM-backed, showing a
+    consent toggle that can never fire.
+    """
+    return (settings.classifier_backend or "auto").lower()
+
+
+def _settings_payload(
+    row: UserLlmCredential | None,
+    resolved: ResolvedExtraction,
+    *,
+    classification_eligible: bool,
+) -> dict:
     """The shared GET response shape. ``row`` carries every field that
     ``ResolvedExtraction`` doesn't (last_verified_at, the display fields) --
     ``resolved`` is still the ONE source for coverage-derived fields
     (``fallback_active``, ``custom_blocked``) so this never re-derives
     coverage from partial signals the way ``ResolvedExtraction``'s own
-    docstring warns against.
+    docstring warns against. ``classification_eligible`` is likewise the
+    caller's ONE source (``resolve_classification_routing(...).mode ==
+    "user"``) -- eligibility, not observed usage.
     """
+    backend = _effective_backend()
     return {
         "configured": row is not None,
         "provider": row.provider if row is not None else None,
@@ -76,6 +95,10 @@ def _settings_payload(row: UserLlmCredential | None, resolved: ResolvedExtractio
         "custom_endpoints_enabled": bool(settings.llm_custom_endpoints_enabled),
         "private_endpoints_enabled": bool(settings.llm_private_endpoints_enabled),
         "custom_blocked": resolved.blocked_reason is not None,
+        "classification_byok": bool(row.classification_byok) if row is not None else False,
+        "classifier_uses_llm": backend != "heuristic",
+        "classifier_backend": backend,
+        "classification_eligible": classification_eligible,
     }
 
 
@@ -88,7 +111,8 @@ def get_llm_settings(
         select(UserLlmCredential).where(UserLlmCredential.user_id == current_user.id)
     ).scalar_one_or_none()
     resolved = resolve_extraction_credential(db, current_user.id)
-    return _settings_payload(row, resolved)
+    routing = resolve_classification_routing(db, current_user.id)
+    return _settings_payload(row, resolved, classification_eligible=routing.mode == "user")
 
 
 async def _read_bounded_body(request: Request) -> bytes:
@@ -152,6 +176,7 @@ async def put_llm_settings(
     api_key = payload.get("api_key")
     model = payload.get("model")
     base_url_input = payload.get("base_url")
+    classification_byok_input = payload.get("classification_byok")
 
     if not isinstance(provider, str):
         raise HTTPException(status_code=422, detail="provider must be a string")
@@ -159,6 +184,8 @@ async def put_llm_settings(
         raise HTTPException(status_code=422, detail="api_key must be a string")
     if not isinstance(model, str):
         raise HTTPException(status_code=422, detail="model must be a string")
+    if classification_byok_input is not None and not isinstance(classification_byok_input, bool):
+        raise HTTPException(status_code=422, detail="classification_byok must be a boolean")
 
     api_key = api_key.strip()
     if not (_MIN_KEY_LEN <= len(api_key) <= _MAX_KEY_LEN):
@@ -184,6 +211,35 @@ async def put_llm_settings(
     else:
         raise HTTPException(status_code=422, detail="invalid provider")
 
+    # Presets-only in v1: classification's per-request destination re-check
+    # is a synchronous DNS round-trip, unaffordable at one call per ingested
+    # message (see providers.py). An explicit ask to turn the flag on for a
+    # `custom` credential is rejected outright, rather than silently
+    # dropped, so the caller isn't left thinking it took effect.
+    if classification_byok_input is True and provider == "custom":
+        raise HTTPException(
+            status_code=422,
+            detail="classification_byok requires a preset provider; custom endpoints "
+            "are not eligible for classification in v1",
+        )
+
+    def _resolve_classification_byok(existing: UserLlmCredential | None) -> bool:
+        """Absent flag means false on create, unchanged on update. A
+        `custom` provider always forces false here -- an explicit true+custom
+        ask already 422'd above, so what's left is a flag the credential is
+        INHERITING across a switch to `custom`; clearing it means no stored
+        row ever combines provider="custom" with classification_byok=true,
+        which `resolve_classification_routing` would otherwise have to treat
+        as "off" anyway.
+        """
+        if classification_byok_input is not None:
+            value = classification_byok_input
+        elif existing is not None:
+            value = bool(existing.classification_byok)
+        else:
+            value = False
+        return False if provider == "custom" else value
+
     # FOR UPDATE before the read-then-branch: two concurrent PUTs for the
     # same user otherwise both read the same revision and bump it only
     # once, weakening the id+revision guard /test relies on. The lock
@@ -196,6 +252,10 @@ async def put_llm_settings(
     now = datetime.now(timezone.utc)
 
     def _apply_update(target: UserLlmCredential) -> None:
+        # Read BEFORE mutating -- `_resolve_classification_byok` needs
+        # `target.classification_byok` as it stood before this write to
+        # implement "unchanged on update" when the flag is absent.
+        target.classification_byok = _resolve_classification_byok(target)
         target.provider = provider
         target.base_url = base_url
         target.api_key = api_key
@@ -219,6 +279,7 @@ async def put_llm_settings(
             base_url=base_url,
             api_key=api_key,
             model=model,
+            classification_byok=_resolve_classification_byok(None),
             revision=1,
         )
         row.updated_at = now
@@ -244,13 +305,17 @@ async def put_llm_settings(
         db.commit()
 
     # Built directly from what we just wrote and validated, NOT a fresh
-    # `resolve_extraction_credential` call: that helper's custom-provider
-    # path calls the SYNC destination-policy re-check, which would block
-    # this async route's event loop for up to its 3s DNS budget -- the exact
-    # thing being async here is meant to avoid. Nothing here needs
-    # re-deriving: a row we just wrote is always `configured`, never
-    # fallback-covered, and (having just passed validation, custom included)
-    # never blocked.
+    # `resolve_extraction_credential`/`resolve_classification_routing` call:
+    # the former's custom-provider path calls the SYNC destination-policy
+    # re-check, which would block this async route's event loop for up to
+    # its 3s DNS budget -- the exact thing being async here is meant to
+    # avoid. Nothing here needs re-deriving: a row we just wrote is always
+    # `configured`, never fallback-covered, and (having just passed
+    # validation, custom included) never blocked. Eligibility follows the
+    # same rule `resolve_classification_routing` applies -- opted in AND a
+    # preset provider -- and both are already guaranteed above (a `custom`
+    # provider always leaves `classification_byok` false here).
+    backend = _effective_backend()
     return {
         "configured": True,
         "provider": row.provider,
@@ -263,6 +328,12 @@ async def put_llm_settings(
         "custom_endpoints_enabled": bool(settings.llm_custom_endpoints_enabled),
         "private_endpoints_enabled": bool(settings.llm_private_endpoints_enabled),
         "custom_blocked": False,
+        "classification_byok": bool(row.classification_byok),
+        "classifier_uses_llm": backend != "heuristic",
+        "classifier_backend": backend,
+        "classification_eligible": (
+            bool(row.classification_byok) and row.provider in PROVIDER_PRESETS
+        ),
     }
 
 

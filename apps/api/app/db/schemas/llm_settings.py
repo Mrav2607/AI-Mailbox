@@ -41,6 +41,25 @@ class LlmSettingsOut(Response):
     # True when a stored custom credential is disabled by the current
     # flag/policy state -- the UI explains why extraction stopped.
     custom_blocked: bool
+    # Per-credential opt-in: does this user's key also pay for classification
+    # (every ingested message), not just extraction (the settled-verdict
+    # subset)? False for an unconfigured user -- there's no credential to
+    # opt in.
+    classification_byok: bool
+    # Whether the effective classifier backend ever reaches an LLM at all --
+    # `classifier_backend != "heuristic"`. Gates the opt-in checkbox itself:
+    # a heuristic-only deployment has no LLM path for the key to pay for.
+    classifier_uses_llm: bool
+    # The effective backend `classify()` actually dispatches on -- the same
+    # normalized `(CLASSIFIER_BACKEND or "auto").lower()` expression, so the
+    # UI explains local-first behavior honestly instead of guessing from the
+    # raw (unconstrained) config string.
+    classifier_backend: str
+    # ELIGIBILITY, not observed usage: `resolve_classification_routing(...)
+    # .mode == "user"`. An eligible credential still isn't called when the
+    # local encoder handles a message or the backend is heuristic -- so this
+    # is never renamed "active", which would overclaim.
+    classification_eligible: bool
 
 
 class LlmTestResultOut(Response):

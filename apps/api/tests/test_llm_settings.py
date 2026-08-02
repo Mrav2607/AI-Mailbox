@@ -33,7 +33,11 @@ from app.core.config import settings
 from app.deps import get_current_user, get_db
 from app.main import app
 from app.routes import llm_settings
-from app.services.nlp.providers import DestinationRejected, ResolvedExtraction
+from app.services.nlp.providers import (
+    ClassificationRouting,
+    DestinationRejected,
+    ResolvedExtraction,
+)
 
 
 def _compiled(stmt) -> str:
@@ -50,6 +54,7 @@ def _make_row(
     model="gpt-4o-mini",
     revision=1,
     last_verified_at=None,
+    classification_byok=False,
 ):
     return SimpleNamespace(
         id=id or uuid4(),
@@ -60,6 +65,7 @@ def _make_row(
         model=model,
         revision=revision,
         last_verified_at=last_verified_at,
+        classification_byok=classification_byok,
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
     )
@@ -159,6 +165,19 @@ def _clear_overrides():
     app.dependency_overrides.clear()
 
 
+@pytest.fixture(autouse=True)
+def _default_classification_routing(monkeypatch):
+    """GET calls `resolve_classification_routing` directly (unlike PUT, which
+    derives eligibility from the row it just wrote) -- default every test to
+    mode="server" so classification_eligible defaults to False without every
+    GET test having to know about routing. Tests asserting eligibility
+    override this explicitly."""
+    monkeypatch.setattr(
+        llm_settings, "resolve_classification_routing",
+        lambda db_, uid: ClassificationRouting(mode="server", credential=None),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Structural: sync/async split, no declared body parameter
 # ---------------------------------------------------------------------------
@@ -190,6 +209,7 @@ def test_get_unconfigured_returns_nulls_and_flags(monkeypatch, user):
     monkeypatch.setattr(settings, "action_extraction_enabled", True)
     monkeypatch.setattr(settings, "llm_custom_endpoints_enabled", False)
     monkeypatch.setattr(settings, "llm_private_endpoints_enabled", False)
+    monkeypatch.setattr(settings, "classifier_backend", "local")
     monkeypatch.setattr(
         llm_settings, "resolve_extraction_credential",
         lambda db_, uid: _resolved(stored=False, source=None),
@@ -209,6 +229,10 @@ def test_get_unconfigured_returns_nulls_and_flags(monkeypatch, user):
         "custom_endpoints_enabled": False,
         "private_endpoints_enabled": False,
         "custom_blocked": False,
+        "classification_byok": False,
+        "classifier_uses_llm": True,
+        "classifier_backend": "local",
+        "classification_eligible": False,
     }
 
 
@@ -293,6 +317,83 @@ def test_get_two_user_isolation(monkeypatch):
     resp_b = TestClient(app).get("/api/v1/settings/llm")
     assert resp_b.json()["provider"] == "gemini"
     assert resp_b.json()["model"] == "model-b"
+
+
+# ---------------------------------------------------------------------------
+# GET -- classification BYOK fields
+# ---------------------------------------------------------------------------
+
+
+def test_get_classification_eligible_true_when_routing_says_user(monkeypatch, user):
+    row = _make_row(user_id=user.id, provider="openai", classification_byok=True)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=True, source="user"),
+    )
+    monkeypatch.setattr(
+        llm_settings, "resolve_classification_routing",
+        lambda db_, uid: ClassificationRouting(mode="user", credential=None),
+    )
+    resp = TestClient(app).get("/api/v1/settings/llm")
+    body = resp.json()
+    assert body["classification_byok"] is True
+    assert body["classification_eligible"] is True
+
+
+def test_get_classification_eligible_false_for_out_of_band_custom_opt_in_row(monkeypatch, user):
+    # A row can end up provider="custom" + classification_byok=True only
+    # out-of-band (the PUT route force-clears the flag on that same write) --
+    # simulate it directly and confirm the router's "off" verdict (tested in
+    # test_providers.py) surfaces here as NOT eligible, even though the flag
+    # itself is still stored as true.
+    row = _make_row(
+        user_id=user.id, provider="custom", base_url="https://llm.internal/v1",
+        classification_byok=True,
+    )
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=True, source="user"),
+    )
+    monkeypatch.setattr(
+        llm_settings, "resolve_classification_routing",
+        lambda db_, uid: ClassificationRouting(mode="off", credential=None),
+    )
+    resp = TestClient(app).get("/api/v1/settings/llm")
+    body = resp.json()
+    assert body["classification_byok"] is True
+    assert body["classification_eligible"] is False
+
+
+@pytest.mark.parametrize(
+    "raw_backend, expected_backend, expected_uses_llm",
+    [
+        ("HEURISTIC", "heuristic", False),
+        ("", "auto", True),
+        ("Auto", "auto", True),
+        ("gemini", "gemini", True),
+    ],
+    ids=["uppercase-heuristic", "empty", "mixed-case-auto", "gemini"],
+)
+def test_get_classifier_backend_fields_use_the_normalized_expression(
+    monkeypatch, user, raw_backend, expected_backend, expected_uses_llm,
+):
+    # Must be the SAME normalization `classify()` applies -- comparing the
+    # raw config string would misreport an uppercase or empty value.
+    db = _CredentialDB()
+    _override(user, db)
+    monkeypatch.setattr(settings, "classifier_backend", raw_backend)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=False),
+    )
+    resp = TestClient(app).get("/api/v1/settings/llm")
+    body = resp.json()
+    assert body["classifier_backend"] == expected_backend
+    assert body["classifier_uses_llm"] is expected_uses_llm
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +706,203 @@ def test_put_custom_provider_stores_the_normalized_base_url(monkeypatch, user):
     assert resp.status_code == 200
     assert resp.json()["base_url"] == "https://llm.example.internal:8080"
     assert db.added[0].base_url == "https://llm.example.internal:8080"
+
+
+# ---------------------------------------------------------------------------
+# PUT -- classification_byok validation, the 422 matrix, and force-clear
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_value", [1, 0, "true", "false", ["true"], {"on": True}],
+    ids=["one", "zero", "str-true", "str-false", "list", "dict"],
+)
+def test_put_classification_byok_non_bool_is_422(user, bad_value):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "api_key": "sk-abcdefgh",
+            "model": "m",
+            "classification_byok": bad_value,
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "classification_byok must be a boolean"}
+    assert db.commits == 0
+
+
+def test_put_classification_byok_true_with_custom_provider_is_422(monkeypatch, user):
+    db = _CredentialDB()
+    _override(user, db)
+    monkeypatch.setattr(settings, "llm_custom_endpoints_enabled", True)
+
+    async def _normalize(url):
+        return "https://llm.example/v1"
+
+    monkeypatch.setattr(llm_settings, "validate_custom_base_url_async", _normalize)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "custom",
+            "api_key": "sk-abcdefgh",
+            "model": "m",
+            "base_url": "https://llm.example/v1",
+            "classification_byok": True,
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json() == {
+        "detail": "classification_byok requires a preset provider; custom endpoints "
+        "are not eligible for classification in v1",
+    }
+    assert db.commits == 0
+
+
+def test_put_classification_byok_false_with_custom_provider_is_not_rejected(monkeypatch, user):
+    # Only an explicit `true` conflicts with `custom` -- an explicit `false`
+    # (or absent, tested separately) must never trip the same 422.
+    db = _CredentialDB()
+    _override(user, db)
+    monkeypatch.setattr(settings, "llm_custom_endpoints_enabled", True)
+
+    async def _normalize(url):
+        return "https://llm.example/v1"
+
+    monkeypatch.setattr(llm_settings, "validate_custom_base_url_async", _normalize)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "custom",
+            "api_key": "sk-abcdefgh",
+            "model": "m",
+            "base_url": "https://llm.example/v1",
+            "classification_byok": False,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["classification_byok"] is False
+
+
+def test_put_classification_byok_absent_defaults_false_on_create(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": "sk-abcdefgh", "model": "m"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["classification_byok"] is False
+    assert resp.json()["classification_eligible"] is False
+    assert db.added[0].classification_byok is False
+
+
+def test_put_classification_byok_true_on_create_with_preset_provider(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "api_key": "sk-abcdefgh",
+            "model": "m",
+            "classification_byok": True,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["classification_byok"] is True
+    assert resp.json()["classification_eligible"] is True
+    assert db.added[0].classification_byok is True
+
+
+def test_put_classification_byok_absent_is_unchanged_on_update(user):
+    row = _make_row(user_id=user.id, provider="openai", classification_byok=True)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": "sk-new-key-1234", "model": "new-model"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["classification_byok"] is True
+    assert resp.json()["classification_eligible"] is True
+    assert row.classification_byok is True
+
+
+def test_put_switching_to_custom_force_clears_classification_byok(monkeypatch, user):
+    """Switching an existing opted-in credential TO custom must not 422 --
+    the flag it's inheriting is silently cleared in the same write, so no
+    stored row ever combines provider="custom" with classification_byok=true."""
+    row = _make_row(user_id=user.id, provider="openai", classification_byok=True)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    monkeypatch.setattr(settings, "llm_custom_endpoints_enabled", True)
+
+    async def _normalize(url):
+        return "https://llm.internal:8080"
+
+    monkeypatch.setattr(llm_settings, "validate_custom_base_url_async", _normalize)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "custom",
+            "api_key": "sk-abcdefgh",
+            "model": "m",
+            "base_url": "https://llm.internal:8080",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["classification_byok"] is False
+    assert body["classification_eligible"] is False
+    assert row.classification_byok is False
+    assert db.commits == 1
+
+
+def test_put_response_carries_every_new_field_on_create(monkeypatch, user):
+    db = _CredentialDB()
+    _override(user, db)
+    monkeypatch.setattr(settings, "classifier_backend", "HEURISTIC")
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "api_key": "sk-abcdefgh",
+            "model": "m",
+            "classification_byok": True,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["classification_byok"] is True
+    assert body["classifier_uses_llm"] is False
+    assert body["classifier_backend"] == "heuristic"
+    assert body["classification_eligible"] is True
+
+
+def test_put_response_carries_every_new_field_on_update(monkeypatch, user):
+    row = _make_row(user_id=user.id, provider="gemini", classification_byok=False)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    monkeypatch.setattr(settings, "classifier_backend", "")
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "gemini",
+            "api_key": "sk-new-key-1234",
+            "model": "new-model",
+            "classification_byok": True,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["classification_byok"] is True
+    assert body["classifier_uses_llm"] is True
+    assert body["classifier_backend"] == "auto"
+    assert body["classification_eligible"] is True
+    assert row.classification_byok is True
 
 
 # ---------------------------------------------------------------------------
