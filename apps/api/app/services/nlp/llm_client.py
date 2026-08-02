@@ -10,6 +10,7 @@ parsing.
 from __future__ import annotations
 
 import json
+from typing import NoReturn
 
 import httpx
 
@@ -36,18 +37,30 @@ class LlmCallError(Exception):
         super().__init__(category)
 
 
-def _raise_invalid_response(provider: str, status: int) -> None:
+def _raise_invalid_response(provider: str, status: int) -> NoReturn:
     logger.warning("LLM call returned a malformed response shape for provider %s", provider)
     raise LlmCallError("invalid_response", status)
 
 
 def call_chat_completion(
-    credential: LlmCredential, *, prompt: str, user_content: str, max_tokens: int
+    credential: LlmCredential,
+    *,
+    prompt: str,
+    user_content: str,
+    max_tokens: int,
+    timeout: float = 30.0,
 ) -> str:
     """
     Perform the OpenAI-compatible chat-completions call and return the raw
     `choices[0].message.content` string. Raises `LlmCallError` on every
     failure -- the single internal failure carrier.
+
+    `timeout` bounds the whole request (connect + read/write/pool all share
+    it, per httpx's default), except connect is always capped at 5s
+    regardless of `timeout` -- a TCP connect that takes longer than that is a
+    dead host no matter how slow the model itself might be, and splitting it
+    out is what makes an unreachable endpoint cheap to fail without also
+    punishing a legitimately slow generation.
 
     For `provider="custom"` the destination policy is re-run and PINNED
     FIRST, immediately before this specific request: a sweep resolves
@@ -101,7 +114,9 @@ def call_chat_completion(
     # `response.json()` and surface as `invalid_response` instead of the
     # `http_<status>` it actually is. Check `is_success` explicitly first.
     try:
-        with httpx.Client(timeout=30.0, trust_env=False) as client:
+        with httpx.Client(
+            timeout=httpx.Timeout(timeout, connect=5.0), trust_env=False
+        ) as client:
             response = client.post(
                 url,
                 headers=headers,

@@ -951,6 +951,38 @@ def test_put_omitted_api_key_key_on_create_is_422(user):
     assert db.added == []
 
 
+def test_put_explicit_null_api_key_on_update_preserves_the_key(user):
+    # An explicit JSON `null` takes the same "absent" path as an omitted
+    # field -- api_key_provided is `api_key is not None`, so null never
+    # reaches the type/length checks.
+    secret = "sk-stored-key-1234"
+    row = _make_row(user_id=user.id, provider="openai", api_key=secret)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": None, "model": "gpt-4o-mini"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["key_suffix"] == secret[-4:]
+    assert row.api_key == secret
+
+
+def test_put_explicit_null_api_key_on_create_is_422(user):
+    # Same absent-path treatment on a create, where there's nothing stored
+    # to fall back on -- still 422s, same as an omitted field.
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": None, "model": "gpt-4o-mini"},
+    )
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "api_key must be a string"}
+    assert db.commits == 0
+    assert db.added == []
+
+
 @pytest.mark.parametrize("bad_key", ["", "short12", "s" * 513], ids=["empty", "short", "long"])
 def test_put_present_but_invalid_api_key_still_422s_on_update(user, bad_key):
     # An explicit (even empty) api_key is never treated as "absent" -- this

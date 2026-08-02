@@ -191,6 +191,13 @@ _CLASSIFICATION_PROMPT = (
 # is deliberately tighter than extractor.py's 512.
 _CLASSIFICATION_MAX_TOKENS = 200
 
+# Classification runs once per ingested message, so a hung endpoint at
+# extraction's 30s default could stall a whole Gmail sweep for hours before
+# degrading to the heuristic. A tiny JSON label doesn't need that headroom --
+# extractor.py stays at 30s since it only runs over a bounded subset of
+# messages and produces longer output.
+_CLASSIFICATION_TIMEOUT_S = 10.0
+
 
 def _classify_llm(
     text: str, routing: ClassificationRouting | None = None
@@ -207,7 +214,16 @@ def _classify_llm(
         return _heuristic_classify(text)
 
     if routing is not None and routing.mode == "user":
-        assert routing.credential is not None  # invariant: "user" always carries one
+        if routing.credential is None:
+            # This should never happen -- "user" mode is supposed to always carry
+            # a credential -- but `assert` gets stripped under `-O`, and a plain
+            # AttributeError from call_chat_completion() isn't an LlmCallError, so
+            # it would escape classify() and blow up the whole ingest run instead
+            # of degrading gracefully. Heuristic, not the server path: a broken
+            # invariant must never silently bill the operator for a user who
+            # opted in with their own key.
+            logger.warning("ClassificationRouting mode='user' had no credential")
+            return _heuristic_classify(text)
         return _classify_llm_user(text, routing.credential)
 
     return _classify_llm_server(text)
@@ -268,6 +284,7 @@ def _classify_llm_user(text: str, credential: LlmCredential) -> tuple[str, float
             prompt=_CLASSIFICATION_PROMPT,
             user_content=f"Email:\n{text[:6000]}",
             max_tokens=_CLASSIFICATION_MAX_TOKENS,
+            timeout=_CLASSIFICATION_TIMEOUT_S,
         )
     except LlmCallError as exc:
         logger.warning(

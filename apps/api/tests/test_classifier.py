@@ -255,8 +255,9 @@ def test_classify_routing_user_mode_calls_openai_compat_with_credential(monkeypa
     )
     captured = {}
 
-    def fake_call(cred, *, prompt, user_content, max_tokens):
+    def fake_call(cred, *, prompt, user_content, max_tokens, timeout):
         captured["credential"] = cred
+        captured["timeout"] = timeout
         return json.dumps({"label": "spam", "confidence": 0.9, "rationale": "scam"})
 
     monkeypatch.setattr(classifier, "call_chat_completion", fake_call)
@@ -267,6 +268,8 @@ def test_classify_routing_user_mode_calls_openai_compat_with_credential(monkeypa
     assert label == "spam"
     assert model_version == "openai:gpt-4o-mini"  # BYOK attribution -- provider:model
     assert captured["credential"] is credential
+    # Classification uses its own tighter timeout, not extraction's 30s default.
+    assert captured["timeout"] == classifier._CLASSIFICATION_TIMEOUT_S
 
 
 def test_classify_routing_off_mode_never_builds_genai_client_or_calls_llm(monkeypatch):
@@ -282,6 +285,26 @@ def test_classify_routing_off_mode_never_builds_genai_client_or_calls_llm(monkey
     label, confidence, rationale, model_version = classify("Can you help?", routing=routing)
 
     assert label == "needs_reply"
+    assert model_version == "heuristic-v1"  # direct heuristic, not "-fallback"
+
+
+def test_classify_routing_user_mode_with_no_credential_falls_back_to_heuristic(monkeypatch):
+    """Guards the broken-invariant path: `assert` gets stripped under `-O`,
+    so mode="user" with credential=None must be a real guard that returns
+    the heuristic, not a crash or a silent fall-through to the server path
+    (which would bill the operator for a user who opted in with their own
+    key)."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier, "_genai_client", _explode)
+    monkeypatch.setattr(classifier, "call_chat_completion", _explode)
+
+    routing = ClassificationRouting(mode="user", credential=None)
+    label, confidence, rationale, model_version = classify(
+        "Security alert: new login detected", routing=routing
+    )
+    assert label == "security_alert"
     assert model_version == "heuristic-v1"  # direct heuristic, not "-fallback"
 
 
@@ -364,7 +387,7 @@ def test_classify_precedence_auto_backend_local_unavailable_falls_through_to_use
     )
     captured = {}
 
-    def fake_call(cred, *, prompt, user_content, max_tokens):
+    def fake_call(cred, *, prompt, user_content, max_tokens, timeout):
         captured["credential"] = cred
         return json.dumps({"label": "promotional", "confidence": 0.7, "rationale": "sale"})
 

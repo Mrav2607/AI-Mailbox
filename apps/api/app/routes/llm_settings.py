@@ -191,13 +191,13 @@ async def put_llm_settings(
     if classification_byok_input is not None and not isinstance(classification_byok_input, bool):
         raise HTTPException(status_code=422, detail="classification_byok must be a boolean")
 
-    # Absent api_key means "keep the stored one" -- the server never echoes
-    # the raw key back, so that's the ONLY way to edit anything else (e.g.
-    # the classification flag) without the caller having the original key in
-    # hand. There's nothing to keep on a brand-new row, so a create with no
-    # key still 422s below, once we know whether a row exists to fall back
-    # on. Anything present -- even null or the wrong type -- is validated
-    # right away, same fixed details as before.
+    # Absent OR explicit null api_key both mean "keep the stored one" -- the
+    # server never echoes the raw key back, so that's the ONLY way to edit
+    # anything else (e.g. the classification flag) without the caller having
+    # the original key in hand. There's nothing to keep on a brand-new row,
+    # so a create with no key (or an explicit null) still 422s below, once we
+    # know whether a row exists to fall back on. Only a non-null value gets
+    # validated right away.
     api_key_provided = api_key is not None
     if api_key_provided:
         if not isinstance(api_key, str):

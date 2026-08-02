@@ -332,8 +332,15 @@ def test_classification_router_is_built_once_per_run_not_once_per_message(monkey
     # lets a mid-run consent revocation take effect within a minute.
     from app.services.nlp.providers import ClassificationRouting
 
+    # A regression that keeps every router call intact but drops `routing=`
+    # from the `classify()` call would still pass every assertion above --
+    # so we also need to prove this exact routing object is what `classify`
+    # actually receives, not just that routing_for got called.
+    SENTINEL_ROUTING = ClassificationRouting(mode="off", credential=None)
+
     router_instances = []
     routing_calls = []
+    classify_calls = []
 
     class CountingRouter:
         def __init__(self, user_id):
@@ -341,9 +348,14 @@ def test_classification_router_is_built_once_per_run_not_once_per_message(monkey
 
         def routing_for(self, db):
             routing_calls.append(db)
-            return ClassificationRouting(mode="off", credential=None)
+            return SENTINEL_ROUTING
+
+    def fake_classify(text, *, routing):
+        classify_calls.append(routing)
+        return ("other", 0.5, "stub", "test-model")
 
     monkeypatch.setattr(gmail_ingest, "ClassificationRouter", CountingRouter)
+    monkeypatch.setattr(gmail_ingest, "classify", fake_classify)
 
     provider = MagicMock(access_token="tok", token_expiry=None, gmail_history_id="4242")
 
@@ -391,6 +403,10 @@ def test_classification_router_is_built_once_per_run_not_once_per_message(monkey
     assert result["classified"] == 2
     assert router_instances == ["u1"]
     assert len(routing_calls) == 2
+    # Both messages' classify calls got the router's actual routing object --
+    # not a dropped kwarg silently falling back to DEFAULT SERVER ROUTING.
+    assert len(classify_calls) == 2
+    assert all(routing is SENTINEL_ROUTING for routing in classify_calls)
 
 
 def test_a_non_json_400_is_not_mistaken_for_a_revoked_token(monkeypatch, google_creds):

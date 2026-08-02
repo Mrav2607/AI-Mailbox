@@ -277,7 +277,61 @@ def test_call_chat_completion_trust_env_false_ignores_private_proxy_env_var(monk
     assert client.trust_env is False
     # With trust_env=False httpx never consults HTTPS_PROXY -- if it had,
     # this client would carry a mounted proxy transport for the https:// pattern.
+    # `_mounts` is a private httpx attribute, so this is coupled to httpx's
+    # internals and could break on an unrelated httpx upgrade -- what it's
+    # really pinning is "no proxy transport got mounted."
     assert not any(client._mounts.values())
+
+
+def test_call_chat_completion_default_timeout_splits_connect_from_read(monkeypatch):
+    """A hung endpoint must fail cheap regardless of how slow generation is
+    allowed to be -- connect is always capped at 5s, separate from the
+    (default 30s) budget for the rest of the call."""
+    real_client_cls = httpx.Client
+    captured = []
+
+    class _SpyClient(real_client_cls):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(
+                _json_handler(200, _choice_payload(VALID_CONTENT))
+            )
+            super().__init__(*args, **kwargs)
+            captured.append(self)
+
+    monkeypatch.setattr(llm_client.httpx, "Client", _SpyClient)
+
+    call_chat_completion(_make_credential(), prompt="prompt", user_content="text", max_tokens=512)
+
+    assert len(captured) == 1
+    timeout = captured[0].timeout
+    assert timeout.connect == 5.0
+    assert timeout.read == 30.0
+
+
+def test_call_chat_completion_honors_an_explicit_timeout(monkeypatch):
+    """Classification passes its own tighter timeout -- this must actually
+    reach httpx, not just be accepted and ignored."""
+    real_client_cls = httpx.Client
+    captured = []
+
+    class _SpyClient(real_client_cls):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(
+                _json_handler(200, _choice_payload(VALID_CONTENT))
+            )
+            super().__init__(*args, **kwargs)
+            captured.append(self)
+
+    monkeypatch.setattr(llm_client.httpx, "Client", _SpyClient)
+
+    call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512, timeout=10.0
+    )
+
+    assert len(captured) == 1
+    timeout = captured[0].timeout
+    assert timeout.connect == 5.0
+    assert timeout.read == 10.0
 
 
 def test_call_chat_completion_never_logs_the_api_key(monkeypatch, caplog):
