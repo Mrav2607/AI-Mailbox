@@ -343,15 +343,29 @@ def test_backfill_out_of_range_params_are_422(backfill_client, params):
     assert resp.status_code == 422
 
 
-def test_backfill_returns_409_when_extraction_disabled(backfill_client, monkeypatch):
-    monkeypatch.setattr(actions, "extraction_available", lambda: False)
+def test_backfill_returns_409_when_master_switch_off(backfill_client, monkeypatch):
+    # The flag-off case takes priority over the per-user coverage check --
+    # never burns a query figuring out coverage when the switch is off.
+    monkeypatch.setattr(actions, "extraction_feature_enabled", lambda: False)
+    monkeypatch.setattr(actions, "extraction_available", lambda db, user_id: True)
     resp = TestClient(app).post("/api/v1/mail/actions/backfill")
     assert resp.status_code == 409
     assert resp.json()["detail"] == "action extraction disabled"
 
 
+def test_backfill_returns_409_when_no_credential_configured(backfill_client, monkeypatch):
+    # Flag on, but this user has no BYOK row and no server fallback covers
+    # them -- a distinct detail from the flag-off case.
+    monkeypatch.setattr(actions, "extraction_feature_enabled", lambda: True)
+    monkeypatch.setattr(actions, "extraction_available", lambda db, user_id: False)
+    resp = TestClient(app).post("/api/v1/mail/actions/backfill")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "no LLM credential configured"
+
+
 def test_backfill_queues_and_returns_202(backfill_client, monkeypatch):
-    monkeypatch.setattr(actions, "extraction_available", lambda: True)
+    monkeypatch.setattr(actions, "extraction_feature_enabled", lambda: True)
+    monkeypatch.setattr(actions, "extraction_available", lambda db, user_id: True)
     fake_task = SimpleNamespace(id="task-123")
     captured = {}
 
@@ -372,7 +386,8 @@ def test_backfill_queues_and_returns_202(backfill_client, monkeypatch):
 
 
 def test_backfill_is_rate_limited_at_three_per_window(backfill_client, monkeypatch):
-    monkeypatch.setattr(actions, "extraction_available", lambda: True)
+    monkeypatch.setattr(actions, "extraction_feature_enabled", lambda: True)
+    monkeypatch.setattr(actions, "extraction_available", lambda db, user_id: True)
     monkeypatch.setattr(
         actions.extract_actions_for_user, "delay", lambda **kw: SimpleNamespace(id="t")
     )

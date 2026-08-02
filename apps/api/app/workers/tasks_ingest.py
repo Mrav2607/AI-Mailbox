@@ -17,19 +17,28 @@ from app.db.base import SessionLocal
 from app.db.models import MailSyncRun, MailThread, ProviderAccount
 from app.services.ingest.gmail_ingest import ingest_gmail_messages
 from app.services.ingest.outlook_ingest import ingest_outlook_messages
-from app.services.nlp.extraction_run import extraction_available
+from app.services.nlp.providers import extraction_available
 from app.services.sync_runs import renew_sync, start_sync_run
 
 
 def _enqueue_action_extraction(user_id: str, result: dict) -> None:
     """Fire-and-forget action-extraction sweep after a successful ingest that
-    upserted at least one message. Gated on extraction_available() so a
-    disabled feature never enqueues a useless job; wrapped so a broker
-    failure here can never fail (or retry) an ingest that already succeeded.
+    upserted at least one message.
+
+    The ingest task's own ``with SessionLocal()`` block has already exited
+    by the time this runs, so the per-user availability lookup
+    (``extraction_available`` now needs a session and this user's id, not
+    just the flag) opens its OWN short-lived session -- and the whole thing,
+    DB lookup included, stays inside this try/except: neither a DB hiccup
+    nor a broker failure here may fail or retry an ingest that already
+    succeeded.
     """
-    if not extraction_available() or result.get("messages_upserted", 0) <= 0:
+    if result.get("messages_upserted", 0) <= 0:
         return
     try:
+        with SessionLocal() as db:
+            if not extraction_available(db, UUID(user_id)):
+                return
         extract_actions_for_user.delay(user_id, limit=50)
     except Exception:
         logger.exception(
