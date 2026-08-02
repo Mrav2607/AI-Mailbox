@@ -10,7 +10,9 @@ interface Props {
   settings: LlmSettings | null;
   onSave: (input: {
     provider: LlmProvider;
-    api_key: string;
+    // Absent when the user leaves the field blank to keep an existing key --
+    // required only when there's nothing stored yet.
+    api_key?: string;
     model: string;
     base_url?: string;
     classification_byok?: boolean;
@@ -157,9 +159,12 @@ export function LlmSettingsModal({
           onSubmit={(e) => {
             e.preventDefault();
             if (modelBlank || baseUrlBlank) return;
+            // A blank key on an already-configured credential means "keep
+            // what's stored" -- only a brand-new credential needs one.
+            const keepsExistingKey = apiKey.trim() === "" && settings.configured;
             onSave({
               provider,
-              api_key: apiKey,
+              ...(keepsExistingKey ? {} : { api_key: apiKey }),
               model: model.trim(),
               base_url: provider === "custom" ? baseUrl.trim() : undefined,
               classification_byok: provider === "custom" ? false : classificationByok,
@@ -240,21 +245,21 @@ export function LlmSettingsModal({
             <input
               type="password"
               autoComplete="new-password"
-              required
+              required={!settings.configured}
               minLength={8}
               maxLength={512}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               placeholder={
                 settings.configured
-                  ? `enter a new key to replace ••••${settings.key_suffix}`
+                  ? "leave blank to keep your saved key"
                   : "paste your API key"
               }
               className={control}
             />
             <span className="block text-[10.5px] text-muted-foreground font-mono leading-snug">
               {settings.configured
-                ? `saving replaces the stored key (currently ending in ••••${settings.key_suffix})`
+                ? `leave this blank to keep your saved key (currently ending in ••••${settings.key_suffix})`
                 : "your key is encrypted, stored, and never shown again after you save it"}
             </span>
           </label>

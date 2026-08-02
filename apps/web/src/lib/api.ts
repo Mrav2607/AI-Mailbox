@@ -886,7 +886,11 @@ export async function getLlmSettings(): Promise<LlmSettings> {
 // server-side and ignore any caller-supplied value.
 export async function putLlmSettings(input: {
   provider: LlmProvider;
-  api_key: string;
+  // Optional so a user who no longer has the raw key can still edit
+  // anything else (e.g. turn off the classification opt-in below) -- the
+  // server preserves the stored key when this is left out of an update, and
+  // still requires it to create a credential in the first place.
+  api_key?: string;
   model: string;
   base_url?: string;
   // Absent means false on create, unchanged on update -- same rule the
@@ -899,9 +903,13 @@ export async function putLlmSettings(input: {
     await new Promise((r) => setTimeout(r, 150));
     return mockPutLlmSettings(input);
   }
+  // Never send an empty string for the key -- that's a real (and rejected)
+  // value to the server, not the same thing as "leave it out."
+  const { api_key, ...rest } = input;
+  const body = api_key ? { ...rest, api_key } : rest;
   return request<LlmSettings>("/settings/llm", {
     method: "PUT",
-    body: JSON.stringify(input),
+    body: JSON.stringify(body),
   });
 }
 

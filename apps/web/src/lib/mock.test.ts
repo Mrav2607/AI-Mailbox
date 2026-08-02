@@ -316,6 +316,31 @@ describe("mock llm settings", () => {
     expect(after).not.toBe(before);
   });
 
+  it("put with an absent api_key preserves the key_suffix and last_verified_at on a flag-only edit", () => {
+    const before = mockGetLlmSettings();
+    expect(before.last_verified_at).not.toBeNull();
+    const updated = mockPutLlmSettings({
+      provider: "custom",
+      model: "local-model",
+      base_url: "https://my-endpoint.example/v1",
+      classification_byok: false,
+    });
+    expect(updated.key_suffix).toBe("9999");
+    expect(updated.last_verified_at).toBe(before.last_verified_at);
+    expect(updated.classification_byok).toBe(false);
+  });
+
+  it("put with a new api_key rotates the key_suffix and clears last_verified_at even when nothing else changed", () => {
+    const updated = mockPutLlmSettings({
+      provider: "custom",
+      api_key: "custom-key-rotated",
+      model: "local-model",
+      base_url: "https://my-endpoint.example/v1",
+    });
+    expect(updated.key_suffix).toBe("ated");
+    expect(updated.last_verified_at).toBeNull();
+  });
+
   it("delete resets to unconfigured with nulled fields", () => {
     mockDeleteLlmSettings();
     const settings = mockGetLlmSettings();

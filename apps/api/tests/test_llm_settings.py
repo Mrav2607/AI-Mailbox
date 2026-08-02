@@ -906,6 +906,160 @@ def test_put_response_carries_every_new_field_on_update(monkeypatch, user):
 
 
 # ---------------------------------------------------------------------------
+# PUT -- absent api_key preserves the stored credential (P2 fix: a caller who
+# no longer has the raw key must still be able to edit anything else,
+# including revoking the classification opt-in)
+# ---------------------------------------------------------------------------
+
+
+def test_put_absent_api_key_on_update_preserves_the_key_and_applies_the_flag_change(user):
+    secret = "sk-stored-key-1234"
+    row = _make_row(
+        user_id=user.id, provider="openai", api_key=secret, classification_byok=False,
+    )
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "classification_byok": True,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["classification_byok"] is True
+    assert body["key_suffix"] == secret[-4:]
+    assert row.api_key == secret
+    assert row.classification_byok is True
+    assert secret not in resp.text
+
+
+def test_put_omitted_api_key_key_on_create_is_422(user):
+    # Not just `api_key: None` -- the field is missing from the body
+    # entirely, same as a real client that never sends it.
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "model": "gpt-4o-mini"},
+    )
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "api_key must be a string"}
+    assert db.commits == 0
+    assert db.added == []
+
+
+@pytest.mark.parametrize("bad_key", ["", "short12", "s" * 513], ids=["empty", "short", "long"])
+def test_put_present_but_invalid_api_key_still_422s_on_update(user, bad_key):
+    # An explicit (even empty) api_key is never treated as "absent" -- this
+    # isn't a way to blank a stored key by accident.
+    row = _make_row(user_id=user.id, provider="openai", api_key="sk-stored-key-1234")
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": bad_key, "model": "gpt-4o-mini"},
+    )
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "api_key length out of bounds"}
+    assert row.api_key == "sk-stored-key-1234"
+    assert db.commits == 0
+
+
+def test_put_flag_only_edit_leaves_last_verified_at_untouched(user):
+    verified_at = datetime.now(timezone.utc)
+    row = _make_row(
+        user_id=user.id,
+        provider="openai",
+        model="gpt-4o-mini",
+        revision=3,
+        last_verified_at=verified_at,
+        classification_byok=False,
+    )
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "classification_byok": True,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["last_verified_at"] is not None
+    assert row.last_verified_at == verified_at
+    assert row.revision == 4
+    assert row.classification_byok is True
+
+
+def test_put_new_api_key_clears_last_verified_at_even_with_no_other_change(user):
+    row = _make_row(
+        user_id=user.id,
+        provider="openai",
+        model="gpt-4o-mini",
+        revision=1,
+        last_verified_at=datetime.now(timezone.utc),
+    )
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "api_key": "sk-brand-new-key-1234",
+            "model": "gpt-4o-mini",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["last_verified_at"] is None
+    assert row.last_verified_at is None
+    assert row.revision == 2
+
+
+def test_put_model_change_clears_last_verified_at_even_when_api_key_is_absent(user):
+    row = _make_row(
+        user_id=user.id,
+        provider="openai",
+        model="gpt-4o-mini",
+        api_key="sk-stored-key-1234",
+        revision=1,
+        last_verified_at=datetime.now(timezone.utc),
+    )
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "model": "a-different-model"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["last_verified_at"] is None
+    assert row.last_verified_at is None
+    assert row.revision == 2
+    # The key itself was still preserved -- only the model changed.
+    assert row.api_key == "sk-stored-key-1234"
+
+
+def test_put_revision_increments_on_a_flag_only_edit_same_as_any_other_write(user):
+    row = _make_row(user_id=user.id, provider="openai", model="gpt-4o-mini", revision=5)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "classification_byok": True,
+        },
+    )
+    assert resp.status_code == 200
+    assert row.revision == 6
+
+
+# ---------------------------------------------------------------------------
 # PUT -- concurrency: FOR UPDATE before the read-then-branch
 # ---------------------------------------------------------------------------
 

@@ -161,6 +161,12 @@ async def put_llm_settings(
     ``validate_custom_base_url_async`` -- the shared executor future is
     awaited rather than blocked on, so the event loop is never held for the
     3s DNS budget.
+
+    ``api_key`` is the one field that can be OMITTED on an update: the
+    server never returns the raw key, so requiring it on every save would
+    mean a user who's forgotten it can't touch anything else -- including
+    turning off the classification opt-in they came here to revoke. A
+    create still needs one, since there's nothing stored to fall back on.
     """
     raw_body = await _read_bounded_body(request)
 
@@ -180,16 +186,25 @@ async def put_llm_settings(
 
     if not isinstance(provider, str):
         raise HTTPException(status_code=422, detail="provider must be a string")
-    if not isinstance(api_key, str):
-        raise HTTPException(status_code=422, detail="api_key must be a string")
     if not isinstance(model, str):
         raise HTTPException(status_code=422, detail="model must be a string")
     if classification_byok_input is not None and not isinstance(classification_byok_input, bool):
         raise HTTPException(status_code=422, detail="classification_byok must be a boolean")
 
-    api_key = api_key.strip()
-    if not (_MIN_KEY_LEN <= len(api_key) <= _MAX_KEY_LEN):
-        raise HTTPException(status_code=422, detail="api_key length out of bounds")
+    # Absent api_key means "keep the stored one" -- the server never echoes
+    # the raw key back, so that's the ONLY way to edit anything else (e.g.
+    # the classification flag) without the caller having the original key in
+    # hand. There's nothing to keep on a brand-new row, so a create with no
+    # key still 422s below, once we know whether a row exists to fall back
+    # on. Anything present -- even null or the wrong type -- is validated
+    # right away, same fixed details as before.
+    api_key_provided = api_key is not None
+    if api_key_provided:
+        if not isinstance(api_key, str):
+            raise HTTPException(status_code=422, detail="api_key must be a string")
+        api_key = api_key.strip()
+        if not (_MIN_KEY_LEN <= len(api_key) <= _MAX_KEY_LEN):
+            raise HTTPException(status_code=422, detail="api_key length out of bounds")
 
     model = model.strip()
     if not (1 <= len(model) <= _MAX_MODEL_LEN):
@@ -251,17 +266,38 @@ async def put_llm_settings(
     ).scalar_one_or_none()
     now = datetime.now(timezone.utc)
 
+    if api_key_provided:
+        effective_api_key = api_key
+    elif row is not None:
+        effective_api_key = row.api_key
+    else:
+        # Nothing stored yet to fall back on -- a brand-new credential
+        # always needs a real key. Same fixed detail as a type-invalid key,
+        # since from the caller's point of view both are "no usable key came
+        # through."
+        raise HTTPException(status_code=422, detail="api_key must be a string")
+
     def _apply_update(target: UserLlmCredential) -> None:
-        # Read BEFORE mutating -- `_resolve_classification_byok` needs
-        # `target.classification_byok` as it stood before this write to
-        # implement "unchanged on update" when the flag is absent.
+        # Read BEFORE mutating -- both `_resolve_classification_byok` and
+        # `material_changed` need `target`'s state as it stood before this
+        # write. A flag-only edit (no new key, same provider/base_url/model)
+        # must NOT clear last_verified_at -- that'd be a confusing "your
+        # verified key just went unverified" regression for a save that
+        # didn't touch the credential itself.
+        material_changed = (
+            api_key_provided
+            or target.provider != provider
+            or target.base_url != base_url
+            or target.model != model
+        )
         target.classification_byok = _resolve_classification_byok(target)
         target.provider = provider
         target.base_url = base_url
-        target.api_key = api_key
+        target.api_key = effective_api_key
         target.model = model
         target.revision += 1
-        target.last_verified_at = None
+        if material_changed:
+            target.last_verified_at = None
         target.updated_at = now
 
     if row is None:
@@ -277,7 +313,7 @@ async def put_llm_settings(
             user_id=current_user.id,
             provider=provider,
             base_url=base_url,
-            api_key=api_key,
+            api_key=effective_api_key,
             model=model,
             classification_byok=_resolve_classification_byok(None),
             revision=1,
