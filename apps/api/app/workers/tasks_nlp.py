@@ -11,7 +11,6 @@ from app.db.models import MailThread, MailMessage
 from app.services.nlp.backfill import run_backfill
 from app.services.nlp.classifier import classify, build_classification_text
 from app.services.nlp.extraction_run import (
-    extraction_available,
     run_extraction_for_message,
     run_extraction_sweep,
     terminalize_expired_pending,
@@ -19,6 +18,7 @@ from app.services.nlp.extraction_run import (
     users_with_unclaimed_actionable_messages,
 )
 from app.services.nlp.persistence import upsert_classification
+from app.services.nlp.providers import extraction_feature_enabled
 
 # Sweep cap for each recovery-tick pass -- generous enough to drain a normal
 # backlog in one tick, cheap enough that a tick never runs long even for a
@@ -151,10 +151,12 @@ def extraction_recovery_tick() -> dict:
     """Beat-scheduled safety net (every 900s -- celery_app.py) so retryable
     rows don't depend on new mail arriving to get swept: a quiet sync, a
     zero-upsert run, or SCHEDULED_SYNC_INTERVAL_SECONDS=0 must not strand
-    work. Cheap no-op unless extraction_available(); otherwise
-    terminalizes every stuck-at-cap pending row (global, not just the users
-    swept below -- a user with no OTHER claimable work would never appear in
-    either set otherwise), then sweeps two independently derived user sets:
+    work. Cheap no-op unless the operator flag is on (`extraction_feature_
+    enabled()` -- flag only, no DB; per-user credential coverage is checked
+    below, inside each sweep); otherwise terminalizes every stuck-at-cap
+    pending row (global, not just the users swept below -- a user with no
+    OTHER claimable work would never appear in either set otherwise), then
+    sweeps two independently derived user sets:
 
     - row-driven: users owning claimable action_item rows (failed/expired
       pending/reclassified-back ineligible), swept with recovery=True
@@ -163,6 +165,13 @@ def extraction_recovery_tick() -> dict:
       action_item row at all -- a broker failure that swallowed the ingest
       hook's enqueue leaves no row behind, so the row-driven set alone can
       never see that user; this pass is what recovers them.
+
+    Both user sets are derived independently of BYOK coverage on purpose
+    (filtering them by credential would be an optimization, not a
+    correctness requirement) -- a credential-less user's own sweep resolves
+    that internally and returns a cheap ``disabled`` result without burning
+    an attempt, so sweeping them here costs one resolve call and nothing
+    else.
 
     One bad user's sweep must never abort the tick for the rest (same
     fan-out isolation as dispatch_scheduled_syncs): roll back and log, then
@@ -174,7 +183,7 @@ def extraction_recovery_tick() -> dict:
 
     No autoretry -- the next tick is the retry.
     """
-    if not extraction_available():
+    if not extraction_feature_enabled():
         return {"status": "disabled"}
 
     row_driven_swept = 0

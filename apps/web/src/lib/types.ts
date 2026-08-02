@@ -188,3 +188,40 @@ export interface User {
   email: string;
   display_name: string | null;
 }
+
+// BYOK LLM providers, mirroring PROVIDER_PRESETS in the API's providers.py
+// plus "custom". Anthropic is deliberately absent -- its OpenAI-compat layer
+// ignores response_format, so it's not offered as an extraction backend.
+export type LlmProvider =
+  | "openai"
+  | "gemini"
+  | "openrouter"
+  | "groq"
+  | "mistral"
+  | "custom";
+
+// Mirrors LlmSettingsOut (GET/PUT /settings/llm). Unconfigured
+// (configured: false) means provider/model/base_url/key_suffix/
+// last_verified_at are all null -- the api_key itself never appears here.
+export interface LlmSettings {
+  configured: boolean;
+  provider: LlmProvider | null;
+  model: string | null;
+  base_url: string | null;
+  key_suffix: string | null;
+  last_verified_at: string | null;
+  extraction_enabled: boolean;
+  fallback_active: boolean;
+  custom_endpoints_enabled: boolean;
+  private_endpoints_enabled: boolean;
+  custom_blocked: boolean;
+}
+
+// POST /settings/llm/test response. `error` is one of the extractor's
+// category constants (e.g. "blocked_by_policy", "invalid_response") --
+// never a raw exception message.
+export interface LlmTestResult {
+  ok: boolean;
+  latency_ms: number;
+  error: string | null;
+}

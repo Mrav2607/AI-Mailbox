@@ -162,7 +162,9 @@ def _reclassify_setup(monkeypatch, *, extraction_available, should_raise=False):
     db = _ReclassifyDB(thread, message, events)
     fake_task = _FakeExtractionTask(events, should_raise=should_raise)
 
-    monkeypatch.setattr(mailbox, "extraction_available", lambda: extraction_available)
+    monkeypatch.setattr(
+        mailbox, "extraction_available", lambda db, user_id: extraction_available
+    )
     monkeypatch.setattr(mailbox, "extract_action_for_message", fake_task)
     app.dependency_overrides[get_current_user] = lambda: user
     app.dependency_overrides[get_db] = lambda: db

@@ -18,6 +18,7 @@ from app.main import app
 NO_BODY = {
     ("/api/v1/mail/thread/{thread_id}", "DELETE"),
     ("/api/v1/auth/connections/{connection_id}", "DELETE"),
+    ("/api/v1/settings/llm", "DELETE"),
 }
 
 
@@ -52,9 +53,9 @@ def test_output_models_forbid_extra_fields():
 def test_schemas_inherit_the_shared_base():
     """Cheap way to keep the config in one place: if a new model skips the base,
     it also skips extra='forbid' and nobody notices."""
-    from app.db.schemas import actions, auth, mailbox
+    from app.db.schemas import actions, auth, llm_settings, mailbox
 
-    for module in (auth, mailbox, actions):
+    for module in (auth, mailbox, actions, llm_settings):
         for name in dir(module):
             obj = getattr(module, name)
             if isinstance(obj, type) and issubclass(obj, BaseModel) and obj is not BaseModel:

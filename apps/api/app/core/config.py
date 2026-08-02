@@ -62,6 +62,20 @@ class Settings(BaseSettings):
     # must not silently start paying for a new workload. Even when true,
     # extraction only runs if gemini_api_key is set (no non-LLM fallback).
     action_extraction_enabled: bool = Field(default=False, alias="ACTION_EXTRACTION_ENABLED")
+    # When true (default), users without their own LLM credential fall back to the
+    # operator's GEMINI_API_KEY for action extraction. Set false for BYOK-only:
+    # extraction runs only for users who saved a credential.
+    action_extraction_server_fallback: bool = Field(default=True, alias="ACTION_EXTRACTION_SERVER_FALLBACK")
+    # Custom (user-supplied) base URLs are an SSRF vector: the server POSTs to
+    # them. Off by default; enforced at save AND at use (turning it off disables
+    # already-stored custom credentials too, not just new saves). This tier is
+    # https-only and globally-routable-only.
+    llm_custom_endpoints_enabled: bool = Field(default=False, alias="LLM_CUSTOM_ENDPOINTS_ENABLED")
+    # Second, louder opt-in on top of the above: also allow NON-GLOBAL
+    # destinations and plain http for custom endpoints (a LAN Ollama). Turning
+    # this on means every authenticated user can point the server at private
+    # addresses -- only for deployments where all users are trusted.
+    llm_private_endpoints_enabled: bool = Field(default=False, alias="LLM_PRIVATE_ENDPOINTS_ENABLED")
     google_client_id: str | None = Field(default=None, alias="GOOGLE_CLIENT_ID")
     google_client_secret: str | None = Field(default=None, alias="GOOGLE_CLIENT_SECRET")
     google_redirect_uri: str | None = Field(default=None, alias="GOOGLE_REDIRECT_URI")

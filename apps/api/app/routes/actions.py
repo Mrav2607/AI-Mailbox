@@ -45,8 +45,8 @@ from app.db.schemas.actions import (
     ActionStatusRequest,
     BackfillQueued,
 )
-from app.services.nlp.extraction_run import extraction_available
 from app.services.nlp.extractor import ACTION_LABELS
+from app.services.nlp.providers import extraction_available, extraction_feature_enabled
 from app.workers.tasks_nlp import extract_actions_for_user
 
 router = APIRouter(prefix="/mail/actions")
@@ -213,17 +213,21 @@ def backfill_actions(
     force: bool = False,
     since_days: int = Query(default=30, ge=1, le=_MAX_SINCE_DAYS),
     current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict:
     """Queue an action-extraction sweep for the caller off the request path.
 
-    Always enqueued, never run inline: every candidate needs its own Gemini
+    Always enqueued, never run inline: every candidate needs its own LLM
     call, so unlike the classification backfill there's no small-batch inline
-    path here. 409s before enqueuing anything when the feature is disabled
-    (flag off, or the flag's on but no Gemini key is configured) -- config
-    absence must never burn a queue slot.
+    path here. 409s before enqueuing anything -- distinguishing the operator
+    flag being off from the flag being on but this user having no usable
+    credential (no BYOK row, no server fallback) -- config absence must
+    never burn a queue slot either way.
     """
-    if not extraction_available():
+    if not extraction_feature_enabled():
         raise HTTPException(status_code=409, detail="action extraction disabled")
+    if not extraction_available(db, current_user.id):
+        raise HTTPException(status_code=409, detail="no LLM credential configured")
 
     task = cast(Any, extract_actions_for_user).delay(
         user_id=str(current_user.id),

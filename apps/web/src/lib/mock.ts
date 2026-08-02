@@ -9,6 +9,9 @@ import type {
   Connection,
   CountsResponse,
   Label,
+  LlmProvider,
+  LlmSettings,
+  LlmTestResult,
   Overview,
   SearchResponse,
   ThreadDetail,
@@ -593,4 +596,89 @@ export function mockBackfill(opts: BackfillOptions): BackfillResult {
     created += 1;
   }
   return { status: "ok", created, scanned: scanned.length };
+}
+
+// --- BYOK LLM settings -------------------------------------------------------
+// Preset base_urls, mirroring PROVIDER_PRESETS in the API's providers.py --
+// a preset write always pins its own base_url, ignoring any caller value,
+// same rule the real route enforces.
+const PRESET_BASE_URLS: Partial<Record<LlmProvider, string>> = {
+  openai: "https://api.openai.com/v1",
+  gemini: "https://generativelanguage.googleapis.com/v1beta/openai",
+  openrouter: "https://openrouter.ai/api/v1",
+  groq: "https://api.groq.com/openai/v1",
+  mistral: "https://api.mistral.ai/v1",
+};
+
+// Demo mode starts CONFIGURED so preview shows a live settings state instead
+// of the empty-state nudge. Mutable, same store pattern as CONNECTIONS above.
+let LLM_SETTINGS: LlmSettings = {
+  configured: true,
+  provider: "openai",
+  model: "gpt-4o-mini",
+  base_url: PRESET_BASE_URLS.openai!,
+  key_suffix: "sk12",
+  last_verified_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+  extraction_enabled: true,
+  fallback_active: false,
+  custom_endpoints_enabled: false,
+  private_endpoints_enabled: false,
+  custom_blocked: false,
+};
+
+export function mockGetLlmSettings(): LlmSettings {
+  return { ...LLM_SETTINGS };
+}
+
+// Upserts the demo credential. Only the last 4 chars of the submitted key
+// ever get stored, same as the server -- and, like a real PUT, this always
+// clears last_verified_at, since a changed credential is unverified again.
+export function mockPutLlmSettings(input: {
+  provider: LlmProvider;
+  api_key: string;
+  model: string;
+  base_url?: string;
+}): LlmSettings {
+  const base_url =
+    input.provider === "custom"
+      ? (input.base_url ?? LLM_SETTINGS.base_url)
+      : (PRESET_BASE_URLS[input.provider] ?? LLM_SETTINGS.base_url);
+  LLM_SETTINGS = {
+    ...LLM_SETTINGS,
+    configured: true,
+    provider: input.provider,
+    model: input.model,
+    base_url,
+    key_suffix: input.api_key.slice(-4),
+    last_verified_at: null,
+    fallback_active: false,
+  };
+  return { ...LLM_SETTINGS };
+}
+
+// Every mock test call succeeds -- there's no real provider to fail against
+// in preview mode.
+export function mockTestLlmSettings(): LlmTestResult {
+  const latency_ms = 180 + Math.floor(Math.random() * 220);
+  LLM_SETTINGS = { ...LLM_SETTINGS, last_verified_at: new Date().toISOString() };
+  return { ok: true, latency_ms, error: null };
+}
+
+// Resets to unconfigured -- extraction then reads as covered by the
+// operator's fallback, mirroring a real deployment with
+// ACTION_EXTRACTION_SERVER_FALLBACK on.
+export function mockDeleteLlmSettings(): void {
+  LLM_SETTINGS = {
+    configured: false,
+    provider: null,
+    model: null,
+    base_url: null,
+    key_suffix: null,
+    last_verified_at: null,
+    extraction_enabled: LLM_SETTINGS.extraction_enabled,
+    fallback_active: true,
+    custom_endpoints_enabled: LLM_SETTINGS.custom_endpoints_enabled,
+    private_endpoints_enabled: LLM_SETTINGS.private_endpoints_enabled,
+    custom_blocked: false,
+  };
 }

@@ -49,8 +49,8 @@ from app.services.nlp.backfill import (
     run_backfill,
 )
 from app.services.nlp.classifier import LABELS
-from app.services.nlp.extraction_run import extraction_available
 from app.services.nlp.extractor import ACTION_LABELS
+from app.services.nlp.providers import extraction_available
 from app.services.nlp.persistence import upsert_classification
 from app.services.sync_runs import (
     ACTIVE_SYNC_STATUSES,
@@ -446,7 +446,7 @@ def reclassify_thread(
         )
     db.commit()
 
-    if payload.label in ACTION_LABELS and extraction_available():
+    if payload.label in ACTION_LABELS and extraction_available(db, current_user.id):
         # Strictly after the commit above, and never inline -- no LLM call on
         # the request path. A broker failure here must never roll back the
         # durable override or turn a successful reclassify into a 500; the

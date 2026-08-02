@@ -69,6 +69,7 @@ interface Props {
   // "Connect Outlook" instead of offering a flow that'd just 503.
   onConnectOutlook?: () => void;
   onDisconnect: (connectionId: string) => void;
+  onOpenLlmSettings: () => void;
   // Set while the tour is anchored to the matching popover — user-originated
   // closes are ignored until the tour itself moves on.
   ingestLocked?: boolean;
@@ -384,12 +385,14 @@ function AccountsMenu({
   onDisconnect,
   onConnectGmail,
   onConnectOutlook,
+  onOpenLlmSettings,
 }: {
   connections: Connection[];
   health: SyncHealth | null;
   onDisconnect: (connectionId: string) => void;
   onConnectGmail: () => void;
   onConnectOutlook?: () => void;
+  onOpenLlmSettings: () => void;
 }) {
   // Two-step confirm: first click arms it, second fires. Armed state lives
   // here (not lifted) so it resets for free whenever the popover closes.
@@ -491,6 +494,13 @@ function AccountsMenu({
           connect outlook
         </button>
       )}
+      <button
+        type="button"
+        onClick={onOpenLlmSettings}
+        className="w-full h-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
+      >
+        AI settings
+      </button>
     </div>
   );
 }
@@ -527,6 +537,7 @@ export function TopBar({
   onConnectGmail,
   onConnectOutlook,
   onDisconnect,
+  onOpenLlmSettings,
   ingestLocked,
   accountsLocked,
 }: Props) {
@@ -697,6 +708,7 @@ export function TopBar({
             onDisconnect={onDisconnect}
             onConnectGmail={onConnectGmail}
             onConnectOutlook={onConnectOutlook}
+            onOpenLlmSettings={onOpenLlmSettings}
           />
         </Popover>
       </div>

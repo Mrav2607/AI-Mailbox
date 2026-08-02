@@ -200,7 +200,7 @@ and point `CLASSIFIER_MODEL_PATH` at the output directory. Until then, run with
 ## Agenda (action extraction)
 
 An optional second stage on top of classification: messages labeled
-`needs_reply` or `action_required` get one extra Gemini call that pulls out the
+`needs_reply` or `action_required` get one extra LLM call that pulls out the
 concrete obligation — what to do, what kind of task it is (reply, payment,
 signature, form, RSVP, deadline, other), the due date, and any amount. Results
 land in the **Agenda** view (press `0` in the console): one deadline-ordered
@@ -228,6 +228,57 @@ POST /api/v1/mail/actions/backfill?limit=100&since_days=30
 Cost stays bounded: only already-classified action mail is considered, each
 message is extracted at most once per classification verdict (retried at most
 3 times on failure), and sweeps are capped per run.
+
+### Who pays: per-user API keys (BYOK)
+
+Each user can store their own LLM credential, so extraction is billed to them
+and not to the server's key. Open **AI settings** from the command palette,
+the accounts menu, or the Agenda's empty state, then pick a provider, paste a
+key, and name a model. The key is encrypted at rest and never sent back to the
+browser — only its last 4 characters are shown. **Test** makes one real call
+so a bad key fails here instead of silently later.
+
+Supported providers, all through the OpenAI-compatible chat API:
+
+| Provider | Example model |
+|---|---|
+| OpenAI | `gpt-4o-mini` |
+| Gemini | `gemini-2.5-flash` |
+| OpenRouter | `openai/gpt-4o-mini` |
+| Groq | `llama-3.3-70b-versatile` |
+| Mistral | `mistral-small-latest` |
+
+Anthropic is not in this list on purpose. Its OpenAI-compatible endpoint
+accepts the request but ignores the JSON response format this feature relies
+on, so replies aren't guaranteed to be machine-readable. Nothing bad gets
+stored — the parser rejects anything malformed — but the calls would be paid
+for and thrown away, which reads like flaky extraction. Native support is a
+possible follow-up.
+
+Two settings control the rest:
+
+```dotenv
+# When true (default), users WITHOUT their own key fall back to the server's
+# GEMINI_API_KEY. Set false so only users with their own key get extraction.
+ACTION_EXTRACTION_SERVER_FALLBACK=true
+
+# Let users point at a custom endpoint. The server sends their key to whatever
+# URL they save, so this is off by default. When on, only https addresses on
+# the public internet are accepted.
+LLM_CUSTOM_ENDPOINTS_ENABLED=false
+
+# On TOP of the flag above: also allow plain http and private/LAN addresses
+# (for example a local Ollama). This lets any signed-in user make the server
+# reach addresses inside your network — only turn it on if you trust every
+# user of this deployment.
+LLM_PRIVATE_ENDPOINTS_ENABLED=false
+```
+
+If a user's custom endpoint stops being allowed (you turned a flag off, or its
+address now resolves somewhere private), their extraction stops and the
+settings panel says so. It deliberately does **not** fall back to the server's
+key — they chose where their mail gets sent, so quietly redirecting it and
+billing you instead would be the wrong default.
 
 ## Notes for local API usage
 

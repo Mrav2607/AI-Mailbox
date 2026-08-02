@@ -1,0 +1,304 @@
+import { useEffect, useRef, useState } from "react";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import type { LlmProvider, LlmSettings, LlmTestResult } from "@/lib/types";
+
+interface Props {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  // Null until the first fetch after login lands -- the modal just doesn't
+  // render yet rather than show a half-built form.
+  settings: LlmSettings | null;
+  onSave: (input: {
+    provider: LlmProvider;
+    api_key: string;
+    model: string;
+    base_url?: string;
+  }) => void;
+  saving: boolean;
+  onTest: () => void;
+  testing: boolean;
+  testResult: LlmTestResult | null;
+  onRemove: () => void;
+  removing: boolean;
+}
+
+const PROVIDER_LABELS: Record<LlmProvider, string> = {
+  openai: "OpenAI",
+  gemini: "Gemini",
+  openrouter: "OpenRouter",
+  groq: "Groq",
+  mistral: "Mistral",
+  custom: "Custom endpoint",
+};
+
+// Hints only, shown as the model field's placeholder -- never submitted on
+// their own, and cleared the moment the caller types something real.
+const MODEL_PLACEHOLDERS: Record<LlmProvider, string> = {
+  openai: "e.g. gpt-4o-mini",
+  gemini: "e.g. gemini-2.5-flash",
+  openrouter: "e.g. openai/gpt-4o-mini",
+  groq: "e.g. llama-3.3-70b-versatile",
+  mistral: "e.g. mistral-small-latest",
+  custom: "the model name your endpoint expects",
+};
+
+const PRESET_PROVIDERS: LlmProvider[] = [
+  "openai",
+  "gemini",
+  "openrouter",
+  "groq",
+  "mistral",
+];
+
+// Maps the /test route's fixed category constants -- never a raw exception
+// string -- to plain copy anyone can follow, regardless of first language.
+function testErrorMessage(error: string): string {
+  if (error === "connection_failed") return "Could not reach the provider.";
+  if (error === "http_401" || error === "http_403") {
+    return "The provider rejected this key.";
+  }
+  if (error.startsWith("http_")) {
+    const code = error.slice("http_".length);
+    return `The provider returned an error (HTTP ${code}).`;
+  }
+  if (error === "invalid_response") {
+    return "The provider replied in an unexpected format.";
+  }
+  if (error === "blocked_by_policy") {
+    return "This endpoint is not allowed by the server's settings.";
+  }
+  return "Something went wrong testing this credential.";
+}
+
+const fieldLabel = "font-mono text-[11px] text-muted-foreground";
+const control =
+  "w-full bg-[var(--color-panel)] border border-border rounded px-2 py-1 text-[12px] font-mono text-foreground";
+
+export function LlmSettingsModal({
+  open,
+  onOpenChange,
+  settings,
+  onSave,
+  saving,
+  onTest,
+  testing,
+  testResult,
+  onRemove,
+  removing,
+}: Props) {
+  const [provider, setProvider] = useState<LlmProvider>("openai");
+  const [model, setModel] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+
+  // A Test while the modal's open refetches `settings` in App -- track the
+  // latest copy in a ref (not state) so that refetch doesn't retrigger the
+  // reset effect below and clobber whatever the user's mid-typing.
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+
+  // Reset the form to whatever's currently saved only when the modal opens
+  // -- never on a later settings refetch, which would blow away unsaved
+  // edits. The key never repopulates, since the server never sends it back.
+  useEffect(() => {
+    if (!open) return;
+    const current = settingsRef.current;
+    if (!current) return;
+    setProvider(current.provider ?? "openai");
+    setModel(current.model ?? "");
+    setApiKey("");
+    setBaseUrl(current.provider === "custom" ? (current.base_url ?? "") : "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  if (!settings) return null;
+
+  const providers = settings.custom_endpoints_enabled
+    ? [...PRESET_PROVIDERS, "custom" as const]
+    : PRESET_PROVIDERS;
+
+  // `required` is satisfied by whitespace, but the submit path trims both of
+  // these before they hit the API -- catch that here so an all-spaces value
+  // never gets stored as a working model name or endpoint.
+  const modelBlank = model.trim() === "";
+  const baseUrlBlank = provider === "custom" && baseUrl.trim() === "";
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md bg-[var(--color-panel)] border-border">
+        <DialogTitle className="font-mono text-[11px] tracking-wide text-muted-foreground mb-1 font-normal">
+          AI extraction settings
+        </DialogTitle>
+        <p className="text-[11px] font-mono text-muted-foreground leading-relaxed">
+          save your own API key and CortexMail uses it to pull deadlines and
+          to-dos out of your mail.
+        </p>
+
+        {settings.custom_blocked && (
+          <div className="rounded border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[11.5px] font-mono text-destructive leading-snug">
+            your custom endpoint isn&apos;t allowed right now, so extraction is
+            paused for your account. Fix the address below, or remove this
+            credential, to turn it back on.
+          </div>
+        )}
+
+        {!settings.configured && (
+          <p className="text-[11px] font-mono text-muted-foreground leading-snug">
+            {settings.fallback_active
+              ? "no key saved yet — the server's shared key is covering your extraction for now."
+              : "no key saved yet — extraction is off for your account until you add one."}
+          </p>
+        )}
+
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (modelBlank || baseUrlBlank) return;
+            onSave({
+              provider,
+              api_key: apiKey,
+              model: model.trim(),
+              base_url: provider === "custom" ? baseUrl.trim() : undefined,
+            });
+          }}
+          className="space-y-2.5"
+        >
+          <label className="block space-y-1">
+            <span className={fieldLabel}>provider</span>
+            <select
+              value={provider}
+              onChange={(e) => {
+                const p = e.target.value as LlmProvider;
+                setProvider(p);
+                // A model name from one provider is almost never valid for
+                // another -- don't let a stale value slip through.
+                setModel("");
+              }}
+              className={control}
+            >
+              {providers.map((p) => (
+                <option key={p} value={p}>
+                  {PROVIDER_LABELS[p]}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="block space-y-1">
+            <span className={fieldLabel}>model</span>
+            <input
+              type="text"
+              required
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder={MODEL_PLACEHOLDERS[provider]}
+              className={control}
+            />
+            {modelBlank && model.length > 0 && (
+              <span className="block text-[10.5px] text-destructive font-mono leading-snug">
+                model can&apos;t be just spaces
+              </span>
+            )}
+          </label>
+
+          {provider === "custom" && (
+            <label className="block space-y-1">
+              <span className={fieldLabel}>endpoint URL</span>
+              <input
+                type="text"
+                required
+                maxLength={200}
+                value={baseUrl}
+                onChange={(e) => setBaseUrl(e.target.value)}
+                placeholder="https://your-endpoint.example.com/v1"
+                className={control}
+              />
+              <span className="block text-[10.5px] text-muted-foreground font-mono leading-snug">
+                {settings.private_endpoints_enabled
+                  ? "must start with https:// — or http:// / a private address, since this server allows private endpoints"
+                  : "must start with https:// and point to a public address"}
+              </span>
+              {baseUrlBlank && baseUrl.length > 0 && (
+                <span className="block text-[10.5px] text-destructive font-mono leading-snug">
+                  endpoint URL can&apos;t be just spaces
+                </span>
+              )}
+            </label>
+          )}
+
+          <label className="block space-y-1">
+            <span className={fieldLabel}>API key</span>
+            <input
+              type="password"
+              autoComplete="new-password"
+              required
+              minLength={8}
+              maxLength={512}
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder={
+                settings.configured
+                  ? `enter a new key to replace ••••${settings.key_suffix}`
+                  : "paste your API key"
+              }
+              className={control}
+            />
+            <span className="block text-[10.5px] text-muted-foreground font-mono leading-snug">
+              {settings.configured
+                ? `saving replaces the stored key (currently ending in ••••${settings.key_suffix})`
+                : "your key is encrypted, stored, and never shown again after you save it"}
+            </span>
+          </label>
+
+          <div className="flex items-center gap-2 pt-1">
+            <button
+              type="submit"
+              disabled={saving || modelBlank || baseUrlBlank}
+              className="h-7 px-3 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+            >
+              {saving ? "saving…" : "save"}
+            </button>
+            <button
+              type="button"
+              onClick={onTest}
+              disabled={!settings.configured || testing || saving || removing}
+              className="h-7 px-3 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+            >
+              {testing ? "testing…" : "test"}
+            </button>
+            {settings.configured && (
+              <button
+                type="button"
+                onClick={onRemove}
+                disabled={removing}
+                className="ml-auto h-7 px-3 rounded border border-destructive/40 text-destructive hover:bg-destructive/10 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+              >
+                {removing ? "removing…" : "remove"}
+              </button>
+            )}
+          </div>
+
+          {testResult && (
+            <p
+              className={
+                testResult.ok
+                  ? "text-[11px] font-mono text-emerald-500"
+                  : "text-[11px] font-mono text-destructive"
+              }
+            >
+              {testResult.ok
+                ? `ok · ${testResult.latency_ms}ms`
+                : testErrorMessage(testResult.error ?? "")}
+            </p>
+          )}
+
+          {settings.configured && settings.last_verified_at && (
+            <p className="text-[10.5px] font-mono text-muted-foreground">
+              last verified {new Date(settings.last_verified_at).toLocaleString()}
+            </p>
+          )}
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}

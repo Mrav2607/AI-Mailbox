@@ -19,6 +19,11 @@ interface Props {
   // Double-click toggles the detail pane open/closed — the row is already
   // selected by the first click, so this doesn't need to know which row.
   onRowDoubleClick?: () => void;
+  // True when this user has no LLM credential AND no server fallback covering
+  // them -- the empty state then offers a way to fix that instead of just
+  // reading as "nothing extracted yet".
+  noExtractionCoverage?: boolean;
+  onSetupExtraction?: () => void;
 }
 
 const KIND_LABELS: Record<ActionKind, string> = {
@@ -185,6 +190,8 @@ export function AgendaList({
   loading,
   error,
   onRowDoubleClick,
+  noExtractionCoverage,
+  onSetupExtraction,
 }: Props) {
   if (error) {
     return (
@@ -219,6 +226,15 @@ export function AgendaList({
         <ListTodo className="h-6 w-6 opacity-40" />
         <div className="text-[12.5px]">nothing on the agenda</div>
         <div className="text-[11px]">extracted actions with a deadline show up here</div>
+        {noExtractionCoverage && onSetupExtraction && (
+          <button
+            type="button"
+            onClick={onSetupExtraction}
+            className="mt-1 h-7 px-3 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-mono cursor-pointer transition-colors"
+          >
+            set up AI extraction
+          </button>
+        )}
       </div>
     );
   }

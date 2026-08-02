@@ -8,6 +8,9 @@ import type {
   Connection,
   CountsResponse,
   Label,
+  LlmProvider,
+  LlmSettings,
+  LlmTestResult,
   Overview,
   SearchResponse,
   ThreadDetail,
@@ -22,13 +25,17 @@ import {
   mockBackfillActions,
   mockCounts,
   mockDeleteConnection,
+  mockDeleteLlmSettings,
   mockDeleteThread,
+  mockGetLlmSettings,
   mockIngest,
   mockListConnections,
   mockOverview,
+  mockPutLlmSettings,
   mockSearch,
   mockSetActionStatus,
   mockSetDone,
+  mockTestLlmSettings,
   mockThread,
   mockTriage,
   mockUser,
@@ -863,6 +870,56 @@ export async function backfillActions(opts?: {
     `/mail/actions/backfill?${qs.toString()}`,
     { method: "POST" },
   );
+}
+
+// --- BYOK LLM settings -------------------------------------------------------
+// One credential per user (provider + key + model), never echoed back --
+// GET/PUT return key_suffix only. See db/schemas/llm_settings.py for the
+// exact response shape this mirrors.
+export async function getLlmSettings(): Promise<LlmSettings> {
+  if (USE_MOCK) return mockGetLlmSettings();
+  return request<LlmSettings>("/settings/llm");
+}
+
+// Upserts the caller's one credential. base_url is only meaningful (and
+// only sent) for provider "custom" -- presets pin their own base_url
+// server-side and ignore any caller-supplied value.
+export async function putLlmSettings(input: {
+  provider: LlmProvider;
+  api_key: string;
+  model: string;
+  base_url?: string;
+}): Promise<LlmSettings> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 150));
+    return mockPutLlmSettings(input);
+  }
+  return request<LlmSettings>("/settings/llm", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+// Exercises the caller's own stored credential with a live provider call.
+// Rate-limited server-side; 409s (as an ApiError) when extraction is
+// disabled or nothing is configured for this user.
+export async function testLlmSettings(): Promise<LlmTestResult> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 300));
+    return mockTestLlmSettings();
+  }
+  return request<LlmTestResult>("/settings/llm/test", { method: "POST" });
+}
+
+// Removes the caller's stored credential; extraction then falls back to
+// the operator's server key (if the deployment allows it).
+export async function deleteLlmSettings(): Promise<void> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 120));
+    mockDeleteLlmSettings();
+    return;
+  }
+  await request<void>("/settings/llm", { method: "DELETE" });
 }
 
 export { USE_MOCK };

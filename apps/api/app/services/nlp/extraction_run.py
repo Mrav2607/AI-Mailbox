@@ -10,8 +10,8 @@ issued in between it and the commit. Inferring lock order from mutation code
 order is therefore not safe; only an explicit ``FOR UPDATE`` establishes it.
 
 Per-message flow mirrors ``backfill.py``'s snapshot-then-release pattern: a
-short claim transaction (thread locked, row claimed) commits before the
-Gemini call runs with no DB transaction checked out, then a short record
+short claim transaction (thread locked, row claimed) commits before the LLM
+call runs with no DB transaction checked out, then a short record
 transaction (classification row locked, done_at re-read) commits the result.
 """
 
@@ -23,7 +23,6 @@ from uuid import UUID
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.core.logging import logger
 from app.db.base import SessionLocal
 from app.db.models import ActionItem, Classification, MailMessage, MailThread
@@ -35,20 +34,14 @@ from app.services.nlp.persistence import (
     claimable_predicate,
     record_extraction,
 )
+from app.services.nlp.providers import (
+    LlmCredential,
+    extraction_feature_enabled,
+    resolve_extraction_credential,
+)
 
 _DEFAULT_SINCE_DAYS = 30
 _RESULT_BUCKETS = ("extracted", "no_action", "ineligible", "failed", "skipped")
-
-
-def extraction_available() -> bool:
-    """THE availability predicate for this feature: flag AND key.
-
-    Every entry point (preflight below, the backfill route's 409, the ingest
-    hook, and the reclassify hook) calls this one function -- flag-only
-    gating would enqueue useless jobs whenever the flag is on but the key is
-    absent.
-    """
-    return bool(settings.action_extraction_enabled and settings.gemini_api_key)
 
 
 def _empty_counts() -> dict:
@@ -107,15 +100,27 @@ def _fence_claim_to_failed(message_id: UUID, claim_token: UUID) -> None:
 
 
 def _claim_extract_record(
-    db: Session, message_id: UUID, *, force: bool = False
+    db: Session,
+    message_id: UUID,
+    *,
+    force: bool = False,
+    credential: LlmCredential | None = None,
 ) -> tuple[str, UUID | None]:
     """One claim -> extract -> record cycle for ``message_id``.
 
     Returns ``(bucket, user_id)`` -- ``bucket`` is one of
-    extracted/no_action/ineligible/failed/skipped, and ``user_id`` is the
-    message's owner when known (``None`` if the message or its thread has
-    vanished), so callers can attach it to a task result without a second
-    query.
+    extracted/no_action/ineligible/failed/skipped/unavailable, and
+    ``user_id`` is the message's owner when known (``None`` if the message
+    or its thread has vanished), so callers can attach it to a task result
+    without a second query.
+
+    ``credential`` is the already-resolved credential for a sweep's user
+    (``run_extraction_sweep`` resolves it once per run, before the loop, and
+    passes it to every call). ``None`` means the caller doesn't know the
+    user yet -- ``run_extraction_for_message``'s user id only becomes known
+    once the thread loads below -- so this function resolves it itself,
+    still before the claim; an unresolvable credential returns bucket
+    ``"unavailable"`` with zero attempts spent (no claim ever issued).
     """
     message = db.get(MailMessage, message_id)
     if message is None:
@@ -139,6 +144,14 @@ def _claim_extract_record(
     received_at = message.sent_at or message.created_at
     user_id = thread.user_id
 
+    if credential is None:
+        credential = resolve_extraction_credential(db, user_id).credential
+        if credential is None:
+            # Nothing was claimed, so a plain commit (not a rollback) is
+            # enough to release the thread lock we just took.
+            db.commit()
+            return "unavailable", user_id
+
     claim_token = claim_action_item(
         db,
         message_id=message.id,
@@ -147,8 +160,8 @@ def _claim_extract_record(
         thread_done=thread_done,
         force=force,
     )
-    # Release the thread lock before the (possibly slow) Gemini call -- no
-    # DB transaction is checked out while extract_action runs.
+    # Release the thread lock before the (possibly slow) LLM call -- no DB
+    # transaction is checked out while extract_action runs.
     db.commit()
     if claim_token is None:
         return "skipped", user_id
@@ -160,6 +173,7 @@ def _claim_extract_record(
             snippet=snippet,
             body_text=body_text,
             received_at=received_at,
+            credential=credential,
         )
 
         # Lock the classification row BEFORE reading its label and hold it
@@ -177,7 +191,7 @@ def _claim_extract_record(
         )
 
         # Re-read done_at -- a concurrent set_thread_done could have
-        # committed while the Gemini call was in flight.
+        # committed while the LLM call was in flight.
         current_done_at = db.execute(
             select(MailThread.done_at).where(MailThread.id == thread.id)
         ).scalar_one_or_none()
@@ -227,11 +241,20 @@ def run_extraction_for_message(db: Session, message_id: UUID) -> dict:
     hook's path). Ignores ``since_days`` and the sweep's done-thread cost
     filter -- the hook may target any thread; ``thread_done`` at record time
     handles a done thread correctly by creating the item already resolved.
+
+    The credential can't be resolved here up front -- this message's owner
+    is only known once ``_claim_extract_record`` loads its thread -- so it
+    resolves internally, still before any claim; an unresolvable credential
+    comes back as the ``"unavailable"`` bucket, which this function reports
+    the same way as the flag being off: zero attempts, ``disabled`` status.
     """
-    if not extraction_available():
+    if not extraction_feature_enabled():
         return _disabled_result()
 
     bucket, user_id = _claim_extract_record(db, message_id)
+    if bucket == "unavailable":
+        return _disabled_result()
+
     counts = _empty_counts()
     counts["processed"] = 1
     counts[bucket] += 1
@@ -348,8 +371,19 @@ def run_extraction_sweep(
     regardless of message age, for the beat-scheduled recovery tick.
     Terminalizes this user's expired-at-cap pending rows before selecting
     candidates either way -- otherwise they'd never settle.
+
+    Resolves this user's credential ONCE, after the flag check and before
+    any of the above (terminalization included) -- a credential-less user
+    (BYOK-only mode with no stored row, or a stored-but-policy-blocked
+    custom row) burns zero attempts and gets the same ``disabled`` shape as
+    the flag being off. The resolved credential then threads through every
+    ``_claim_extract_record`` call this sweep makes.
     """
-    if not extraction_available():
+    if not extraction_feature_enabled():
+        return _disabled_result()
+
+    credential = resolve_extraction_credential(db, user_id).credential
+    if credential is None:
         return _disabled_result()
 
     terminalize_expired_pending(db, user_id=user_id)
@@ -365,7 +399,9 @@ def run_extraction_sweep(
     for message_id in message_ids:
         counts["processed"] += 1
         try:
-            bucket, _user_id = _claim_extract_record(db, message_id, force=force)
+            bucket, _user_id = _claim_extract_record(
+                db, message_id, force=force, credential=credential
+            )
         except Exception:
             # _claim_extract_record already fences its OWN pre-claim/
             # containment failures to a `failed` row and re-raises only when
