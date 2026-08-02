@@ -18,11 +18,13 @@ from app.services.nlp import providers
 from app.services.nlp.providers import (
     PROVIDER_PRESETS,
     DestinationRejected,
+    PinnedDestination,
     ResolvedExtraction,
     assert_url_still_allowed,
     assert_url_still_allowed_async,
     extraction_available,
     extraction_feature_enabled,
+    pin_custom_destination,
     resolve_extraction_credential,
     resolve_preset_base_url,
     validate_custom_base_url,
@@ -450,3 +452,99 @@ def test_assert_url_still_allowed_async_rejects_within_deadline_on_stalling_dns(
         assert elapsed < 3.9
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# pin_custom_destination: the pinned-IP transport closing the DNS-rebinding
+# TOCTOU window -- assert_url_still_allowed validates a hostname and then
+# hands that SAME hostname to httpx for its own separate lookup; this is the
+# entry point that connects to the address actually validated instead.
+# ---------------------------------------------------------------------------
+
+
+def test_pin_custom_destination_pins_to_resolved_ip_preserves_port_and_path(monkeypatch):
+    _enable_custom(monkeypatch)
+    _mock_resolves_to(monkeypatch, "93.184.216.34")
+    pinned = pin_custom_destination("https://example.com:8443/v1/custom")
+    assert isinstance(pinned, PinnedDestination)
+    assert pinned.url == "https://93.184.216.34:8443/v1/custom"
+    assert pinned.host_header == "example.com:8443"
+    assert pinned.sni_hostname == "example.com"
+
+
+def test_pin_custom_destination_brackets_ipv6_resolved_address(monkeypatch):
+    _enable_custom(monkeypatch)
+    _mock_resolves_to(monkeypatch, "2606:4700:4700::1111")
+    pinned = pin_custom_destination("https://example.com/v1")
+    assert pinned.url == "https://[2606:4700:4700::1111]/v1"
+    assert pinned.host_header == "example.com"
+
+
+def test_pin_custom_destination_host_header_has_no_port_when_url_had_none(monkeypatch):
+    _enable_custom(monkeypatch)
+    _mock_resolves_to(monkeypatch, "93.184.216.34")
+    pinned = pin_custom_destination("https://example.com/v1")
+    assert pinned.host_header == "example.com"
+
+
+def test_pin_custom_destination_sni_hostname_none_for_http(monkeypatch):
+    _enable_custom(monkeypatch, private=True)
+    _mock_resolves_to(monkeypatch, "192.168.1.5")
+    pinned = pin_custom_destination("http://ollama.local:11434/v1")
+    assert pinned.url == "http://192.168.1.5:11434/v1"
+    assert pinned.host_header == "ollama.local:11434"
+    assert pinned.sni_hostname is None
+
+
+def test_pin_custom_destination_ip_literal_host_passes_through_unchanged(monkeypatch):
+    _enable_custom(monkeypatch)
+    # No DNS resolution should even be attempted for an IP-literal host.
+    monkeypatch.setattr(
+        providers.socket,
+        "getaddrinfo",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not resolve an IP literal")),
+    )
+    pinned = pin_custom_destination("https://93.184.216.34/v1")
+    assert pinned.url == "https://93.184.216.34/v1"
+    assert pinned.host_header == "93.184.216.34"
+    assert pinned.sni_hostname is None
+
+
+def test_pin_custom_destination_rejected_when_custom_flag_off(monkeypatch):
+    _disable_custom(monkeypatch)
+    with pytest.raises(DestinationRejected) as exc_info:
+        pin_custom_destination("https://example.com/v1")
+    assert exc_info.value.reason == "custom_disabled"
+
+
+def test_pin_custom_destination_rejects_non_global_resolved_address(monkeypatch):
+    _enable_custom(monkeypatch)
+    _mock_resolves_to(monkeypatch, "169.254.169.254")
+    with pytest.raises(DestinationRejected) as exc_info:
+        pin_custom_destination("https://metadata.internal/v1")
+    assert exc_info.value.reason == "destination_rejected"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://key@example.com/v1",
+        "https://user:pass@example.com/v1",
+        "https://example.com/v1?token=secret",
+        "https://example.com/v1#fragment",
+    ],
+    ids=["userinfo-only", "userinfo-password", "query", "fragment"],
+)
+def test_pin_custom_destination_rejects_structural_violations(monkeypatch, url):
+    _enable_custom(monkeypatch)
+    _mock_resolves_to(monkeypatch, "93.184.216.34")
+    with pytest.raises(DestinationRejected) as exc_info:
+        pin_custom_destination(url)
+    assert exc_info.value.reason == "destination_rejected"
+
+
+def test_pin_custom_destination_rejects_malformed_url_instead_of_500ing(monkeypatch):
+    _enable_custom(monkeypatch)
+    with pytest.raises(DestinationRejected) as exc_info:
+        pin_custom_destination("https://[::1/v1")
+    assert exc_info.value.reason == "destination_rejected"

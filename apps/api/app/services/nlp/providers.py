@@ -10,6 +10,14 @@ failure dead-stops a stored row instead of just blocking new saves), and
 immediately before every HTTP request the extractor makes for a custom
 credential (a sweep can run for minutes; a DNS answer flipping non-global
 between two calls must block the second one before any request leaves).
+
+`assert_url_still_allowed` re-validates but still hands httpx a hostname to
+resolve on its own -- a narrow TOCTOU window remains between the check and
+httpx's own lookup. `pin_custom_destination` closes it: it runs the same
+policy and returns a `PinnedDestination` connected to the exact address just
+validated, so there's no second resolution left to race. The extractor uses
+it for every `provider="custom"` request; `assert_url_still_allowed` stays
+as-is for non-request callers (credential resolution, save-time checks).
 """
 
 from __future__ import annotations
@@ -142,13 +150,35 @@ def _reject_if_non_global(addresses: list[str]) -> None:
             )
 
 
+def _format_host(host: str) -> str:
+    """Bracket a bare IPv6 literal for use in a URL or Host header -- shared
+    by every place below that assembles one from a hostname or an address."""
+    return f"[{host}]" if ":" in host else host
+
+
 def _normalize(parsed: SplitResult) -> str:
-    host = (parsed.hostname or "").lower()
-    if ":" in host:  # IPv6 literal -- put the brackets back for a valid URL.
-        host = f"[{host}]"
+    host = _format_host((parsed.hostname or "").lower())
     port = f":{parsed.port}" if parsed.port else ""
     path = parsed.path.rstrip("/")
     return f"{parsed.scheme.lower()}://{host}{port}{path}"
+
+
+def _host_header(parsed: SplitResult) -> str:
+    """The ORIGINAL host (+ :port when the URL had one) for the Host header
+    `pin_custom_destination` sends alongside a pinned IP -- the server on
+    the other end still needs to see the hostname it was configured with."""
+    host = _format_host((parsed.hostname or "").lower())
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{host}{port}"
+
+
+def _build_pinned_url(parsed: SplitResult, address: str) -> str:
+    """The request URL with `address` -- one of the addresses the policy
+    just validated -- substituted for the parsed URL's host. Port and path
+    are preserved; an IPv6 address gets bracketed."""
+    port = f":{parsed.port}" if parsed.port else ""
+    path = parsed.path.rstrip("/")
+    return f"{parsed.scheme.lower()}://{_format_host(address)}{port}{path}"
 
 
 def _validate_structure_and_tier(url: str) -> tuple[SplitResult, bool]:
@@ -251,6 +281,52 @@ def assert_url_still_allowed(url: str) -> None:
 async def assert_url_still_allowed_async(url: str) -> None:
     """Async form of the above -- used by the PUT route only."""
     await validate_custom_base_url_async(url)
+
+
+@dataclass(frozen=True)
+class PinnedDestination:
+    """What the extractor actually connects to for one `provider="custom"`
+    request, closing the gap `assert_url_still_allowed` alone leaves open:
+    validating a hostname and then handing that SAME hostname to httpx for
+    its own (separate) DNS lookup is a TOCTOU -- a hostname can answer with
+    a public address during the check and a private one microseconds later
+    for httpx's lookup. Connecting to the address we actually validated
+    removes the second lookup, and therefore the window, entirely."""
+
+    url: str  # request URL with the host swapped for the validated address
+    host_header: str  # original host (+ :port if present), sent as Host
+    sni_hostname: str | None  # original hostname for TLS SNI + cert check; None for http or an IP-literal host
+
+
+def pin_custom_destination(url: str) -> PinnedDestination:
+    """Runs the full destination policy -- same as `validate_custom_base_url`,
+    reusing its `_prepare` / `_resolve_host_sync` / `_reject_if_non_global`
+    helpers rather than re-implementing the policy a second time -- and then
+    pins the request to ONE of the addresses that policy actually validated.
+    Raises `DestinationRejected` on any violation, same as
+    `validate_custom_base_url`.
+
+    An IP-literal host has nothing to pin (there's no separate resolution
+    for httpx to redo) -- it passes through unchanged with `sni_hostname`
+    left `None`, since there's no hostname to verify a cert against.
+    """
+    parsed, private_tier, host_to_resolve = _prepare(url)
+    host_header = _host_header(parsed)
+
+    if host_to_resolve is None:
+        return PinnedDestination(url=_normalize(parsed), host_header=host_header, sni_hostname=None)
+
+    addresses = _resolve_host_sync(host_to_resolve)
+    if not private_tier:
+        _reject_if_non_global(addresses)
+
+    # Any validated address is safe to use -- when the standard tier
+    # applies every one of them just passed the all-global check; the
+    # private tier permits non-global ones by design. There's no reason to
+    # prefer one over another, so just take the first.
+    pinned_url = _build_pinned_url(parsed, addresses[0])
+    sni_hostname = host_to_resolve if parsed.scheme.lower() == "https" else None
+    return PinnedDestination(url=pinned_url, host_header=host_header, sni_hostname=sni_hostname)
 
 
 def resolve_extraction_credential(db: Session, user_id: UUID) -> ResolvedExtraction:

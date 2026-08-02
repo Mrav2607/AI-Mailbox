@@ -8,7 +8,7 @@ from datetime import datetime, time as dtime, timezone
 import httpx
 
 from app.core.logging import logger
-from app.services.nlp.providers import DestinationRejected, LlmCredential, assert_url_still_allowed
+from app.services.nlp.providers import DestinationRejected, LlmCredential, pin_custom_destination
 
 # Labels the classifier can assign that make a message eligible for
 # second-stage extraction (needs a reply, or a concrete off-email task).
@@ -238,15 +238,21 @@ def _call_llm(credential: LlmCredential, prompt: str, message_text: str) -> str:
     `choices[0].message.content` string. Raises `ExtractionCallError` on
     every failure -- the single internal failure carrier.
 
-    For `provider="custom"` the destination policy is re-checked FIRST,
-    immediately before this specific request: a sweep resolves credentials
-    once but can run for minutes, so a DNS answer or a flag flipping
-    non-global between two calls must block the second one before any
-    request leaves.
+    For `provider="custom"` the destination policy is re-run and PINNED
+    FIRST, immediately before this specific request: a sweep resolves
+    credentials once but can run for minutes, so a DNS answer or a flag
+    flipping non-global between two calls must block the second one before
+    any request leaves. Re-validating and then handing httpx the same
+    hostname would still leave a TOCTOU window -- httpx does its own DNS
+    lookup, and a hostname can answer public for the check and private for
+    that lookup microseconds later. `pin_custom_destination` closes it: we
+    connect to the exact address just validated, so httpx never resolves
+    the hostname itself.
     """
+    pinned = None
     if credential.provider == "custom":
         try:
-            assert_url_still_allowed(credential.base_url)
+            pinned = pin_custom_destination(credential.base_url)
         except DestinationRejected as exc:
             raise ExtractionCallError("blocked_by_policy", None) from exc
 
@@ -259,6 +265,24 @@ def _call_llm(credential: LlmCredential, prompt: str, message_text: str) -> str:
         "max_tokens": 512,
     }
 
+    if pinned is not None:
+        url = f"{pinned.url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {credential.api_key}",
+            # The server on the other end still needs the hostname it was
+            # configured with, even though we're connecting to its IP.
+            "Host": pinned.host_header,
+        }
+        # None for http, or when the host was already an IP literal -- the
+        # SNI extension of the TLS ClientHello is meaningless there, and
+        # httpx would otherwise send the bare IP as both SNI and the
+        # hostname it verifies the certificate against.
+        extensions = {"sni_hostname": pinned.sni_hostname} if pinned.sni_hostname else None
+    else:
+        url = f"{credential.base_url}/chat/completions"
+        headers = {"Authorization": f"Bearer {credential.api_key}"}
+        extensions = None
+
     # trust_env=False is mandatory: httpx otherwise honors HTTP(S)_PROXY/
     # ALL_PROXY env vars and would route the bearer credential through a
     # proxy address the destination policy never validated. Redirects are
@@ -270,9 +294,10 @@ def _call_llm(credential: LlmCredential, prompt: str, message_text: str) -> str:
     try:
         with httpx.Client(timeout=30.0, trust_env=False) as client:
             response = client.post(
-                f"{credential.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {credential.api_key}"},
+                url,
+                headers=headers,
                 json=body,
+                extensions=extensions,
             )
             if not response.is_success:
                 status = response.status_code

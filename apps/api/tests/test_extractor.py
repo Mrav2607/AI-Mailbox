@@ -13,6 +13,7 @@ fake that part)."""
 
 import json
 import logging
+import socket
 from datetime import datetime, timezone
 
 import httpx
@@ -30,6 +31,7 @@ from app.services.nlp.extractor import test_credential as _test_credential
 # Imported under a private alias -- pytest collects any top-level `test_*`
 # callable in a test module, including ones merely imported by that name.
 from app.services.nlp.providers import DestinationRejected, LlmCredential
+from app.services.nlp import providers as providers_module
 
 VALID_PAYLOAD = {
     "has_action": True,
@@ -181,10 +183,10 @@ def test_call_llm_blocked_by_policy_for_custom_provider(monkeypatch):
     calls = []
     _install_mock_transport(monkeypatch, _json_handler(200, {}, calls))
 
-    def fake_assert(url):
+    def fake_pin(url):
         raise DestinationRejected("destination_rejected", "nope")
 
-    monkeypatch.setattr(extractor, "assert_url_still_allowed", fake_assert)
+    monkeypatch.setattr(extractor, "pin_custom_destination", fake_pin)
     credential = _make_credential(provider="custom", base_url="https://ollama.example.com/v1")
 
     with pytest.raises(ExtractionCallError) as exc_info:
@@ -203,13 +205,19 @@ def test_call_llm_rechecks_destination_before_every_request(monkeypatch):
     )
 
     check_count = {"n": 0}
+    pinned = providers_module.PinnedDestination(
+        url="https://93.184.216.34/v1",
+        host_header="ollama.example.com",
+        sni_hostname="ollama.example.com",
+    )
 
-    def fake_assert(url):
+    def fake_pin(url):
         check_count["n"] += 1
         if check_count["n"] > 1:
             raise DestinationRejected("destination_rejected", "flipped non-global")
+        return pinned
 
-    monkeypatch.setattr(extractor, "assert_url_still_allowed", fake_assert)
+    monkeypatch.setattr(extractor, "pin_custom_destination", fake_pin)
     credential = _make_credential(provider="custom", base_url="https://ollama.example.com/v1")
 
     content = extractor._call_llm(credential, "prompt", "text")
@@ -220,6 +228,65 @@ def test_call_llm_rechecks_destination_before_every_request(monkeypatch):
         extractor._call_llm(credential, "prompt", "text")
     assert exc_info.value.category == "blocked_by_policy"
     assert len(calls) == 1  # second call never reached the wire
+
+
+def test_call_llm_rebinding_regression_connects_to_pinned_address_not_a_second_lookup(monkeypatch):
+    """The finding this closes: `assert_url_still_allowed` validates a
+    HOSTNAME and then hands that same hostname to httpx, which does its OWN
+    DNS lookup -- a hostname can answer public for the check and private
+    microseconds later for httpx's lookup (DNS rebinding). Simulate exactly
+    that with a getaddrinfo stub returning a public address on the
+    validation call and a private one on any later call, and assert the
+    request actually reaches the transport addressed at the PINNED public
+    IP -- proving httpx never got a chance to re-resolve the hostname."""
+    monkeypatch.setattr(providers_module.settings, "llm_custom_endpoints_enabled", True)
+    monkeypatch.setattr(providers_module.settings, "llm_private_endpoints_enabled", False)
+
+    call_count = {"n": 0}
+
+    def rebinding_getaddrinfo(host, port):
+        call_count["n"] += 1
+        ip = "93.184.216.34" if call_count["n"] == 1 else "169.254.169.254"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+    monkeypatch.setattr(providers_module.socket, "getaddrinfo", rebinding_getaddrinfo)
+
+    calls = []
+    _install_mock_transport(
+        monkeypatch, _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD)), calls)
+    )
+    credential = _make_credential(provider="custom", base_url="https://rebind.example.com/v1")
+
+    content = extractor._call_llm(credential, "prompt", "text")
+
+    assert content
+    assert call_count["n"] == 1  # DNS resolved exactly once -- httpx never re-resolved
+    request = calls[0]
+    assert str(request.url) == "https://93.184.216.34/v1/chat/completions"
+    assert request.headers["host"] == "rebind.example.com"
+    assert request.extensions["sni_hostname"] == "rebind.example.com"
+
+
+def test_call_llm_preset_request_unchanged_no_host_override_or_extensions(monkeypatch):
+    """Presets are pinned to fixed, operator-controlled hostnames -- pinning
+    them too would add failure modes on CDN-fronted endpoints for no
+    security gain (out of scope, per the frozen contract). A preset
+    credential's request must be byte-for-byte the same as before this
+    change: no Host override, no sni_hostname extension."""
+    calls = []
+    _install_mock_transport(
+        monkeypatch, _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD)), calls)
+    )
+    credential = _make_credential(provider="openai", base_url="https://api.openai.com/v1")
+
+    content = extractor._call_llm(credential, "prompt", "text")
+
+    assert content
+    request = calls[0]
+    assert str(request.url) == "https://api.openai.com/v1/chat/completions"
+    # httpx's own auto-generated Host header from the URL -- not an override.
+    assert request.headers["host"] == "api.openai.com"
+    assert request.extensions.get("sni_hostname") is None
 
 
 def test_call_llm_trust_env_false_ignores_private_proxy_env_var(monkeypatch):
