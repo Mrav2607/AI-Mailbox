@@ -5,10 +5,14 @@ import {
   mockBackfillActions,
   mockCounts,
   mockDeleteConnection,
+  mockDeleteLlmSettings,
+  mockGetLlmSettings,
   mockIngest,
   mockListConnections,
+  mockPutLlmSettings,
   mockSearch,
   mockSetActionStatus,
+  mockTestLlmSettings,
   mockTriage,
 } from "./mock";
 import { ApiError } from "./api";
@@ -207,5 +211,79 @@ describe("mock delete connection", () => {
     // a crash — the caller (api.ts) turns a `false` here into an ApiError.
     expect(mockDeleteConnection(target.id)).toBe(false);
     expect(mockDeleteConnection("not-a-real-id")).toBe(false);
+  });
+});
+
+// Mutates the module-level LLM settings singleton, ending in the
+// unconfigured state -- placed last (after the also-destructive delete-
+// connection block above) so nothing later in the file can observe a
+// mid-round-trip state.
+describe("mock llm settings", () => {
+  it("starts configured with a demo credential", () => {
+    const settings = mockGetLlmSettings();
+    expect(settings.configured).toBe(true);
+    expect(settings.provider).toBe("openai");
+    expect(settings.key_suffix).toBe("sk12");
+    expect(settings.last_verified_at).not.toBeNull();
+    expect(settings.fallback_active).toBe(false);
+  });
+
+  it("put derives key_suffix from the last 4 chars and clears last_verified_at", () => {
+    const updated = mockPutLlmSettings({
+      provider: "groq",
+      api_key: "gsk_live_abcd1234",
+      model: "llama-3.1-8b-instant",
+    });
+    expect(updated.configured).toBe(true);
+    expect(updated.provider).toBe("groq");
+    expect(updated.model).toBe("llama-3.1-8b-instant");
+    expect(updated.key_suffix).toBe("1234");
+    expect(updated.last_verified_at).toBeNull();
+    expect(mockGetLlmSettings()).toEqual(updated);
+  });
+
+  it("put pins a preset's base_url, ignoring any caller-supplied value", () => {
+    const updated = mockPutLlmSettings({
+      provider: "mistral",
+      api_key: "mistral-key-5678",
+      model: "mistral-small",
+      base_url: "https://not-the-real-endpoint.example",
+    });
+    expect(updated.base_url).toBe("https://api.mistral.ai/v1");
+  });
+
+  it("put stores a custom base_url as given", () => {
+    const updated = mockPutLlmSettings({
+      provider: "custom",
+      api_key: "custom-key-9999",
+      model: "local-model",
+      base_url: "https://my-endpoint.example/v1",
+    });
+    expect(updated.provider).toBe("custom");
+    expect(updated.base_url).toBe("https://my-endpoint.example/v1");
+  });
+
+  it("test stamps last_verified_at and reports ok with a plausible latency", () => {
+    const before = mockGetLlmSettings().last_verified_at;
+    const result = mockTestLlmSettings();
+    expect(result.ok).toBe(true);
+    expect(result.error).toBeNull();
+    expect(result.latency_ms).toBeGreaterThan(0);
+    const after = mockGetLlmSettings().last_verified_at;
+    expect(after).not.toBeNull();
+    expect(after).not.toBe(before);
+  });
+
+  it("delete resets to unconfigured with nulled fields", () => {
+    mockDeleteLlmSettings();
+    const settings = mockGetLlmSettings();
+    expect(settings.configured).toBe(false);
+    expect(settings.provider).toBeNull();
+    expect(settings.model).toBeNull();
+    expect(settings.base_url).toBeNull();
+    expect(settings.key_suffix).toBeNull();
+    expect(settings.last_verified_at).toBeNull();
+    expect(settings.custom_blocked).toBe(false);
+    expect(settings.fallback_active).toBe(true);
   });
 });

@@ -14,10 +14,12 @@ import {
   classifyBackfill,
   classifyQueue,
   deleteConnection,
+  deleteLlmSettings,
   deleteThread,
   flushDeleteThread,
   getActions,
   getCounts,
+  getLlmSettings,
   getMe,
   getSyncHealth,
   googleAuthCallback,
@@ -32,6 +34,7 @@ import {
   microsoftAuthCallback,
   microsoftConnectCallback,
   microsoftConnectStart,
+  putLlmSettings,
   reclassify,
   searchThreads,
   setActionStatus,
@@ -39,6 +42,7 @@ import {
   revokeAllTokens,
   setToken,
   sumIngestResults,
+  testLlmSettings,
   waitForTask,
   waitForSyncRuns,
   WORKER_TASK_TIMEOUT_MS,
@@ -56,6 +60,9 @@ import type {
   Connection,
   IngestOptions,
   Label,
+  LlmProvider,
+  LlmSettings,
+  LlmTestResult,
   Overview,
   ThreadDetail,
   TriageItem,
@@ -74,6 +81,7 @@ import { ThreadDetailPane } from "@/components/console/ThreadDetailPane";
 import { TopBar } from "@/components/console/TopBar";
 import { CommandPalette } from "@/components/console/CommandPalette";
 import { Shortcuts } from "@/components/console/Shortcuts";
+import { LlmSettingsModal } from "@/components/console/LlmSettings";
 import { LoginScreen } from "@/components/console/LoginScreen";
 import { VerifyEmailScreen } from "@/components/console/VerifyEmailScreen";
 import { ResetPasswordScreen } from "@/components/console/ResetPasswordScreen";
@@ -211,6 +219,14 @@ export default function Console() {
   const [refreshedHealth, setRefreshedHealth] = useState<SyncHealth | null>(null);
   const [connections, setConnections] = useState<Connection[]>([]);
   const [accountsOpen, setAccountsOpen] = useState(false);
+  // BYOK LLM credential -- fetched once per login alongside connections, no
+  // polling; refreshed after every save/test/delete.
+  const [llmSettings, setLlmSettings] = useState<LlmSettings | null>(null);
+  const [llmSettingsOpen, setLlmSettingsOpen] = useState(false);
+  const [llmSaving, setLlmSaving] = useState(false);
+  const [llmTesting, setLlmTesting] = useState(false);
+  const [llmRemoving, setLlmRemoving] = useState(false);
+  const [llmTestResult, setLlmTestResult] = useState<LlmTestResult | null>(null);
   // Which OAuth providers this deployment has configured — gates "Connect
   // Outlook" everywhere it'd otherwise show up next to Gmail.
   const [authProviders, setAuthProviders] = useState<string[]>([]);
@@ -592,6 +608,74 @@ export default function Console() {
     }
   }, [handleSessionExpired]);
 
+  const refreshLlmSettings = useCallback(async () => {
+    try {
+      setLlmSettings(await getLlmSettings());
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) handleSessionExpired();
+    }
+  }, [handleSessionExpired]);
+
+  // Opening always starts the modal from a clean test result -- otherwise a
+  // stale ok/error from a previous visit would flash before the user does
+  // anything this time.
+  const openLlmSettings = useCallback(() => {
+    setLlmTestResult(null);
+    setLlmSettingsOpen(true);
+  }, []);
+
+  const doSaveLlmSettings = useCallback(
+    async (input: {
+      provider: LlmProvider;
+      api_key: string;
+      model: string;
+      base_url?: string;
+    }) => {
+      setLlmSaving(true);
+      try {
+        const next = await putLlmSettings(input);
+        setLlmSettings(next);
+        setLlmTestResult(null);
+        toast.success("AI settings saved");
+      } catch (e) {
+        toast.error((e as Error).message || "could not save these settings");
+      } finally {
+        setLlmSaving(false);
+      }
+    },
+    [],
+  );
+
+  const doTestLlmSettings = useCallback(async () => {
+    setLlmTesting(true);
+    setLlmTestResult(null);
+    try {
+      const res = await testLlmSettings();
+      setLlmTestResult(res);
+      // A successful test stamps last_verified_at server-side -- pull that
+      // in so the modal reflects it without a second explicit refresh.
+      if (res.ok) refreshLlmSettings();
+    } catch (e) {
+      toast.error((e as Error).message || "could not test this credential");
+    } finally {
+      setLlmTesting(false);
+    }
+  }, [refreshLlmSettings]);
+
+  const doRemoveLlmSettings = useCallback(async () => {
+    setLlmRemoving(true);
+    try {
+      await deleteLlmSettings();
+      setLlmTestResult(null);
+      await refreshLlmSettings();
+      toast.success("AI credential removed");
+    } catch (e) {
+      toast.error((e as Error).message || "could not remove this credential");
+    } finally {
+      setLlmRemoving(false);
+    }
+  }, [refreshLlmSettings]);
+
   // The page-0 reset: always starts over at offset 0 under the current
   // sort/account filter (read from refs so this callback's identity — and
   // every effect keyed on it — doesn't change every time either one flips).
@@ -899,13 +983,14 @@ export default function Console() {
     refreshOverview();
     refreshCounts();
     refreshConnections();
+    refreshLlmSettings();
     listAuthProviders()
       .then(setAuthProviders)
       .catch(() => {
         // Connect Outlook is additive UI; a failed providers fetch just means
         // it stays hidden, not that the console itself is broken.
       });
-  }, [user, refreshOverview, refreshCounts, refreshConnections]);
+  }, [user, refreshOverview, refreshCounts, refreshConnections, refreshLlmSettings]);
 
   // Account filter change: re-issue whatever's on screen under the new scope
   // — a live search stays a search (just re-run against the new account),
@@ -2319,6 +2404,10 @@ export default function Console() {
           loading={actionsLoading}
           error={actionsError}
           onRowDoubleClick={isNarrow ? undefined : handleRowDoubleClick}
+          noExtractionCoverage={
+            !!llmSettings && !llmSettings.configured && !llmSettings.fallback_active
+          }
+          onSetupExtraction={openLlmSettings}
         />
       </div>
     </section>
@@ -2646,6 +2735,7 @@ export default function Console() {
           onConnectGmail={handleConnectGmail}
           onConnectOutlook={outlookEnabled ? handleConnectOutlook : undefined}
           onDisconnect={handleDisconnect}
+          onOpenLlmSettings={openLlmSettings}
           ingestLocked={lockedPopover === "ingest"}
           accountsLocked={lockedPopover === "accounts"}
           onLogout={async () => {
@@ -2715,8 +2805,21 @@ export default function Console() {
           onRestartTour={restartTour}
           onOpenAgenda={() => setView("agenda")}
           onBackfillActions={doBackfillActions}
+          onOpenLlmSettings={openLlmSettings}
         />
         <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+        <LlmSettingsModal
+          open={llmSettingsOpen}
+          onOpenChange={setLlmSettingsOpen}
+          settings={llmSettings}
+          onSave={doSaveLlmSettings}
+          saving={llmSaving}
+          onTest={doTestLlmSettings}
+          testing={llmTesting}
+          testResult={llmTestResult}
+          onRemove={doRemoveLlmSettings}
+          removing={llmRemoving}
+        />
         {!isNarrow && (tourActive || tourVersion < TOUR_VERSION) && (
           <Suspense fallback={null}>
             <OnboardingTour

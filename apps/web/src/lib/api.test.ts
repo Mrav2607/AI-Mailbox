@@ -391,3 +391,138 @@ describe("backfillActions", () => {
     expect(res.task_id).toMatch(/^mock-actions-task-/);
   });
 });
+
+describe("getLlmSettings", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("requests GET /settings/llm", async () => {
+    const api = await importLiveApi();
+    const body = {
+      configured: true,
+      provider: "openai",
+      model: "gpt-4o-mini",
+      base_url: "https://api.openai.com/v1",
+      key_suffix: "ab12",
+      last_verified_at: null,
+      extraction_enabled: true,
+      fallback_active: false,
+      custom_endpoints_enabled: false,
+      private_endpoints_enabled: false,
+      custom_blocked: false,
+    };
+    const fetchMock = stubFetch(body);
+    const res = await api.getLlmSettings();
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(new URL(url as string).pathname).toBe("/api/v1/settings/llm");
+    expect((opts as RequestInit).method ?? "GET").toBe("GET");
+    expect(res).toEqual(body);
+  });
+
+  it("in mock mode, returns the demo settings state", async () => {
+    const api = await importMockApi();
+    const res = await api.getLlmSettings();
+    expect(res.configured).toBe(true);
+    expect(res.provider).toBe("openai");
+  });
+});
+
+describe("putLlmSettings", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("PUTs to /settings/llm with the submitted fields as the body", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({
+      configured: true,
+      provider: "groq",
+      model: "llama-3.1-8b-instant",
+      base_url: "https://api.groq.com/openai/v1",
+      key_suffix: "cdef",
+      last_verified_at: null,
+      extraction_enabled: true,
+      fallback_active: false,
+      custom_endpoints_enabled: false,
+      private_endpoints_enabled: false,
+      custom_blocked: false,
+    });
+    const input = {
+      provider: "groq" as const,
+      api_key: "gsk_live_abcdef",
+      model: "llama-3.1-8b-instant",
+    };
+    const res = await api.putLlmSettings(input);
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(new URL(url as string).pathname).toBe("/api/v1/settings/llm");
+    expect((opts as RequestInit).method).toBe("PUT");
+    expect(JSON.parse((opts as RequestInit).body as string)).toEqual(input);
+    expect(res.provider).toBe("groq");
+  });
+
+  it("in mock mode, updates the demo settings and derives key_suffix", async () => {
+    const api = await importMockApi();
+    const res = await api.putLlmSettings({
+      provider: "mistral",
+      api_key: "mistral-key-7890",
+      model: "mistral-small",
+    });
+    expect(res.provider).toBe("mistral");
+    expect(res.key_suffix).toBe("7890");
+    expect(res.last_verified_at).toBeNull();
+  });
+});
+
+describe("testLlmSettings", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("posts to /settings/llm/test", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ ok: true, latency_ms: 210, error: null });
+    const res = await api.testLlmSettings();
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(new URL(url as string).pathname).toBe("/api/v1/settings/llm/test");
+    expect((opts as RequestInit).method).toBe("POST");
+    expect(res).toEqual({ ok: true, latency_ms: 210, error: null });
+  });
+
+  it("in mock mode, always reports ok with a positive latency", async () => {
+    const api = await importMockApi();
+    const res = await api.testLlmSettings();
+    expect(res.ok).toBe(true);
+    expect(res.error).toBeNull();
+    expect(res.latency_ms).toBeGreaterThan(0);
+  });
+});
+
+describe("deleteLlmSettings", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("DELETEs /settings/llm and resolves void on a 204", async () => {
+    const api = await importLiveApi();
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 204, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+    const res = await api.deleteLlmSettings();
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(new URL(url as string).pathname).toBe("/api/v1/settings/llm");
+    expect((opts as RequestInit).method).toBe("DELETE");
+    expect(res).toBeUndefined();
+  });
+
+  it("in mock mode, resets the demo settings to unconfigured", async () => {
+    const api = await importMockApi();
+    await api.deleteLlmSettings();
+    const res = await api.getLlmSettings();
+    expect(res.configured).toBe(false);
+    expect(res.provider).toBeNull();
+  });
+});
