@@ -651,6 +651,7 @@ export default function Console() {
       api_key: string;
       model: string;
       base_url?: string;
+      classification_byok?: boolean;
     }) => {
       setLlmSaving(true);
       try {

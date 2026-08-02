@@ -215,6 +215,22 @@ export interface LlmSettings {
   custom_endpoints_enabled: boolean;
   private_endpoints_enabled: boolean;
   custom_blocked: boolean;
+  // Per-credential opt-in: does this user's key also pay for classification
+  // (every ingested message), not just extraction? False when unconfigured.
+  classification_byok: boolean;
+  // Whether the effective classifier backend ever reaches an LLM at all --
+  // gates the opt-in checkbox itself, since a heuristic-only deployment has
+  // no LLM path for the key to pay for.
+  classifier_uses_llm: boolean;
+  // The effective backend `classify()` dispatches on ("heuristic" | "local" |
+  // "gemini" | "auto" as normalized server-side) -- lets the UI explain
+  // local-first behavior instead of guessing from raw config.
+  classifier_backend: string;
+  // ELIGIBILITY, not observed usage -- true iff routing would actually send
+  // a message to this user's key. Never renamed "active": an eligible
+  // credential still isn't called when the local encoder handles a message
+  // or the backend is heuristic.
+  classification_eligible: boolean;
 }
 
 // POST /settings/llm/test response. `error` is one of the extractor's

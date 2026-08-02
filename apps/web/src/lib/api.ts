@@ -889,6 +889,11 @@ export async function putLlmSettings(input: {
   api_key: string;
   model: string;
   base_url?: string;
+  // Absent means false on create, unchanged on update -- same rule the
+  // server applies. Omit rather than send `false` unless the user actually
+  // unchecked it, so an update to an unrelated field never silently revokes
+  // a standing opt-in.
+  classification_byok?: boolean;
 }): Promise<LlmSettings> {
   if (USE_MOCK) {
     await new Promise((r) => setTimeout(r, 150));
