@@ -164,7 +164,14 @@ def _validate_structure_and_tier(url: str) -> tuple[SplitResult, bool]:
     if len(url) > _MAX_BASE_URL_LEN:
         raise DestinationRejected(_DESTINATION_REJECTED, "base_url exceeds max length")
 
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        # e.g. an unbalanced IPv6 bracket ("https://[::1/v1") -- urlsplit
+        # raises instead of returning a SplitResult here, and every caller
+        # only catches DestinationRejected, so an uncaught ValueError would
+        # 500 a PUT for a value that's never even stored.
+        raise DestinationRejected(_DESTINATION_REJECTED, "base_url is malformed") from exc
 
     # A secret embedded as https://key@host/ must be structurally
     # impossible -- it would otherwise be stored, echoed in GET, and surface

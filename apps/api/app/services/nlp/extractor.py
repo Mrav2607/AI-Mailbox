@@ -263,7 +263,10 @@ def _call_llm(credential: LlmCredential, prompt: str, message_text: str) -> str:
     # ALL_PROXY env vars and would route the bearer credential through a
     # proxy address the destination policy never validated. Redirects are
     # never followed (httpx's default) -- a 3xx is a call failure, not
-    # something to chase.
+    # something to chase, but `raise_for_status()` alone only raises on
+    # 4xx/5xx, so a 3xx (never followed) would otherwise fall through to
+    # `response.json()` and surface as `invalid_response` instead of the
+    # `http_<status>` it actually is. Check `is_success` explicitly first.
     try:
         with httpx.Client(timeout=30.0, trust_env=False) as client:
             response = client.post(
@@ -271,14 +274,13 @@ def _call_llm(credential: LlmCredential, prompt: str, message_text: str) -> str:
                 headers={"Authorization": f"Bearer {credential.api_key}"},
                 json=body,
             )
-            response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        status = exc.response.status_code
-        logger.warning(
-            "Action extraction call failed for provider %s: http_%s (%s)",
-            credential.provider, status, type(exc).__name__,
-        )
-        raise ExtractionCallError(f"http_{status}", status) from exc
+            if not response.is_success:
+                status = response.status_code
+                logger.warning(
+                    "Action extraction call failed for provider %s: http_%s",
+                    credential.provider, status,
+                )
+                raise ExtractionCallError(f"http_{status}", status)
     except httpx.HTTPError as exc:
         logger.warning(
             "Action extraction call failed for provider %s: %s",

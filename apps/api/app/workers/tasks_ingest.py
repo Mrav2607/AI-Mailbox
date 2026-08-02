@@ -17,7 +17,7 @@ from app.db.base import SessionLocal
 from app.db.models import MailSyncRun, MailThread, ProviderAccount
 from app.services.ingest.gmail_ingest import ingest_gmail_messages
 from app.services.ingest.outlook_ingest import ingest_outlook_messages
-from app.services.nlp.providers import extraction_available
+from app.services.nlp.providers import extraction_available, extraction_feature_enabled
 from app.services.sync_runs import renew_sync, start_sync_run
 
 
@@ -32,8 +32,15 @@ def _enqueue_action_extraction(user_id: str, result: dict) -> None:
     DB lookup included, stays inside this try/except: neither a DB hiccup
     nor a broker failure here may fail or retry an ingest that already
     succeeded.
+
+    The operator flag is checked FIRST, before opening that session --
+    ``ACTION_EXTRACTION_ENABLED`` defaults to false, so a disabled deployment
+    would otherwise open a DB session per ingest for a lookup whose answer
+    the flag alone already determines.
     """
     if result.get("messages_upserted", 0) <= 0:
+        return
+    if not extraction_feature_enabled():
         return
     try:
         with SessionLocal() as db:

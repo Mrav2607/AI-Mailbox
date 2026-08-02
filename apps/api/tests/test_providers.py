@@ -161,6 +161,22 @@ def test_validate_custom_base_url_rejects_over_length(monkeypatch):
     assert exc_info.value.reason == "destination_rejected"
 
 
+@pytest.mark.parametrize(
+    "url",
+    ["https://[::1/v1", "https://[::1:v1"],
+    ids=["unbalanced-ipv6-bracket", "missing-closing-bracket-with-port-like-suffix"],
+)
+def test_validate_custom_base_url_rejects_malformed_url_instead_of_500ing(monkeypatch, url):
+    """`urlsplit` raises a bare ValueError on a malformed URL like an
+    unbalanced IPv6 bracket -- every caller only catches DestinationRejected,
+    so an uncaught ValueError here would 500 a PUT for a value that's never
+    even stored."""
+    _enable_custom(monkeypatch)
+    with pytest.raises(DestinationRejected) as exc_info:
+        validate_custom_base_url(url)
+    assert exc_info.value.reason == "destination_rejected"
+
+
 # ---------------------------------------------------------------------------
 # Non-global rejection: IP literal and resolved address
 # ---------------------------------------------------------------------------

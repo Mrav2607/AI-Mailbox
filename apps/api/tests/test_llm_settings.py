@@ -26,6 +26,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import Update
+from sqlalchemy.exc import IntegrityError
 from starlette.requests import Request as StarletteRequest
 
 from app.core.config import settings
@@ -93,6 +94,7 @@ class _CredentialDB:
     def __init__(self, rows: dict[str, object] | None = None):
         self.rows: dict[str, object] = dict(rows or {})
         self.commits = 0
+        self.rollbacks = 0
         self.added: list[object] = []
         self.deleted: list[object] = []
         self.statements: list[object] = []
@@ -136,6 +138,9 @@ class _CredentialDB:
 
     def commit(self):
         self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
 
 
 @pytest.fixture
@@ -450,6 +455,32 @@ def test_put_api_key_length_out_of_bounds_is_422(user, bad_key):
     assert db.commits == 0
 
 
+@pytest.mark.parametrize(
+    "bad_model", ["", "   ", "m" * 201], ids=["empty", "whitespace-only", "over-long"]
+)
+def test_put_model_length_out_of_bounds_is_422(user, bad_model):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": "sk-abcdefgh", "model": bad_model},
+    )
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "model length out of bounds"}
+    assert db.commits == 0
+
+
+def test_put_model_is_stripped_before_the_bound_check_and_storage(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": "sk-abcdefgh", "model": "  gpt-4o-mini  "},
+    )
+    assert resp.status_code == 200
+    assert db.added[0].model == "gpt-4o-mini"
+
+
 def test_put_api_key_is_stripped_before_the_bound_check_and_storage(user):
     db = _CredentialDB()
     _override(user, db)
@@ -574,6 +605,107 @@ def test_put_custom_provider_stores_the_normalized_base_url(monkeypatch, user):
     assert resp.status_code == 200
     assert resp.json()["base_url"] == "https://llm.example.internal:8080"
     assert db.added[0].base_url == "https://llm.example.internal:8080"
+
+
+# ---------------------------------------------------------------------------
+# PUT -- concurrency: FOR UPDATE before the read-then-branch
+# ---------------------------------------------------------------------------
+
+
+def test_put_select_issues_for_update_before_the_insert_or_update_branch(user):
+    """Every PUT locks the row (if any) before branching -- two concurrent
+    PUTs against an EXISTING row would otherwise both read the same
+    revision and bump it only once. FOR UPDATE takes no lock when this
+    SELECT matches zero rows (see the IntegrityError-fallback test below for
+    how the very-first-save race is closed separately)."""
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": "sk-abcdefgh", "model": "gpt-4o-mini"},
+    )
+    assert resp.status_code == 200
+    select_statement = db.statements[0]
+    compiled = _compiled(select_statement)
+    assert "FOR UPDATE" in compiled
+    assert f"user_llm_credential.user_id = '{user.id.hex}'" in compiled
+
+
+def test_put_concurrent_first_save_falls_back_to_update_after_integrity_error(user):
+    """FOR UPDATE takes no lock when the SELECT matches zero rows, so for a
+    brand-new user the unique constraint (`uq_llm_credential_user`) is the
+    only thing serializing two concurrent first-time PUTs -- the loser's own
+    INSERT raises IntegrityError once the winner has committed. The route
+    must roll back, re-read the winner's now-committed row, and apply the
+    normal update path against it instead of 500ing: last writer wins,
+    exactly as two sequential saves would behave."""
+    db = _CredentialDB()
+    _override(user, db)
+    winner_row = _make_row(
+        user_id=user.id,
+        provider="gemini",
+        model="winner-model",
+        revision=1,
+        last_verified_at=datetime.now(timezone.utc),
+    )
+
+    commit_calls = []
+    real_commit = db.commit
+
+    def _commit_raises_once():
+        commit_calls.append(1)
+        if len(commit_calls) == 1:
+            raise IntegrityError("insert", {}, Exception("uq_llm_credential_user"))
+        real_commit()
+
+    def _rollback_reveals_the_winner():
+        # A real rollback wouldn't conjure a row -- it undoes OUR failed
+        # insert. What it exposes on the next read is whatever the OTHER
+        # session already committed, which is this winner row.
+        db.rows.pop(user.id.hex, None)
+        db.rows[user.id.hex] = winner_row
+
+    db.commit = _commit_raises_once
+    db.rollback = _rollback_reveals_the_winner
+
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": "sk-new-key-1234", "model": "new-model"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["configured"] is True
+    assert body["provider"] == "openai"
+    assert body["model"] == "new-model"
+    assert body["last_verified_at"] is None
+    # The update path ran against the WINNER's row -- not a second insert.
+    assert winner_row.provider == "openai"
+    assert winner_row.model == "new-model"
+    assert winner_row.revision == 2
+    assert winner_row.last_verified_at is None
+    assert len(commit_calls) == 2
+
+
+def test_put_first_save_race_reraises_if_winner_row_vanished(user):
+    """If the re-read after the IntegrityError somehow finds no row (e.g. a
+    racing DELETE), the route re-raises rather than looping -- one retry
+    only, never an unbounded retry. The app's own IntegrityError handler
+    then turns that into a 409 (a real constraint conflict), not a 500."""
+    db = _CredentialDB()
+    _override(user, db)
+
+    def _commit_always_raises():
+        raise IntegrityError("insert", {}, Exception("uq_llm_credential_user"))
+
+    db.commit = _commit_always_raises
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": "sk-new-key-1234", "model": "new-model"},
+    )
+    assert resp.status_code == 409
+    assert "sk-new-key-1234" not in resp.text
 
 
 # ---------------------------------------------------------------------------

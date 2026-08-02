@@ -148,6 +148,17 @@ def test_call_llm_raises_http_status_category_on_non_2xx(monkeypatch):
     assert exc_info.value.status == 500
 
 
+def test_call_llm_raises_http_status_category_on_3xx(monkeypatch):
+    """Redirects are never followed, so `raise_for_status()` alone wouldn't
+    catch this -- a 3xx must be categorized as `http_<status>`, not fall
+    through to `response.json()` and surface as `invalid_response`."""
+    _install_mock_transport(monkeypatch, _json_handler(302, {"error": "moved"}))
+    with pytest.raises(ExtractionCallError) as exc_info:
+        extractor._call_llm(_make_credential(), "prompt", "text")
+    assert exc_info.value.category == "http_302"
+    assert exc_info.value.status == 302
+
+
 @pytest.mark.parametrize(
     "body",
     [

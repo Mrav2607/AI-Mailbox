@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -47,6 +48,11 @@ router = APIRouter(prefix="/settings/llm")
 _MAX_BODY_BYTES = 8192
 _MIN_KEY_LEN = 8
 _MAX_KEY_LEN = 512
+# Same discipline as api_key: an empty/whitespace-only model gets stored and
+# fails opaquely against the provider later, and a wildly long one is never
+# a real model name -- both are rejected here with a fixed detail, not left
+# for the provider's own error message to surface.
+_MAX_MODEL_LEN = 200
 
 
 def _settings_payload(row: UserLlmCredential | None, resolved: ResolvedExtraction) -> dict:
@@ -158,6 +164,10 @@ async def put_llm_settings(
     if not (_MIN_KEY_LEN <= len(api_key) <= _MAX_KEY_LEN):
         raise HTTPException(status_code=422, detail="api_key length out of bounds")
 
+    model = model.strip()
+    if not (1 <= len(model) <= _MAX_MODEL_LEN):
+        raise HTTPException(status_code=422, detail="model length out of bounds")
+
     if provider in PROVIDER_PRESETS:
         # A preset write always takes the pinned base_url -- any
         # caller-supplied one is ignored, or pinning would mean nothing.
@@ -174,11 +184,35 @@ async def put_llm_settings(
     else:
         raise HTTPException(status_code=422, detail="invalid provider")
 
+    # FOR UPDATE before the read-then-branch: two concurrent PUTs for the
+    # same user otherwise both read the same revision and bump it only
+    # once, weakening the id+revision guard /test relies on. The lock
+    # serializes the second caller behind the first -- for an EXISTING row.
     row = db.execute(
-        select(UserLlmCredential).where(UserLlmCredential.user_id == current_user.id)
+        select(UserLlmCredential)
+        .where(UserLlmCredential.user_id == current_user.id)
+        .with_for_update()
     ).scalar_one_or_none()
     now = datetime.now(timezone.utc)
+
+    def _apply_update(target: UserLlmCredential) -> None:
+        target.provider = provider
+        target.base_url = base_url
+        target.api_key = api_key
+        target.model = model
+        target.revision += 1
+        target.last_verified_at = None
+        target.updated_at = now
+
     if row is None:
+        # FOR UPDATE takes NO lock when the SELECT matches zero rows --
+        # Postgres only locks rows it actually returns -- so for a
+        # brand-new user the unique constraint (`uq_llm_credential_user`),
+        # not the lock, is what serializes two concurrent first-time PUTs.
+        # The loser's INSERT raises IntegrityError here; roll back, re-read
+        # the winner's now-committed row WITH the lock (it's lockable now
+        # that it exists), and apply the normal update path against it --
+        # last writer wins, exactly as two sequential saves would behave.
         row = UserLlmCredential(
             user_id=current_user.id,
             provider=provider,
@@ -187,16 +221,27 @@ async def put_llm_settings(
             model=model,
             revision=1,
         )
+        row.updated_at = now
         db.add(row)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            row = db.execute(
+                select(UserLlmCredential)
+                .where(UserLlmCredential.user_id == current_user.id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                # The winning row vanished between the failed insert and
+                # this re-read (e.g. a racing DELETE) -- one retry only,
+                # never an unbounded loop.
+                raise
+            _apply_update(row)
+            db.commit()
     else:
-        row.provider = provider
-        row.base_url = base_url
-        row.api_key = api_key
-        row.model = model
-        row.revision += 1
-        row.last_verified_at = None
-    row.updated_at = now
-    db.commit()
+        _apply_update(row)
+        db.commit()
 
     # Built directly from what we just wrote and validated, NOT a fresh
     # `resolve_extraction_credential` call: that helper's custom-provider

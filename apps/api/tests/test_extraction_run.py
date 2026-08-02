@@ -1213,11 +1213,31 @@ def test_extraction_recovery_tick_returns_partial_counts_on_soft_time_limit(monk
 
 
 def test_enqueue_action_extraction_skips_when_disabled(monkeypatch):
+    monkeypatch.setattr(tasks_ingest, "extraction_feature_enabled", lambda: True)
     monkeypatch.setattr(tasks_ingest, "SessionLocal", lambda: nullcontext(MagicMock()))
     monkeypatch.setattr(tasks_ingest, "extraction_available", lambda db, uid: False)
     monkeypatch.setattr(
         tasks_ingest.extract_actions_for_user, "delay",
         lambda *a, **k: pytest.fail("must not enqueue when disabled"),
+    )
+
+    tasks_ingest._enqueue_action_extraction(str(uuid4()), {"messages_upserted": 5})
+
+
+def test_enqueue_action_extraction_skips_without_opening_a_session_when_feature_flag_off(
+    monkeypatch,
+):
+    # ACTION_EXTRACTION_ENABLED defaults to false -- the cheap flag check
+    # must short-circuit before the per-user availability lookup opens any
+    # session at all, not just before enqueueing.
+    monkeypatch.setattr(tasks_ingest, "extraction_feature_enabled", lambda: False)
+    monkeypatch.setattr(
+        tasks_ingest, "SessionLocal",
+        lambda: pytest.fail("must not open a session when the feature flag is off"),
+    )
+    monkeypatch.setattr(
+        tasks_ingest.extract_actions_for_user, "delay",
+        lambda *a, **k: pytest.fail("must not enqueue when the feature flag is off"),
     )
 
     tasks_ingest._enqueue_action_extraction(str(uuid4()), {"messages_upserted": 5})
@@ -1239,6 +1259,7 @@ def test_enqueue_action_extraction_skips_when_nothing_upserted(monkeypatch):
 
 
 def test_enqueue_action_extraction_fires_when_available_and_upserted(monkeypatch):
+    monkeypatch.setattr(tasks_ingest, "extraction_feature_enabled", lambda: True)
     monkeypatch.setattr(tasks_ingest, "SessionLocal", lambda: nullcontext(MagicMock()))
     monkeypatch.setattr(tasks_ingest, "extraction_available", lambda db, uid: True)
     calls = []
@@ -1263,6 +1284,7 @@ def test_enqueue_action_extraction_opens_its_own_session_for_the_lookup(monkeypa
         opened.append(True)
         return nullcontext(MagicMock())
 
+    monkeypatch.setattr(tasks_ingest, "extraction_feature_enabled", lambda: True)
     monkeypatch.setattr(tasks_ingest, "SessionLocal", fake_session_local)
     monkeypatch.setattr(tasks_ingest, "extraction_available", lambda db, uid: True)
     monkeypatch.setattr(
@@ -1275,6 +1297,7 @@ def test_enqueue_action_extraction_opens_its_own_session_for_the_lookup(monkeypa
 
 
 def test_enqueue_action_extraction_swallows_broker_failure(monkeypatch):
+    monkeypatch.setattr(tasks_ingest, "extraction_feature_enabled", lambda: True)
     monkeypatch.setattr(tasks_ingest, "SessionLocal", lambda: nullcontext(MagicMock()))
     monkeypatch.setattr(tasks_ingest, "extraction_available", lambda db, uid: True)
 
@@ -1294,6 +1317,7 @@ def test_enqueue_action_extraction_availability_lookup_exception_does_not_fail_i
     def _boom_session_local():
         raise RuntimeError("db is down")
 
+    monkeypatch.setattr(tasks_ingest, "extraction_feature_enabled", lambda: True)
     monkeypatch.setattr(tasks_ingest, "SessionLocal", _boom_session_local)
     monkeypatch.setattr(
         tasks_ingest.extract_actions_for_user, "delay",
@@ -1320,6 +1344,7 @@ def test_ingest_gmail_for_user_enqueues_extraction_after_success(monkeypatch):
         tasks_ingest, "ingest_gmail_messages",
         lambda **kwargs: {"threads_upserted": 1, "messages_upserted": 1},
     )
+    monkeypatch.setattr(tasks_ingest, "extraction_feature_enabled", lambda: True)
     monkeypatch.setattr(tasks_ingest, "extraction_available", lambda db, uid: True)
     calls = []
     monkeypatch.setattr(
@@ -1367,6 +1392,7 @@ def test_ingest_gmail_for_user_succeeds_even_if_enqueue_availability_lookup_blow
         tasks_ingest, "ingest_gmail_messages",
         lambda **kwargs: {"threads_upserted": 1, "messages_upserted": 1},
     )
+    monkeypatch.setattr(tasks_ingest, "extraction_feature_enabled", lambda: True)
     monkeypatch.setattr(
         tasks_ingest.extract_actions_for_user, "delay",
         lambda *a, **k: pytest.fail("must not enqueue if the availability lookup blew up"),
