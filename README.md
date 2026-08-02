@@ -248,9 +248,12 @@ Supported providers, all through the OpenAI-compatible chat API:
 | Groq | `llama-3.3-70b-versatile` |
 | Mistral | `mistral-small-latest` |
 
-Anthropic is not in this list on purpose: its OpenAI-compatible endpoint
-ignores the JSON response format this feature depends on, so it would fail in
-ways that look like flaky extraction. Native support is a possible follow-up.
+Anthropic is not in this list on purpose. Its OpenAI-compatible endpoint
+accepts the request but ignores the JSON response format this feature relies
+on, so replies aren't guaranteed to be machine-readable. Nothing bad gets
+stored — the parser rejects anything malformed — but the calls would be paid
+for and thrown away, which reads like flaky extraction. Native support is a
+possible follow-up.
 
 Two settings control the rest:
 
