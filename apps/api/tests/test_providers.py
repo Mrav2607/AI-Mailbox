@@ -666,6 +666,48 @@ def test_resolve_classification_routing_projection_never_selects_api_key():
     assert "api_key" not in cols
 
 
+def test_resolve_classification_routing_second_read_uses_columns_not_stale_entity():
+    """Regression for the identity-map hazard: if step 2 issued
+    `select(UserLlmCredential)` (the whole entity) instead of projecting
+    columns, a Session that already loaded this same row earlier in an
+    uncommitted ingest/backfill batch would hand back that cached instance
+    instead of re-reading -- so a key/model rotated mid-batch would stay
+    stale for the rest of it, past the 60s TTL. This fake answers an
+    entity-style statement with a STALE row and a column-style one with a
+    FRESH row, so a resolver that regressed to an entity select here would
+    get caught returning the stale key/model."""
+    stale = _make_classification_row(provider="openai", api_key="stale-key-0000", model="gpt-4o")
+    fresh = _make_classification_row(provider="openai", api_key="fresh-key-9999", model="gpt-4o-mini")
+
+    class _StaleVsFreshDB:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, stmt):
+            self.statements.append(stmt)
+            cols = [c.key for c in stmt.selected_columns]
+            if cols == ["provider", "classification_byok"]:
+                return _RoutingResult(SimpleNamespace(provider="openai", classification_byok=True))
+            if set(cols) == {"provider", "base_url", "api_key", "model"}:
+                return _RoutingResult(fresh)
+            # Any other shape (e.g. the old `select(UserLlmCredential)`)
+            # simulates the identity map handing back the stale instance.
+            return _RoutingResult(stale)
+
+    db = _StaleVsFreshDB()
+    routing = resolve_classification_routing(db, uuid4())
+
+    assert routing.mode == "user"
+    assert routing.credential.api_key == "fresh-key-9999"
+    assert routing.credential.model == "gpt-4o-mini"
+
+    second_read_cols = [c.key for c in db.statements[1].selected_columns]
+    assert set(second_read_cols) == {"provider", "base_url", "api_key", "model"}
+    # The full mapped entity carries `id` (among others); a column select
+    # doesn't -- confirms this isn't just a same-length coincidence.
+    assert "id" not in second_read_cols
+
+
 def test_resolve_classification_routing_never_triggers_dns(monkeypatch):
     """Classification routing must never call the destination policy --
     presets are pinned and custom never reaches the user path, so there's

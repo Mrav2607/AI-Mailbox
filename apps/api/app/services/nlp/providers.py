@@ -475,6 +475,15 @@ def resolve_classification_routing(db: Session, user_id: UUID) -> Classification
        reads, and reusing step 1's answer could hand `mode="user"` to a
        credential the user has since disabled or switched to custom.
 
+       This second read ALSO projects columns rather than the entity, same
+       reasoning as step 1 but for a different hazard: an entity `select`
+       goes through the Session's identity map, and if this same Session
+       already loaded that row earlier in the ingest/backfill batch (still
+       open, uncommitted), SQLAlchemy hands back that cached instance instead
+       of re-reading -- so a key/model rotated mid-batch would stay stale for
+       the rest of it, past the 60s TTL below. A column `select` always hits
+       the database, so it can't return a stale identity-map instance.
+
     Resolution:
       - no row, or opted out -> `("server", None)` -- today's behavior, the
         operator's key or the heuristic fallback.
@@ -505,12 +514,17 @@ def resolve_classification_routing(db: Session, user_id: UUID) -> Classification
         return ClassificationRouting(mode="off", credential=None)
 
     row = db.execute(
-        select(UserLlmCredential).where(
+        select(
+            UserLlmCredential.provider,
+            UserLlmCredential.base_url,
+            UserLlmCredential.api_key,
+            UserLlmCredential.model,
+        ).where(
             UserLlmCredential.user_id == user_id,
             UserLlmCredential.classification_byok.is_(True),
             UserLlmCredential.provider.in_(_CLASSIFICATION_ELIGIBLE_PROVIDERS),
         )
-    ).scalar_one_or_none()
+    ).first()
 
     if row is None:
         return ClassificationRouting(mode="off", credential=None)
