@@ -127,11 +127,11 @@ export function LlmSettingsModal({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md bg-[var(--color-panel)] border-border">
         <DialogTitle className="font-mono text-[11px] tracking-wide text-muted-foreground mb-1 font-normal">
-          ai extraction settings
+          AI extraction settings
         </DialogTitle>
         <p className="text-[11px] font-mono text-muted-foreground leading-relaxed">
           save your own API key and CortexMail uses it to pull deadlines and
-          to-dos out of your mail, instead of the shared server key.
+          to-dos out of your mail.
         </p>
 
         {settings.custom_blocked && (
@@ -246,7 +246,7 @@ export function LlmSettingsModal({
             <span className="block text-[10.5px] text-muted-foreground font-mono leading-snug">
               {settings.configured
                 ? `saving replaces the stored key (currently ending in ••••${settings.key_suffix})`
-                : "your key is stored encrypted and is never shown again after you save it"}
+                : "your key is encrypted, stored, and never shown again after you save it"}
             </span>
           </label>
 
