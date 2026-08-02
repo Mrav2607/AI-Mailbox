@@ -1,22 +1,20 @@
 """Unit tests for the action extractor: three-way result semantics
-(ExtractedAction | NoAction | None), the OpenAI-compatible wire call
-(_call_llm / ExtractionCallError), strict response parsing, and
-test_credential's category mapping -- all offline via httpx.MockTransport,
-no real LLM or network required.
+(ExtractedAction | NoAction | None), the prompt/message framing `_call_llm`
+adds around the shared wire call, strict response parsing, and
+test_credential's category mapping.
 
-Every httpx.Client the extractor builds is routed through MockTransport by
-subclassing httpx.Client for the duration of a test (_install_mock_transport)
--- this is the only way to inject a fake transport without changing
-_call_llm's signature, and it exercises the REAL trust_env=False behavior
-(httpx itself decides whether to honor a proxy env var; a subclass can't
-fake that part)."""
+The wire call itself (`llm_client.call_chat_completion` -- trust_env,
+redirects/non-2xx, per-request destination pinning, response-shape checks,
+key-never-logged) is tested in `test_llm_client.py`; here we monkeypatch
+`extractor.call_chat_completion` directly, since extractor no longer touches
+httpx or the destination policy at all -- it only builds a prompt/content
+pair and maps the wire call's result (or `LlmCallError`) onto its own
+three-way / test-credential contracts."""
 
 import json
 import logging
-import socket
 from datetime import datetime, timezone
 
-import httpx
 import pytest
 
 from app.services.nlp import extractor
@@ -30,8 +28,7 @@ from app.services.nlp.extractor import test_credential as _test_credential
 
 # Imported under a private alias -- pytest collects any top-level `test_*`
 # callable in a test module, including ones merely imported by that name.
-from app.services.nlp.providers import DestinationRejected, LlmCredential
-from app.services.nlp import providers as providers_module
+from app.services.nlp.providers import LlmCredential
 
 VALID_PAYLOAD = {
     "has_action": True,
@@ -72,250 +69,49 @@ def _default_kwargs(**overrides):
     return kwargs
 
 
-def _choice_payload(content: str) -> dict:
-    return {"choices": [{"message": {"content": content}}]}
-
-
-def _install_mock_transport(monkeypatch, handler):
-    """Route every httpx.Client the extractor constructs through
-    MockTransport(handler) -- no real network, no new dependency."""
-    real_client_cls = httpx.Client
-
-    class _MockedClient(real_client_cls):
-        def __init__(self, *args, **kwargs):
-            kwargs.setdefault("transport", httpx.MockTransport(handler))
-            super().__init__(*args, **kwargs)
-
-    monkeypatch.setattr(extractor.httpx, "Client", _MockedClient)
-
-
-def _json_handler(status_code, body, calls=None):
-    def handler(request: httpx.Request) -> httpx.Response:
+def _stub_returns(content, *, calls=None):
+    """A fake `call_chat_completion` that returns `content` and records the
+    kwargs it was called with, so tests can assert what extractor built."""
+    def fn(credential, *, prompt, user_content, max_tokens):
         if calls is not None:
-            calls.append(request)
-        return httpx.Response(status_code, json=body)
+            calls.append(dict(credential=credential, prompt=prompt, user_content=user_content, max_tokens=max_tokens))
+        return content
+    return fn
 
-    return handler
 
-
-def _raising_handler(exc):
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise exc
-
-    return handler
+def _stub_raises(category, status=None):
+    def fn(credential, *, prompt, user_content, max_tokens):
+        raise ExtractionCallError(category, status)
+    return fn
 
 
 # ---------------------------------------------------------------------------
-# _call_llm / ExtractionCallError categories
+# _call_llm -- the prompt/content framing extractor adds around the shared
+# wire call (`llm_client.call_chat_completion`), plus ExtractionCallError's
+# propagation as the LlmCallError alias.
 # ---------------------------------------------------------------------------
 
 
-def test_call_llm_success_round_trip_asserts_wire_shape(monkeypatch):
+def test_call_llm_builds_email_prefixed_and_truncated_user_content(monkeypatch):
     calls = []
-    _install_mock_transport(
-        monkeypatch, _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD)), calls)
-    )
-    credential = _make_credential()
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_returns(json.dumps(VALID_PAYLOAD), calls=calls))
+    long_text = "x" * 7000
 
-    content = extractor._call_llm(credential, "the prompt", "the email text")
+    content = extractor._call_llm(_make_credential(), "the prompt", long_text)
 
     assert content == json.dumps(VALID_PAYLOAD)
     assert len(calls) == 1
-    request = calls[0]
-    assert str(request.url) == "https://api.openai.com/v1/chat/completions"
-    assert request.headers["authorization"] == f"Bearer {SECRET_KEY}"
-    body = json.loads(request.content)
-    assert body["model"] == "gpt-4o-mini"
-    assert body["response_format"] == {"type": "json_object"}
-    assert body["max_tokens"] == 512
-    assert len(body["messages"]) == 1
-    assert body["messages"][0]["role"] == "user"
-    assert "the prompt" in body["messages"][0]["content"]
-    assert "the email text" in body["messages"][0]["content"]
+    assert calls[0]["prompt"] == "the prompt"
+    assert calls[0]["user_content"] == f"Email:\n{long_text[:6000]}"
+    assert calls[0]["max_tokens"] == 512
 
 
-def test_call_llm_raises_connection_failed_on_network_error(monkeypatch):
-    _install_mock_transport(monkeypatch, _raising_handler(httpx.ConnectError("boom")))
-    with pytest.raises(ExtractionCallError) as exc_info:
-        extractor._call_llm(_make_credential(), "prompt", "text")
-    assert exc_info.value.category == "connection_failed"
-    assert exc_info.value.status is None
-
-
-def test_call_llm_raises_http_status_category_on_non_2xx(monkeypatch):
-    _install_mock_transport(monkeypatch, _json_handler(500, {"error": "boom"}))
+def test_call_llm_propagates_llm_call_error_as_extraction_call_error(monkeypatch):
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_raises("http_500", 500))
     with pytest.raises(ExtractionCallError) as exc_info:
         extractor._call_llm(_make_credential(), "prompt", "text")
     assert exc_info.value.category == "http_500"
     assert exc_info.value.status == 500
-
-
-def test_call_llm_raises_http_status_category_on_3xx(monkeypatch):
-    """Redirects are never followed, so `raise_for_status()` alone wouldn't
-    catch this -- a 3xx must be categorized as `http_<status>`, not fall
-    through to `response.json()` and surface as `invalid_response`."""
-    _install_mock_transport(monkeypatch, _json_handler(302, {"error": "moved"}))
-    with pytest.raises(ExtractionCallError) as exc_info:
-        extractor._call_llm(_make_credential(), "prompt", "text")
-    assert exc_info.value.category == "http_302"
-    assert exc_info.value.status == 302
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        {"choices": []},
-        {"choices": [{}]},
-        {"choices": [{"message": {"content": None}}]},
-        {"choices": [{"message": "not a dict"}]},
-        {},
-    ],
-    ids=["empty-choices", "missing-message", "null-content", "message-not-dict", "missing-choices"],
-)
-def test_call_llm_raises_invalid_response_for_malformed_shapes(monkeypatch, body):
-    _install_mock_transport(monkeypatch, _json_handler(200, body))
-    with pytest.raises(ExtractionCallError) as exc_info:
-        extractor._call_llm(_make_credential(), "prompt", "text")
-    assert exc_info.value.category == "invalid_response"
-
-
-def test_call_llm_blocked_by_policy_for_custom_provider(monkeypatch):
-    calls = []
-    _install_mock_transport(monkeypatch, _json_handler(200, {}, calls))
-
-    def fake_pin(url):
-        raise DestinationRejected("destination_rejected", "nope")
-
-    monkeypatch.setattr(extractor, "pin_custom_destination", fake_pin)
-    credential = _make_credential(provider="custom", base_url="https://ollama.example.com/v1")
-
-    with pytest.raises(ExtractionCallError) as exc_info:
-        extractor._call_llm(credential, "prompt", "text")
-    assert exc_info.value.category == "blocked_by_policy"
-    assert not calls  # rejected before any request left
-
-
-def test_call_llm_rechecks_destination_before_every_request(monkeypatch):
-    """A sweep resolves a credential once but can run for minutes -- a DNS
-    answer flipping non-global between two calls must block the SECOND one
-    before any request reaches the wire, not just the first."""
-    calls = []
-    _install_mock_transport(
-        monkeypatch, _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD)), calls)
-    )
-
-    check_count = {"n": 0}
-    pinned = providers_module.PinnedDestination(
-        url="https://93.184.216.34/v1",
-        host_header="ollama.example.com",
-        sni_hostname="ollama.example.com",
-    )
-
-    def fake_pin(url):
-        check_count["n"] += 1
-        if check_count["n"] > 1:
-            raise DestinationRejected("destination_rejected", "flipped non-global")
-        return pinned
-
-    monkeypatch.setattr(extractor, "pin_custom_destination", fake_pin)
-    credential = _make_credential(provider="custom", base_url="https://ollama.example.com/v1")
-
-    content = extractor._call_llm(credential, "prompt", "text")
-    assert content
-    assert len(calls) == 1
-
-    with pytest.raises(ExtractionCallError) as exc_info:
-        extractor._call_llm(credential, "prompt", "text")
-    assert exc_info.value.category == "blocked_by_policy"
-    assert len(calls) == 1  # second call never reached the wire
-
-
-def test_call_llm_rebinding_regression_connects_to_pinned_address_not_a_second_lookup(monkeypatch):
-    """The finding this closes: `assert_url_still_allowed` validates a
-    HOSTNAME and then hands that same hostname to httpx, which does its OWN
-    DNS lookup -- a hostname can answer public for the check and private
-    microseconds later for httpx's lookup (DNS rebinding). Simulate exactly
-    that with a getaddrinfo stub returning a public address on the
-    validation call and a private one on any later call, and assert the
-    request actually reaches the transport addressed at the PINNED public
-    IP -- proving httpx never got a chance to re-resolve the hostname."""
-    monkeypatch.setattr(providers_module.settings, "llm_custom_endpoints_enabled", True)
-    monkeypatch.setattr(providers_module.settings, "llm_private_endpoints_enabled", False)
-
-    call_count = {"n": 0}
-
-    def rebinding_getaddrinfo(host, port):
-        call_count["n"] += 1
-        ip = "93.184.216.34" if call_count["n"] == 1 else "169.254.169.254"
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
-
-    monkeypatch.setattr(providers_module.socket, "getaddrinfo", rebinding_getaddrinfo)
-
-    calls = []
-    _install_mock_transport(
-        monkeypatch, _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD)), calls)
-    )
-    credential = _make_credential(provider="custom", base_url="https://rebind.example.com/v1")
-
-    content = extractor._call_llm(credential, "prompt", "text")
-
-    assert content
-    assert call_count["n"] == 1  # DNS resolved exactly once -- httpx never re-resolved
-    request = calls[0]
-    assert str(request.url) == "https://93.184.216.34/v1/chat/completions"
-    assert request.headers["host"] == "rebind.example.com"
-    assert request.extensions["sni_hostname"] == "rebind.example.com"
-
-
-def test_call_llm_preset_request_unchanged_no_host_override_or_extensions(monkeypatch):
-    """Presets are pinned to fixed, operator-controlled hostnames -- pinning
-    them too would add failure modes on CDN-fronted endpoints for no
-    security gain (out of scope, per the frozen contract). A preset
-    credential's request must be byte-for-byte the same as before this
-    change: no Host override, no sni_hostname extension."""
-    calls = []
-    _install_mock_transport(
-        monkeypatch, _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD)), calls)
-    )
-    credential = _make_credential(provider="openai", base_url="https://api.openai.com/v1")
-
-    content = extractor._call_llm(credential, "prompt", "text")
-
-    assert content
-    request = calls[0]
-    assert str(request.url) == "https://api.openai.com/v1/chat/completions"
-    # httpx's own auto-generated Host header from the URL -- not an override.
-    assert request.headers["host"] == "api.openai.com"
-    assert request.extensions.get("sni_hostname") is None
-
-
-def test_call_llm_trust_env_false_ignores_private_proxy_env_var(monkeypatch):
-    """trust_env=False is mandatory: httpx otherwise honors HTTP(S)_PROXY
-    and would route the bearer credential through a proxy address the
-    destination policy never validated."""
-    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9999")
-    real_client_cls = httpx.Client
-    captured = []
-
-    class _SpyClient(real_client_cls):
-        def __init__(self, *args, **kwargs):
-            kwargs["transport"] = httpx.MockTransport(
-                _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD)))
-            )
-            super().__init__(*args, **kwargs)
-            captured.append(self)
-
-    monkeypatch.setattr(extractor.httpx, "Client", _SpyClient)
-
-    content = extractor._call_llm(_make_credential(), "prompt", "text")
-
-    assert content == json.dumps(VALID_PAYLOAD)
-    assert len(captured) == 1
-    client = captured[0]
-    assert client.trust_env is False
-    # With trust_env=False httpx never consults HTTPS_PROXY -- if it had,
-    # this client would carry a mounted proxy transport for the https:// pattern.
-    assert not any(client._mounts.values())
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +120,7 @@ def test_call_llm_trust_env_false_ignores_private_proxy_env_var(monkeypatch):
 
 
 def test_extract_action_success_round_trip(monkeypatch):
-    _install_mock_transport(monkeypatch, _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD))))
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_returns(json.dumps(VALID_PAYLOAD)))
     result = extract_action(**_default_kwargs())
     assert isinstance(result, ExtractedAction)
     assert result.kind == "payment"
@@ -339,42 +135,39 @@ def test_extract_action_success_round_trip(monkeypatch):
 
 def test_extract_action_has_action_false_returns_no_action_not_none(monkeypatch):
     payload = {"has_action": False, "confidence": 0.9}
-    _install_mock_transport(monkeypatch, _json_handler(200, _choice_payload(json.dumps(payload))))
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_returns(json.dumps(payload)))
     result = extract_action(**_default_kwargs())
     assert isinstance(result, NoAction)
     assert result is not None
 
 
 def test_extract_action_returns_none_on_non_2xx(monkeypatch):
-    _install_mock_transport(monkeypatch, _json_handler(503, {"error": "unavailable"}))
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_raises("http_503", 503))
     assert extract_action(**_default_kwargs()) is None
 
 
 def test_extract_action_returns_none_on_network_error(monkeypatch):
-    _install_mock_transport(monkeypatch, _raising_handler(httpx.ConnectTimeout("timed out")))
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_raises("connection_failed", None))
     assert extract_action(**_default_kwargs()) is None
 
 
 def test_extract_action_returns_none_on_prose_reply(monkeypatch):
-    _install_mock_transport(
-        monkeypatch, _json_handler(200, _choice_payload("Sure, I'll get right on it!"))
-    )
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_returns("Sure, I'll get right on it!"))
     assert extract_action(**_default_kwargs()) is None
 
 
-@pytest.mark.parametrize(
-    "body",
-    [{"choices": []}, {"choices": [{}]}, {"choices": [{"message": {"content": None}}]}],
-    ids=["empty-choices", "missing-message", "null-content"],
-)
-def test_extract_action_returns_none_on_malformed_shape(monkeypatch, body):
-    _install_mock_transport(monkeypatch, _json_handler(200, body))
+def test_extract_action_returns_none_on_invalid_response(monkeypatch):
+    """The exhaustive malformed-response-shape enumeration is a wire-level
+    concern owned by `llm_client.call_chat_completion` now (covered in
+    test_llm_client.py); this proves extract_action's mapping of that
+    category to `None` still holds."""
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_raises("invalid_response", 200))
     assert extract_action(**_default_kwargs()) is None
 
 
 def test_extract_action_date_only_resolves_to_end_of_day_utc(monkeypatch):
     payload = {**VALID_PAYLOAD, "due_at": "2024-03-15", "due_is_date_only": True}
-    _install_mock_transport(monkeypatch, _json_handler(200, _choice_payload(json.dumps(payload))))
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_returns(json.dumps(payload)))
     result = extract_action(**_default_kwargs())
     assert isinstance(result, ExtractedAction)
     assert result.due_precision == "date"
@@ -383,41 +176,38 @@ def test_extract_action_date_only_resolves_to_end_of_day_utc(monkeypatch):
 
 def test_extract_action_prompt_includes_received_at(monkeypatch):
     calls = []
-    _install_mock_transport(
-        monkeypatch, _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD)), calls)
-    )
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_returns(json.dumps(VALID_PAYLOAD), calls=calls))
     received_at = datetime(2024, 3, 10, 12, 0, 0, tzinfo=timezone.utc)
     extract_action(**_default_kwargs(received_at=received_at))
-    body = json.loads(calls[0].content)
-    assert received_at.isoformat() in body["messages"][0]["content"]
+    assert received_at.isoformat() in calls[0]["prompt"]
 
 
 def test_extract_action_model_version_attribution(monkeypatch):
-    _install_mock_transport(monkeypatch, _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD))))
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_returns(json.dumps(VALID_PAYLOAD)))
     credential = _make_credential(provider="openai", model="gpt-4o-mini")
     result = extract_action(**_default_kwargs(credential=credential))
     assert isinstance(result, ExtractedAction)
     assert result.model_version == "openai:gpt-4o-mini"
 
     credential = _make_credential(provider="groq", model="llama-3.3-70b")
-    _install_mock_transport(monkeypatch, _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD))))
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_returns(json.dumps(VALID_PAYLOAD)))
     result = extract_action(**_default_kwargs(credential=credential))
     assert result.model_version == "groq:llama-3.3-70b"
 
 
 @pytest.mark.parametrize(
-    "make_handler,expect_result_is_none",
+    "make_stub,expect_result_is_none",
     [
-        (lambda: _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD))), False),
-        (lambda: _json_handler(500, {"error": "boom"}), True),
-        (lambda: _raising_handler(httpx.ConnectError("boom")), True),
-        (lambda: _json_handler(200, _choice_payload("not json at all")), True),
-        (lambda: _json_handler(200, {"choices": []}), True),
+        (lambda: _stub_returns(json.dumps(VALID_PAYLOAD)), False),
+        (lambda: _stub_raises("http_500", 500), True),
+        (lambda: _stub_raises("connection_failed", None), True),
+        (lambda: _stub_returns("not json at all"), True),
+        (lambda: _stub_raises("invalid_response", 200), True),
     ],
     ids=["success", "http-error", "network-error", "prose-reply", "malformed-shape"],
 )
-def test_extract_action_never_logs_the_api_key(monkeypatch, caplog, make_handler, expect_result_is_none):
-    _install_mock_transport(monkeypatch, make_handler())
+def test_extract_action_never_logs_the_api_key(monkeypatch, caplog, make_stub, expect_result_is_none):
+    monkeypatch.setattr(extractor, "call_chat_completion", make_stub())
     credential = _make_credential(api_key=SECRET_KEY)
     with caplog.at_level(logging.WARNING, logger="ai-mailbox"):
         result = extract_action(**_default_kwargs(credential=credential))
@@ -432,7 +222,7 @@ def test_extract_action_never_logs_the_api_key(monkeypatch, caplog, make_handler
 
 
 def test_test_credential_success(monkeypatch):
-    _install_mock_transport(monkeypatch, _json_handler(200, _choice_payload(json.dumps(VALID_PAYLOAD))))
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_returns(json.dumps(VALID_PAYLOAD)))
     ok, category, latency_ms = _test_credential(_make_credential())
     assert ok is True
     assert category is None
@@ -440,21 +230,21 @@ def test_test_credential_success(monkeypatch):
 
 
 def test_test_credential_maps_call_error_category(monkeypatch):
-    _install_mock_transport(monkeypatch, _json_handler(500, {"error": "boom"}))
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_raises("http_500", 500))
     ok, category, latency_ms = _test_credential(_make_credential())
     assert ok is False
     assert category == "http_500"
 
 
 def test_test_credential_maps_parse_failure_to_invalid_response(monkeypatch):
-    _install_mock_transport(monkeypatch, _json_handler(200, _choice_payload("not json")))
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_returns("not json"))
     ok, category, latency_ms = _test_credential(_make_credential())
     assert ok is False
     assert category == "invalid_response"
 
 
 def test_test_credential_never_logs_the_api_key(monkeypatch, caplog):
-    _install_mock_transport(monkeypatch, _json_handler(500, {"error": "boom"}))
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_raises("http_500", 500))
     credential = _make_credential(api_key=SECRET_KEY)
     with caplog.at_level(logging.WARNING, logger="ai-mailbox"):
         _test_credential(credential)
