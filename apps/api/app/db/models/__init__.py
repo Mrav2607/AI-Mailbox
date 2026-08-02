@@ -10,3 +10,4 @@ from .calendar_event import CalendarEvent  # noqa: F401
 from .embedding import MessageEmbedding  # noqa: F401
 from .action_log import ActionLog  # noqa: F401
 from .sync_run import MailSyncRun  # noqa: F401
+from .llm_credential import UserLlmCredential  # noqa: F401
