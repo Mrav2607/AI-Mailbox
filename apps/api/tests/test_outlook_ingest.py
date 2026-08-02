@@ -317,6 +317,89 @@ def test_removal_budget_deferral_at_a_page_boundary_still_makes_forward_progress
 
 
 # ---------------------------------------------------------------------------
+# Classification router lifetime: one instance per run, reused across pages
+# ---------------------------------------------------------------------------
+
+
+def test_classification_router_is_built_once_per_run_and_reused_across_pages(monkeypatch):
+    # ClassificationRouter is built once in ingest_outlook_messages and PASSED
+    # INTO _upsert_page_messages (called once per delta page) -- rebuilding it
+    # per page would restart its 60s memo (and re-query routing) every page.
+    # routing_for still has to run per message so a mid-run consent
+    # revocation takes effect within a minute rather than at the end of the
+    # run. This drives _upsert_page_messages for real (not stubbed) across
+    # two pages so both halves of the contract are exercised together.
+    from app.services.nlp.providers import ClassificationRouting
+
+    router_instances = []
+    routed_selves = []
+
+    class CountingRouter:
+        def __init__(self, user_id):
+            router_instances.append(user_id)
+
+        def routing_for(self, db):
+            routed_selves.append(self)
+            return ClassificationRouting(mode="off", credential=None)
+
+    monkeypatch.setattr(outlook_ingest, "ClassificationRouter", CountingRouter)
+
+    provider = _fake_provider()
+
+    def execute(stmt):
+        sql = str(stmt).lower()
+        result = MagicMock()
+        if "from provider_account" in sql:
+            result.scalars.return_value.first.return_value = provider
+        elif "insert into mail_thread" in sql:
+            result.scalar_one.return_value = uuid4()
+        elif "insert into mail_message" in sql:
+            result.scalar_one.return_value = uuid4()
+        elif "from classification" in sql:
+            # Neither message has a prior classification -- both must
+            # actually reach the classifier instead of being skipped.
+            result.scalars.return_value.first.return_value = None
+        return result
+
+    db = MagicMock()
+    db.execute.side_effect = execute
+    # Thread-reopen bookkeeping is orthogonal to this contract.
+    db.get.return_value = None
+
+    page1 = {
+        "messages": [{"id": "m1", "conversationId": "t1", "subject": "s1"}],
+        "removed_ids": [],
+        "next_url": "https://page-2",
+        "delta_url": None,
+    }
+    page2 = {
+        "messages": [{"id": "m2", "conversationId": "t1", "subject": "s2"}],
+        "removed_ids": [],
+        "next_url": None,
+        "delta_url": "https://delta-final",
+    }
+    client = MagicMock()
+    client.delta_page = MagicMock(side_effect=[page1, page2])
+    monkeypatch.setattr(outlook_ingest, "OutlookClient", lambda token: client)
+
+    result = outlook_ingest.ingest_outlook_messages(
+        db, "u1", provider_account_id=str(provider.id), max_results=2, max_pages=20
+    )
+
+    # Two delta pages actually got fetched -- otherwise "reused across pages"
+    # would be vacuous.
+    assert client.delta_page.call_count == 2
+    assert result["messages_upserted"] == 2
+    assert result["classified"] == 2
+
+    assert router_instances == ["u1"]
+    assert len(routed_selves) == 2
+    # Both calls -- one per message, one per page -- landed on the exact same
+    # router object, not a lookalike rebuilt per page.
+    assert len({id(r) for r in routed_selves}) == 1
+
+
+# ---------------------------------------------------------------------------
 # Baseline + cap-detection narrowing across runs, and the 7-day floor
 # ---------------------------------------------------------------------------
 

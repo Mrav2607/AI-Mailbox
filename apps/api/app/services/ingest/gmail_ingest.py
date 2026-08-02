@@ -17,6 +17,7 @@ from app.services.ingest.gmail_client import GmailClient
 from app.services.ingest.normalizer import normalize_message
 from app.services.nlp.classifier import classify, build_classification_text
 from app.services.nlp.persistence import upsert_classification
+from app.services.nlp.providers import ClassificationRouter
 
 
 def _collect_history_thread_ids(
@@ -368,6 +369,12 @@ def ingest_gmail_messages(
     threads_reopened = 0
     threads_missing = 0
 
+    # One router per run, built once before the thread loop -- its 60s memo
+    # (see ClassificationRouter) means routing_for(db) below is ~free per
+    # message, while still letting a mid-run revocation take effect within a
+    # minute instead of only at the next run.
+    classification_router = ClassificationRouter(user_id)
+
     for index, tid in enumerate(thread_ids):
         try:
             raw_thread = with_token_retry(lambda tid=tid: client.get_thread(tid))
@@ -486,7 +493,10 @@ def ingest_gmail_messages(
                         normalized.get("snippet"),
                         normalized.get("body_text"),
                     )
-                    label, confidence, rationale, model_version = classify(text_for_classification)
+                    routing = classification_router.routing_for(db)
+                    label, confidence, rationale, model_version = classify(
+                        text_for_classification, routing=routing
+                    )
                     upsert_classification(
                         db,
                         message_id=new_message_id,

@@ -1,9 +1,13 @@
 """Unit tests for the classifier: heuristic rules + backend dispatch/fallback
 (local/gemini/heuristic), all offline -- no LLM or network required."""
 
+import json
+
 import pytest
 
 from app.services.nlp.classifier import LABELS, _heuristic_classify, classify
+from app.services.nlp.llm_client import LlmCallError
+from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
 
 @pytest.mark.parametrize(
@@ -179,3 +183,195 @@ def test_genai_client_is_cached_across_calls(monkeypatch):
     finally:
         # Don't leave a client built from the test key cached for other tests.
         classifier._genai_client.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Classification routing: tri-state dispatch inside _classify_llm, and the
+# frozen precedence matrix against CLASSIFIER_BACKEND / the local encoder.
+# ---------------------------------------------------------------------------
+
+
+def _fake_genai_response(label="fyi", confidence=0.8, rationale="test"):
+    class _FakeResponse:
+        text = json.dumps({"label": label, "confidence": confidence, "rationale": rationale})
+
+    class _FakeModels:
+        def generate_content(self, **kwargs):
+            return _FakeResponse()
+
+    class _FakeClient:
+        models = _FakeModels()
+
+    return _FakeClient()
+
+
+def _explode(*args, **kwargs):
+    raise AssertionError("this call must never happen for this routing mode")
+
+
+def test_classify_routing_none_and_server_are_byte_identical_no_key(monkeypatch):
+    """With no gemini_api_key configured, routing=None and mode="server"
+    must both fall back to heuristic identically -- BYOK is additive."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", None)
+
+    result_none = classify("Can you review this?", routing=None)
+    result_server = classify(
+        "Can you review this?", routing=ClassificationRouting(mode="server", credential=None)
+    )
+    assert result_none == result_server
+    assert result_none[3] == "heuristic-v1"
+
+
+def test_classify_routing_none_and_server_are_byte_identical_with_genai(monkeypatch):
+    """Same as above but through a mocked successful genai call -- both
+    routing=None and mode="server" must reach the native path and stamp the
+    bare model name, unchanged from before BYOK classification existed."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
+    monkeypatch.setattr(classifier.settings, "gemini_model", "gemini-2.5-flash")
+    monkeypatch.setattr(
+        classifier, "_genai_client", lambda: _fake_genai_response(label="fyi")
+    )
+
+    for routing in (None, ClassificationRouting(mode="server", credential=None)):
+        label, confidence, rationale, model_version = classify("hi there", routing=routing)
+        assert label == "fyi"
+        assert model_version == "gemini-2.5-flash"  # bare model name -- server attribution
+
+
+def test_classify_routing_user_mode_calls_openai_compat_with_credential(monkeypatch):
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier, "_genai_client", _explode)  # must never be built for mode="user"
+
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="user-key", model="gpt-4o-mini"
+    )
+    captured = {}
+
+    def fake_call(cred, *, prompt, user_content, max_tokens):
+        captured["credential"] = cred
+        return json.dumps({"label": "spam", "confidence": 0.9, "rationale": "scam"})
+
+    monkeypatch.setattr(classifier, "call_chat_completion", fake_call)
+
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify("You won a prize!", routing=routing)
+
+    assert label == "spam"
+    assert model_version == "openai:gpt-4o-mini"  # BYOK attribution -- provider:model
+    assert captured["credential"] is credential
+
+
+def test_classify_routing_off_mode_never_builds_genai_client_or_calls_llm(monkeypatch):
+    """The point of the seam assertions here: proving the operator was not
+    billed, not merely checking the returned label."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier, "_genai_client", _explode)
+    monkeypatch.setattr(classifier, "call_chat_completion", _explode)
+
+    routing = ClassificationRouting(mode="off", credential=None)
+    label, confidence, rationale, model_version = classify("Can you help?", routing=routing)
+
+    assert label == "needs_reply"
+    assert model_version == "heuristic-v1"  # direct heuristic, not "-fallback"
+
+
+def test_classify_routing_user_mode_falls_back_to_heuristic_on_call_error(monkeypatch):
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    credential = LlmCredential(
+        provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
+    )
+
+    def failing_call(*args, **kwargs):
+        raise LlmCallError("connection_failed", None)
+
+    monkeypatch.setattr(classifier, "call_chat_completion", failing_call)
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify(
+        "Security alert: new login detected", routing=routing
+    )
+    assert label == "security_alert"
+    assert model_version == "heuristic-fallback"
+
+
+def test_classify_routing_user_mode_falls_back_to_heuristic_on_unparseable_response(monkeypatch):
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    credential = LlmCredential(
+        provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
+    )
+    monkeypatch.setattr(classifier, "call_chat_completion", lambda *a, **k: "not json at all")
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify(
+        "Invoice #1842 is due Friday", routing=routing
+    )
+    assert label == "action_required"
+    assert model_version == "heuristic-fallback"
+
+
+def test_classify_precedence_heuristic_backend_ignores_user_routing(monkeypatch):
+    """Row 1 of the frozen precedence matrix: a heuristic-only deployment
+    ignores routing entirely -- there's no LLM to route to."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "heuristic")
+    monkeypatch.setattr(classifier, "call_chat_completion", _explode)
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify(
+        "Security alert: new login detected", routing=routing
+    )
+    assert label == "security_alert"
+    assert model_version == "heuristic-v1"
+
+
+def test_classify_precedence_local_available_wins_over_off_routing(monkeypatch):
+    """Row 2 of the matrix: a healthy local encoder's result is returned as
+    -is, never downgraded to heuristic just because routing says "off"."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test"))
+    routing = ClassificationRouting(mode="off", credential=None)
+    label, confidence, rationale, model_version = classify("anything at all", routing=routing)
+    assert label == "fyi"
+    assert model_version == "local:test"
+
+
+def test_classify_precedence_auto_backend_local_unavailable_falls_through_to_user(monkeypatch):
+    """Row 3 of the matrix: when the local encoder is unavailable, "auto"
+    falls through to the LLM path, and mode="user" spends that credential."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "auto")
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
+    credential = LlmCredential(
+        provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
+    )
+    captured = {}
+
+    def fake_call(cred, *, prompt, user_content, max_tokens):
+        captured["credential"] = cred
+        return json.dumps({"label": "promotional", "confidence": 0.7, "rationale": "sale"})
+
+    monkeypatch.setattr(classifier, "call_chat_completion", fake_call)
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify("50% off this weekend!", routing=routing)
+
+    assert label == "promotional"
+    assert model_version == "mistral:mistral-small"
+    assert captured["credential"] is credential

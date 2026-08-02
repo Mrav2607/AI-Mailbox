@@ -18,7 +18,7 @@ from app.services.nlp.extraction_run import (
     users_with_unclaimed_actionable_messages,
 )
 from app.services.nlp.persistence import upsert_classification
-from app.services.nlp.providers import extraction_feature_enabled
+from app.services.nlp.providers import extraction_feature_enabled, resolve_classification_routing
 
 # Sweep cap for each recovery-tick pass -- generous enough to drain a normal
 # backlog in one tick, cheap enough that a tick never runs long even for a
@@ -38,7 +38,12 @@ def classify_message(message_id: str) -> dict:
             message.snippet,
             message.body_text,
         )
-        label, confidence, rationale, model_version = classify(text_for_classification)
+        # A single message, so no per-run router (and its memo) is needed --
+        # resolve once, directly.
+        routing = resolve_classification_routing(db, thread.user_id) if thread else None
+        label, confidence, rationale, model_version = classify(
+            text_for_classification, routing=routing
+        )
         upsert_classification(
             db,
             message_id=message.id,

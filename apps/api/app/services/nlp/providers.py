@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from urllib.parse import SplitResult, urlsplit
@@ -410,3 +411,144 @@ def extraction_available(db: Session, user_id: UUID) -> bool:
         settings.action_extraction_enabled
         and resolve_extraction_credential(db, user_id).credential is not None
     )
+
+
+# ---------------------------------------------------------------------------
+# Classification BYOK routing
+#
+# Classification runs on every ingested message, not just the settled-verdict
+# subset extraction covers -- so a user who saves a key for extraction has NOT
+# agreed to pay for classifying every marketing email they receive. Hence a
+# SEPARATE per-credential opt-in (`classification_byok`) and a resolver that
+# is deliberately NOT the extraction one: extraction is fine decrypting one
+# row per credentialed user; classification would decrypt one row per message
+# for every user in a running ingest, presets-only, tri-state, no fallback.
+# ---------------------------------------------------------------------------
+
+# Presets only in v1: a custom endpoint's per-request destination re-check is
+# a synchronous DNS round-trip with a 3s deadline, unaffordable at one call
+# per ingested message. Presets are pinned server-side and need no such
+# check, so this resolver contains no code path that can perform DNS.
+_CLASSIFICATION_ELIGIBLE_PROVIDERS = tuple(PROVIDER_PRESETS.keys())
+
+# Bounded staleness for `ClassificationRouter`'s per-run memo. A Gmail ingest
+# classifies message-by-message for up to 30 minutes; a once-per-run decision
+# would mean un-ticking the opt-in checkbox has no effect until the run ends
+# -- during exactly the flood the opt-in exists to guard against.
+_ROUTING_TTL_SECONDS = 60.0
+
+
+@dataclass(frozen=True)
+class ClassificationRouting:
+    """
+    Tri-state routing decision for one classification call -- deliberately
+    NOT `Optional[LlmCredential]`. The classifier reads a bare `None` as
+    "use the operator's server key", so an optional type would silently bill
+    the operator for a user whose credential just became blocked or
+    ineligible. `credential` is set if and only if `mode == "user"`.
+    """
+
+    mode: str  # "user" | "server" | "off"
+    credential: LlmCredential | None
+
+
+def resolve_classification_routing(db: Session, user_id: UUID) -> ClassificationRouting:
+    """
+    Resolve who pays for classifying this user's messages, if and when the
+    LLM path is reached (routing never overrides `CLASSIFIER_BACKEND` or the
+    local encoder -- see `classifier.classify`).
+
+    Two-step read, and the ORDER is a security requirement, not an
+    optimization:
+
+    1. Project ONLY `(provider, classification_byok)` -- never select the
+       whole entity here. `api_key` is `EncryptedText`, which transparently
+       DECRYPTS on row materialization; selecting the entity just to read a
+       boolean would decrypt the plaintext key of every extraction-only user,
+       in every active ingest worker, once a minute.
+    2. Only when step 1 says opted-in AND the provider is a preset, issue a
+       SECOND read that re-asserts every condition in its OWN WHERE clause
+       (`user_id` AND `classification_byok IS true` AND `provider IN
+       presets`) and builds the credential from what THAT returns. The
+       predicate is never inherited from step 1's verdict: a PUT can rewrite
+       provider/key/model/revision with no read lock between these two
+       reads, and reusing step 1's answer could hand `mode="user"` to a
+       credential the user has since disabled or switched to custom.
+
+    Resolution:
+      - no row, or opted out -> `("server", None)` -- today's behavior, the
+        operator's key or the heuristic fallback.
+      - opted in, `provider == "custom"` -> `("off", None)`, decided from the
+        projected provider string alone. Presets-only in v1; no destination
+        check, no DNS.
+      - opted in, preset, second read returns zero rows -> `("off", None)`.
+        The state changed mid-resolve; erring to `off` rather than `server`
+        is deliberate -- an unresolvable race must never hand the bill to
+        the operator. The next refresh (see `ClassificationRouter`) settles
+        it either way.
+      - opted in, preset, second read confirms it -> `("user", credential)`.
+
+    A DB error propagates -- the caller is mid-ingest and about to write to
+    this same session, so swallowing it here would trade a loud failure for
+    a silent wrong-payer decision.
+    """
+    projection = db.execute(
+        select(UserLlmCredential.provider, UserLlmCredential.classification_byok).where(
+            UserLlmCredential.user_id == user_id
+        )
+    ).first()
+
+    if projection is None or not projection.classification_byok:
+        return ClassificationRouting(mode="server", credential=None)
+
+    if projection.provider not in _CLASSIFICATION_ELIGIBLE_PROVIDERS:
+        return ClassificationRouting(mode="off", credential=None)
+
+    row = db.execute(
+        select(UserLlmCredential).where(
+            UserLlmCredential.user_id == user_id,
+            UserLlmCredential.classification_byok.is_(True),
+            UserLlmCredential.provider.in_(_CLASSIFICATION_ELIGIBLE_PROVIDERS),
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        return ClassificationRouting(mode="off", credential=None)
+
+    credential = LlmCredential(
+        provider=row.provider, base_url=row.base_url, api_key=row.api_key, model=row.model
+    )
+    return ClassificationRouting(mode="user", credential=credential)
+
+
+class ClassificationRouter:
+    """
+    Per-run memo over `resolve_classification_routing`, re-reading every
+    `_ROUTING_TTL_SECONDS`. Constructed ONCE per ingest run (never inside a
+    per-message or per-page loop) and exposes `routing_for(db)`, which call
+    sites invoke once per message -- the memo makes that ~free between
+    refreshes.
+
+    Without this, a Gmail ingest classifying message-by-message for up to 30
+    minutes would resolve routing once at the start, so un-ticking the
+    consent box mid-run would have no effect until the run finished --
+    during precisely the flood the opt-in exists to guard against. Re-reading
+    every minute instead settles a revocation within a minute, at the cost of
+    one cheap indexed query per minute per run rather than one per message.
+    """
+
+    def __init__(self, user_id: UUID) -> None:
+        self._user_id = user_id
+        self._routing: ClassificationRouting | None = None
+        self._resolved_at: float | None = None
+
+    def routing_for(self, db: Session) -> ClassificationRouting:
+        now = time.monotonic()
+        if (
+            self._routing is None
+            or self._resolved_at is None
+            or now - self._resolved_at >= _ROUTING_TTL_SECONDS
+        ):
+            self._routing = resolve_classification_routing(db, self._user_id)
+            self._resolved_at = now
+        return self._routing
