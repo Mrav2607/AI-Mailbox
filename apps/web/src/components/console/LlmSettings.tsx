@@ -261,7 +261,7 @@ export function LlmSettingsModal({
             <button
               type="button"
               onClick={onTest}
-              disabled={!settings.configured || testing}
+              disabled={!settings.configured || testing || saving || removing}
               className="h-7 px-3 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
               {testing ? "testing…" : "test"}

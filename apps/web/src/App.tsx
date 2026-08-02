@@ -315,6 +315,12 @@ export default function Console() {
   // Bumped on every page-0 reset so a loadMore response that resolves after a
   // newer reset started can be told apart from the page it thinks it's for.
   const pagingGenRef = useRef(0);
+  // Bumped whenever a save or remove of the LLM credential completes (success
+  // or failure -- either way the stored credential may have changed). A test
+  // in flight across that boundary captures the generation before awaiting and
+  // discards its response if this has moved on, so a stale result never
+  // renders against a credential it didn't actually test.
+  const llmCredentialGenRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const liveSearchRef = useRef<LiveSearchController | null>(null);
 
@@ -655,6 +661,9 @@ export default function Console() {
       } catch (e) {
         toast.error((e as Error).message || "could not save these settings");
       } finally {
+        // The credential may have changed either way -- bump so any test that
+        // started before this save discards its response when it lands.
+        llmCredentialGenRef.current++;
         setLlmSaving(false);
       }
     },
@@ -662,15 +671,18 @@ export default function Console() {
   );
 
   const doTestLlmSettings = useCallback(async () => {
+    const generation = llmCredentialGenRef.current;
     setLlmTesting(true);
     setLlmTestResult(null);
     try {
       const res = await testLlmSettings();
+      if (generation !== llmCredentialGenRef.current) return; // credential changed mid-flight -- discard
       setLlmTestResult(res);
       // A successful test stamps last_verified_at server-side -- pull that
       // in so the modal reflects it without a second explicit refresh.
       if (res.ok) refreshLlmSettings();
     } catch (e) {
+      if (generation !== llmCredentialGenRef.current) return; // ditto for a stale failure
       toast.error((e as Error).message || "could not test this credential");
     } finally {
       setLlmTesting(false);
@@ -687,6 +699,7 @@ export default function Console() {
     } catch (e) {
       toast.error((e as Error).message || "could not remove this credential");
     } finally {
+      llmCredentialGenRef.current++;
       setLlmRemoving(false);
     }
   }, [refreshLlmSettings]);
