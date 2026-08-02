@@ -618,11 +618,26 @@ export default function Console() {
 
   // Opening always starts the modal from a clean test result -- otherwise a
   // stale ok/error from a previous visit would flash before the user does
-  // anything this time.
-  const openLlmSettings = useCallback(() => {
+  // anything this time. If the post-login fetch never landed (settings is
+  // still null), retry it here and await it -- otherwise every entry point
+  // into this modal (palette, accounts menu, agenda CTA) would silently do
+  // nothing on a bad connection.
+  const openLlmSettings = useCallback(async () => {
     setLlmTestResult(null);
+    if (!llmSettings) {
+      try {
+        setLlmSettings(await getLlmSettings());
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) {
+          handleSessionExpired();
+        } else {
+          toast.error((e as Error).message || "could not load AI settings");
+        }
+        return;
+      }
+    }
     setLlmSettingsOpen(true);
-  }, []);
+  }, [llmSettings, handleSessionExpired]);
 
   const doSaveLlmSettings = useCallback(
     async (input: {
@@ -2405,7 +2420,10 @@ export default function Console() {
           error={actionsError}
           onRowDoubleClick={isNarrow ? undefined : handleRowDoubleClick}
           noExtractionCoverage={
-            !!llmSettings && !llmSettings.configured && !llmSettings.fallback_active
+            !!llmSettings &&
+            llmSettings.extraction_enabled &&
+            !llmSettings.configured &&
+            !llmSettings.fallback_active
           }
           onSetupExtraction={openLlmSettings}
         />

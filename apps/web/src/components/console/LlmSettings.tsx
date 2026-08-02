@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import type { LlmProvider, LlmSettings, LlmTestResult } from "@/lib/types";
 
@@ -91,22 +91,37 @@ export function LlmSettingsModal({
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
 
-  // Reset the form to whatever's currently saved every time the modal opens
-  // (and whenever a save actually lands a new settings object) -- the key
-  // never repopulates, since the server never sends it back.
+  // A Test while the modal's open refetches `settings` in App -- track the
+  // latest copy in a ref (not state) so that refetch doesn't retrigger the
+  // reset effect below and clobber whatever the user's mid-typing.
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+
+  // Reset the form to whatever's currently saved only when the modal opens
+  // -- never on a later settings refetch, which would blow away unsaved
+  // edits. The key never repopulates, since the server never sends it back.
   useEffect(() => {
-    if (!open || !settings) return;
-    setProvider(settings.provider ?? "openai");
-    setModel(settings.model ?? "");
+    if (!open) return;
+    const current = settingsRef.current;
+    if (!current) return;
+    setProvider(current.provider ?? "openai");
+    setModel(current.model ?? "");
     setApiKey("");
-    setBaseUrl(settings.provider === "custom" ? (settings.base_url ?? "") : "");
-  }, [open, settings]);
+    setBaseUrl(current.provider === "custom" ? (current.base_url ?? "") : "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
 
   if (!settings) return null;
 
   const providers = settings.custom_endpoints_enabled
     ? [...PRESET_PROVIDERS, "custom" as const]
     : PRESET_PROVIDERS;
+
+  // `required` is satisfied by whitespace, but the submit path trims both of
+  // these before they hit the API -- catch that here so an all-spaces value
+  // never gets stored as a working model name or endpoint.
+  const modelBlank = model.trim() === "";
+  const baseUrlBlank = provider === "custom" && baseUrl.trim() === "";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -138,6 +153,7 @@ export function LlmSettingsModal({
         <form
           onSubmit={(e) => {
             e.preventDefault();
+            if (modelBlank || baseUrlBlank) return;
             onSave({
               provider,
               api_key: apiKey,
@@ -178,6 +194,11 @@ export function LlmSettingsModal({
               placeholder={MODEL_PLACEHOLDERS[provider]}
               className={control}
             />
+            {modelBlank && model.length > 0 && (
+              <span className="block text-[10.5px] text-destructive font-mono leading-snug">
+                model can&apos;t be just spaces
+              </span>
+            )}
           </label>
 
           {provider === "custom" && (
@@ -197,6 +218,11 @@ export function LlmSettingsModal({
                   ? "must start with https:// — or http:// / a private address, since this server allows private endpoints"
                   : "must start with https:// and point to a public address"}
               </span>
+              {baseUrlBlank && baseUrl.length > 0 && (
+                <span className="block text-[10.5px] text-destructive font-mono leading-snug">
+                  endpoint URL can&apos;t be just spaces
+                </span>
+              )}
             </label>
           )}
 
@@ -227,7 +253,7 @@ export function LlmSettingsModal({
           <div className="flex items-center gap-2 pt-1">
             <button
               type="submit"
-              disabled={saving}
+              disabled={saving || modelBlank || baseUrlBlank}
               className="h-7 px-3 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
               {saving ? "saving…" : "save"}
