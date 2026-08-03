@@ -474,6 +474,91 @@ describe("putLlmSettings", () => {
     expect(res.key_suffix).toBe("7890");
     expect(res.last_verified_at).toBeNull();
   });
+
+  it("passes classification_byok through to the request body when given", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({
+      configured: true,
+      provider: "groq",
+      model: "llama-3.1-8b-instant",
+      base_url: "https://api.groq.com/openai/v1",
+      key_suffix: "cdef",
+      last_verified_at: null,
+      extraction_enabled: true,
+      fallback_active: false,
+      custom_endpoints_enabled: false,
+      private_endpoints_enabled: false,
+      custom_blocked: false,
+      classification_byok: true,
+      classifier_uses_llm: true,
+      classifier_backend: "auto",
+      classification_eligible: true,
+    });
+    const input = {
+      provider: "groq" as const,
+      api_key: "gsk_live_abcdef",
+      model: "llama-3.1-8b-instant",
+      classification_byok: true,
+    };
+    const res = await api.putLlmSettings(input);
+    expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual(input);
+    expect(res.classification_byok).toBe(true);
+    expect(res.classification_eligible).toBe(true);
+  });
+
+  it("in mock mode, threads classification_byok through and reports eligibility", async () => {
+    const api = await importMockApi();
+    const res = await api.putLlmSettings({
+      provider: "mistral",
+      api_key: "mistral-key-7890",
+      model: "mistral-small",
+      classification_byok: true,
+    });
+    expect(res.classification_byok).toBe(true);
+    expect(res.classification_eligible).toBe(true);
+  });
+
+  it("omits api_key from the request body when left out -- never sends an empty string", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({
+      configured: true,
+      provider: "openai",
+      model: "gpt-4o-mini",
+      base_url: "https://api.openai.com/v1",
+      key_suffix: "abcd",
+      last_verified_at: null,
+      extraction_enabled: true,
+      fallback_active: false,
+      custom_endpoints_enabled: false,
+      private_endpoints_enabled: false,
+      custom_blocked: false,
+    });
+    await api.putLlmSettings({
+      provider: "openai",
+      model: "gpt-4o-mini",
+      classification_byok: true,
+    });
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect("api_key" in body).toBe(false);
+  });
+
+  it("in mock mode, omitting api_key preserves the existing key_suffix", async () => {
+    const api = await importMockApi();
+    const first = await api.putLlmSettings({
+      provider: "groq",
+      api_key: "gsk-live-first-1234",
+      model: "llama-3.1-8b-instant",
+    });
+    expect(first.key_suffix).toBe("1234");
+
+    const second = await api.putLlmSettings({
+      provider: "groq",
+      model: "llama-3.1-8b-instant",
+      classification_byok: true,
+    });
+    expect(second.key_suffix).toBe("1234");
+    expect(second.classification_byok).toBe(true);
+  });
 });
 
 describe("testLlmSettings", () => {

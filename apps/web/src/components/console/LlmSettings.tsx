@@ -10,9 +10,12 @@ interface Props {
   settings: LlmSettings | null;
   onSave: (input: {
     provider: LlmProvider;
-    api_key: string;
+    // Absent when the user leaves the field blank to keep an existing key --
+    // required only when there's nothing stored yet.
+    api_key?: string;
     model: string;
     base_url?: string;
+    classification_byok?: boolean;
   }) => void;
   saving: boolean;
   onTest: () => void;
@@ -54,6 +57,7 @@ const PRESET_PROVIDERS: LlmProvider[] = [
 // string -- to plain copy anyone can follow, regardless of first language.
 function testErrorMessage(error: string): string {
   if (error === "connection_failed") return "Could not reach the provider.";
+  if (error === "timed_out") return "The provider took too long to reply.";
   if (error === "http_401" || error === "http_403") {
     return "The provider rejected this key.";
   }
@@ -90,6 +94,7 @@ export function LlmSettingsModal({
   const [model, setModel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
+  const [classificationByok, setClassificationByok] = useState(false);
 
   // A Test while the modal's open refetches `settings` in App -- track the
   // latest copy in a ref (not state) so that refetch doesn't retrigger the
@@ -108,6 +113,7 @@ export function LlmSettingsModal({
     setModel(current.model ?? "");
     setApiKey("");
     setBaseUrl(current.provider === "custom" ? (current.base_url ?? "") : "");
+    setClassificationByok(current.classification_byok);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
@@ -154,11 +160,15 @@ export function LlmSettingsModal({
           onSubmit={(e) => {
             e.preventDefault();
             if (modelBlank || baseUrlBlank) return;
+            // A blank key on an already-configured credential means "keep
+            // what's stored" -- only a brand-new credential needs one.
+            const keepsExistingKey = apiKey.trim() === "" && settings.configured;
             onSave({
               provider,
-              api_key: apiKey,
+              ...(keepsExistingKey ? {} : { api_key: apiKey }),
               model: model.trim(),
               base_url: provider === "custom" ? baseUrl.trim() : undefined,
+              classification_byok: provider === "custom" ? false : classificationByok,
             });
           }}
           className="space-y-2.5"
@@ -173,6 +183,11 @@ export function LlmSettingsModal({
                 // A model name from one provider is almost never valid for
                 // another -- don't let a stale value slip through.
                 setModel("");
+                // Classification BYOK is presets-only -- a custom endpoint
+                // always saves with the flag cleared server-side, so clear
+                // it here too rather than show it checked next to a
+                // disabled, about-to-be-ignored control.
+                if (p === "custom") setClassificationByok(false);
               }}
               className={control}
             >
@@ -231,24 +246,61 @@ export function LlmSettingsModal({
             <input
               type="password"
               autoComplete="new-password"
-              required
+              required={!settings.configured}
               minLength={8}
               maxLength={512}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               placeholder={
                 settings.configured
-                  ? `enter a new key to replace ••••${settings.key_suffix}`
+                  ? "leave blank to keep your saved key"
                   : "paste your API key"
               }
               className={control}
             />
             <span className="block text-[10.5px] text-muted-foreground font-mono leading-snug">
               {settings.configured
-                ? `saving replaces the stored key (currently ending in ••••${settings.key_suffix})`
+                ? `leave this blank to keep your saved key (currently ending in ••••${settings.key_suffix})`
                 : "your key is encrypted, stored, and never shown again after you save it"}
             </span>
           </label>
+
+          {settings.classifier_uses_llm && (
+            <div className="space-y-1">
+              <label className="flex items-start gap-1.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={classificationByok}
+                  disabled={provider === "custom"}
+                  onChange={(e) => setClassificationByok(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span className="text-[12px] font-mono text-foreground leading-snug">
+                  Also use my key to sort incoming mail
+                </span>
+              </label>
+              <p className="text-[10.5px] font-mono text-muted-foreground leading-snug pl-[18px]">
+                {provider === "custom"
+                  ? "Not available for a custom endpoint yet -- only the providers above."
+                  : "Sorting runs on every email you receive, so it uses far more of your quota than the Agenda does. Off by default."}
+              </p>
+              {settings.classification_byok && !settings.classification_eligible && (
+                <p className="text-[11px] font-mono text-amber-500 leading-snug pl-[18px]">
+                  Your key isn&apos;t set up to sort your mail — the built-in rules are being
+                  used instead.
+                </p>
+              )}
+              {settings.classification_byok &&
+                settings.classification_eligible &&
+                (settings.classifier_backend === "local" ||
+                  settings.classifier_backend === "auto") && (
+                  <p className="text-[10.5px] font-mono text-muted-foreground leading-snug pl-[18px]">
+                    The built-in model sorts most mail on its own -- your key is only used
+                    when it can&apos;t.
+                  </p>
+                )}
+            </div>
+          )}
 
           <div className="flex items-center gap-2 pt-1">
             <button

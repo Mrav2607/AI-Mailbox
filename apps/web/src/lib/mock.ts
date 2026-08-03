@@ -612,6 +612,9 @@ const PRESET_BASE_URLS: Partial<Record<LlmProvider, string>> = {
 
 // Demo mode starts CONFIGURED so preview shows a live settings state instead
 // of the empty-state nudge. Mutable, same store pattern as CONNECTIONS above.
+// classification_byok starts true on this preset provider (classification_
+// eligible follows, true too) so preview shows the "local model handles most
+// mail, your key only backs it up" notice from the very first load.
 let LLM_SETTINGS: LlmSettings = {
   configured: true,
   provider: "openai",
@@ -624,6 +627,10 @@ let LLM_SETTINGS: LlmSettings = {
   custom_endpoints_enabled: false,
   private_endpoints_enabled: false,
   custom_blocked: false,
+  classification_byok: true,
+  classifier_uses_llm: true,
+  classifier_backend: "auto",
+  classification_eligible: true,
 };
 
 export function mockGetLlmSettings(): LlmSettings {
@@ -631,27 +638,44 @@ export function mockGetLlmSettings(): LlmSettings {
 }
 
 // Upserts the demo credential. Only the last 4 chars of the submitted key
-// ever get stored, same as the server -- and, like a real PUT, this always
-// clears last_verified_at, since a changed credential is unverified again.
+// ever get stored, same as the server. An absent key preserves the demo's
+// existing key_suffix -- mirroring the server's "nothing to replace it with"
+// rule -- and last_verified_at only clears when the key or another material
+// field actually changes, not on a flag-only edit.
 export function mockPutLlmSettings(input: {
   provider: LlmProvider;
-  api_key: string;
+  api_key?: string;
   model: string;
   base_url?: string;
+  classification_byok?: boolean;
 }): LlmSettings {
   const base_url =
     input.provider === "custom"
       ? (input.base_url ?? LLM_SETTINGS.base_url)
       : (PRESET_BASE_URLS[input.provider] ?? LLM_SETTINGS.base_url);
+  // Absent means "unchanged", same as the server. Unlike the real API, this
+  // deliberately does NOT force-clear the flag on a switch to "custom" --
+  // the demo exists to show both notice states, and a stored
+  // classification_byok=true against a custom provider is exactly the
+  // out-of-band shape the "isn't set up to sort your mail" notice covers.
+  const classificationByok = input.classification_byok ?? LLM_SETTINGS.classification_byok;
+  const key_suffix = input.api_key ? input.api_key.slice(-4) : LLM_SETTINGS.key_suffix;
+  const materialChanged =
+    Boolean(input.api_key) ||
+    input.provider !== LLM_SETTINGS.provider ||
+    base_url !== LLM_SETTINGS.base_url ||
+    input.model !== LLM_SETTINGS.model;
   LLM_SETTINGS = {
     ...LLM_SETTINGS,
     configured: true,
     provider: input.provider,
     model: input.model,
     base_url,
-    key_suffix: input.api_key.slice(-4),
-    last_verified_at: null,
+    key_suffix,
+    last_verified_at: materialChanged ? null : LLM_SETTINGS.last_verified_at,
     fallback_active: false,
+    classification_byok: classificationByok,
+    classification_eligible: input.provider === "custom" ? false : classificationByok,
   };
   return { ...LLM_SETTINGS };
 }
@@ -680,5 +704,11 @@ export function mockDeleteLlmSettings(): void {
     custom_endpoints_enabled: LLM_SETTINGS.custom_endpoints_enabled,
     private_endpoints_enabled: LLM_SETTINGS.private_endpoints_enabled,
     custom_blocked: false,
+    // No credential left to opt in -- classification falls back to the
+    // deployment default, same as extraction's fallback story above.
+    classification_byok: false,
+    classifier_uses_llm: LLM_SETTINGS.classifier_uses_llm,
+    classifier_backend: LLM_SETTINGS.classifier_backend,
+    classification_eligible: false,
   };
 }

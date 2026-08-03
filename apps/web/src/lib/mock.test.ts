@@ -226,6 +226,12 @@ describe("mock llm settings", () => {
     expect(settings.key_suffix).toBe("sk12");
     expect(settings.last_verified_at).not.toBeNull();
     expect(settings.fallback_active).toBe(false);
+    // Opted in on a preset provider from the start, so preview shows the
+    // "local model handles most mail" notice on first load.
+    expect(settings.classification_byok).toBe(true);
+    expect(settings.classifier_uses_llm).toBe(true);
+    expect(settings.classifier_backend).toBe("auto");
+    expect(settings.classification_eligible).toBe(true);
   });
 
   it("put derives key_suffix from the last 4 chars and clears last_verified_at", () => {
@@ -240,6 +246,42 @@ describe("mock llm settings", () => {
     expect(updated.key_suffix).toBe("1234");
     expect(updated.last_verified_at).toBeNull();
     expect(mockGetLlmSettings()).toEqual(updated);
+  });
+
+  it("put leaves classification_byok unchanged when the field is absent", () => {
+    // The prior test's PUT didn't touch classification_byok -- still true
+    // from the initial demo state.
+    const updated = mockPutLlmSettings({
+      provider: "groq",
+      api_key: "gsk_live_ignored123",
+      model: "llama-3.1-8b-instant",
+    });
+    expect(updated.classification_byok).toBe(true);
+    expect(updated.classification_eligible).toBe(true);
+  });
+
+  it("put turns classification_byok off on request, dropping eligibility with it", () => {
+    const updated = mockPutLlmSettings({
+      provider: "groq",
+      api_key: "gsk_live_abcd5678",
+      model: "llama-3.1-8b-instant",
+      classification_byok: false,
+    });
+    expect(updated.classification_byok).toBe(false);
+    expect(updated.classification_eligible).toBe(false);
+  });
+
+  it("put marks classification_eligible false for a custom provider even with the flag on -- the out-of-band notice state", () => {
+    const updated = mockPutLlmSettings({
+      provider: "custom",
+      api_key: "custom-key-eligible",
+      model: "local-model",
+      base_url: "https://my-endpoint.example/v1",
+      classification_byok: true,
+    });
+    expect(updated.provider).toBe("custom");
+    expect(updated.classification_byok).toBe(true);
+    expect(updated.classification_eligible).toBe(false);
   });
 
   it("put pins a preset's base_url, ignoring any caller-supplied value", () => {
@@ -274,6 +316,31 @@ describe("mock llm settings", () => {
     expect(after).not.toBe(before);
   });
 
+  it("put with an absent api_key preserves the key_suffix and last_verified_at on a flag-only edit", () => {
+    const before = mockGetLlmSettings();
+    expect(before.last_verified_at).not.toBeNull();
+    const updated = mockPutLlmSettings({
+      provider: "custom",
+      model: "local-model",
+      base_url: "https://my-endpoint.example/v1",
+      classification_byok: false,
+    });
+    expect(updated.key_suffix).toBe("9999");
+    expect(updated.last_verified_at).toBe(before.last_verified_at);
+    expect(updated.classification_byok).toBe(false);
+  });
+
+  it("put with a new api_key rotates the key_suffix and clears last_verified_at even when nothing else changed", () => {
+    const updated = mockPutLlmSettings({
+      provider: "custom",
+      api_key: "custom-key-rotated",
+      model: "local-model",
+      base_url: "https://my-endpoint.example/v1",
+    });
+    expect(updated.key_suffix).toBe("ated");
+    expect(updated.last_verified_at).toBeNull();
+  });
+
   it("delete resets to unconfigured with nulled fields", () => {
     mockDeleteLlmSettings();
     const settings = mockGetLlmSettings();
@@ -285,5 +352,12 @@ describe("mock llm settings", () => {
     expect(settings.last_verified_at).toBeNull();
     expect(settings.custom_blocked).toBe(false);
     expect(settings.fallback_active).toBe(true);
+    // No credential left to opt in -- classification falls back to the
+    // deployment default; the effective-backend fields are untouched by
+    // deleting a credential.
+    expect(settings.classification_byok).toBe(false);
+    expect(settings.classification_eligible).toBe(false);
+    expect(settings.classifier_uses_llm).toBe(true);
+    expect(settings.classifier_backend).toBe("auto");
   });
 });

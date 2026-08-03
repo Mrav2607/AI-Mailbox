@@ -648,9 +648,12 @@ export default function Console() {
   const doSaveLlmSettings = useCallback(
     async (input: {
       provider: LlmProvider;
-      api_key: string;
+      // Optional: omitted on an update means "keep the saved key", so a user
+      // who no longer has the raw string can still change other settings.
+      api_key?: string;
       model: string;
       base_url?: string;
+      classification_byok?: boolean;
     }) => {
       setLlmSaving(true);
       try {

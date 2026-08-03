@@ -5,10 +5,23 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timezone
 
-import httpx
-
 from app.core.logging import logger
-from app.services.nlp.providers import DestinationRejected, LlmCredential, pin_custom_destination
+from app.services.nlp.llm_client import LlmCallError, call_chat_completion
+from app.services.nlp.providers import LlmCredential
+
+# Kept as an alias so existing importers of the old name (tests included)
+# don't break -- the wire call and its error type moved to llm_client, but
+# this module still owns extraction's category-to-result mapping.
+ExtractionCallError = LlmCallError
+
+# The extraction call's own token budget -- classification (a different
+# caller of call_chat_completion) sets its own.
+_MAX_TOKENS = 512
+
+# The extraction call truncates the message body before sending it -- kept
+# here since it's specific to how extraction builds its user content, not a
+# wire-level concern.
+_MESSAGE_TEXT_MAX_LEN = 6000
 
 # Labels the classifier can assign that make a message eligible for
 # second-stage extraction (needs a reply, or a concrete off-email task).
@@ -51,25 +64,6 @@ class NoAction:
     which means the attempt itself failed (call/parse error) and is still
     retryable.
     """
-
-
-class ExtractionCallError(Exception):
-    """
-    The single internal failure carrier for `_call_llm`: every failure mode
-    -- destination policy, connection, non-2xx, or a malformed response
-    shape -- raises this instead of letting an unrelated exception type
-    escape. `category` is one of connection_failed | http_<status> |
-    invalid_response | blocked_by_policy; `status` is the HTTP status code
-    when one exists, else `None`. `extract_action` maps this to the
-    unchanged public `None` contract; `test_credential` maps it to the
-    /test route's category set directly -- neither derives a category from
-    a lossy `None`.
-    """
-
-    def __init__(self, category: str, status: int | None) -> None:
-        self.category = category
-        self.status = status
-        super().__init__(category)
 
 
 def _build_message_text(
@@ -227,116 +221,18 @@ def _parse_extraction(content: str, *, model_version: str) -> ExtractedAction | 
     )
 
 
-def _raise_invalid_response(provider: str, status: int) -> None:
-    logger.warning("Action extraction returned a malformed response shape for provider %s", provider)
-    raise ExtractionCallError("invalid_response", status)
-
-
 def _call_llm(credential: LlmCredential, prompt: str, message_text: str) -> str:
     """
-    Perform the OpenAI-compatible chat-completions call and return the raw
-    `choices[0].message.content` string. Raises `ExtractionCallError` on
-    every failure -- the single internal failure carrier.
-
-    For `provider="custom"` the destination policy is re-run and PINNED
-    FIRST, immediately before this specific request: a sweep resolves
-    credentials once but can run for minutes, so a DNS answer or a flag
-    flipping non-global between two calls must block the second one before
-    any request leaves. Re-validating and then handing httpx the same
-    hostname would still leave a TOCTOU window -- httpx does its own DNS
-    lookup, and a hostname can answer public for the check and private for
-    that lookup microseconds later. `pin_custom_destination` closes it: we
-    connect to the exact address just validated, so httpx never resolves
-    the hostname itself.
+    Thin wrapper around the shared wire call (`llm_client.call_chat_completion`)
+    that adds extraction's own framing -- the "Email:" label and the 6000-char
+    truncation -- around the message text. Raises `ExtractionCallError`
+    (== `LlmCallError`) on every failure, unchanged from before the wire call
+    moved to `llm_client`.
     """
-    pinned = None
-    if credential.provider == "custom":
-        try:
-            pinned = pin_custom_destination(credential.base_url)
-        except DestinationRejected as exc:
-            raise ExtractionCallError("blocked_by_policy", None) from exc
-
-    body = {
-        "model": credential.model,
-        "messages": [
-            {"role": "user", "content": f"{prompt}\n\nEmail:\n{message_text[:6000]}"}
-        ],
-        "response_format": {"type": "json_object"},
-        "max_tokens": 512,
-    }
-
-    if pinned is not None:
-        url = f"{pinned.url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {credential.api_key}",
-            # The server on the other end still needs the hostname it was
-            # configured with, even though we're connecting to its IP.
-            "Host": pinned.host_header,
-        }
-        # None for http, or when the host was already an IP literal -- the
-        # SNI extension of the TLS ClientHello is meaningless there, and
-        # httpx would otherwise send the bare IP as both SNI and the
-        # hostname it verifies the certificate against.
-        extensions = {"sni_hostname": pinned.sni_hostname} if pinned.sni_hostname else None
-    else:
-        url = f"{credential.base_url}/chat/completions"
-        headers = {"Authorization": f"Bearer {credential.api_key}"}
-        extensions = None
-
-    # trust_env=False is mandatory: httpx otherwise honors HTTP(S)_PROXY/
-    # ALL_PROXY env vars and would route the bearer credential through a
-    # proxy address the destination policy never validated. Redirects are
-    # never followed (httpx's default) -- a 3xx is a call failure, not
-    # something to chase, but `raise_for_status()` alone only raises on
-    # 4xx/5xx, so a 3xx (never followed) would otherwise fall through to
-    # `response.json()` and surface as `invalid_response` instead of the
-    # `http_<status>` it actually is. Check `is_success` explicitly first.
-    try:
-        with httpx.Client(timeout=30.0, trust_env=False) as client:
-            response = client.post(
-                url,
-                headers=headers,
-                json=body,
-                extensions=extensions,
-            )
-            if not response.is_success:
-                status = response.status_code
-                logger.warning(
-                    "Action extraction call failed for provider %s: http_%s",
-                    credential.provider, status,
-                )
-                raise ExtractionCallError(f"http_{status}", status)
-    except httpx.HTTPError as exc:
-        logger.warning(
-            "Action extraction call failed for provider %s: %s",
-            credential.provider, type(exc).__name__,
-        )
-        raise ExtractionCallError("connection_failed", None) from exc
-
-    try:
-        payload = response.json()
-    except json.JSONDecodeError as exc:
-        logger.warning(
-            "Action extraction returned unparseable JSON for provider %s: %s",
-            credential.provider, type(exc).__name__,
-        )
-        raise ExtractionCallError("invalid_response", response.status_code) from exc
-
-    # Explicit shape checks -- never let an uncaught IndexError/KeyError/
-    # TypeError leak out of a malformed but "successful" reply.
-    choices = payload.get("choices") if isinstance(payload, dict) else None
-    if not isinstance(choices, list) or not choices:
-        _raise_invalid_response(credential.provider, response.status_code)
-
-    message = choices[0].get("message") if isinstance(choices[0], dict) else None
-    if not isinstance(message, dict):
-        _raise_invalid_response(credential.provider, response.status_code)
-
-    content = message.get("content")
-    if not isinstance(content, str):
-        _raise_invalid_response(credential.provider, response.status_code)
-
-    return content
+    user_content = f"Email:\n{message_text[:_MESSAGE_TEXT_MAX_LEN]}"
+    return call_chat_completion(
+        credential, prompt=prompt, user_content=user_content, max_tokens=_MAX_TOKENS
+    )
 
 
 def extract_action(

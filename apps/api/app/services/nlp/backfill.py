@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.db.models import MailThread, MailMessage, Classification
 from app.services.nlp.classifier import classify, build_classification_text
 from app.services.nlp.persistence import upsert_classification
+from app.services.nlp.providers import ClassificationRouter
 
 
 def latest_message_ordering():
@@ -168,6 +169,11 @@ def run_backfill(
     # idle-in-transaction on a pooled connection while that runs.
     db.commit()
 
+    # One router for the whole run -- its 60s memo keeps a mid-run opt-out
+    # effective within a minute without re-resolving routing per message (see
+    # ClassificationRouter).
+    classification_router = ClassificationRouter(user_id)
+
     batch_size = 25
     created = 0
     pending: list[tuple[UUID, str | None, float | None, str | None, str | None]] = []
@@ -190,8 +196,9 @@ def run_backfill(
     # Classify outside any transaction, then commit results in small batches so
     # a late classifier failure only loses the current batch, not the whole run.
     for message_id, text_for_classification in to_classify:
+        routing = classification_router.routing_for(db)
         label, confidence, rationale, model_version = classify(
-            text_for_classification, backend=backend
+            text_for_classification, backend=backend, routing=routing
         )
         pending.append((message_id, label, confidence, rationale, model_version))
         if len(pending) >= batch_size:

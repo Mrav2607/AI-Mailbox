@@ -47,6 +47,7 @@ from app.services.ingest.outlook_client import (
 )
 from app.services.nlp.classifier import build_classification_text, classify
 from app.services.nlp.persistence import upsert_classification
+from app.services.nlp.providers import ClassificationRouter
 
 # Inbox first: it's the folder users actually triage, so it gets first claim
 # on a bounded run's message/page budget.
@@ -293,8 +294,15 @@ def _upsert_page_messages(
     folder_key: str,
     messages: list[dict[str, Any]],
     classify_messages: bool,
+    classification_router: ClassificationRouter,
 ) -> dict[str, int]:
-    """Upsert one delta page's messages (and their threads) for one folder."""
+    """Upsert one delta page's messages (and their threads) for one folder.
+
+    ``classification_router`` is built ONCE by the caller (`ingest_outlook_
+    messages`), not here -- this helper runs once per delta page, so
+    constructing it in here would restart the 60s memo (and re-query) every
+    page instead of once per run.
+    """
     threads_upserted = 0
     messages_upserted = 0
     classified = 0
@@ -373,7 +381,10 @@ def _upsert_page_messages(
                     normalized.get("snippet"),
                     normalized.get("body_text"),
                 )
-                label, confidence, rationale, model_version = classify(text_for_classification)
+                routing = classification_router.routing_for(db)
+                label, confidence, rationale, model_version = classify(
+                    text_for_classification, routing=routing
+                )
                 upsert_classification(
                     db,
                     message_id=new_message_id,
@@ -461,6 +472,11 @@ def ingest_outlook_messages(
                 return call()
             raise
 
+    # Built once per run, here in the page loop's caller -- never inside
+    # _upsert_page_messages, which runs once per delta page and would
+    # otherwise restart the 60s memo (and re-query routing) every page.
+    classification_router = ClassificationRouter(user_id)
+
     remaining = max_results
     pages_done = 0
     stats = {
@@ -540,7 +556,8 @@ def ingest_outlook_messages(
                 break
 
             upsert_stats = _upsert_page_messages(
-                db, user_id, provider, folder_key, messages, classify_messages
+                db, user_id, provider, folder_key, messages, classify_messages,
+                classification_router,
             )
             removal_stats = with_token_retry(
                 lambda deduped_removed=deduped_removed: _apply_removals(

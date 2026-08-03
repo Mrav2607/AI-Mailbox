@@ -324,6 +324,91 @@ def test_a_401_from_the_token_endpoint_is_our_problem_not_the_users(monkeypatch,
     assert paused == {}
 
 
+def test_classification_router_is_built_once_per_run_not_once_per_message(monkeypatch):
+    # ClassificationRouter's 60s memo only pays off if one instance lives for
+    # the whole run -- rebuilding it per message would restart that memo (and
+    # re-query routing) on every single message instead of once a minute. The
+    # other half of the contract, routing_for called per message, is what
+    # lets a mid-run consent revocation take effect within a minute.
+    from app.services.nlp.providers import ClassificationRouting
+
+    # A regression that keeps every router call intact but drops `routing=`
+    # from the `classify()` call would still pass every assertion above --
+    # so we also need to prove this exact routing object is what `classify`
+    # actually receives, not just that routing_for got called.
+    SENTINEL_ROUTING = ClassificationRouting(mode="off", credential=None)
+
+    router_instances = []
+    routing_calls = []
+    classify_calls = []
+
+    class CountingRouter:
+        def __init__(self, user_id):
+            router_instances.append(user_id)
+
+        def routing_for(self, db):
+            routing_calls.append(db)
+            return SENTINEL_ROUTING
+
+    def fake_classify(text, *, routing):
+        classify_calls.append(routing)
+        return ("other", 0.5, "stub", "test-model")
+
+    monkeypatch.setattr(gmail_ingest, "ClassificationRouter", CountingRouter)
+    monkeypatch.setattr(gmail_ingest, "classify", fake_classify)
+
+    provider = MagicMock(access_token="tok", token_expiry=None, gmail_history_id="4242")
+
+    def execute(stmt):
+        sql = str(stmt).lower()
+        result = MagicMock()
+        if "from provider_account" in sql:
+            result.scalars.return_value.first.return_value = provider
+        elif "from mail_thread" in sql and "provider_thread_id" in sql:
+            result.scalars.return_value.all.return_value = []
+        elif "insert into mail_thread" in sql:
+            result.scalar_one.return_value = uuid4()
+        elif "insert into mail_message" in sql:
+            result.scalar_one.return_value = uuid4()
+        elif "from classification" in sql:
+            # No prior classification for either message -- both must
+            # actually reach the classifier, not get skipped as "already done".
+            result.scalars.return_value.first.return_value = None
+        return result
+
+    db = MagicMock()
+    db.execute.side_effect = execute
+    # Thread reopen bookkeeping (`db.get(MailThread, ...)`) is orthogonal to
+    # this contract -- None keeps that branch a no-op.
+    db.get.return_value = None
+
+    client = MagicMock()
+    client.list_history.return_value = {
+        "historyId": "4300",
+        "history": [
+            {"messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}]}
+        ],
+    }
+    client.get_thread.return_value = {
+        "messages": [
+            {"id": "m1", "threadId": "t1", "payload": {"headers": []}, "snippet": "hi"},
+            {"id": "m2", "threadId": "t1", "payload": {"headers": []}, "snippet": "there"},
+        ]
+    }
+    monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
+
+    result = ingest_gmail_messages(db, "u1", new_only=True)
+
+    assert result["messages_upserted"] == 2
+    assert result["classified"] == 2
+    assert router_instances == ["u1"]
+    assert len(routing_calls) == 2
+    # Both messages' classify calls got the router's actual routing object --
+    # not a dropped kwarg silently falling back to DEFAULT SERVER ROUTING.
+    assert len(classify_calls) == 2
+    assert all(routing is SENTINEL_ROUTING for routing in classify_calls)
+
+
 def test_a_non_json_400_is_not_mistaken_for_a_revoked_token(monkeypatch, google_creds):
     provider = MagicMock(id=uuid4(), refresh_token="rt")
     paused = {}

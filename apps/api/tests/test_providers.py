@@ -17,7 +17,10 @@ import pytest
 from app.services.nlp import providers
 from app.services.nlp.providers import (
     PROVIDER_PRESETS,
+    ClassificationRouter,
+    ClassificationRouting,
     DestinationRejected,
+    LlmCredential,
     PinnedDestination,
     ResolvedExtraction,
     assert_url_still_allowed,
@@ -25,6 +28,7 @@ from app.services.nlp.providers import (
     extraction_available,
     extraction_feature_enabled,
     pin_custom_destination,
+    resolve_classification_routing,
     resolve_extraction_credential,
     resolve_preset_base_url,
     validate_custom_base_url,
@@ -548,3 +552,242 @@ def test_pin_custom_destination_rejects_malformed_url_instead_of_500ing(monkeypa
     with pytest.raises(DestinationRejected) as exc_info:
         pin_custom_destination("https://[::1/v1")
     assert exc_info.value.reason == "destination_rejected"
+
+
+# ---------------------------------------------------------------------------
+# resolve_classification_routing: tri-state, two-step read, no DNS ever.
+#
+# _FakeClassificationDB answers the up-to-two SELECTs resolve_classification_
+# routing issues. It's constructed with one item per resolve() call: `None`
+# means the projection read finds no row at all; `(provider, byok, full_row)`
+# means it does, where `full_row` is what the second (re-asserted) read
+# returns -- or `None` to simulate the race where the row changed underneath
+# the first read. Statements are captured so a test can assert the projection
+# never selects `api_key`.
+# ---------------------------------------------------------------------------
+
+
+class _RoutingResult:
+    def __init__(self, row):
+        self._row = row
+
+    def first(self):
+        return self._row
+
+    def scalar_one_or_none(self):
+        return self._row
+
+
+class _FakeClassificationDB:
+    def __init__(self, *reads):
+        self._queue = list(reads)
+        self._pending = None
+        self.statements = []
+
+    def execute(self, stmt):
+        self.statements.append(stmt)
+        cols = [c.key for c in stmt.selected_columns]
+        if cols == ["provider", "classification_byok"]:
+            item = self._queue.pop(0)
+            self._pending = item
+            if item is None:
+                return _RoutingResult(None)
+            provider, byok, _full = item
+            return _RoutingResult(SimpleNamespace(provider=provider, classification_byok=byok))
+        # The second (re-asserted) read -- only reached when the pending
+        # projection said opted-in + preset.
+        _provider, _byok, full = self._pending
+        return _RoutingResult(full)
+
+
+def _make_classification_row(provider="openai", api_key="user-key-1234", model="gpt-4o-mini"):
+    return SimpleNamespace(
+        provider=provider,
+        base_url=PROVIDER_PRESETS.get(provider, "https://example.com/v1"),
+        api_key=api_key,
+        model=model,
+    )
+
+
+def test_resolve_classification_routing_no_row_returns_server():
+    db = _FakeClassificationDB(None)
+    routing = resolve_classification_routing(db, uuid4())
+    assert routing == ClassificationRouting(mode="server", credential=None)
+    assert len(db.statements) == 1  # opted out (implicitly) -- no second read
+
+
+def test_resolve_classification_routing_opt_in_false_returns_server():
+    db = _FakeClassificationDB(("openai", False, None))
+    routing = resolve_classification_routing(db, uuid4())
+    assert routing == ClassificationRouting(mode="server", credential=None)
+    assert len(db.statements) == 1
+
+
+def test_resolve_classification_routing_opt_in_true_custom_returns_off():
+    """Presets-only in v1: a custom provider resolves to `off` from the
+    projected provider string alone -- never a second read, never DNS."""
+    db = _FakeClassificationDB(("custom", True, None))
+    routing = resolve_classification_routing(db, uuid4())
+    assert routing == ClassificationRouting(mode="off", credential=None)
+    assert len(db.statements) == 1
+
+
+def test_resolve_classification_routing_opt_in_true_preset_returns_user():
+    full = _make_classification_row(provider="openai", api_key="user-key-1234", model="gpt-4o-mini")
+    db = _FakeClassificationDB(("openai", True, full))
+    routing = resolve_classification_routing(db, uuid4())
+    assert routing.mode == "user"
+    assert routing.credential == LlmCredential(
+        provider="openai",
+        base_url=PROVIDER_PRESETS["openai"],
+        api_key="user-key-1234",
+        model="gpt-4o-mini",
+    )
+    assert len(db.statements) == 2  # the re-asserted second read did fire
+
+
+def test_resolve_classification_routing_second_read_empty_resolves_off():
+    """A PUT landing between the two reads (toggle off, or switch to custom)
+    must resolve to `off`, never `server` -- an unresolvable race must never
+    hand the bill to the operator."""
+    db = _FakeClassificationDB(("openai", True, None))
+    routing = resolve_classification_routing(db, uuid4())
+    assert routing == ClassificationRouting(mode="off", credential=None)
+
+
+def test_resolve_classification_routing_projection_never_selects_api_key():
+    """The step-1 read must project only (provider, classification_byok) --
+    never the whole entity, or `api_key` (EncryptedText) gets decrypted just
+    to read a boolean, for every extraction-only user, once a minute."""
+    db = _FakeClassificationDB(("openai", False, None))
+    resolve_classification_routing(db, uuid4())
+    cols = [c.key for c in db.statements[0].selected_columns]
+    assert cols == ["provider", "classification_byok"]
+    assert "api_key" not in cols
+
+
+def test_resolve_classification_routing_second_read_uses_columns_not_stale_entity():
+    """Regression for the identity-map hazard: if step 2 issued
+    `select(UserLlmCredential)` (the whole entity) instead of projecting
+    columns, a Session that already loaded this same row earlier in an
+    uncommitted ingest/backfill batch would hand back that cached instance
+    instead of re-reading -- so a key/model rotated mid-batch would stay
+    stale for the rest of it, past the 60s TTL. This fake answers an
+    entity-style statement with a STALE row and a column-style one with a
+    FRESH row, so a resolver that regressed to an entity select here would
+    get caught returning the stale key/model."""
+    stale = _make_classification_row(provider="openai", api_key="stale-key-0000", model="gpt-4o")
+    fresh = _make_classification_row(provider="openai", api_key="fresh-key-9999", model="gpt-4o-mini")
+
+    class _StaleVsFreshDB:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, stmt):
+            self.statements.append(stmt)
+            cols = [c.key for c in stmt.selected_columns]
+            if cols == ["provider", "classification_byok"]:
+                return _RoutingResult(SimpleNamespace(provider="openai", classification_byok=True))
+            if set(cols) == {"provider", "base_url", "api_key", "model"}:
+                return _RoutingResult(fresh)
+            # Any other shape (e.g. the old `select(UserLlmCredential)`)
+            # simulates the identity map handing back the stale instance.
+            return _RoutingResult(stale)
+
+    db = _StaleVsFreshDB()
+    routing = resolve_classification_routing(db, uuid4())
+
+    assert routing.mode == "user"
+    assert routing.credential.api_key == "fresh-key-9999"
+    assert routing.credential.model == "gpt-4o-mini"
+
+    second_read_cols = [c.key for c in db.statements[1].selected_columns]
+    assert set(second_read_cols) == {"provider", "base_url", "api_key", "model"}
+    # The full mapped entity carries `id` (among others); a column select
+    # doesn't -- confirms this isn't just a same-length coincidence.
+    assert "id" not in second_read_cols
+
+
+def test_resolve_classification_routing_never_triggers_dns(monkeypatch):
+    """Classification routing must never call the destination policy --
+    presets are pinned and custom never reaches the user path, so there's
+    no code path here that can perform DNS."""
+
+    def boom(*args, **kwargs):
+        raise AssertionError("classification routing must never resolve DNS")
+
+    monkeypatch.setattr(providers.socket, "getaddrinfo", boom)
+    full = _make_classification_row(provider="gemini")
+    db = _FakeClassificationDB(("gemini", True, full))
+    routing = resolve_classification_routing(db, uuid4())
+    assert routing.mode == "user"
+
+
+# ---------------------------------------------------------------------------
+# ClassificationRouter: 60s memo, constructed once per run
+# ---------------------------------------------------------------------------
+
+
+def test_classification_router_memoizes_within_ttl(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_resolve(db, user_id):
+        calls["n"] += 1
+        return ClassificationRouting(mode="server", credential=None)
+
+    monkeypatch.setattr(providers, "resolve_classification_routing", fake_resolve)
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(providers.time, "monotonic", lambda: clock["t"])
+
+    router = ClassificationRouter(uuid4())
+    first = router.routing_for(object())
+    assert calls["n"] == 1
+    clock["t"] += 30.0  # well within the 60s TTL
+    second = router.routing_for(object())
+    assert calls["n"] == 1
+    assert first is second
+
+
+def test_classification_router_reexecutes_after_ttl(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_resolve(db, user_id):
+        calls["n"] += 1
+        return ClassificationRouting(mode="server", credential=None)
+
+    monkeypatch.setattr(providers, "resolve_classification_routing", fake_resolve)
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(providers.time, "monotonic", lambda: clock["t"])
+
+    router = ClassificationRouter(uuid4())
+    router.routing_for(object())
+    assert calls["n"] == 1
+    clock["t"] += 60.0
+    router.routing_for(object())
+    assert calls["n"] == 2
+
+
+def test_classification_router_revoked_opt_in_flips_within_ttl_window(monkeypatch):
+    """A user un-ticking the opt-in mid-run must flip `mode` within one
+    refresh window -- not wait for the whole ingest run to finish."""
+    credential = LlmCredential(
+        provider="openai", base_url=PROVIDER_PRESETS["openai"], api_key="k", model="gpt-4o-mini"
+    )
+    decisions = iter(
+        [
+            ClassificationRouting(mode="user", credential=credential),
+            ClassificationRouting(mode="off", credential=None),
+        ]
+    )
+    monkeypatch.setattr(
+        providers, "resolve_classification_routing", lambda db, user_id: next(decisions)
+    )
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(providers.time, "monotonic", lambda: clock["t"])
+
+    router = ClassificationRouter(uuid4())
+    first = router.routing_for(object())
+    assert first.mode == "user"
+    clock["t"] += 60.0
+    second = router.routing_for(object())
+    assert second.mode == "off"

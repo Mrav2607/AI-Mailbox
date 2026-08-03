@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -56,6 +57,12 @@ class UserLlmCredential(Base):
     # credential replaced mid-test can never be marked verified by the old
     # credential's test call.
     revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    # Separate from having a credential at all: extraction runs on a settled
+    # verdict subset, classification runs on every ingested message, so a
+    # user who opts a key into one has NOT agreed to pay for the other.
+    classification_byok: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default="now()"
     )

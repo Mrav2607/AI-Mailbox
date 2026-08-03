@@ -7,6 +7,8 @@ import httpx
 
 from app.core.config import settings
 from app.core.logging import logger
+from app.services.nlp.llm_client import LlmCallError, call_chat_completion
+from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
 LABELS = (
     "needs_reply",
@@ -82,7 +84,11 @@ def _parse_llm_response(content: str) -> tuple[str, float, str]:
     return label, float(confidence), str(rationale)
 
 
-def classify(text: str, backend: str | None = None) -> tuple[str, float, str, str]:
+def classify(
+    text: str,
+    backend: str | None = None,
+    routing: ClassificationRouting | None = None,
+) -> tuple[str, float, str, str]:
     """
     Classify an email into the 6-label taxonomy.
     Returns (label, confidence, rationale, model_version).
@@ -94,6 +100,16 @@ def classify(text: str, backend: str | None = None) -> tuple[str, float, str, st
       - "gemini":    LLM with heuristic fallback (the original behavior).
       - "heuristic": keyword rules only.
       - "auto":      try local, then LLM, then heuristic.
+
+    `routing` (see `providers.ClassificationRouting`) decides WHO PAYS if and
+    only if the LLM path is actually reached -- it never overrides `backend`
+    and never bypasses a locally-available encoder, since local inference is
+    free for everyone and spending anyone's key instead would be strictly
+    worse. `None` and `mode="server"` are byte-identical to the pre-BYOK
+    behavior (the operator's key or heuristic); `mode="user"` spends the
+    caller's own credential via the shared OpenAI-compatible wire client;
+    `mode="off"` classifies heuristically without calling any LLM at all, so
+    neither key is spent.
     """
     backend = (backend or settings.classifier_backend or "auto").lower()
 
@@ -108,7 +124,7 @@ def classify(text: str, backend: str | None = None) -> tuple[str, float, str, st
             return result
         # local unavailable -> fall through to the LLM / heuristic path
 
-    return _classify_llm(text)
+    return _classify_llm(text, routing)
 
 
 @lru_cache(maxsize=1)
@@ -126,13 +142,12 @@ def _genai_client():
     )
 
 
-def _classify_llm(text: str) -> tuple[str, float, str, str]:
-    """LLM-backed classifier with heuristic fallback."""
-    if not settings.gemini_api_key:
-        return _heuristic_classify(text)
-
-    prompt = (
-        "You classify an email into exactly ONE label, from the RECIPIENT's point "
+# Shared by both LLM paths (native google-genai on the server key, and the
+# OpenAI-compat call on a user's BYOK credential) -- the BYOK path's fallback
+# test asserts the SAME strict parse a bad reply hits either way, so the two
+# paths must be judging the model against identical wording.
+_CLASSIFICATION_PROMPT = (
+    "You classify an email into exactly ONE label, from the RECIPIENT's point "
         "of view. Decide what the recipient must actually DO.\n\n"
         "Labels:\n"
         "- needs_reply: the recipient is personally expected to WRITE BACK. A real "
@@ -170,6 +185,58 @@ def _classify_llm(text: str) -> tuple[str, float, str, str]:
         "- 'New sign-in to your account from a new device' -> security_alert\n\n"
         "Return JSON only with keys: label, confidence (0-1), rationale."
     )
+
+# The BYOK classification call's own token budget -- a label/confidence/
+# rationale reply is far smaller than extraction's structured JSON, so this
+# is deliberately tighter than extractor.py's 512.
+_CLASSIFICATION_MAX_TOKENS = 200
+
+# Classification runs once per ingested message, so a hung endpoint at
+# extraction's 30s default could stall a whole Gmail sweep for hours before
+# degrading to the heuristic. A tiny JSON label doesn't need that headroom --
+# extractor.py stays at 30s since it only runs over a bounded subset of
+# messages and produces longer output. This is a TOTAL wall-clock budget for
+# the call, so it's a real per-message ceiling: worst case a full sweep costs
+# this many seconds times the message count, and never more.
+_CLASSIFICATION_TIMEOUT_S = 10.0
+
+
+def _classify_llm(
+    text: str, routing: ClassificationRouting | None = None
+) -> tuple[str, float, str, str]:
+    """
+    Dispatch to the LLM path that pays for this call, per `routing`
+    (see `providers.ClassificationRouting` and `classify`'s docstring for the
+    full precedence rules). `None`/`mode="server"` is the unchanged native
+    google-genai path; `mode="user"` is the OpenAI-compatible BYOK path;
+    `mode="off"` never calls either -- straight to the heuristic classifier,
+    so the operator is never billed for a message the user opted out of.
+    """
+    if routing is not None and routing.mode == "off":
+        return _heuristic_classify(text)
+
+    if routing is not None and routing.mode == "user":
+        if routing.credential is None:
+            # This should never happen -- "user" mode is supposed to always carry
+            # a credential -- but `assert` gets stripped under `-O`, and a plain
+            # AttributeError from call_chat_completion() isn't an LlmCallError, so
+            # it would escape classify() and blow up the whole ingest run instead
+            # of degrading gracefully. Heuristic, not the server path: a broken
+            # invariant must never silently bill the operator for a user who
+            # opted in with their own key.
+            logger.warning("ClassificationRouting mode='user' had no credential")
+            return _heuristic_classify(text)
+        return _classify_llm_user(text, routing.credential)
+
+    return _classify_llm_server(text)
+
+
+def _classify_llm_server(text: str) -> tuple[str, float, str, str]:
+    """LLM-backed classifier with heuristic fallback, on the operator's
+    Gemini key. Unchanged from before BYOK classification existed."""
+    if not settings.gemini_api_key:
+        return _heuristic_classify(text)
+
     # Each step below catches only what it can actually fail with. The old blanket
     # `except Exception` also swallowed our own bugs -- a typo in here came back as
     # a confident heuristic answer instead of a 500, which is exactly how a broken
@@ -188,7 +255,7 @@ def _classify_llm(text: str) -> tuple[str, float, str, str]:
     try:
         response = _genai_client().models.generate_content(
             model=settings.gemini_model,
-            contents=f"{prompt}\n\nEmail:\n{text[:6000]}",
+            contents=f"{_CLASSIFICATION_PROMPT}\n\nEmail:\n{text[:6000]}",
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
     except (genai_errors.APIError, httpx.HTTPError, TimeoutError) as exc:
@@ -202,3 +269,40 @@ def _classify_llm(text: str) -> tuple[str, float, str, str]:
         return fallback("returned an unusable answer", exc)
 
     return (label, confidence, rationale, settings.gemini_model)
+
+
+def _classify_llm_user(text: str, credential: LlmCredential) -> tuple[str, float, str, str]:
+    """
+    BYOK classification path: the same prompt and the same strict parse as
+    the server path, wired through the shared OpenAI-compatible call instead
+    of the native genai SDK. `model_version` is `f"{provider}:{model}"` --
+    deliberately different attribution from the server path's bare model
+    name, since a BYOK verdict can come from any provider/model the user
+    picked, not the operator's fixed Gemini deployment.
+    """
+    try:
+        content = call_chat_completion(
+            credential,
+            prompt=_CLASSIFICATION_PROMPT,
+            user_content=f"Email:\n{text[:6000]}",
+            max_tokens=_CLASSIFICATION_MAX_TOKENS,
+            timeout=_CLASSIFICATION_TIMEOUT_S,
+        )
+    except LlmCallError as exc:
+        logger.warning(
+            "Classification call failed for provider %s: %s", credential.provider, exc.category
+        )
+        label, confidence, rationale, _ = _heuristic_classify(text)
+        return (label, confidence, rationale, "heuristic-fallback")
+
+    try:
+        label, confidence, rationale = _parse_llm_response(content)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning(
+            "Classification returned an unusable response for provider %s: %s",
+            credential.provider, type(exc).__name__,
+        )
+        label, confidence, rationale, _ = _heuristic_classify(text)
+        return (label, confidence, rationale, "heuristic-fallback")
+
+    return (label, confidence, rationale, f"{credential.provider}:{credential.model}")

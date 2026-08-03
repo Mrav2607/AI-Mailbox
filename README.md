@@ -255,6 +255,32 @@ stored — the parser rejects anything malformed — but the calls would be paid
 for and thrown away, which reads like flaky extraction. Native support is a
 possible follow-up.
 
+#### Using your key for sorting too
+
+By default a saved key only powers the Agenda. There's a second checkbox,
+**"Also use my key to sort incoming mail"**, that extends it to
+classification — the step that files each message into needs-reply, action
+required, promotional and so on.
+
+It's a separate choice on purpose. Sorting runs on **every email you
+receive**, while the Agenda only looks at the small slice already marked as
+needing action, so turning this on uses far more of your quota. It's off
+until you tick it.
+
+Two things to know:
+
+- **Preset providers only.** Custom endpoints aren't offered here yet — the
+  safety check that runs before every request to a custom URL costs a DNS
+  lookup, which is fine once per action but not once per email.
+- **The built-in model goes first.** If this deployment has the local
+  classifier (`CLASSIFIER_BACKEND=local` or `auto`), it handles most mail for
+  free and your key is only used when it can't. The checkbox is hidden
+  entirely on a `heuristic` deployment, where no LLM is used at all.
+
+If your key ever stops being usable for sorting, the settings panel says so
+and mail falls back to the built-in rules — it never quietly switches to the
+server's key.
+
 Two settings control the rest:
 
 ```dotenv
