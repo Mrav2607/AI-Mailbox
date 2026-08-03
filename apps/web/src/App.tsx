@@ -334,6 +334,13 @@ export default function Console() {
   // discards its response if this has moved on, so a stale result never
   // renders against a credential it didn't actually test.
   const llmCredentialGenRef = useRef(0);
+  // Usage fetches get their OWN counter. They share the credential's
+  // invalidation reasons (a save or remove bumps both), but they also have
+  // one of their own -- switching the card's 7/30/90 range -- and that must
+  // not touch the credential generation. Sharing one ref meant a range click
+  // during an in-flight Test discarded the test's response: no result, no
+  // error, just the button settling silently.
+  const llmUsageGenRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const liveSearchRef = useRef<LiveSearchController | null>(null);
 
@@ -637,21 +644,21 @@ export default function Console() {
 
   // Usage changes constantly (every ingested message can add to it), so
   // unlike settings above it's never cached against a "do we already have
-  // it?" check -- always re-fetched. Reuses llmCredentialGenRef (bumped by
-  // save/remove below, and by a range change in the usage card) rather than
-  // a second ref: a fetch that started before a save/remove/range-change
-  // completed is stale the moment that generation moves, same as
-  // doTestLlmSettings's own guard against its credential.
+  // it?" check -- always re-fetched. Guards on llmUsageGenRef, which a range
+  // change bumps on its own and which save/remove bump alongside the
+  // credential's -- so an out-of-order response (a 7d answered after a
+  // superseded 30d request) never clobbers the range on screen, without a
+  // range click reaching into an unrelated in-flight credential test.
   const refreshLlmUsage = useCallback(
     async (days: number) => {
-      const generation = llmCredentialGenRef.current;
+      const generation = llmUsageGenRef.current;
       try {
         const usage = await getLlmUsage(days);
-        if (generation !== llmCredentialGenRef.current) return; // superseded mid-flight -- discard
+        if (generation !== llmUsageGenRef.current) return; // superseded mid-flight -- discard
         setLlmUsage(usage);
         setLlmUsageError(false);
       } catch (e) {
-        if (generation !== llmCredentialGenRef.current) return; // ditto for a stale failure
+        if (generation !== llmUsageGenRef.current) return; // ditto for a stale failure
         if (e instanceof ApiError && e.status === 401) {
           handleSessionExpired();
           return;
@@ -700,13 +707,15 @@ export default function Console() {
   }, [refreshLlmUsage, llmUsageDays]);
 
   // Changing the range invalidates whatever usage fetch is still in flight
-  // for the old window -- bump the shared generation ref so an out-of-order
-  // response (e.g. 7d answered after a since-superseded 30d request) never
-  // clobbers the range the user is actually looking at now.
+  // for the old window, so an out-of-order response (a 7d answered after a
+  // since-superseded 30d request) never clobbers the range on screen. Bumps
+  // ONLY the usage generation -- the credential hasn't changed, and touching
+  // its counter here would make a range click silently void an in-flight
+  // credential test.
   const changeLlmUsageDays = useCallback(
     (days: number) => {
       setLlmUsageDays(days);
-      llmCredentialGenRef.current++;
+      llmUsageGenRef.current++;
       void refreshLlmUsage(days);
     },
     [refreshLlmUsage],
@@ -733,10 +742,11 @@ export default function Console() {
       } catch (e) {
         toast.error((e as Error).message || "could not save these settings");
       } finally {
-        // The credential may have changed either way -- bump so any test (or
-        // usage fetch) that started before this save discards its response
-        // when it lands.
+        // The credential may have changed either way -- bump both so any test
+        // AND any usage fetch that started before this save discards its
+        // response when it lands.
         llmCredentialGenRef.current++;
+        llmUsageGenRef.current++;
         setLlmSaving(false);
       }
       // Refetch only on success, and only after the bump above -- otherwise
@@ -778,7 +788,10 @@ export default function Console() {
     } catch (e) {
       toast.error((e as Error).message || "could not remove this credential");
     } finally {
+      // Same as the save path: a removal invalidates an in-flight test and an
+      // in-flight usage fetch alike.
       llmCredentialGenRef.current++;
+      llmUsageGenRef.current++;
       setLlmRemoving(false);
     }
     // Same ordering rule as doSaveLlmSettings: refetch after the generation
