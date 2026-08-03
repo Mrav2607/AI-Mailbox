@@ -717,13 +717,19 @@ export function mockDeleteLlmSettings(): void {
   };
 }
 
-// Deterministic multi-day demo usage so the console's "Usage, not billing"
-// panel has real volume and a real trend to show in preview mode -- weighted
+// Deterministic multi-day demo usage so the console's usage card has real
+// volume, a real trend, and real gaps to show in preview mode -- weighted
 // toward classification, since it fires on every ingested message and
-// extraction only runs per action-bearing thread. Every 9th day, this
+// extraction only runs per action-bearing thread. Every 9th active day, this
 // "provider" reports usage for all but two of its classification calls, so
-// the panel's partial-token-reporting copy has something real to render
-// against instead of only ever hitting the all-or-nothing branches.
+// the disclosure line has something real to render against instead of only
+// ever hitting the all-or-nothing branches.
+//
+// Every 11th day is genuinely idle -- no calls at all -- and gets no `daily`
+// entry, same as the real API (it only ever returns rows for days that had
+// usage). That's what actually exercises fillDailySeries and the chart's
+// gap-filling in preview, instead of a dense series that never has a gap to
+// fill in the first place.
 function buildMockUsage(days: number): LlmUsage {
   const provider = LLM_SETTINGS.provider ?? "openai";
   const daily: LlmUsageDailyPoint[] = [];
@@ -736,14 +742,17 @@ function buildMockUsage(days: number): LlmUsage {
     // i counts back from "today" at i=0 -- daily[] still ends up oldest-first
     // since we push in the same order the API's own day-ascending list would.
     const dayIndex = days - 1 - i;
-    const isQuiet = dayIndex % 7 === 5 || dayIndex % 7 === 6;
-    const classificationCalls = isQuiet ? 4 + (dayIndex % 3) : 14 + (dayIndex % 6);
-    const missingTokenCalls = dayIndex % 9 === 0 ? Math.min(2, classificationCalls) : 0;
+    const isWeekend = dayIndex % 7 === 5 || dayIndex % 7 === 6;
+    const isIdle = dayIndex % 11 === 0;
+
+    const classificationCalls = isIdle ? 0 : isWeekend ? 3 + (dayIndex % 3) : 14 + (dayIndex % 6);
+    const missingTokenCalls =
+      !isIdle && dayIndex % 9 === 0 ? Math.min(2, classificationCalls) : 0;
     const classificationCallsWithTokens = classificationCalls - missingTokenCalls;
     const classificationPromptTokens = classificationCallsWithTokens * 220;
     const classificationCompletionTokens = classificationCallsWithTokens * 18;
 
-    const extractionCalls = isQuiet ? 0 : dayIndex % 4 === 0 ? 2 : 1;
+    const extractionCalls = isIdle || isWeekend ? 0 : dayIndex % 4 === 0 ? 2 : 1;
     const extractionPromptTokens = extractionCalls * 640;
     const extractionCompletionTokens = extractionCalls * 95;
 
@@ -759,12 +768,15 @@ function buildMockUsage(days: number): LlmUsage {
     stageTotals.extraction.completion_tokens += extractionCompletionTokens;
     stageTotals.extraction.total_tokens += extractionPromptTokens + extractionCompletionTokens;
 
+    const callsToday = classificationCalls + extractionCalls;
+    if (callsToday === 0) continue; // an idle day -- the API wouldn't send a row for it either
+
     const date = new Date(Date.now() - dayIndex * 24 * 60 * 60 * 1000)
       .toISOString()
       .slice(0, 10);
     daily.push({
       date,
-      calls: classificationCalls + extractionCalls,
+      calls: callsToday,
       total_tokens:
         classificationPromptTokens +
         classificationCompletionTokens +

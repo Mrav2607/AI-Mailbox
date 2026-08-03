@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import type { LlmProvider, LlmSettings, LlmTestResult, LlmUsage } from "@/lib/types";
+import { PROVIDER_LABELS } from "@/lib/usage";
 
 interface Props {
   open: boolean;
@@ -25,22 +26,18 @@ interface Props {
   removing: boolean;
   // Null while the fetch is in flight (or hasn't started) and no prior error
   // -- fetched fresh every time this modal opens, since usage keeps moving
-  // even when the credential itself hasn't changed.
+  // even when the credential itself hasn't changed. Only feeds the one-line
+  // summary here; the full breakdown lives in the usage card.
   usage: LlmUsage | null;
   // True when the usage fetch failed. Kept separate from `usage` being null
   // so the panel can tell "still loading" apart from "unavailable" -- an
   // outage here must never make the rest of this modal look broken.
   usageError: boolean;
+  // Opens the separate usage card (charts, breakdowns, dashboard links) --
+  // the cost signal belongs here where the key is configured, but the detail
+  // lives there.
+  onOpenUsage: () => void;
 }
-
-const PROVIDER_LABELS: Record<LlmProvider, string> = {
-  openai: "OpenAI",
-  gemini: "Gemini",
-  openrouter: "OpenRouter",
-  groq: "Groq",
-  mistral: "Mistral",
-  custom: "Custom endpoint",
-};
 
 // Hints only, shown as the model field's placeholder -- never submitted on
 // their own, and cleared the moment the caller types something real.
@@ -60,31 +57,6 @@ const PRESET_PROVIDERS: LlmProvider[] = [
   "groq",
   "mistral",
 ];
-
-// The UI's own words for each stage -- never the internal "classification" /
-// "extraction" column values from the usage response.
-const STAGE_LABELS: Record<string, string> = {
-  classification: "Sorting",
-  extraction: "Agenda",
-};
-
-// Only providers we're confident actually resolve to a real usage/billing
-// page. Deliberately partial: guessing a URL that 404s is worse than no
-// link at all, and "custom" has no dashboard we could point to anyway.
-// Where a user goes for the actual money. We only report call and token
-// counts, so this link is the other half of "Usage, not billing".
-//
-// OpenAI and OpenRouter get a deep link straight to the usage page. The rest
-// point at the console home instead: those products move their billing pages
-// around, and a stale deep link that 404s is worse than one extra click. No
-// entry for "custom" on purpose -- we have no idea where that endpoint bills.
-const USAGE_DASHBOARD_URLS: Partial<Record<LlmProvider, string>> = {
-  openai: "https://platform.openai.com/usage",
-  openrouter: "https://openrouter.ai/activity",
-  gemini: "https://aistudio.google.com/",
-  groq: "https://console.groq.com/",
-  mistral: "https://console.mistral.ai/",
-};
 
 // Maps the /test route's fixed category constants -- never a raw exception
 // string -- to plain copy anyone can follow, regardless of first language.
@@ -124,6 +96,7 @@ export function LlmSettingsModal({
   removing,
   usage,
   usageError,
+  onOpenUsage,
 }: Props) {
   const [provider, setProvider] = useState<LlmProvider>("openai");
   const [model, setModel] = useState("");
@@ -385,83 +358,26 @@ export function LlmSettingsModal({
             </p>
           )}
 
-          <div className="space-y-1 pt-2 mt-1 border-t border-border/60">
-            <span className={fieldLabel}>Usage, not billing</span>
-            {usageError ? (
-              <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-                Usage isn&apos;t available right now.
-              </p>
-            ) : !usage ? (
-              <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-                checking your usage…
-              </p>
-            ) : usage.totals.calls === 0 ? (
-              <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-                Your key hasn&apos;t been used yet.
-              </p>
-            ) : (
-              <>
-                {/* Account-level on purpose. These totals cover the whole
-                    window, so they include any key or provider the account
-                    used during it -- saying "your key" or "this provider"
-                    would pin historic usage on whatever happens to be
-                    configured right now. The provider breakdown below does
-                    the attributing instead of the copy implying it. */}
-                <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-                  CortexMail made {usage.totals.calls} AI calls billed to you in the last{" "}
-                  {usage.window_days} days.
-                </p>
-                {usage.totals.calls_with_total_tokens > 0 ? (
-                  <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-                    About {usage.totals.total_tokens.toLocaleString()} tokens total
-                    {usage.totals.calls_with_total_tokens < usage.totals.calls
-                      ? ` — across ${usage.totals.calls_with_total_tokens} of those calls. Token counts weren't reported for the rest.`
-                      : "."}
-                  </p>
-                ) : (
-                  <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-                    No token counts were reported.
-                  </p>
-                )}
-                {usage.by_stage.length > 0 && (
-                  <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-                    {usage.by_stage
-                      .map((s) => `${STAGE_LABELS[s.stage] ?? s.stage}: ${s.calls}`)
-                      .join(" · ")}
-                  </p>
-                )}
-                {usage.by_provider.length > 0 && (
-                  <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-                    {usage.by_provider
-                      .map((p) => `${PROVIDER_LABELS[p.provider] ?? p.provider}: ${p.calls}`)
-                      .join(" · ")}
-                  </p>
-                )}
-              </>
-            )}
-            {/* Linked per provider that actually ran in the window, not the
-                one configured right now -- after a provider switch those are
-                different, and pointing at today's dashboard for last month's
-                calls sends people somewhere the money isn't. Falls back to the
-                configured provider only when there's no usage to attribute. */}
-            {(usage && usage.totals.calls > 0
-              ? usage.by_provider.map((p) => p.provider)
-              : settings.provider
-                ? [settings.provider]
-                : []
-            )
-              .filter((p) => USAGE_DASHBOARD_URLS[p])
-              .map((p) => (
-                <a
-                  key={p}
-                  href={USAGE_DASHBOARD_URLS[p]}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="block text-[10.5px] font-mono text-primary underline underline-offset-2"
-                >
-                  See what this actually cost on {PROVIDER_LABELS[p] ?? p}
-                </a>
-              ))}
+          {/* Just the cost signal here -- the full breakdown (charts, per-stage
+              and per-provider splits, dashboard links) lives in its own card,
+              since this modal is about the key, not the usage detail. */}
+          <div className="flex items-center justify-between gap-2 pt-2 mt-1 border-t border-border/60">
+            <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+              {usageError
+                ? "Usage isn't available right now."
+                : !usage
+                  ? "checking your usage…"
+                  : usage.totals.calls === 0
+                    ? "Your key hasn't been used yet."
+                    : `${usage.totals.calls.toLocaleString()} AI calls in the last ${usage.window_days} days.`}
+            </p>
+            <button
+              type="button"
+              onClick={onOpenUsage}
+              className="shrink-0 h-6 px-2 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[10.5px] font-mono cursor-pointer transition-colors"
+            >
+              view usage
+            </button>
           </div>
         </form>
       </DialogContent>

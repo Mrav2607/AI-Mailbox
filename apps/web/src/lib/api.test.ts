@@ -653,7 +653,10 @@ describe("getLlmUsage", () => {
     const res = await api.getLlmUsage();
     expect(res.window_days).toBe(30);
     expect(res.totals.calls).toBeGreaterThan(0);
-    expect(res.daily).toHaveLength(30);
+    // Sparse on purpose -- idle days are absent, matching the real API, which
+    // only stores days that have usage.
+    expect(res.daily.length).toBeGreaterThan(0);
+    expect(res.daily.length).toBeLessThan(30);
     expect(res.by_stage.map((s) => s.stage).sort()).toEqual(["classification", "extraction"]);
   });
 
@@ -661,6 +664,7 @@ describe("getLlmUsage", () => {
     const api = await importMockApi();
     const res = await api.getLlmUsage(7);
     expect(res.window_days).toBe(7);
-    expect(res.daily).toHaveLength(7);
+    expect(res.daily.length).toBeGreaterThan(0);
+    expect(res.daily.length).toBeLessThanOrEqual(7);
   });
 });

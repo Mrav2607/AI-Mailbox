@@ -182,19 +182,33 @@ describe("mock agenda", () => {
 });
 
 describe("mock llm usage", () => {
-  it("defaults to a 30-day window with one point per day, oldest first", () => {
+  it("defaults to a 30-day window of sparse days, oldest first", () => {
     const usage = mockGetLlmUsage();
     expect(usage.window_days).toBe(30);
-    expect(usage.daily).toHaveLength(30);
+    // Deliberately sparse: the real API only returns days that actually have
+    // rows, so idle days are ABSENT rather than zero. A dense mock would hide
+    // the gap-filling fillDailySeries has to do before anything is charted.
+    expect(usage.daily.length).toBeGreaterThan(0);
+    expect(usage.daily.length).toBeLessThan(30);
     for (let i = 1; i < usage.daily.length; i++) {
-      expect(usage.daily[i].date >= usage.daily[i - 1].date).toBe(true);
+      expect(usage.daily[i].date > usage.daily[i - 1].date).toBe(true);
     }
   });
 
-  it("respects a non-default days window", () => {
+  it("keeps every day inside the requested window", () => {
     const usage = mockGetLlmUsage(7);
     expect(usage.window_days).toBe(7);
-    expect(usage.daily).toHaveLength(7);
+    expect(usage.daily.length).toBeGreaterThan(0);
+    expect(usage.daily.length).toBeLessThanOrEqual(7);
+
+    const oldest = new Date();
+    oldest.setUTCDate(oldest.getUTCDate() - 6);
+    const oldestDay = oldest.toISOString().slice(0, 10);
+    const today = new Date().toISOString().slice(0, 10);
+    for (const point of usage.daily) {
+      expect(point.date >= oldestDay).toBe(true);
+      expect(point.date <= today).toBe(true);
+    }
   });
 
   it("has non-zero calls and tokens, so the panel actually demos something", () => {

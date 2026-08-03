@@ -39,6 +39,7 @@ interface Props {
   onOpenAgenda: () => void;
   onBackfillActions: () => void;
   onOpenLlmSettings: () => void;
+  onOpenLlmUsage: () => void;
 }
 
 export function CommandPalette({
@@ -65,6 +66,7 @@ export function CommandPalette({
   onOpenAgenda,
   onBackfillActions,
   onOpenLlmSettings,
+  onOpenLlmUsage,
 }: Props) {
   const run = (fn: () => void) => {
     onOpenChange(false);
@@ -184,6 +186,12 @@ export function CommandPalette({
                 value="ai settings llm provider api key byok extraction"
               >
                 AI settings…
+              </CommandItem>
+              <CommandItem
+                onSelect={() => run(onOpenLlmUsage)}
+                value="ai usage llm calls tokens charts"
+              >
+                AI usage…
               </CommandItem>
               {AUTO_SYNC_CHOICES.map((c) => (
                 <CommandItem
