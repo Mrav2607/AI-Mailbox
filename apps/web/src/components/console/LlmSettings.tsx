@@ -401,20 +401,26 @@ export function LlmSettingsModal({
               </p>
             ) : (
               <>
+                {/* Account-level on purpose. These totals cover the whole
+                    window, so they include any key or provider the account
+                    used during it -- saying "your key" or "this provider"
+                    would pin historic usage on whatever happens to be
+                    configured right now. The provider breakdown below does
+                    the attributing instead of the copy implying it. */}
                 <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-                  CortexMail used your key {usage.totals.calls} times in the last{" "}
+                  CortexMail made {usage.totals.calls} AI calls billed to you in the last{" "}
                   {usage.window_days} days.
                 </p>
                 {usage.totals.calls_with_total_tokens > 0 ? (
                   <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
                     About {usage.totals.total_tokens.toLocaleString()} tokens total
                     {usage.totals.calls_with_total_tokens < usage.totals.calls
-                      ? ` — across ${usage.totals.calls_with_total_tokens} of those calls. This provider doesn't report token counts for the rest.`
+                      ? ` — across ${usage.totals.calls_with_total_tokens} of those calls. Token counts weren't reported for the rest.`
                       : "."}
                   </p>
                 ) : (
                   <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-                    This provider doesn&apos;t report token counts.
+                    No token counts were reported.
                   </p>
                 )}
                 {usage.by_stage.length > 0 && (
@@ -424,18 +430,38 @@ export function LlmSettingsModal({
                       .join(" · ")}
                   </p>
                 )}
+                {usage.by_provider.length > 0 && (
+                  <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+                    {usage.by_provider
+                      .map((p) => `${PROVIDER_LABELS[p.provider] ?? p.provider}: ${p.calls}`)
+                      .join(" · ")}
+                  </p>
+                )}
               </>
             )}
-            {settings.provider && USAGE_DASHBOARD_URLS[settings.provider] && (
-              <a
-                href={USAGE_DASHBOARD_URLS[settings.provider]}
-                target="_blank"
-                rel="noreferrer"
-                className="block text-[10.5px] font-mono text-primary underline underline-offset-2"
-              >
-                See what this actually cost on {PROVIDER_LABELS[settings.provider]}
-              </a>
-            )}
+            {/* Linked per provider that actually ran in the window, not the
+                one configured right now -- after a provider switch those are
+                different, and pointing at today's dashboard for last month's
+                calls sends people somewhere the money isn't. Falls back to the
+                configured provider only when there's no usage to attribute. */}
+            {(usage && usage.totals.calls > 0
+              ? usage.by_provider.map((p) => p.provider)
+              : settings.provider
+                ? [settings.provider]
+                : []
+            )
+              .filter((p) => USAGE_DASHBOARD_URLS[p])
+              .map((p) => (
+                <a
+                  key={p}
+                  href={USAGE_DASHBOARD_URLS[p]}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="block text-[10.5px] font-mono text-primary underline underline-offset-2"
+                >
+                  See what this actually cost on {PROVIDER_LABELS[p] ?? p}
+                </a>
+              ))}
           </div>
         </form>
       </DialogContent>
