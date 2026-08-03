@@ -1,11 +1,17 @@
 """Unit tests for the classifier: heuristic rules + backend dispatch/fallback
-(local/gemini/heuristic), all offline -- no LLM or network required."""
+(local/llm/heuristic), all offline -- no LLM or network required."""
 
 import json
 
 import pytest
 
-from app.services.nlp.classifier import LABELS, _heuristic_classify, classify, classify_with_usage
+from app.services.nlp.classifier import (
+    LABELS,
+    ClassificationAttempt,
+    _heuristic_classify,
+    classify,
+    classify_with_usage,
+)
 from app.services.nlp.llm_client import LlmCallError, LlmCallResult, LlmUsage
 from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
@@ -51,7 +57,7 @@ def test_heuristic_only_returns_canonical_labels(text):
 def test_classify_gemini_backend_falls_back_to_heuristic_without_api_key(monkeypatch):
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     monkeypatch.setattr(classifier.settings, "gemini_api_key", None)
     label, confidence, rationale, model_version = classify("Can you review this?")
     assert label == "needs_reply"
@@ -209,12 +215,47 @@ def _explode(*args, **kwargs):
     raise AssertionError("this call must never happen for this routing mode")
 
 
+def test_classify_backend_gemini_is_an_alias_for_llm(monkeypatch):
+    """"gemini" was the old name for the LLM path. Deployments still carry it
+    in their .env, so it has to keep landing on the same branch as "llm" --
+    if it ever fell through to the local/auto branch instead, BYOK
+    classification would silently stop running on those boxes."""
+    from app.services.nlp import classifier
+
+    reached = []
+
+    def _spy(text, routing=None):
+        reached.append(text)
+        return ClassificationAttempt(
+            verdict=("fyi", 0.9, "spy", "spy-v1"),
+            provider_call_succeeded=True,
+            usage=None,
+        )
+
+    monkeypatch.setattr(classifier, "_classify_llm", _spy)
+
+    # Both ways in: the configured default, and the explicit per-call override
+    # that the backfill route passes. They dispatch through the same lookup,
+    # but only the override path is reachable from the API, so pin both.
+    for backend in ("gemini", "llm"):
+        monkeypatch.setattr(classifier.settings, "classifier_backend", backend)
+        assert classify("Can you review this?")[3] == "spy-v1", f"configured {backend}"
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "heuristic")
+    for backend in ("gemini", "llm"):
+        assert classify("Can you review this?", backend=backend)[3] == "spy-v1", (
+            f"override {backend}"
+        )
+
+    assert len(reached) == 4
+
+
 def test_classify_routing_none_and_server_are_byte_identical_no_key(monkeypatch):
     """With no gemini_api_key configured, routing=None and mode="server"
     must both fall back to heuristic identically -- BYOK is additive."""
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     monkeypatch.setattr(classifier.settings, "gemini_api_key", None)
 
     result_none = classify("Can you review this?", routing=None)
@@ -231,7 +272,7 @@ def test_classify_routing_none_and_server_are_byte_identical_with_genai(monkeypa
     bare model name, unchanged from before BYOK classification existed."""
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
     monkeypatch.setattr(classifier.settings, "gemini_model", "gemini-2.5-flash")
     monkeypatch.setattr(
@@ -247,7 +288,7 @@ def test_classify_routing_none_and_server_are_byte_identical_with_genai(monkeypa
 def test_classify_routing_user_mode_calls_openai_compat_with_credential(monkeypatch):
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     monkeypatch.setattr(classifier, "_genai_client", _explode)  # must never be built for mode="user"
 
     credential = LlmCredential(
@@ -278,7 +319,7 @@ def test_classify_routing_off_mode_never_builds_genai_client_or_calls_llm(monkey
     billed, not merely checking the returned label."""
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     monkeypatch.setattr(classifier, "_genai_client", _explode)
     monkeypatch.setattr(classifier, "call_chat_completion", _explode)
 
@@ -297,7 +338,7 @@ def test_classify_routing_user_mode_with_no_credential_falls_back_to_heuristic(m
     key)."""
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     monkeypatch.setattr(classifier, "_genai_client", _explode)
     monkeypatch.setattr(classifier, "call_chat_completion", _explode)
 
@@ -312,7 +353,7 @@ def test_classify_routing_user_mode_with_no_credential_falls_back_to_heuristic(m
 def test_classify_routing_user_mode_falls_back_to_heuristic_on_call_error(monkeypatch):
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     credential = LlmCredential(
         provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
     )
@@ -332,7 +373,7 @@ def test_classify_routing_user_mode_falls_back_to_heuristic_on_call_error(monkey
 def test_classify_routing_user_mode_falls_back_to_heuristic_on_unparseable_response(monkeypatch):
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     credential = LlmCredential(
         provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
     )
@@ -419,7 +460,7 @@ def test_classify_with_usage_verdict_matches_classify_for_every_routing_mode(mon
     mode -- the whole point of `classify` being a one-line wrapper."""
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     monkeypatch.setattr(classifier.settings, "gemini_api_key", None)
 
     credential = LlmCredential(
@@ -468,7 +509,7 @@ def test_classify_with_usage_local_backend_never_touched_provider(monkeypatch):
 def test_classify_with_usage_routing_off_never_touched_provider(monkeypatch):
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     monkeypatch.setattr(classifier, "_genai_client", _explode)
     monkeypatch.setattr(classifier, "call_chat_completion", _explode)
 
@@ -481,7 +522,7 @@ def test_classify_with_usage_routing_off_never_touched_provider(monkeypatch):
 def test_classify_with_usage_user_mode_no_credential_never_touched_provider(monkeypatch):
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     monkeypatch.setattr(classifier, "_genai_client", _explode)
     monkeypatch.setattr(classifier, "call_chat_completion", _explode)
 
@@ -494,7 +535,7 @@ def test_classify_with_usage_user_mode_no_credential_never_touched_provider(monk
 def test_classify_with_usage_user_mode_call_error_never_touched_provider(monkeypatch):
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     credential = LlmCredential(
         provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
     )
@@ -514,7 +555,7 @@ def test_classify_with_usage_user_mode_success_carries_usage_through(monkeypatch
     the reported tokens both count."""
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     credential = LlmCredential(
         provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
     )
@@ -539,7 +580,7 @@ def test_classify_with_usage_user_mode_counts_the_call_even_when_content_is_unpa
     only the verdict falls back to the heuristic label."""
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     credential = LlmCredential(
         provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
     )
@@ -562,7 +603,7 @@ def test_classify_with_usage_server_path_success_reports_call_but_no_usage(monke
     `response.usage_metadata` is never parsed here."""
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
     monkeypatch.setattr(classifier.settings, "gemini_model", "gemini-2.5-flash")
     monkeypatch.setattr(

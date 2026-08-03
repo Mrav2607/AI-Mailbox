@@ -60,6 +60,56 @@ def test_backfill_rejects_bad_bucket_and_backend(client):
     bad_backend = client.post("/api/v1/mail/classify/backfill?backend=not_a_model")
     assert bad_backend.status_code == 422
     assert "Invalid backend" in bad_backend.json()["detail"]
+    # The "gemini" alias still works, but an error must not teach it to anyone.
+    assert "gemini" not in bad_backend.json()["detail"]
+    assert "llm" in bad_backend.json()["detail"]
+
+
+@pytest.mark.parametrize("requested", ["llm", "gemini"])
+def test_backfill_folds_gemini_alias_to_llm_inline(client, monkeypatch, requested):
+    """Existing .env files still say "gemini", so it has to clear validation --
+    but it must also arrive downstream as "llm", or logs and task kwargs carry
+    two names for one path. Asserting the response alone wouldn't catch that:
+    the route forwarding "gemini" unchanged looks identical from outside."""
+    from app.routes import mailbox
+
+    seen = []
+
+    def _spy(db, user_id, **kwargs):
+        seen.append(kwargs["backend"])
+        return {"status": "ok", "created": 0, "scanned": 0}
+
+    monkeypatch.setattr(mailbox, "run_backfill", _spy)
+
+    # limit stays under _MAX_INLINE_BACKFILL so this takes the inline path
+    # instead of needing a live Celery broker.
+    resp = client.post(f"/api/v1/mail/classify/backfill?backend={requested}&limit=10")
+
+    assert resp.status_code == 200
+    assert seen == ["llm"]
+
+
+@pytest.mark.parametrize("requested", ["llm", "gemini"])
+def test_backfill_folds_gemini_alias_to_llm_queued(client, monkeypatch, requested):
+    """Same contract on the queued path. This is the one that matters in
+    practice -- the default limit of 100 is over _MAX_INLINE_BACKFILL, so a
+    real backfill goes to the worker, and the alias would otherwise reach it
+    unfolded in the task kwargs."""
+    from app.routes import mailbox
+
+    seen = []
+
+    class _FakeTask:
+        def delay(self, **kwargs):
+            seen.append(kwargs["backend"])
+            return MagicMock(id="task-1")
+
+    monkeypatch.setattr(mailbox, "backfill_threads_for_user", _FakeTask())
+
+    resp = client.post(f"/api/v1/mail/classify/backfill?backend={requested}&limit=100")
+
+    assert resp.status_code == 202
+    assert seen == ["llm"]
 
 
 def test_backfill_valid_params_pass_validation(client):
