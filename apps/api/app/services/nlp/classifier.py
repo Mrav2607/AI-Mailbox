@@ -287,7 +287,7 @@ def _classify_llm_user(text: str, credential: LlmCredential) -> tuple[str, float
             user_content=f"Email:\n{text[:6000]}",
             max_tokens=_CLASSIFICATION_MAX_TOKENS,
             timeout=_CLASSIFICATION_TIMEOUT_S,
-        )
+        ).content
     except LlmCallError as exc:
         logger.warning(
             "Classification call failed for provider %s: %s", credential.provider, exc.category

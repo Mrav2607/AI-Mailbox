@@ -6,7 +6,7 @@ import json
 import pytest
 
 from app.services.nlp.classifier import LABELS, _heuristic_classify, classify
-from app.services.nlp.llm_client import LlmCallError
+from app.services.nlp.llm_client import LlmCallError, LlmCallResult
 from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
 
@@ -258,7 +258,8 @@ def test_classify_routing_user_mode_calls_openai_compat_with_credential(monkeypa
     def fake_call(cred, *, prompt, user_content, max_tokens, timeout):
         captured["credential"] = cred
         captured["timeout"] = timeout
-        return json.dumps({"label": "spam", "confidence": 0.9, "rationale": "scam"})
+        content = json.dumps({"label": "spam", "confidence": 0.9, "rationale": "scam"})
+        return LlmCallResult(content=content, usage=None)
 
     monkeypatch.setattr(classifier, "call_chat_completion", fake_call)
 
@@ -335,7 +336,12 @@ def test_classify_routing_user_mode_falls_back_to_heuristic_on_unparseable_respo
     credential = LlmCredential(
         provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
     )
-    monkeypatch.setattr(classifier, "call_chat_completion", lambda *a, **k: "not json at all")
+    # Wire type, still an unparseable body -- the point of the test is the
+    # fallback on a bad parse, not on the wire shape.
+    monkeypatch.setattr(
+        classifier, "call_chat_completion",
+        lambda *a, **k: LlmCallResult(content="not json at all", usage=None),
+    )
     routing = ClassificationRouting(mode="user", credential=credential)
     label, confidence, rationale, model_version = classify(
         "Invoice #1842 is due Friday", routing=routing
@@ -389,7 +395,8 @@ def test_classify_precedence_auto_backend_local_unavailable_falls_through_to_use
 
     def fake_call(cred, *, prompt, user_content, max_tokens, timeout):
         captured["credential"] = cred
-        return json.dumps({"label": "promotional", "confidence": 0.7, "rationale": "sale"})
+        content = json.dumps({"label": "promotional", "confidence": 0.7, "rationale": "sale"})
+        return LlmCallResult(content=content, usage=None)
 
     monkeypatch.setattr(classifier, "call_chat_completion", fake_call)
     routing = ClassificationRouting(mode="user", credential=credential)

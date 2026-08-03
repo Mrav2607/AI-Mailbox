@@ -232,7 +232,7 @@ def _call_llm(credential: LlmCredential, prompt: str, message_text: str) -> str:
     user_content = f"Email:\n{message_text[:_MESSAGE_TEXT_MAX_LEN]}"
     return call_chat_completion(
         credential, prompt=prompt, user_content=user_content, max_tokens=_MAX_TOKENS
-    )
+    ).content
 
 
 def extract_action(

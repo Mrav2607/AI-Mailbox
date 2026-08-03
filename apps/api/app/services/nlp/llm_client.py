@@ -12,12 +12,37 @@ from __future__ import annotations
 import json
 import threading
 import time
+from dataclasses import dataclass
 from typing import NoReturn
 
 import httpx
 
 from app.core.logging import logger
 from app.services.nlp.providers import DestinationRejected, LlmCredential, pin_custom_destination
+
+
+@dataclass(frozen=True)
+class LlmUsage:
+    """
+    Token counts a provider reported for one call, each field independently
+    optional -- a provider can send `prompt_tokens` and omit `total_tokens`,
+    and we must not paper over that by adding the parts we do have. See
+    `_parse_usage` for why `total_tokens` is never synthesized.
+    """
+
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+
+
+@dataclass(frozen=True)
+class LlmCallResult:
+    """What `call_chat_completion` hands back: the parsed content string
+    every caller already expects, plus whatever usage telemetry came with it
+    (`None` when the provider sent nothing usable)."""
+
+    content: str
+    usage: LlmUsage | None
 
 
 class LlmCallError(Exception):
@@ -113,6 +138,56 @@ def _read_body_within_deadline(response: httpx.Response, deadline: float, provid
     return b"".join(chunks)
 
 
+def _parse_token_count(value: object) -> int | None:
+    """
+    Accept a field only if it's a real, non-negative `int`. `bool` is a
+    subclass of `int` in Python (`isinstance(True, int)` is `True`), so it's
+    excluded explicitly -- otherwise a provider (or a fuzzer) sending
+    `"prompt_tokens": true` would silently count as one token. A negative
+    count is nonsensical and treated the same as absent, not clamped.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def _parse_usage(payload: object) -> LlmUsage | None:
+    """
+    Pull token counts out of `payload["usage"]`, as defensively as possible.
+
+    This can NEVER raise and never synthesizes a missing field -- usage is
+    telemetry riding along on a successful response, not part of the
+    contract that response has to satisfy. A malformed or absent `usage`
+    block must still let an otherwise-good call return its content
+    normally, so every shape failure here just means "count this field (or
+    the whole block) as absent" rather than an error.
+
+    In particular, `total_tokens` is never computed as `prompt_tokens +
+    completion_tokens` when the provider omits it: the plan tracks "calls
+    that reported a usable total" as its own counter, and a total we made up
+    ourselves would corrupt that count with numbers no provider actually
+    reported.
+    """
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return None
+
+    prompt_tokens = _parse_token_count(usage.get("prompt_tokens"))
+    completion_tokens = _parse_token_count(usage.get("completion_tokens"))
+    total_tokens = _parse_token_count(usage.get("total_tokens"))
+
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+
+    return LlmUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+
+
 def call_chat_completion(
     credential: LlmCredential,
     *,
@@ -120,11 +195,13 @@ def call_chat_completion(
     user_content: str,
     max_tokens: int,
     timeout: float = 30.0,
-) -> str:
+) -> LlmCallResult:
     """
-    Perform the OpenAI-compatible chat-completions call and return the raw
-    `choices[0].message.content` string. Raises `LlmCallError` on every
-    failure -- the single internal failure carrier.
+    Perform the OpenAI-compatible chat-completions call and return an
+    `LlmCallResult` carrying the raw `choices[0].message.content` string plus
+    whatever usage telemetry the provider included. Raises `LlmCallError` on
+    every failure -- the single internal failure carrier. A malformed
+    `usage` block is never one of those failures; see `_parse_usage`.
 
     `timeout` is a TOTAL WALL-CLOCK budget for the complete call -- DNS and
     destination pinning, connect, send, and reading the entire body -- not a
@@ -246,4 +323,4 @@ def call_chat_completion(
     if not isinstance(content, str):
         _raise_invalid_response(credential.provider, status)
 
-    return content
+    return LlmCallResult(content=content, usage=_parse_usage(payload))

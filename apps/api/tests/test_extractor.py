@@ -25,6 +25,7 @@ from app.services.nlp.extractor import (
     extract_action,
 )
 from app.services.nlp.extractor import test_credential as _test_credential
+from app.services.nlp.llm_client import LlmCallResult
 
 # Imported under a private alias -- pytest collects any top-level `test_*`
 # callable in a test module, including ones merely imported by that name.
@@ -70,12 +71,13 @@ def _default_kwargs(**overrides):
 
 
 def _stub_returns(content, *, calls=None):
-    """A fake `call_chat_completion` that returns `content` and records the
+    """A fake `call_chat_completion` that returns `content` wrapped in the
+    real wire type (usage untested here -- that's Wave 2a) and records the
     kwargs it was called with, so tests can assert what extractor built."""
     def fn(credential, *, prompt, user_content, max_tokens):
         if calls is not None:
             calls.append(dict(credential=credential, prompt=prompt, user_content=user_content, max_tokens=max_tokens))
-        return content
+        return LlmCallResult(content=content, usage=None)
     return fn
 
 
