@@ -402,7 +402,7 @@ export function LlmSettingsModal({
             ) : (
               <>
                 <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-                  AI-Mailbox used your key {usage.totals.calls} times in the last{" "}
+                  CortexMail used your key {usage.totals.calls} times in the last{" "}
                   {usage.window_days} days.
                 </p>
                 {usage.totals.calls_with_total_tokens > 0 ? (
