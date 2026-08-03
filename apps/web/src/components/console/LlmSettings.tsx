@@ -57,6 +57,7 @@ const PRESET_PROVIDERS: LlmProvider[] = [
 // string -- to plain copy anyone can follow, regardless of first language.
 function testErrorMessage(error: string): string {
   if (error === "connection_failed") return "Could not reach the provider.";
+  if (error === "timed_out") return "The provider took too long to reply.";
   if (error === "http_401" || error === "http_403") {
     return "The provider rejected this key.";
   }

@@ -15,6 +15,8 @@ var; a subclass can't fake that part)."""
 import json
 import logging
 import socket
+import threading
+import time
 
 import httpx
 import pytest
@@ -283,10 +285,9 @@ def test_call_chat_completion_trust_env_false_ignores_private_proxy_env_var(monk
     assert not any(client._mounts.values())
 
 
-def test_call_chat_completion_default_timeout_splits_connect_from_read(monkeypatch):
-    """A hung endpoint must fail cheap regardless of how slow generation is
-    allowed to be -- connect is always capped at 5s, separate from the
-    (default 30s) budget for the rest of the call."""
+def _install_spy_client(monkeypatch):
+    """Like _install_mock_transport, but hands back the constructed clients
+    so a test can read the timeout config httpx actually received."""
     real_client_cls = httpx.Client
     captured = []
 
@@ -299,6 +300,14 @@ def test_call_chat_completion_default_timeout_splits_connect_from_read(monkeypat
             captured.append(self)
 
     monkeypatch.setattr(llm_client.httpx, "Client", _SpyClient)
+    return captured
+
+
+def test_call_chat_completion_default_timeout_splits_connect_from_read(monkeypatch):
+    """A hung endpoint must fail cheap regardless of how slow generation is
+    allowed to be -- connect is capped at 5s, separate from the (default 30s)
+    budget for the rest of the call."""
+    captured = _install_spy_client(monkeypatch)
 
     call_chat_completion(_make_credential(), prompt="prompt", user_content="text", max_tokens=512)
 
@@ -311,18 +320,7 @@ def test_call_chat_completion_default_timeout_splits_connect_from_read(monkeypat
 def test_call_chat_completion_honors_an_explicit_timeout(monkeypatch):
     """Classification passes its own tighter timeout -- this must actually
     reach httpx, not just be accepted and ignored."""
-    real_client_cls = httpx.Client
-    captured = []
-
-    class _SpyClient(real_client_cls):
-        def __init__(self, *args, **kwargs):
-            kwargs["transport"] = httpx.MockTransport(
-                _json_handler(200, _choice_payload(VALID_CONTENT))
-            )
-            super().__init__(*args, **kwargs)
-            captured.append(self)
-
-    monkeypatch.setattr(llm_client.httpx, "Client", _SpyClient)
+    captured = _install_spy_client(monkeypatch)
 
     call_chat_completion(
         _make_credential(), prompt="prompt", user_content="text", max_tokens=512, timeout=10.0
@@ -332,6 +330,133 @@ def test_call_chat_completion_honors_an_explicit_timeout(monkeypatch):
     timeout = captured[0].timeout
     assert timeout.connect == 5.0
     assert timeout.read == 10.0
+
+
+def test_call_chat_completion_connect_cap_never_exceeds_a_smaller_budget(monkeypatch):
+    """A budget tighter than the 5s connect cap wins -- otherwise connect
+    alone could outlast the whole call."""
+    captured = _install_spy_client(monkeypatch)
+
+    call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512, timeout=2.0
+    )
+
+    assert captured[0].timeout.connect == 2.0
+
+
+class _ChunkedStream(httpx.SyncByteStream):
+    """A body that arrives in pieces. MockTransport hands back a single-shot
+    body by default, which never exercises the between-chunks deadline check
+    that a trickling endpoint is supposed to trip."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def __iter__(self):
+        yield from self._chunks
+
+    def close(self):
+        pass
+
+
+def test_call_chat_completion_aborts_a_body_that_trickles_past_the_deadline(monkeypatch):
+    """The core of the wall-clock bound: each chunk landing just inside
+    httpx's per-read timeout resets that timeout forever, so `read` alone
+    never ends the call. The deadline does.
+
+    Deterministic and instant -- the clock is scripted, so nothing here waits
+    on real time or on thread scheduling.
+    """
+    payload = json.dumps(_choice_payload(VALID_CONTENT)).encode()
+    chunks = [payload[i : i + 4] for i in range(0, len(payload), 4)]
+    assert len(chunks) > 2, "need several chunks for the trickle to be meaningful"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_ChunkedStream(chunks),
+            headers={"content-type": "application/json"},
+        )
+
+    _install_mock_transport(monkeypatch, handler)
+
+    # Scripted clock: the call starts at 0 with a 10s budget, the first chunk
+    # lands at 1s, and the second at 11s -- past the deadline. Every later
+    # call repeats the last value.
+    ticks = iter([0.0, 0.0, 1.0, 11.0])
+    last = [0.0]
+
+    def fake_monotonic():
+        try:
+            last[0] = next(ticks)
+        except StopIteration:
+            pass
+        return last[0]
+
+    monkeypatch.setattr(llm_client.time, "monotonic", fake_monotonic)
+
+    with pytest.raises(LlmCallError) as excinfo:
+        call_chat_completion(
+            _make_credential(), prompt="prompt", user_content="text", max_tokens=512, timeout=10.0
+        )
+
+    assert excinfo.value.category == "timed_out"
+    assert excinfo.value.status is None
+
+
+def test_read_body_within_deadline_closes_a_response_that_goes_silent():
+    """The half httpx can't cover: once a read is ALREADY blocked on a socket
+    that went quiet, no amount of checking between chunks helps -- only
+    closing the response interrupts it. Proves the watchdog actually fires
+    and that the call ends at the deadline rather than one full read timeout
+    later.
+
+    Event-driven, so it returns the instant the watchdog closes the response
+    instead of waiting out a fixed sleep.
+    """
+    closed = threading.Event()
+
+    class _SilentResponse:
+        def close(self):
+            closed.set()
+
+        def iter_bytes(self):
+            yield b'{"cho'
+            # Stands in for a read blocked on a silent socket: the only thing
+            # that ends it is our own close(). The timeout here is a test
+            # backstop, not the behavior under test.
+            if not closed.wait(timeout=5.0):
+                raise AssertionError("the watchdog never closed the response")
+            raise httpx.ReadError("connection closed")
+
+    start = time.monotonic()
+    with pytest.raises(LlmCallError) as excinfo:
+        llm_client._read_body_within_deadline(
+            _SilentResponse(), deadline=time.monotonic() + 0.2, provider="openai"
+        )
+    elapsed = time.monotonic() - start
+
+    assert excinfo.value.category == "timed_out"
+    assert closed.is_set(), "the deadline must close the response, not just report late"
+    assert elapsed < 2.0, f"cancellation should land near the 0.2s deadline, took {elapsed:.2f}s"
+
+
+def test_read_body_within_deadline_reraises_a_real_failure_untouched():
+    """A transport error that isn't our watchdog must stay a transport error
+    -- mislabeling it `timed_out` would hide genuine connection failures."""
+
+    class _BrokenResponse:
+        def close(self):
+            pass
+
+        def iter_bytes(self):
+            raise httpx.ReadError("connection reset")
+            yield  # pragma: no cover -- makes this a generator
+
+    with pytest.raises(httpx.ReadError):
+        llm_client._read_body_within_deadline(
+            _BrokenResponse(), deadline=time.monotonic() + 30.0, provider="openai"
+        )
 
 
 def test_call_chat_completion_never_logs_the_api_key(monkeypatch, caplog):

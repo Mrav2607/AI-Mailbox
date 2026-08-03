@@ -195,7 +195,9 @@ _CLASSIFICATION_MAX_TOKENS = 200
 # extraction's 30s default could stall a whole Gmail sweep for hours before
 # degrading to the heuristic. A tiny JSON label doesn't need that headroom --
 # extractor.py stays at 30s since it only runs over a bounded subset of
-# messages and produces longer output.
+# messages and produces longer output. This is a TOTAL wall-clock budget for
+# the call, so it's a real per-message ceiling: worst case a full sweep costs
+# this many seconds times the message count, and never more.
 _CLASSIFICATION_TIMEOUT_S = 10.0
 
 
