@@ -28,6 +28,7 @@ import socket
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Literal
 from urllib.parse import SplitResult, urlsplit
 from uuid import UUID
 
@@ -60,6 +61,17 @@ class LlmCredential:
     base_url: str
     api_key: str
     model: str
+
+
+@dataclass(frozen=True)
+class CallContext:
+    """Who a resolved credential bills, for the usage-recording call sites
+    Wave 2b wires up. Kept here, next to `LlmCredential`, rather than in
+    `llm_client` -- that module owns transport and security only, never
+    `user_id` or billing attribution (see plan §3)."""
+
+    credential: LlmCredential
+    payer: Literal["user", "operator"]
 
 
 PROVIDER_PRESETS: dict[str, str] = {

@@ -20,12 +20,14 @@ import pytest
 from app.services.nlp import extractor
 from app.services.nlp.extractor import (
     ExtractedAction,
+    ExtractionAttempt,
     ExtractionCallError,
     NoAction,
     extract_action,
+    extract_action_with_usage,
 )
 from app.services.nlp.extractor import test_credential as _test_credential
-from app.services.nlp.llm_client import LlmCallResult
+from app.services.nlp.llm_client import LlmCallResult, LlmUsage
 
 # Imported under a private alias -- pytest collects any top-level `test_*`
 # callable in a test module, including ones merely imported by that name.
@@ -70,14 +72,14 @@ def _default_kwargs(**overrides):
     return kwargs
 
 
-def _stub_returns(content, *, calls=None):
+def _stub_returns(content, *, calls=None, usage=None):
     """A fake `call_chat_completion` that returns `content` wrapped in the
-    real wire type (usage untested here -- that's Wave 2a) and records the
-    kwargs it was called with, so tests can assert what extractor built."""
+    real wire type, optionally carrying `usage`, and records the kwargs it
+    was called with so tests can assert what extractor built."""
     def fn(credential, *, prompt, user_content, max_tokens):
         if calls is not None:
             calls.append(dict(credential=credential, prompt=prompt, user_content=user_content, max_tokens=max_tokens))
-        return LlmCallResult(content=content, usage=None)
+        return LlmCallResult(content=content, usage=usage)
     return fn
 
 
@@ -99,9 +101,10 @@ def test_call_llm_builds_email_prefixed_and_truncated_user_content(monkeypatch):
     monkeypatch.setattr(extractor, "call_chat_completion", _stub_returns(json.dumps(VALID_PAYLOAD), calls=calls))
     long_text = "x" * 7000
 
-    content = extractor._call_llm(_make_credential(), "the prompt", long_text)
+    call_result = extractor._call_llm(_make_credential(), "the prompt", long_text)
 
-    assert content == json.dumps(VALID_PAYLOAD)
+    assert isinstance(call_result, LlmCallResult)
+    assert call_result.content == json.dumps(VALID_PAYLOAD)
     assert len(calls) == 1
     assert calls[0]["prompt"] == "the prompt"
     assert calls[0]["user_content"] == f"Email:\n{long_text[:6000]}"
@@ -216,6 +219,60 @@ def test_extract_action_never_logs_the_api_key(monkeypatch, caplog, make_stub, e
     if expect_result_is_none:
         assert result is None
     assert SECRET_KEY not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# extract_action_with_usage -- usage-bearing wrapper around _extract_attempt.
+# provider_call_succeeded means "the wire call came back", not "we got a
+# usable answer" -- the parse-failure case below is the one most likely to
+# get broken by a future refactor, since it's tempting to conflate the two.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_action_with_usage_success_carries_usage_and_marks_call_succeeded(monkeypatch):
+    usage = LlmUsage(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+    monkeypatch.setattr(
+        extractor, "call_chat_completion", _stub_returns(json.dumps(VALID_PAYLOAD), usage=usage)
+    )
+    attempt = extract_action_with_usage(**_default_kwargs())
+    assert isinstance(attempt, ExtractionAttempt)
+    assert isinstance(attempt.result, ExtractedAction)
+    assert attempt.provider_call_succeeded is True
+    assert attempt.usage == usage
+
+
+def test_extract_action_with_usage_parse_failure_after_wire_success_still_counts_the_call(monkeypatch):
+    """A response that comes back over the wire fine but fails to parse still
+    means the provider was reached (and, for BYOK, billed) -- it must count
+    as a real call even though there's no usable result."""
+    usage = LlmUsage(prompt_tokens=50, completion_tokens=None, total_tokens=None)
+    monkeypatch.setattr(
+        extractor, "call_chat_completion", _stub_returns("not json at all", usage=usage)
+    )
+    attempt = extract_action_with_usage(**_default_kwargs())
+    assert attempt.result is None
+    assert attempt.provider_call_succeeded is True
+    assert attempt.usage == usage
+
+
+def test_extract_action_with_usage_wire_failure_does_not_count_the_call(monkeypatch):
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_raises("connection_failed", None))
+    attempt = extract_action_with_usage(**_default_kwargs())
+    assert attempt.result is None
+    assert attempt.provider_call_succeeded is False
+    assert attempt.usage is None
+
+
+def test_extract_action_with_usage_no_action_result_still_carries_call_succeeded(monkeypatch):
+    payload = {"has_action": False, "confidence": 0.9}
+    usage = LlmUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    monkeypatch.setattr(
+        extractor, "call_chat_completion", _stub_returns(json.dumps(payload), usage=usage)
+    )
+    attempt = extract_action_with_usage(**_default_kwargs())
+    assert isinstance(attempt.result, NoAction)
+    assert attempt.provider_call_succeeded is True
+    assert attempt.usage == usage
 
 
 # ---------------------------------------------------------------------------
