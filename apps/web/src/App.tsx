@@ -20,6 +20,7 @@ import {
   getActions,
   getCounts,
   getLlmSettings,
+  getLlmUsage,
   getMe,
   getSyncHealth,
   googleAuthCallback,
@@ -63,6 +64,7 @@ import type {
   LlmProvider,
   LlmSettings,
   LlmTestResult,
+  LlmUsage,
   Overview,
   ThreadDetail,
   TriageItem,
@@ -227,6 +229,11 @@ export default function Console() {
   const [llmTesting, setLlmTesting] = useState(false);
   const [llmRemoving, setLlmRemoving] = useState(false);
   const [llmTestResult, setLlmTestResult] = useState<LlmTestResult | null>(null);
+  // Usage gets its own state, separate from llmSettings above -- it's fetched
+  // fresh every time the modal opens (never gated on "is this null yet") since
+  // background usage keeps moving even when the stored credential hasn't.
+  const [llmUsage, setLlmUsage] = useState<LlmUsage | null>(null);
+  const [llmUsageError, setLlmUsageError] = useState(false);
   // Which OAuth providers this deployment has configured — gates "Connect
   // Outlook" everywhere it'd otherwise show up next to Gmail.
   const [authProviders, setAuthProviders] = useState<string[]>([]);
@@ -622,14 +629,43 @@ export default function Console() {
     }
   }, [handleSessionExpired]);
 
+  // Usage changes constantly (every ingested message can add to it), so
+  // unlike settings above it's never cached against a "do we already have
+  // it?" check -- always re-fetched. Reuses llmCredentialGenRef (bumped by
+  // save/remove below) rather than a second ref: a fetch that started before
+  // a save/remove completed is stale the moment that generation moves, same
+  // as doTestLlmSettings's own guard against its credential.
+  const refreshLlmUsage = useCallback(async () => {
+    const generation = llmCredentialGenRef.current;
+    try {
+      const usage = await getLlmUsage();
+      if (generation !== llmCredentialGenRef.current) return; // credential changed mid-flight -- discard
+      setLlmUsage(usage);
+      setLlmUsageError(false);
+    } catch (e) {
+      if (generation !== llmCredentialGenRef.current) return; // ditto for a stale failure
+      if (e instanceof ApiError && e.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      // A usage outage must never make the rest of this modal look broken --
+      // no toast, just a quiet fallback the panel itself renders.
+      setLlmUsage(null);
+      setLlmUsageError(true);
+    }
+  }, [handleSessionExpired]);
+
   // Opening always starts the modal from a clean test result -- otherwise a
   // stale ok/error from a previous visit would flash before the user does
   // anything this time. If the post-login fetch never landed (settings is
   // still null), retry it here and await it -- otherwise every entry point
   // into this modal (palette, accounts menu, agenda CTA) would silently do
-  // nothing on a bad connection.
+  // nothing on a bad connection. Usage, unlike settings, is fetched every
+  // single time regardless of what's already loaded -- it's never stale-safe
+  // to skip.
   const openLlmSettings = useCallback(async () => {
     setLlmTestResult(null);
+    void refreshLlmUsage();
     if (!llmSettings) {
       try {
         setLlmSettings(await getLlmSettings());
@@ -643,7 +679,7 @@ export default function Console() {
       }
     }
     setLlmSettingsOpen(true);
-  }, [llmSettings, handleSessionExpired]);
+  }, [llmSettings, handleSessionExpired, refreshLlmUsage]);
 
   const doSaveLlmSettings = useCallback(
     async (input: {
@@ -656,21 +692,28 @@ export default function Console() {
       classification_byok?: boolean;
     }) => {
       setLlmSaving(true);
+      let saved = false;
       try {
         const next = await putLlmSettings(input);
         setLlmSettings(next);
         setLlmTestResult(null);
         toast.success("AI settings saved");
+        saved = true;
       } catch (e) {
         toast.error((e as Error).message || "could not save these settings");
       } finally {
-        // The credential may have changed either way -- bump so any test that
-        // started before this save discards its response when it lands.
+        // The credential may have changed either way -- bump so any test (or
+        // usage fetch) that started before this save discards its response
+        // when it lands.
         llmCredentialGenRef.current++;
         setLlmSaving(false);
       }
+      // Refetch only on success, and only after the bump above -- otherwise
+      // this fetch would capture the pre-bump generation and immediately
+      // discard its own result once the finally block ran.
+      if (saved) void refreshLlmUsage();
     },
-    [],
+    [refreshLlmUsage],
   );
 
   const doTestLlmSettings = useCallback(async () => {
@@ -694,18 +737,23 @@ export default function Console() {
 
   const doRemoveLlmSettings = useCallback(async () => {
     setLlmRemoving(true);
+    let removed = false;
     try {
       await deleteLlmSettings();
       setLlmTestResult(null);
       await refreshLlmSettings();
       toast.success("AI credential removed");
+      removed = true;
     } catch (e) {
       toast.error((e as Error).message || "could not remove this credential");
     } finally {
       llmCredentialGenRef.current++;
       setLlmRemoving(false);
     }
-  }, [refreshLlmSettings]);
+    // Same ordering rule as doSaveLlmSettings: refetch after the generation
+    // bump above, and only once the remove actually went through.
+    if (removed) void refreshLlmUsage();
+  }, [refreshLlmSettings, refreshLlmUsage]);
 
   // The page-0 reset: always starts over at offset 0 under the current
   // sort/account filter (read from refs so this callback's identity — and
@@ -2853,6 +2901,8 @@ export default function Console() {
           testResult={llmTestResult}
           onRemove={doRemoveLlmSettings}
           removing={llmRemoving}
+          usage={llmUsage}
+          usageError={llmUsageError}
         />
         {!isNarrow && (tourActive || tourVersion < TOUR_VERSION) && (
           <Suspense fallback={null}>

@@ -17,7 +17,8 @@ import asyncio
 import inspect
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -394,6 +395,236 @@ def test_get_classifier_backend_fields_use_the_normalized_expression(
     body = resp.json()
     assert body["classifier_backend"] == expected_backend
     assert body["classifier_uses_llm"] is expected_uses_llm
+
+
+# ---------------------------------------------------------------------------
+# GET /usage
+# ---------------------------------------------------------------------------
+#
+# The route issues four separate aggregate queries (totals, by_stage,
+# by_provider, daily) -- one per SQL GROUP BY dimension, per plan §6 ("aggregate
+# in SQL, not in Python"). `_usage_db` stubs `db.execute` with one canned
+# result per call, in that fixed order, so these tests exercise the route's
+# own assembly/casting logic (Decimal -> int, empty-state zeroing, window
+# math) without a live DB -- the actual SUM/GROUP BY correctness is Postgres's
+# job, proven by the live migration round-trip, not this offline suite's.
+
+
+def _usage_db(*, totals, by_stage, by_provider, daily):
+    """Sequences four `db.execute(...)` results in the exact call order
+    `get_llm_usage` issues them: totals via `.one()`, then by_stage/
+    by_provider/daily via `.all()`.
+    """
+    results = []
+    for method, value in (
+        ("one", totals),
+        ("all", by_stage),
+        ("all", by_provider),
+        ("all", daily),
+    ):
+        result = MagicMock()
+        setattr(result, method, MagicMock(return_value=value))
+        results.append(result)
+    db = MagicMock()
+    db.execute = MagicMock(side_effect=results)
+    return db
+
+
+_ZERO_COUNTERS = (0, 0, 0, 0, 0)
+_ZERO_TOTALS = {
+    "calls": 0,
+    "calls_with_total_tokens": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+}
+
+
+def test_usage_empty_state_is_zeroed_lists_and_200_not_404(user):
+    db = _usage_db(totals=_ZERO_COUNTERS, by_stage=[], by_provider=[], daily=[])
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/usage")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "window_days": 30,
+        "totals": _ZERO_TOTALS,
+        "by_stage": [],
+        "by_provider": [],
+        "daily": [],
+    }
+
+
+def test_usage_totals_and_splits_assemble_from_the_sql_aggregates(user):
+    db = _usage_db(
+        totals=(Decimal(12), Decimal(9), Decimal(1000), Decimal(500), Decimal(1500)),
+        by_stage=[
+            ("classification", Decimal(10), Decimal(8), Decimal(800), Decimal(400), Decimal(1200)),
+            ("extraction", Decimal(2), Decimal(1), Decimal(200), Decimal(100), Decimal(300)),
+        ],
+        by_provider=[
+            ("openai", Decimal(12), Decimal(9), Decimal(1000), Decimal(500), Decimal(1500)),
+        ],
+        daily=[
+            (date(2026, 7, 30), Decimal(5), Decimal(700)),
+            (date(2026, 7, 31), Decimal(7), Decimal(800)),
+        ],
+    )
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/usage?days=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["window_days"] == 2
+    assert body["totals"] == {
+        "calls": 12,
+        "calls_with_total_tokens": 9,
+        "prompt_tokens": 1000,
+        "completion_tokens": 500,
+        "total_tokens": 1500,
+    }
+    assert body["by_stage"] == [
+        {
+            "stage": "classification",
+            "calls": 10,
+            "calls_with_total_tokens": 8,
+            "prompt_tokens": 800,
+            "completion_tokens": 400,
+            "total_tokens": 1200,
+        },
+        {
+            "stage": "extraction",
+            "calls": 2,
+            "calls_with_total_tokens": 1,
+            "prompt_tokens": 200,
+            "completion_tokens": 100,
+            "total_tokens": 300,
+        },
+    ]
+    assert body["by_provider"] == [
+        {
+            "provider": "openai",
+            "calls": 12,
+            "calls_with_total_tokens": 9,
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+            "total_tokens": 1500,
+        },
+    ]
+    assert body["daily"] == [
+        {"date": "2026-07-30", "calls": 5, "total_tokens": 700},
+        {"date": "2026-07-31", "calls": 7, "total_tokens": 800},
+    ]
+
+
+def test_usage_route_casts_decimal_sums_to_real_python_ints(user):
+    # Calling the route function directly (same idiom as
+    # `mailbox._assemble_triage_items` in test_mailbox.py) since a JSON
+    # round-trip can't distinguish a whole Decimal from an int -- this proves
+    # the ROUTE itself, not just its serialized output, never hands a
+    # Decimal onward.
+    db = _usage_db(
+        totals=(Decimal(3), Decimal(2), Decimal(30), Decimal(20), Decimal(50)),
+        by_stage=[], by_provider=[], daily=[],
+    )
+    result = llm_settings.get_llm_usage(days=30, current_user=user, db=db)
+    for value in result["totals"].values():
+        assert type(value) is int
+
+
+@pytest.mark.parametrize("days", [1, 400])
+def test_usage_days_bounds_accepted(user, days):
+    db = _usage_db(totals=_ZERO_COUNTERS, by_stage=[], by_provider=[], daily=[])
+    _override(user, db)
+    resp = TestClient(app).get(f"/api/v1/settings/llm/usage?days={days}")
+    assert resp.status_code == 200
+    assert resp.json()["window_days"] == days
+
+
+@pytest.mark.parametrize("days", [0, 401])
+def test_usage_days_out_of_range_is_422(user, days):
+    db = _usage_db(totals=_ZERO_COUNTERS, by_stage=[], by_provider=[], daily=[])
+    _override(user, db)
+    resp = TestClient(app).get(f"/api/v1/settings/llm/usage?days={days}")
+    assert resp.status_code == 422
+    assert db.execute.call_count == 0  # rejected before any query is issued
+
+
+def test_usage_non_integer_days_is_422(user):
+    db = _usage_db(totals=_ZERO_COUNTERS, by_stage=[], by_provider=[], daily=[])
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/usage?days=not-a-number")
+    assert resp.status_code == 422
+    assert db.execute.call_count == 0
+
+
+def test_usage_days_defaults_to_thirty(user):
+    db = _usage_db(totals=_ZERO_COUNTERS, by_stage=[], by_provider=[], daily=[])
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/usage")
+    assert resp.status_code == 200
+    assert resp.json()["window_days"] == 30
+
+
+def test_usage_window_boundary_days_minus_one_apart(user):
+    """`days=N` must cut off exactly one calendar day earlier than
+    `days=N+1` -- the plan's `usage_date >= today - (days - 1)` convention.
+    Proven by reading the literal cutoff each call's totals query compiled,
+    not by asserting against a frozen "today" (this suite doesn't stub
+    `datetime.now`), so the assertion holds regardless of when the suite
+    runs.
+    """
+    db = _usage_db(totals=_ZERO_COUNTERS, by_stage=[], by_provider=[], daily=[])
+    _override(user, db)
+    TestClient(app).get("/api/v1/settings/llm/usage?days=5")
+    cutoff_5 = _compiled(db.execute.call_args_list[0].args[0])
+
+    db2 = _usage_db(totals=_ZERO_COUNTERS, by_stage=[], by_provider=[], daily=[])
+    _override(user, db2)
+    TestClient(app).get("/api/v1/settings/llm/usage?days=6")
+    cutoff_6 = _compiled(db2.execute.call_args_list[0].args[0])
+
+    def _extract_date(compiled: str) -> date:
+        marker = "usage_date >= '"
+        start = compiled.index(marker) + len(marker)
+        end = compiled.index("'", start)
+        return date.fromisoformat(compiled[start:end])
+
+    assert _extract_date(cutoff_5) - _extract_date(cutoff_6) == timedelta(days=1)
+
+
+def test_usage_days_one_means_today_only(user):
+    db = _usage_db(totals=_ZERO_COUNTERS, by_stage=[], by_provider=[], daily=[])
+    _override(user, db)
+    TestClient(app).get("/api/v1/settings/llm/usage?days=1")
+    compiled = _compiled(db.execute.call_args_list[0].args[0])
+    today = datetime.now(timezone.utc).date()
+    assert f"usage_date >= '{today.isoformat()}'" in compiled
+
+
+def test_usage_statement_filters_by_current_users_id_first(user):
+    db = _usage_db(totals=_ZERO_COUNTERS, by_stage=[], by_provider=[], daily=[])
+    _override(user, db)
+    TestClient(app).get("/api/v1/settings/llm/usage")
+    compiled = _compiled(db.execute.call_args_list[0].args[0])
+    assert f"llm_usage_daily.user_id = '{user.id.hex}'" in compiled
+
+
+def test_usage_two_user_isolation_each_gets_their_own_scoped_query(monkeypatch):
+    user_a = MagicMock(id=uuid4())
+    user_b = MagicMock(id=uuid4())
+
+    db_a = _usage_db(totals=_ZERO_COUNTERS, by_stage=[], by_provider=[], daily=[])
+    _override(user_a, db_a)
+    TestClient(app).get("/api/v1/settings/llm/usage")
+    compiled_a = _compiled(db_a.execute.call_args_list[0].args[0])
+    assert f"llm_usage_daily.user_id = '{user_a.id.hex}'" in compiled_a
+    assert user_b.id.hex not in compiled_a
+
+    db_b = _usage_db(totals=_ZERO_COUNTERS, by_stage=[], by_provider=[], daily=[])
+    _override(user_b, db_b)
+    TestClient(app).get("/api/v1/settings/llm/usage")
+    compiled_b = _compiled(db_b.execute.call_args_list[0].args[0])
+    assert f"llm_usage_daily.user_id = '{user_b.id.hex}'" in compiled_b
+    assert user_a.id.hex not in compiled_b
 
 
 # ---------------------------------------------------------------------------

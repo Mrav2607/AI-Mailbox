@@ -17,18 +17,18 @@ current_user.id`` -- ownership is a WHERE clause, never an assumption.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlalchemy import select, update
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.ratelimit import user_rate_limit
 from app.deps import get_current_user, get_db
-from app.db.models import AppUser, UserLlmCredential
-from app.db.schemas.llm_settings import LlmSettingsOut, LlmTestResultOut
+from app.db.models import AppUser, LlmUsageDaily, UserLlmCredential
+from app.db.schemas.llm_settings import LlmSettingsOut, LlmTestResultOut, LlmUsageOut
 from app.services.nlp.extractor import test_credential
 from app.services.nlp.providers import (
     PROVIDER_PRESETS,
@@ -113,6 +113,129 @@ def get_llm_settings(
     resolved = resolve_extraction_credential(db, current_user.id)
     routing = resolve_classification_routing(db, current_user.id)
     return _settings_payload(row, resolved, classification_eligible=routing.mode == "user")
+
+
+# `days` bounds: a 400-day cap matches the retention tick (plan §8), so the
+# window can never outrun what's actually still on disk. An unbounded value
+# would be an unbounded scan over `llm_usage_daily`, hence the hard `le`.
+_MIN_USAGE_WINDOW_DAYS = 1
+_MAX_USAGE_WINDOW_DAYS = 400
+
+# Every breakdown (totals, by_stage, by_provider) sums the same five
+# columns -- named once here so the three queries below can't drift apart
+# on which columns they aggregate.
+_USAGE_COUNTER_COLUMNS = (
+    LlmUsageDaily.calls,
+    LlmUsageDaily.calls_with_total_tokens,
+    LlmUsageDaily.prompt_tokens,
+    LlmUsageDaily.completion_tokens,
+    LlmUsageDaily.total_tokens,
+)
+
+
+def _usage_sums(*columns):
+    """`SUM` alone returns SQL `NULL` over zero matching rows -- coalescing
+    to 0 here is what lets an unused account get zeroed totals back instead
+    of nulls.
+    """
+    return [func.coalesce(func.sum(column), 0) for column in columns]
+
+
+def _usage_counters_dict(counters) -> dict:
+    """Postgres returns `SUM(bigint)` as `numeric`, which arrives as
+    `Decimal` -- cast every counter to `int` here so nothing downstream
+    (the response schema, the UI's JSON parsing) has to special-case that.
+    `counters` is any 5-item iterable in `_USAGE_COUNTER_COLUMNS` order.
+    """
+    calls, calls_with_total_tokens, prompt_tokens, completion_tokens, total_tokens = counters
+    return {
+        "calls": int(calls),
+        "calls_with_total_tokens": int(calls_with_total_tokens),
+        "prompt_tokens": int(prompt_tokens),
+        "completion_tokens": int(completion_tokens),
+        "total_tokens": int(total_tokens),
+    }
+
+
+@router.get("/usage", response_model=LlmUsageOut)
+def get_llm_usage(
+    days: int = Query(default=30, ge=_MIN_USAGE_WINDOW_DAYS, le=_MAX_USAGE_WINDOW_DAYS),
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Account-level background LLM usage over a trailing window: calls and
+    tokens split by stage and provider, plus a daily series. A readout, never
+    billing -- no currency amount is computed or returned here, on purpose
+    (docs/plans/2026-08-02-llm-usage-visibility-plan.md §1). Pricing varies
+    per provider/model/tier and we have no authoritative table, least of all
+    for a `custom` endpoint, so this route never carries a number that
+    invites one.
+
+    Deliberately its OWN endpoint, not a field folded onto `GET
+    /settings/llm`: `_settings_payload` above is already duplicated verbatim
+    in the PUT response, so every field added there has to be added twice,
+    and a plain settings read shouldn't drag an aggregate query along with
+    it.
+
+    Window convention: `usage_date >= today - (days - 1)`, UTC calendar
+    days -- so `days=1` means "today only," not "the last 24 hours." Get
+    that `-1` backwards and every window silently reports one extra (or one
+    fewer) day than the caller asked for.
+
+    All four aggregates are computed in SQL (`func.sum`/`func.coalesce`),
+    never by pulling raw rows and summing them in Python -- a user with no
+    rows at all still gets a well-formed response back (zeroed totals, empty
+    lists), never a 404.
+    """
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=days - 1)
+    # user_id filtered FIRST, same self-scoping convention as every other
+    # lookup in this router -- ownership is a WHERE clause, never an
+    # assumption.
+    where = (LlmUsageDaily.user_id == current_user.id, LlmUsageDaily.usage_date >= cutoff)
+
+    totals_row = db.execute(select(*_usage_sums(*_USAGE_COUNTER_COLUMNS)).where(*where)).one()
+    totals = _usage_counters_dict(totals_row)
+
+    by_stage_rows = db.execute(
+        select(LlmUsageDaily.stage, *_usage_sums(*_USAGE_COUNTER_COLUMNS))
+        .where(*where)
+        .group_by(LlmUsageDaily.stage)
+        .order_by(LlmUsageDaily.stage)
+    ).all()
+    by_stage = [{"stage": stage, **_usage_counters_dict(counters)} for stage, *counters in by_stage_rows]
+
+    by_provider_rows = db.execute(
+        select(LlmUsageDaily.provider, *_usage_sums(*_USAGE_COUNTER_COLUMNS))
+        .where(*where)
+        .group_by(LlmUsageDaily.provider)
+        .order_by(LlmUsageDaily.provider)
+    ).all()
+    by_provider = [
+        {"provider": provider, **_usage_counters_dict(counters)}
+        for provider, *counters in by_provider_rows
+    ]
+
+    daily_rows = db.execute(
+        select(
+            LlmUsageDaily.usage_date,
+            *_usage_sums(LlmUsageDaily.calls, LlmUsageDaily.total_tokens),
+        )
+        .where(*where)
+        .group_by(LlmUsageDaily.usage_date)
+        .order_by(LlmUsageDaily.usage_date)
+    ).all()
+    daily = [
+        {"date": usage_date, "calls": int(calls), "total_tokens": int(total_tokens)}
+        for usage_date, calls, total_tokens in daily_rows
+    ]
+
+    return {
+        "window_days": days,
+        "totals": totals,
+        "by_stage": by_stage,
+        "by_provider": by_provider,
+        "daily": daily,
+    }
 
 
 async def _read_bounded_body(request: Request) -> bytes:

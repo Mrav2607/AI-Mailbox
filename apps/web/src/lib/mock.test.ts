@@ -7,6 +7,7 @@ import {
   mockDeleteConnection,
   mockDeleteLlmSettings,
   mockGetLlmSettings,
+  mockGetLlmUsage,
   mockIngest,
   mockListConnections,
   mockPutLlmSettings,
@@ -177,6 +178,65 @@ describe("mock agenda", () => {
     const result = mockBackfillActions();
     expect(result.status).toBe("queued");
     expect(result.task_id).toMatch(/^mock-actions-task-/);
+  });
+});
+
+describe("mock llm usage", () => {
+  it("defaults to a 30-day window with one point per day, oldest first", () => {
+    const usage = mockGetLlmUsage();
+    expect(usage.window_days).toBe(30);
+    expect(usage.daily).toHaveLength(30);
+    for (let i = 1; i < usage.daily.length; i++) {
+      expect(usage.daily[i].date >= usage.daily[i - 1].date).toBe(true);
+    }
+  });
+
+  it("respects a non-default days window", () => {
+    const usage = mockGetLlmUsage(7);
+    expect(usage.window_days).toBe(7);
+    expect(usage.daily).toHaveLength(7);
+  });
+
+  it("has non-zero calls and tokens, so the panel actually demos something", () => {
+    const usage = mockGetLlmUsage();
+    expect(usage.totals.calls).toBeGreaterThan(0);
+    expect(usage.totals.total_tokens).toBeGreaterThan(0);
+  });
+
+  it("sums by_stage into totals exactly", () => {
+    const usage = mockGetLlmUsage();
+    const summed = usage.by_stage.reduce(
+      (acc, s) => ({
+        calls: acc.calls + s.calls,
+        calls_with_total_tokens: acc.calls_with_total_tokens + s.calls_with_total_tokens,
+        prompt_tokens: acc.prompt_tokens + s.prompt_tokens,
+        completion_tokens: acc.completion_tokens + s.completion_tokens,
+        total_tokens: acc.total_tokens + s.total_tokens,
+      }),
+      { calls: 0, calls_with_total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    );
+    expect(summed).toEqual(usage.totals);
+  });
+
+  it("sums the daily series' calls/tokens into the same totals", () => {
+    const usage = mockGetLlmUsage();
+    const dailyCalls = usage.daily.reduce((sum, d) => sum + d.calls, 0);
+    const dailyTokens = usage.daily.reduce((sum, d) => sum + d.total_tokens, 0);
+    expect(dailyCalls).toBe(usage.totals.calls);
+    expect(dailyTokens).toBe(usage.totals.total_tokens);
+  });
+
+  it("some days have calls_with_total_tokens below calls -- the partial-reporting case", () => {
+    const usage = mockGetLlmUsage();
+    const classification = usage.by_stage.find((s) => s.stage === "classification")!;
+    expect(classification.calls_with_total_tokens).toBeLessThan(classification.calls);
+  });
+
+  it("attributes every call to the currently configured provider", () => {
+    const usage = mockGetLlmUsage();
+    expect(usage.by_provider).toHaveLength(1);
+    expect(usage.by_provider[0].provider).toBe(mockGetLlmSettings().provider);
+    expect(usage.by_provider[0].calls).toBe(usage.totals.calls);
   });
 });
 

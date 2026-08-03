@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from .common import Response
@@ -73,3 +73,69 @@ class LlmTestResultOut(Response):
     ok: bool
     latency_ms: int
     error: str | None
+
+
+class LlmUsageCounters(Response):
+    """The five additive counters shared verbatim by `totals` and every
+    `by_stage`/`by_provider` row -- one shape, so a totals-only reader and a
+    per-dimension reader see identical field names for identical numbers.
+    Always ints here, never `Decimal`/`None`: the route coalesces SQL `NULL`
+    (zero matching rows) to 0 and casts every summed column, since Postgres
+    returns `SUM(bigint)` as `numeric`.
+    """
+
+    calls: int
+    # A response can report `prompt_tokens` and omit `total_tokens`; this
+    # counts only the calls where a genuine `total_tokens` came back, so the
+    # UI can tell a full total from a partial one instead of rendering a
+    # partial sum as if it covered every call.
+    calls_with_total_tokens: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class LlmUsageByStage(LlmUsageCounters):
+    """One row per stage (`classification`/`extraction`) within the window."""
+
+    stage: str
+
+
+class LlmUsageByProvider(LlmUsageCounters):
+    """One row per provider (a preset or `custom`) within the window."""
+
+    provider: str
+
+
+class LlmUsageDailyPoint(Response):
+    """One point in the daily series -- calls and total tokens only, not the
+    full counter set: the UI's trend line doesn't need a per-day stage/
+    provider/partial-token breakdown, and the totals/by_stage/by_provider
+    blocks already carry that detail for the whole window.
+    """
+
+    date: date
+    calls: int
+    total_tokens: int
+
+
+class LlmUsageOut(Response):
+    """`GET /settings/llm/usage` response -- a readout, not billing (see
+    docs/plans/2026-08-02-llm-usage-visibility-plan.md §1). No currency
+    field lives here, on purpose: we have no authoritative pricing table,
+    least of all for a `custom` endpoint, so this never carries a number
+    that invites one.
+
+    A user with zero usage rows still gets this shape back with zeroed
+    totals and empty lists -- never a 404 and never a null field -- so the
+    UI can render a genuine empty state instead of special-casing "no data."
+    """
+
+    # Echoes the validated `?days=` query param back, so the UI never has to
+    # guess what window it's looking at after a request with a stale/default
+    # value.
+    window_days: int
+    totals: LlmUsageCounters
+    by_stage: list[LlmUsageByStage]
+    by_provider: list[LlmUsageByProvider]
+    daily: list[LlmUsageDailyPoint]

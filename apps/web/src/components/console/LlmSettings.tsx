@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
-import type { LlmProvider, LlmSettings, LlmTestResult } from "@/lib/types";
+import type { LlmProvider, LlmSettings, LlmTestResult, LlmUsage } from "@/lib/types";
 
 interface Props {
   open: boolean;
@@ -23,6 +23,14 @@ interface Props {
   testResult: LlmTestResult | null;
   onRemove: () => void;
   removing: boolean;
+  // Null while the fetch is in flight (or hasn't started) and no prior error
+  // -- fetched fresh every time this modal opens, since usage keeps moving
+  // even when the credential itself hasn't changed.
+  usage: LlmUsage | null;
+  // True when the usage fetch failed. Kept separate from `usage` being null
+  // so the panel can tell "still loading" apart from "unavailable" -- an
+  // outage here must never make the rest of this modal look broken.
+  usageError: boolean;
 }
 
 const PROVIDER_LABELS: Record<LlmProvider, string> = {
@@ -52,6 +60,31 @@ const PRESET_PROVIDERS: LlmProvider[] = [
   "groq",
   "mistral",
 ];
+
+// The UI's own words for each stage -- never the internal "classification" /
+// "extraction" column values from the usage response.
+const STAGE_LABELS: Record<string, string> = {
+  classification: "Sorting",
+  extraction: "Agenda",
+};
+
+// Only providers we're confident actually resolve to a real usage/billing
+// page. Deliberately partial: guessing a URL that 404s is worse than no
+// link at all, and "custom" has no dashboard we could point to anyway.
+// Where a user goes for the actual money. We only report call and token
+// counts, so this link is the other half of "Usage, not billing".
+//
+// OpenAI and OpenRouter get a deep link straight to the usage page. The rest
+// point at the console home instead: those products move their billing pages
+// around, and a stale deep link that 404s is worse than one extra click. No
+// entry for "custom" on purpose -- we have no idea where that endpoint bills.
+const USAGE_DASHBOARD_URLS: Partial<Record<LlmProvider, string>> = {
+  openai: "https://platform.openai.com/usage",
+  openrouter: "https://openrouter.ai/activity",
+  gemini: "https://aistudio.google.com/",
+  groq: "https://console.groq.com/",
+  mistral: "https://console.mistral.ai/",
+};
 
 // Maps the /test route's fixed category constants -- never a raw exception
 // string -- to plain copy anyone can follow, regardless of first language.
@@ -89,6 +122,8 @@ export function LlmSettingsModal({
   testResult,
   onRemove,
   removing,
+  usage,
+  usageError,
 }: Props) {
   const [provider, setProvider] = useState<LlmProvider>("openai");
   const [model, setModel] = useState("");
@@ -349,6 +384,59 @@ export function LlmSettingsModal({
               last verified {new Date(settings.last_verified_at).toLocaleString()}
             </p>
           )}
+
+          <div className="space-y-1 pt-2 mt-1 border-t border-border/60">
+            <span className={fieldLabel}>Usage, not billing</span>
+            {usageError ? (
+              <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+                Usage isn&apos;t available right now.
+              </p>
+            ) : !usage ? (
+              <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+                checking your usage…
+              </p>
+            ) : usage.totals.calls === 0 ? (
+              <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+                Your key hasn&apos;t been used yet.
+              </p>
+            ) : (
+              <>
+                <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+                  AI-Mailbox used your key {usage.totals.calls} times in the last{" "}
+                  {usage.window_days} days.
+                </p>
+                {usage.totals.calls_with_total_tokens > 0 ? (
+                  <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+                    About {usage.totals.total_tokens.toLocaleString()} tokens total
+                    {usage.totals.calls_with_total_tokens < usage.totals.calls
+                      ? ` — across ${usage.totals.calls_with_total_tokens} of those calls. This provider doesn't report token counts for the rest.`
+                      : "."}
+                  </p>
+                ) : (
+                  <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+                    This provider doesn&apos;t report token counts.
+                  </p>
+                )}
+                {usage.by_stage.length > 0 && (
+                  <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+                    {usage.by_stage
+                      .map((s) => `${STAGE_LABELS[s.stage] ?? s.stage}: ${s.calls}`)
+                      .join(" · ")}
+                  </p>
+                )}
+              </>
+            )}
+            {settings.provider && USAGE_DASHBOARD_URLS[settings.provider] && (
+              <a
+                href={USAGE_DASHBOARD_URLS[settings.provider]}
+                target="_blank"
+                rel="noreferrer"
+                className="block text-[10.5px] font-mono text-primary underline underline-offset-2"
+              >
+                See what this actually cost on {PROVIDER_LABELS[settings.provider]}
+              </a>
+            )}
+          </div>
         </form>
       </DialogContent>
     </Dialog>
