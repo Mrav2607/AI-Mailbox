@@ -234,11 +234,20 @@ def test_classify_backend_gemini_is_an_alias_for_llm(monkeypatch):
 
     monkeypatch.setattr(classifier, "_classify_llm", _spy)
 
+    # Both ways in: the configured default, and the explicit per-call override
+    # that the backfill route passes. They dispatch through the same lookup,
+    # but only the override path is reachable from the API, so pin both.
     for backend in ("gemini", "llm"):
         monkeypatch.setattr(classifier.settings, "classifier_backend", backend)
-        assert classify("Can you review this?")[3] == "spy-v1", backend
+        assert classify("Can you review this?")[3] == "spy-v1", f"configured {backend}"
 
-    assert len(reached) == 2
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "heuristic")
+    for backend in ("gemini", "llm"):
+        assert classify("Can you review this?", backend=backend)[3] == "spy-v1", (
+            f"override {backend}"
+        )
+
+    assert len(reached) == 4
 
 
 def test_classify_routing_none_and_server_are_byte_identical_no_key(monkeypatch):
