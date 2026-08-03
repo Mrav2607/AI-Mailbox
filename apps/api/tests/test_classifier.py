@@ -5,8 +5,8 @@ import json
 
 import pytest
 
-from app.services.nlp.classifier import LABELS, _heuristic_classify, classify
-from app.services.nlp.llm_client import LlmCallError
+from app.services.nlp.classifier import LABELS, _heuristic_classify, classify, classify_with_usage
+from app.services.nlp.llm_client import LlmCallError, LlmCallResult, LlmUsage
 from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
 
@@ -258,7 +258,8 @@ def test_classify_routing_user_mode_calls_openai_compat_with_credential(monkeypa
     def fake_call(cred, *, prompt, user_content, max_tokens, timeout):
         captured["credential"] = cred
         captured["timeout"] = timeout
-        return json.dumps({"label": "spam", "confidence": 0.9, "rationale": "scam"})
+        content = json.dumps({"label": "spam", "confidence": 0.9, "rationale": "scam"})
+        return LlmCallResult(content=content, usage=None)
 
     monkeypatch.setattr(classifier, "call_chat_completion", fake_call)
 
@@ -335,7 +336,12 @@ def test_classify_routing_user_mode_falls_back_to_heuristic_on_unparseable_respo
     credential = LlmCredential(
         provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
     )
-    monkeypatch.setattr(classifier, "call_chat_completion", lambda *a, **k: "not json at all")
+    # Wire type, still an unparseable body -- the point of the test is the
+    # fallback on a bad parse, not on the wire shape.
+    monkeypatch.setattr(
+        classifier, "call_chat_completion",
+        lambda *a, **k: LlmCallResult(content="not json at all", usage=None),
+    )
     routing = ClassificationRouting(mode="user", credential=credential)
     label, confidence, rationale, model_version = classify(
         "Invoice #1842 is due Friday", routing=routing
@@ -389,7 +395,8 @@ def test_classify_precedence_auto_backend_local_unavailable_falls_through_to_use
 
     def fake_call(cred, *, prompt, user_content, max_tokens, timeout):
         captured["credential"] = cred
-        return json.dumps({"label": "promotional", "confidence": 0.7, "rationale": "sale"})
+        content = json.dumps({"label": "promotional", "confidence": 0.7, "rationale": "sale"})
+        return LlmCallResult(content=content, usage=None)
 
     monkeypatch.setattr(classifier, "call_chat_completion", fake_call)
     routing = ClassificationRouting(mode="user", credential=credential)
@@ -398,3 +405,172 @@ def test_classify_precedence_auto_backend_local_unavailable_falls_through_to_use
     assert label == "promotional"
     assert model_version == "mistral:mistral-small"
     assert captured["credential"] is credential
+
+
+# ---------------------------------------------------------------------------
+# ClassificationAttempt contract: classify_with_usage() and
+# provider_call_succeeded / usage on every path (plan §3's wrapper contract).
+# ---------------------------------------------------------------------------
+
+
+def test_classify_with_usage_verdict_matches_classify_for_every_routing_mode(monkeypatch):
+    """Regression guard for the refactor: classify() must still return
+    exactly what classify_with_usage().verdict returns, for every routing
+    mode -- the whole point of `classify` being a one-line wrapper."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", None)
+
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+    )
+    monkeypatch.setattr(
+        classifier, "call_chat_completion",
+        lambda *a, **k: LlmCallResult(
+            content=json.dumps({"label": "fyi", "confidence": 0.5, "rationale": "r"}), usage=None
+        ),
+    )
+
+    for routing in (
+        None,
+        ClassificationRouting(mode="server", credential=None),
+        ClassificationRouting(mode="off", credential=None),
+        ClassificationRouting(mode="user", credential=credential),
+    ):
+        text = "Can you review this?"
+        assert classify(text, routing=routing) == classify_with_usage(text, routing=routing).verdict
+
+
+def test_classify_with_usage_heuristic_backend_never_touched_provider(monkeypatch):
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "heuristic")
+    attempt = classify_with_usage("Security alert: new login detected")
+    assert attempt.provider_call_succeeded is False
+    assert attempt.usage is None
+    assert attempt.verdict[0] == "security_alert"
+
+
+def test_classify_with_usage_local_backend_never_touched_provider(monkeypatch):
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(
+        local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test")
+    )
+    attempt = classify_with_usage("anything at all")
+    assert attempt.provider_call_succeeded is False
+    assert attempt.usage is None
+    assert attempt.verdict == ("fyi", 0.5, "local rationale", "local:test")
+
+
+def test_classify_with_usage_routing_off_never_touched_provider(monkeypatch):
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier, "_genai_client", _explode)
+    monkeypatch.setattr(classifier, "call_chat_completion", _explode)
+
+    routing = ClassificationRouting(mode="off", credential=None)
+    attempt = classify_with_usage("Can you help?", routing=routing)
+    assert attempt.provider_call_succeeded is False
+    assert attempt.usage is None
+
+
+def test_classify_with_usage_user_mode_no_credential_never_touched_provider(monkeypatch):
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier, "_genai_client", _explode)
+    monkeypatch.setattr(classifier, "call_chat_completion", _explode)
+
+    routing = ClassificationRouting(mode="user", credential=None)
+    attempt = classify_with_usage("Security alert: new login detected", routing=routing)
+    assert attempt.provider_call_succeeded is False
+    assert attempt.usage is None
+
+
+def test_classify_with_usage_user_mode_call_error_never_touched_provider(monkeypatch):
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    credential = LlmCredential(
+        provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
+    )
+
+    def failing_call(*args, **kwargs):
+        raise LlmCallError("connection_failed", None)
+
+    monkeypatch.setattr(classifier, "call_chat_completion", failing_call)
+    routing = ClassificationRouting(mode="user", credential=credential)
+    attempt = classify_with_usage("Security alert: new login detected", routing=routing)
+    assert attempt.provider_call_succeeded is False
+    assert attempt.usage is None
+
+
+def test_classify_with_usage_user_mode_success_carries_usage_through(monkeypatch):
+    """The BYOK call succeeded and parsed cleanly -- the recorded call and
+    the reported tokens both count."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+    )
+    usage = LlmUsage(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+    content = json.dumps({"label": "spam", "confidence": 0.9, "rationale": "scam"})
+    monkeypatch.setattr(
+        classifier, "call_chat_completion",
+        lambda *a, **k: LlmCallResult(content=content, usage=usage),
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    attempt = classify_with_usage("You won a prize!", routing=routing)
+
+    assert attempt.provider_call_succeeded is True
+    assert attempt.usage is usage
+    assert attempt.verdict == ("spam", 0.9, "scam", "openai:gpt-4o-mini")
+
+
+def test_classify_with_usage_user_mode_counts_the_call_even_when_content_is_unparseable(monkeypatch):
+    """The one a future refactor is most likely to break: the provider
+    answered (and billed the user) even though its content didn't parse, so
+    the provider-reported usage still has to survive on `attempt.usage` --
+    only the verdict falls back to the heuristic label."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    credential = LlmCredential(
+        provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
+    )
+    usage = LlmUsage(prompt_tokens=50, completion_tokens=None, total_tokens=None)
+    monkeypatch.setattr(
+        classifier, "call_chat_completion",
+        lambda *a, **k: LlmCallResult(content="not json at all", usage=usage),
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    attempt = classify_with_usage("Invoice #1842 is due Friday", routing=routing)
+
+    assert attempt.provider_call_succeeded is True
+    assert attempt.usage is usage
+    assert attempt.verdict[3] == "heuristic-fallback"
+
+
+def test_classify_with_usage_server_path_success_reports_call_but_no_usage(monkeypatch):
+    """Server (operator-paid) path: the call counts, but usage is
+    deliberately left None -- operator-paid usage is a v1 non-goal and
+    `response.usage_metadata` is never parsed here."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
+    monkeypatch.setattr(classifier.settings, "gemini_model", "gemini-2.5-flash")
+    monkeypatch.setattr(
+        classifier, "_genai_client", lambda: _fake_genai_response(label="fyi")
+    )
+
+    for routing in (None, ClassificationRouting(mode="server", credential=None)):
+        attempt = classify_with_usage("hi there", routing=routing)
+        assert attempt.provider_call_succeeded is True
+        assert attempt.usage is None
+        assert attempt.verdict[3] == "gemini-2.5-flash"

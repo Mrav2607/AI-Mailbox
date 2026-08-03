@@ -9,9 +9,15 @@ and lets us inspect the exact statement it built (mirroring
 test_tasks_nlp.py's compiled-SQL-inspection style), and extraction_run.py's
 orchestration is exercised with a FakeSession answering only the plain
 SELECTs it issues directly -- claim_action_item/record_extraction and
-extract_action are monkeypatched per test, since they're covered in
-isolation elsewhere in this file. Controlled call ordering stands in for
+extract_action_with_usage are monkeypatched per test, since they're covered
+in isolation elsewhere in this file. Controlled call ordering stands in for
 real cross-connection lock contention, which is exercised in live QA.
+
+Usage-recording tests use `_FakeAcc` rather than the real UsageAccumulator --
+that class's own DB shape (the sorted multi-row UPSERT) is out of this
+module's boundary and covered where it's defined; these tests only assert
+the CALL-SITE contract (who gets recorded, and the flush-before-commit
+ordering from plan §5).
 """
 
 from __future__ import annotations
@@ -24,19 +30,36 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import settings
 from app.db.models import MailMessage
 from app.services.nlp import extraction_run, persistence
-from app.services.nlp.extractor import ExtractedAction, NoAction
-from app.services.nlp.providers import LlmCredential, ResolvedExtraction
+from app.services.nlp.extractor import ExtractedAction, ExtractionAttempt, NoAction
+from app.services.nlp.llm_client import LlmUsage
+from app.services.nlp.providers import CallContext, LlmCredential, ResolvedExtraction
 from app.workers import tasks_ingest, tasks_nlp
 
 # A fake resolved credential for tests that drive _claim_extract_record
 # directly and don't care about resolution itself -- passing it explicitly
 # sidesteps the real DB-backed resolve_extraction_credential call, mirroring
-# how these tests already monkeypatch claim_action_item/extract_action.
+# how these tests already monkeypatch claim_action_item/extract_action_with_usage.
 _CRED = LlmCredential(provider="gemini", base_url="https://example.test", api_key="key", model="gemini-x")
+
+# Default call context for tests that only care about credential threading,
+# not usage -- "operator" so _claim_extract_record never records/flushes
+# anything, and these tests don't need to know about UsageAccumulator at
+# all. Tests that DO care about usage recording use _USER_CTX instead.
+_CTX = CallContext(credential=_CRED, payer="operator")
+_USER_CTX = CallContext(credential=_CRED, payer="user")
+
+
+def _extraction_attempt(result, *, provider_call_succeeded=True, usage=None):
+    """Build the ExtractionAttempt extract_action_with_usage's fakes return --
+    a thin helper so every test doesn't hand-roll the same three fields."""
+    return ExtractionAttempt(
+        result=result, provider_call_succeeded=provider_call_succeeded, usage=usage
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +145,9 @@ class _FakeSession:
     to understand their SQL, only extraction_run.py's own.
     """
 
-    def __init__(self, *, message=None, thread=None, classification=None, done_at_reads=None):
+    def __init__(
+        self, *, message=None, thread=None, classification=None, done_at_reads=None, events=None
+    ):
         self.message = message
         self.thread = thread
         self.classification = classification
@@ -130,6 +155,10 @@ class _FakeSession:
         self.commits = 0
         self.rollbacks = 0
         self.executed = []
+        # Optional shared list a usage-flush-ordering test appends to
+        # alongside _FakeAcc's own events, so the two can be interleaved
+        # into one timeline without a real clock.
+        self.events = events
 
     def get(self, model, pk):
         assert model is MailMessage
@@ -146,11 +175,59 @@ class _FakeSession:
             return _FakeResult(scalar=self.classification)
         raise AssertionError(f"unexpected statement in fake session: {stmt}")
 
+    def flush(self):
+        # Core DML (claim_action_item/record_extraction) never dirties ORM
+        # state, so this is a no-op in practice -- it exists so
+        # _claim_extract_record's unconditional db.flush() has something to
+        # call, matching persistence.py's real Core-DML shape.
+        if self.events is not None:
+            self.events.append("db.flush")
+
+    def begin_nested(self):
+        return nullcontext()
+
     def commit(self):
         self.commits += 1
+        if self.events is not None:
+            self.events.append("db.commit")
 
     def rollback(self):
         self.rollbacks += 1
+
+
+class _FakeAcc:
+    """Stands in for UsageAccumulator at the call site so these tests assert
+    who gets recorded and the flush/commit/discard ordering (plan §5)
+    without depending on UsageAccumulator's own DB-shape internals -- those
+    live outside this module's boundary and are covered where the class is
+    defined.
+    """
+
+    def __init__(self, user_id, *, events=None, flush_raises=None):
+        self.user_id = user_id
+        self.records = []
+        self.calls = []
+        self.events = events
+        self.flush_raises = flush_raises
+
+    def record(self, stage, provider, usage, *, provider_call_succeeded):
+        self.records.append((stage, provider, usage, provider_call_succeeded))
+        self.calls.append("record")
+
+    def flush(self, db):
+        self.calls.append("flush")
+        if self.events is not None:
+            self.events.append("acc.flush")
+        if self.flush_raises is not None:
+            raise self.flush_raises
+
+    def discard(self):
+        self.calls.append("discard")
+
+    def committed(self):
+        self.calls.append("committed")
+        if self.events is not None:
+            self.events.append("acc.committed")
 
 
 def _enable_extraction(monkeypatch):
@@ -440,11 +517,11 @@ def test_claim_extract_record_not_claimable_skips_before_extraction(monkeypatch)
     session = _FakeSession(message=message, thread=thread)
     monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: None)
     monkeypatch.setattr(
-        extraction_run, "extract_action",
-        lambda **k: pytest.fail("extract_action must not run without a claim"),
+        extraction_run, "extract_action_with_usage",
+        lambda **k: pytest.fail("extraction must not run without a claim"),
     )
 
-    bucket, user_id = extraction_run._claim_extract_record(session, message.id, credential=_CRED)
+    bucket, user_id = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     assert bucket == "skipped"
     assert user_id == thread.user_id
@@ -466,11 +543,11 @@ def test_claim_extract_record_releases_transaction_before_llm_call(monkeypatch):
 
     def fake_extract(**kwargs):
         commits_observed.append(session.commits)
-        return NoAction()
+        return _extraction_attempt(NoAction())
 
-    monkeypatch.setattr(extraction_run, "extract_action", fake_extract)
+    monkeypatch.setattr(extraction_run, "extract_action_with_usage", fake_extract)
 
-    extraction_run._claim_extract_record(session, message.id, credential=_CRED)
+    extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     assert commits_observed == [1]  # claim already committed before the call
 
@@ -483,7 +560,9 @@ def test_claim_extract_record_locks_classification_before_reading_label(monkeypa
         message=message, thread=thread, classification=classification, done_at_reads=[None]
     )
     monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
-    monkeypatch.setattr(extraction_run, "extract_action", lambda **k: NoAction())
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage", lambda **k: _extraction_attempt(NoAction())
+    )
     recorded = {}
 
     def fake_record(db, **kwargs):
@@ -492,7 +571,7 @@ def test_claim_extract_record_locks_classification_before_reading_label(monkeypa
 
     monkeypatch.setattr(extraction_run, "record_extraction", fake_record)
 
-    bucket, _ = extraction_run._claim_extract_record(session, message.id, credential=_CRED)
+    bucket, _ = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     classification_stmt = next(
         s for s in session.executed if s.column_descriptions[0]["name"] == "Classification"
@@ -508,7 +587,7 @@ def test_claim_extract_record_thread_row_locked_for_update(monkeypatch):
     session = _FakeSession(message=message, thread=thread)
     monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: None)
 
-    extraction_run._claim_extract_record(session, message.id, force=False, credential=_CRED)
+    extraction_run._claim_extract_record(session, message.id, force=False, call_context=_CTX)
 
     thread_stmt = next(
         s for s in session.executed if s.column_descriptions[0]["name"] == "MailThread"
@@ -527,7 +606,9 @@ def test_claim_extract_record_rereads_done_at_at_record_time(monkeypatch):
         classification=_make_classification(), done_at_reads=[datetime.now(timezone.utc)],
     )
     monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
-    monkeypatch.setattr(extraction_run, "extract_action", lambda **k: NoAction())
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage", lambda **k: _extraction_attempt(NoAction())
+    )
     recorded = {}
 
     def fake_record(db, **kwargs):
@@ -536,7 +617,7 @@ def test_claim_extract_record_rereads_done_at_at_record_time(monkeypatch):
 
     monkeypatch.setattr(extraction_run, "record_extraction", fake_record)
 
-    extraction_run._claim_extract_record(session, message.id, credential=_CRED)
+    extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     assert recorded["thread_done"] is True
 
@@ -549,10 +630,12 @@ def test_claim_extract_record_stale_record_is_skipped(monkeypatch):
         classification=_make_classification(), done_at_reads=[None],
     )
     monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
-    monkeypatch.setattr(extraction_run, "extract_action", lambda **k: NoAction())
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage", lambda **k: _extraction_attempt(NoAction())
+    )
     monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: False)
 
-    bucket, _ = extraction_run._claim_extract_record(session, message.id, credential=_CRED)
+    bucket, _ = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     assert bucket == "skipped"
 
@@ -575,10 +658,12 @@ def test_claim_extract_record_outcome_buckets(monkeypatch, label, result, expect
         classification=_make_classification(label=label), done_at_reads=[None],
     )
     monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
-    monkeypatch.setattr(extraction_run, "extract_action", lambda **k: result)
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage", lambda **k: _extraction_attempt(result)
+    )
     monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
 
-    bucket, user_id = extraction_run._claim_extract_record(session, message.id, credential=_CRED)
+    bucket, user_id = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     assert bucket == expected
     assert user_id == thread.user_id
@@ -596,7 +681,7 @@ def test_claim_extract_record_force_forwarded_to_claim(monkeypatch):
 
     monkeypatch.setattr(extraction_run, "claim_action_item", fake_claim)
 
-    extraction_run._claim_extract_record(session, message.id, force=True, credential=_CRED)
+    extraction_run._claim_extract_record(session, message.id, force=True, call_context=_CTX)
 
     assert captured["force"] is True
 
@@ -611,12 +696,12 @@ def test_claim_extract_record_exception_after_claim_fences_to_failed(monkeypatch
     def _boom(**kwargs):
         raise RuntimeError("gemini call blew up")
 
-    monkeypatch.setattr(extraction_run, "extract_action", _boom)
+    monkeypatch.setattr(extraction_run, "extract_action_with_usage", _boom)
 
     fresh_session = MagicMock()
     monkeypatch.setattr(extraction_run, "SessionLocal", lambda: nullcontext(fresh_session))
 
-    bucket, user_id = extraction_run._claim_extract_record(session, message.id, credential=_CRED)
+    bucket, user_id = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     assert bucket == "failed"
     assert user_id == thread.user_id
@@ -639,14 +724,151 @@ def test_claim_extract_record_containment_commit_failure_reraises_original(monke
     def _boom(**kwargs):
         raise RuntimeError("original failure")
 
-    monkeypatch.setattr(extraction_run, "extract_action", _boom)
+    monkeypatch.setattr(extraction_run, "extract_action_with_usage", _boom)
 
     fresh_session = MagicMock()
     fresh_session.commit.side_effect = RuntimeError("fencing commit also failed")
     monkeypatch.setattr(extraction_run, "SessionLocal", lambda: nullcontext(fresh_session))
 
     with pytest.raises(RuntimeError, match="original failure"):
-        extraction_run._claim_extract_record(session, message.id, credential=_CRED)
+        extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+
+
+# ---------------------------------------------------------------------------
+# _claim_extract_record: usage recording (plan §5's flush/commit contract)
+# ---------------------------------------------------------------------------
+
+
+def test_claim_extract_record_records_usage_only_for_user_payer(monkeypatch):
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(
+        message=message, thread=thread,
+        classification=_make_classification(), done_at_reads=[None],
+    )
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+    monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
+    usage = LlmUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage",
+        lambda **k: _extraction_attempt(NoAction(), usage=usage),
+    )
+
+    fake_acc = _FakeAcc(thread.user_id)
+    extraction_run._claim_extract_record(
+        session, message.id, call_context=_USER_CTX, acc=fake_acc
+    )
+
+    assert fake_acc.records == [("extraction", _CRED.provider, usage, True)]
+
+
+def test_claim_extract_record_fallback_payer_records_nothing(monkeypatch):
+    # The regression guard for the source plumbing: without it, the
+    # operator's key would silently get billed onto the user's readout.
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(
+        message=message, thread=thread,
+        classification=_make_classification(), done_at_reads=[None],
+    )
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+    monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
+    usage = LlmUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage",
+        lambda **k: _extraction_attempt(NoAction(), usage=usage),
+    )
+
+    fake_acc = _FakeAcc(thread.user_id)
+    extraction_run._claim_extract_record(
+        session, message.id, call_context=_CTX, acc=fake_acc
+    )
+
+    assert fake_acc.records == []
+    # Nothing recorded -- the flush block must skip cheaply too, not just
+    # the record() call.
+    assert "flush" not in fake_acc.calls
+    assert "committed" in fake_acc.calls
+
+
+def test_claim_extract_record_flush_happens_before_commit_and_committed_after(monkeypatch):
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    events = []
+    session = _FakeSession(
+        message=message, thread=thread,
+        classification=_make_classification(), done_at_reads=[None],
+        events=events,
+    )
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+    monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage",
+        lambda **k: _extraction_attempt(NoAction()),
+    )
+
+    fake_acc = _FakeAcc(thread.user_id, events=events)
+
+    extraction_run._claim_extract_record(
+        session, message.id, call_context=_USER_CTX, acc=fake_acc
+    )
+
+    # The leading "db.commit" is the claim-release commit (snapshot-then-
+    # release, unrelated to usage) -- what matters is the tail: flush lands
+    # before the business commit, and committed() only fires once that
+    # commit has actually returned.
+    assert events == ["db.commit", "db.flush", "acc.flush", "db.commit", "acc.committed"]
+
+
+def test_claim_extract_record_failing_usage_flush_does_not_block_business_commit(monkeypatch):
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(
+        message=message, thread=thread,
+        classification=_make_classification(), done_at_reads=[None],
+    )
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+    monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage",
+        lambda **k: _extraction_attempt(NoAction()),
+    )
+
+    fake_acc = _FakeAcc(thread.user_id, flush_raises=SQLAlchemyError("boom"))
+
+    bucket, _ = extraction_run._claim_extract_record(
+        session, message.id, call_context=_USER_CTX, acc=fake_acc
+    )
+
+    assert bucket == "no_action"  # the business write still landed
+    assert session.commits == 2  # claim commit + the business commit, both intact
+    assert fake_acc.calls.index("discard") < fake_acc.calls.index("committed")
+
+
+def test_claim_extract_record_rollback_path_discards_the_batch(monkeypatch):
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(message=message, thread=thread)
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+
+    def _boom(**kwargs):
+        raise RuntimeError("gemini call blew up")
+
+    monkeypatch.setattr(extraction_run, "extract_action_with_usage", _boom)
+    fresh_session = MagicMock()
+    monkeypatch.setattr(extraction_run, "SessionLocal", lambda: nullcontext(fresh_session))
+
+    fake_acc = _FakeAcc(thread.user_id)
+    bucket, _ = extraction_run._claim_extract_record(
+        session, message.id, call_context=_USER_CTX, acc=fake_acc
+    )
+
+    assert bucket == "failed"
+    # Nothing was ever recorded here (the call blew up before record()), but
+    # the rollback path must discard unconditionally -- this is the exact
+    # spot plan §5 calls out, so a batch a LATER exception rolled back can
+    # never survive into the next flush.
+    assert fake_acc.calls == ["discard"]
 
 
 # ---------------------------------------------------------------------------
@@ -740,7 +962,7 @@ def test_run_extraction_for_message_threads_resolved_credential_to_extract_actio
     )
     monkeypatch.setattr(
         extraction_run, "resolve_extraction_credential",
-        lambda db, uid: SimpleNamespace(credential=_CRED),
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
     )
     monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
     monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
@@ -748,9 +970,9 @@ def test_run_extraction_for_message_threads_resolved_credential_to_extract_actio
 
     def fake_extract(**kwargs):
         captured.update(kwargs)
-        return NoAction()
+        return _extraction_attempt(NoAction())
 
-    monkeypatch.setattr(extraction_run, "extract_action", fake_extract)
+    monkeypatch.setattr(extraction_run, "extract_action_with_usage", fake_extract)
 
     extraction_run.run_extraction_for_message(session, message.id)
 
@@ -778,7 +1000,7 @@ def test_run_extraction_sweep_terminalizes_before_selecting_candidates(monkeypat
     _enable_extraction(monkeypatch)
     monkeypatch.setattr(
         extraction_run, "resolve_extraction_credential",
-        lambda db, uid: SimpleNamespace(credential=_CRED),
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
     )
     order = []
     monkeypatch.setattr(
@@ -799,7 +1021,7 @@ def test_run_extraction_sweep_message_driven_by_default(monkeypatch):
     _enable_extraction(monkeypatch)
     monkeypatch.setattr(
         extraction_run, "resolve_extraction_credential",
-        lambda db, uid: SimpleNamespace(credential=_CRED),
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
     )
     monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -815,7 +1037,7 @@ def test_run_extraction_sweep_recovery_uses_row_driven_candidates(monkeypatch):
     _enable_extraction(monkeypatch)
     monkeypatch.setattr(
         extraction_run, "resolve_extraction_credential",
-        lambda db, uid: SimpleNamespace(credential=_CRED),
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
     )
     monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -831,7 +1053,7 @@ def test_run_extraction_sweep_counts_a_bucket_per_message(monkeypatch):
     _enable_extraction(monkeypatch)
     monkeypatch.setattr(
         extraction_run, "resolve_extraction_credential",
-        lambda db, uid: SimpleNamespace(credential=_CRED),
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
     )
     monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
     message_ids = [uuid4(), uuid4(), uuid4()]
@@ -839,7 +1061,7 @@ def test_run_extraction_sweep_counts_a_bucket_per_message(monkeypatch):
     buckets = iter(["extracted", "no_action", "failed"])
     monkeypatch.setattr(
         extraction_run, "_claim_extract_record",
-        lambda db, mid, force=False, credential=None: (next(buckets), uuid4()),
+        lambda db, mid, force=False, call_context=None, acc=None: (next(buckets), uuid4()),
     )
 
     result = extraction_run.run_extraction_sweep(MagicMock(), uuid4())
@@ -857,7 +1079,7 @@ def test_run_extraction_sweep_isolates_one_bad_message_and_continues(monkeypatch
     _enable_extraction(monkeypatch)
     monkeypatch.setattr(
         extraction_run, "resolve_extraction_credential",
-        lambda db, uid: SimpleNamespace(credential=_CRED),
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
     )
     monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
     bad_message, good_message = uuid4(), uuid4()
@@ -866,7 +1088,7 @@ def test_run_extraction_sweep_isolates_one_bad_message_and_continues(monkeypatch
         lambda *a, **k: [bad_message, good_message],
     )
 
-    def fake_claim(db, mid, force=False, credential=None):
+    def fake_claim(db, mid, force=False, call_context=None, acc=None):
         if mid == bad_message:
             raise RuntimeError("boom")
         return "extracted", uuid4()
@@ -892,7 +1114,7 @@ def test_run_extraction_sweep_end_to_end_terminalizes_expired_at_cap_row(monkeyp
     db = _FakeDB([_FakeResult(rowcount=1)])
     monkeypatch.setattr(
         extraction_run, "resolve_extraction_credential",
-        lambda db, uid: SimpleNamespace(credential=_CRED),
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
     )
     monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: [])
 
@@ -929,7 +1151,9 @@ def test_run_extraction_sweep_no_credential_is_disabled_with_zero_attempts(monke
 def test_run_extraction_sweep_resolves_credential_once_and_threads_it(monkeypatch):
     # The fallback (synthetic gemini) credential resolves once for the whole
     # run and is passed unchanged to every _claim_extract_record call --
-    # never re-resolved per message.
+    # never re-resolved per message. Its "fallback" source must map to an
+    # "operator" payer, and one accumulator must be shared across every call
+    # in the run, not rebuilt per message.
     _enable_extraction(monkeypatch)
     fallback_credential = LlmCredential(
         provider="gemini", base_url="https://generativelanguage.googleapis.com/v1beta/openai",
@@ -947,10 +1171,12 @@ def test_run_extraction_sweep_resolves_credential_once_and_threads_it(monkeypatc
     monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
     message_ids = [uuid4(), uuid4()]
     monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
-    captured_credentials = []
+    captured_call_contexts = []
+    captured_accs = []
 
-    def fake_claim(db, mid, force=False, credential=None):
-        captured_credentials.append(credential)
+    def fake_claim(db, mid, force=False, call_context=None, acc=None):
+        captured_call_contexts.append(call_context)
+        captured_accs.append(acc)
         return "extracted", uuid4()
 
     monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
@@ -959,7 +1185,11 @@ def test_run_extraction_sweep_resolves_credential_once_and_threads_it(monkeypatc
     extraction_run.run_extraction_sweep(MagicMock(), user_id)
 
     assert resolve_calls == [user_id]  # exactly one resolution for the whole run
-    assert captured_credentials == [fallback_credential, fallback_credential]
+    assert [ctx.credential for ctx in captured_call_contexts] == [
+        fallback_credential, fallback_credential
+    ]
+    assert [ctx.payer for ctx in captured_call_contexts] == ["operator", "operator"]
+    assert captured_accs[0] is captured_accs[1]  # one shared accumulator, not one per message
 
 
 # ---------------------------------------------------------------------------
@@ -1134,7 +1364,7 @@ def test_extraction_recovery_tick_skips_credential_less_users_via_sweep_prefligh
 
     def fake_resolve(db, user_id):
         credential = _CRED if user_id == credentialed_user else None
-        return SimpleNamespace(credential=credential)
+        return SimpleNamespace(credential=credential, source="fallback" if credential else None)
 
     monkeypatch.setattr(extraction_run, "resolve_extraction_credential", fake_resolve)
     candidate_queries = []

@@ -20,6 +20,7 @@ import {
   getActions,
   getCounts,
   getLlmSettings,
+  getLlmUsage,
   getMe,
   getSyncHealth,
   googleAuthCallback,
@@ -63,6 +64,7 @@ import type {
   LlmProvider,
   LlmSettings,
   LlmTestResult,
+  LlmUsage,
   Overview,
   ThreadDetail,
   TriageItem,
@@ -82,6 +84,7 @@ import { TopBar } from "@/components/console/TopBar";
 import { CommandPalette } from "@/components/console/CommandPalette";
 import { Shortcuts } from "@/components/console/Shortcuts";
 import { LlmSettingsModal } from "@/components/console/LlmSettings";
+import { LlmUsageCard } from "@/components/console/LlmUsageCard";
 import { LoginScreen } from "@/components/console/LoginScreen";
 import { VerifyEmailScreen } from "@/components/console/VerifyEmailScreen";
 import { ResetPasswordScreen } from "@/components/console/ResetPasswordScreen";
@@ -227,6 +230,16 @@ export default function Console() {
   const [llmTesting, setLlmTesting] = useState(false);
   const [llmRemoving, setLlmRemoving] = useState(false);
   const [llmTestResult, setLlmTestResult] = useState<LlmTestResult | null>(null);
+  // Usage gets its own state, separate from llmSettings above -- it's fetched
+  // fresh every time the modal opens (never gated on "is this null yet") since
+  // background usage keeps moving even when the stored credential hasn't.
+  const [llmUsage, setLlmUsage] = useState<LlmUsage | null>(null);
+  const [llmUsageError, setLlmUsageError] = useState(false);
+  // The usage card's own dialog + range selector -- separate from the
+  // settings modal above, since it opens independently (palette, or the
+  // settings modal's "view usage" button).
+  const [llmUsageOpen, setLlmUsageOpen] = useState(false);
+  const [llmUsageDays, setLlmUsageDays] = useState(30);
   // Which OAuth providers this deployment has configured — gates "Connect
   // Outlook" everywhere it'd otherwise show up next to Gmail.
   const [authProviders, setAuthProviders] = useState<string[]>([]);
@@ -321,6 +334,13 @@ export default function Console() {
   // discards its response if this has moved on, so a stale result never
   // renders against a credential it didn't actually test.
   const llmCredentialGenRef = useRef(0);
+  // Usage fetches get their OWN counter. They share the credential's
+  // invalidation reasons (a save or remove bumps both), but they also have
+  // one of their own -- switching the card's 7/30/90 range -- and that must
+  // not touch the credential generation. Sharing one ref meant a range click
+  // during an in-flight Test discarded the test's response: no result, no
+  // error, just the button settling silently.
+  const llmUsageGenRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const liveSearchRef = useRef<LiveSearchController | null>(null);
 
@@ -622,14 +642,47 @@ export default function Console() {
     }
   }, [handleSessionExpired]);
 
+  // Usage changes constantly (every ingested message can add to it), so
+  // unlike settings above it's never cached against a "do we already have
+  // it?" check -- always re-fetched. Guards on llmUsageGenRef, which a range
+  // change bumps on its own and which save/remove bump alongside the
+  // credential's -- so an out-of-order response (a 7d answered after a
+  // superseded 30d request) never clobbers the range on screen, without a
+  // range click reaching into an unrelated in-flight credential test.
+  const refreshLlmUsage = useCallback(
+    async (days: number) => {
+      const generation = llmUsageGenRef.current;
+      try {
+        const usage = await getLlmUsage(days);
+        if (generation !== llmUsageGenRef.current) return; // superseded mid-flight -- discard
+        setLlmUsage(usage);
+        setLlmUsageError(false);
+      } catch (e) {
+        if (generation !== llmUsageGenRef.current) return; // ditto for a stale failure
+        if (e instanceof ApiError && e.status === 401) {
+          handleSessionExpired();
+          return;
+        }
+        // A usage outage must never make the rest of this modal look broken --
+        // no toast, just a quiet fallback the panel itself renders.
+        setLlmUsage(null);
+        setLlmUsageError(true);
+      }
+    },
+    [handleSessionExpired],
+  );
+
   // Opening always starts the modal from a clean test result -- otherwise a
   // stale ok/error from a previous visit would flash before the user does
   // anything this time. If the post-login fetch never landed (settings is
   // still null), retry it here and await it -- otherwise every entry point
   // into this modal (palette, accounts menu, agenda CTA) would silently do
-  // nothing on a bad connection.
+  // nothing on a bad connection. Usage, unlike settings, is fetched every
+  // single time regardless of what's already loaded -- it's never stale-safe
+  // to skip.
   const openLlmSettings = useCallback(async () => {
     setLlmTestResult(null);
+    void refreshLlmUsage(llmUsageDays);
     if (!llmSettings) {
       try {
         setLlmSettings(await getLlmSettings());
@@ -643,7 +696,30 @@ export default function Console() {
       }
     }
     setLlmSettingsOpen(true);
-  }, [llmSettings, handleSessionExpired]);
+  }, [llmSettings, handleSessionExpired, refreshLlmUsage, llmUsageDays]);
+
+  // Opens the usage card directly (palette, or the settings modal's "view
+  // usage" button) -- same "always refetch, never stale-safe to skip" rule
+  // as the settings modal's own usage fetch above.
+  const openLlmUsage = useCallback(() => {
+    setLlmUsageOpen(true);
+    void refreshLlmUsage(llmUsageDays);
+  }, [refreshLlmUsage, llmUsageDays]);
+
+  // Changing the range invalidates whatever usage fetch is still in flight
+  // for the old window, so an out-of-order response (a 7d answered after a
+  // since-superseded 30d request) never clobbers the range on screen. Bumps
+  // ONLY the usage generation -- the credential hasn't changed, and touching
+  // its counter here would make a range click silently void an in-flight
+  // credential test.
+  const changeLlmUsageDays = useCallback(
+    (days: number) => {
+      setLlmUsageDays(days);
+      llmUsageGenRef.current++;
+      void refreshLlmUsage(days);
+    },
+    [refreshLlmUsage],
+  );
 
   const doSaveLlmSettings = useCallback(
     async (input: {
@@ -656,21 +732,29 @@ export default function Console() {
       classification_byok?: boolean;
     }) => {
       setLlmSaving(true);
+      let saved = false;
       try {
         const next = await putLlmSettings(input);
         setLlmSettings(next);
         setLlmTestResult(null);
         toast.success("AI settings saved");
+        saved = true;
       } catch (e) {
         toast.error((e as Error).message || "could not save these settings");
       } finally {
-        // The credential may have changed either way -- bump so any test that
-        // started before this save discards its response when it lands.
+        // The credential may have changed either way -- bump both so any test
+        // AND any usage fetch that started before this save discards its
+        // response when it lands.
         llmCredentialGenRef.current++;
+        llmUsageGenRef.current++;
         setLlmSaving(false);
       }
+      // Refetch only on success, and only after the bump above -- otherwise
+      // this fetch would capture the pre-bump generation and immediately
+      // discard its own result once the finally block ran.
+      if (saved) void refreshLlmUsage(llmUsageDays);
     },
-    [],
+    [refreshLlmUsage, llmUsageDays],
   );
 
   const doTestLlmSettings = useCallback(async () => {
@@ -694,18 +778,26 @@ export default function Console() {
 
   const doRemoveLlmSettings = useCallback(async () => {
     setLlmRemoving(true);
+    let removed = false;
     try {
       await deleteLlmSettings();
       setLlmTestResult(null);
       await refreshLlmSettings();
       toast.success("AI credential removed");
+      removed = true;
     } catch (e) {
       toast.error((e as Error).message || "could not remove this credential");
     } finally {
+      // Same as the save path: a removal invalidates an in-flight test and an
+      // in-flight usage fetch alike.
       llmCredentialGenRef.current++;
+      llmUsageGenRef.current++;
       setLlmRemoving(false);
     }
-  }, [refreshLlmSettings]);
+    // Same ordering rule as doSaveLlmSettings: refetch after the generation
+    // bump above, and only once the remove actually went through.
+    if (removed) void refreshLlmUsage(llmUsageDays);
+  }, [refreshLlmSettings, refreshLlmUsage, llmUsageDays]);
 
   // The page-0 reset: always starts over at offset 0 under the current
   // sort/account filter (read from refs so this callback's identity — and
@@ -2840,6 +2932,7 @@ export default function Console() {
           onOpenAgenda={() => setView("agenda")}
           onBackfillActions={doBackfillActions}
           onOpenLlmSettings={openLlmSettings}
+          onOpenLlmUsage={openLlmUsage}
         />
         <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
         <LlmSettingsModal
@@ -2853,6 +2946,17 @@ export default function Console() {
           testResult={llmTestResult}
           onRemove={doRemoveLlmSettings}
           removing={llmRemoving}
+          usage={llmUsage}
+          usageError={llmUsageError}
+          onOpenUsage={openLlmUsage}
+        />
+        <LlmUsageCard
+          open={llmUsageOpen}
+          onOpenChange={setLlmUsageOpen}
+          usage={llmUsage}
+          usageError={llmUsageError}
+          days={llmUsageDays}
+          onDaysChange={changeLlmUsageDays}
         />
         {!isNarrow && (tourActive || tourVersion < TOUR_VERSION) && (
           <Suspense fallback={null}>

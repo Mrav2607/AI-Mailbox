@@ -22,7 +22,7 @@ import httpx
 import pytest
 
 from app.services.nlp import llm_client
-from app.services.nlp.llm_client import LlmCallError, call_chat_completion
+from app.services.nlp.llm_client import LlmCallError, LlmCallResult, LlmUsage, call_chat_completion
 from app.services.nlp.providers import DestinationRejected, LlmCredential
 from app.services.nlp import providers as providers_module
 
@@ -42,6 +42,12 @@ def _make_credential(**overrides):
 
 def _choice_payload(content: str) -> dict:
     return {"choices": [{"message": {"content": content}}]}
+
+
+def _choice_payload_with_usage(content: str, usage: object) -> dict:
+    payload = _choice_payload(content)
+    payload["usage"] = usage
+    return payload
 
 
 def _install_mock_transport(monkeypatch, handler):
@@ -86,11 +92,15 @@ def test_call_chat_completion_success_round_trip_asserts_wire_shape(monkeypatch)
     _install_mock_transport(monkeypatch, _json_handler(200, _choice_payload(VALID_CONTENT), calls))
     credential = _make_credential()
 
-    content = call_chat_completion(
+    result = call_chat_completion(
         credential, prompt="the prompt", user_content="the email text", max_tokens=512
     )
 
-    assert content == VALID_CONTENT
+    assert isinstance(result, LlmCallResult)
+    assert result.content == VALID_CONTENT
+    # _choice_payload never sets a "usage" key, so this doubles as the
+    # usage-absent case -- no usage block at all must not raise.
+    assert result.usage is None
     assert len(calls) == 1
     request = calls[0]
     assert str(request.url) == "https://api.openai.com/v1/chat/completions"
@@ -102,6 +112,117 @@ def test_call_chat_completion_success_round_trip_asserts_wire_shape(monkeypatch)
     assert len(body["messages"]) == 1
     assert body["messages"][0]["role"] == "user"
     assert body["messages"][0]["content"] == "the prompt\n\nthe email text"
+
+
+# ---------------------------------------------------------------------------
+# Defensive `usage` parsing -- see `_parse_usage` in llm_client.py for the
+# reasoning. These are wire-result tests (plan §3): they only check what
+# `call_chat_completion` hands back, not any downstream stage contract.
+# ---------------------------------------------------------------------------
+
+
+def test_call_chat_completion_parses_a_complete_usage_block(monkeypatch):
+    payload = _choice_payload_with_usage(
+        VALID_CONTENT,
+        {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+    )
+    _install_mock_transport(monkeypatch, _json_handler(200, payload))
+
+    result = call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512
+    )
+
+    assert result.content == VALID_CONTENT
+    assert result.usage == LlmUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150)
+
+
+def test_call_chat_completion_parses_a_partial_usage_block_without_synthesizing_total(monkeypatch):
+    """A provider can report `prompt_tokens` and just not send a total --
+    the parse must NOT add prompt + completion to invent one. A synthesized
+    total would corrupt the "calls with a usable total" counter downstream."""
+    payload = _choice_payload_with_usage(VALID_CONTENT, {"prompt_tokens": 100})
+    _install_mock_transport(monkeypatch, _json_handler(200, payload))
+
+    result = call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512
+    )
+
+    assert result.usage == LlmUsage(prompt_tokens=100, completion_tokens=None, total_tokens=None)
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"prompt_tokens": "100"},
+        {"prompt_tokens": 12.5},
+        {"prompt_tokens": None},
+        {},
+    ],
+    ids=["string", "float", "null", "empty-dict"],
+)
+def test_call_chat_completion_ignores_non_int_usage_fields(monkeypatch, usage):
+    payload = _choice_payload_with_usage(VALID_CONTENT, usage)
+    _install_mock_transport(monkeypatch, _json_handler(200, payload))
+
+    result = call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512
+    )
+
+    assert result.content == VALID_CONTENT
+    assert result.usage is None
+
+
+def test_call_chat_completion_ignores_a_negative_usage_field(monkeypatch):
+    payload = _choice_payload_with_usage(VALID_CONTENT, {"prompt_tokens": -5, "total_tokens": 10})
+    _install_mock_transport(monkeypatch, _json_handler(200, payload))
+
+    result = call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512
+    )
+
+    assert result.usage == LlmUsage(prompt_tokens=None, completion_tokens=None, total_tokens=10)
+
+
+def test_call_chat_completion_rejects_a_bool_as_a_token_count(monkeypatch):
+    """`bool` is a subclass of `int` in Python -- `True` must not be counted
+    as a token, or a provider sending a boolean flag under a token-shaped key
+    would silently register as one token."""
+    payload = _choice_payload_with_usage(VALID_CONTENT, {"prompt_tokens": True, "total_tokens": 10})
+    _install_mock_transport(monkeypatch, _json_handler(200, payload))
+
+    result = call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512
+    )
+
+    assert result.usage == LlmUsage(prompt_tokens=None, completion_tokens=None, total_tokens=10)
+
+
+def test_call_chat_completion_treats_a_non_dict_usage_as_absent(monkeypatch):
+    payload = _choice_payload(VALID_CONTENT)
+    payload["usage"] = "not a dict"
+    _install_mock_transport(monkeypatch, _json_handler(200, payload))
+
+    result = call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512
+    )
+
+    assert result.content == VALID_CONTENT
+    assert result.usage is None
+
+
+def test_call_chat_completion_survives_a_malformed_usage_block_and_still_returns_content(monkeypatch):
+    """The core guarantee: usage is telemetry, not the payload. A response
+    with a completely garbage `usage` shape must still be a successful call."""
+    payload = _choice_payload(VALID_CONTENT)
+    payload["usage"] = [1, 2, 3]
+    _install_mock_transport(monkeypatch, _json_handler(200, payload))
+
+    result = call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512
+    )
+
+    assert result.content == VALID_CONTENT
+    assert result.usage is None
 
 
 def test_call_chat_completion_raises_connection_failed_on_network_error(monkeypatch):
@@ -188,8 +309,8 @@ def test_call_chat_completion_rechecks_destination_before_every_request(monkeypa
     monkeypatch.setattr(llm_client, "pin_custom_destination", fake_pin)
     credential = _make_credential(provider="custom", base_url="https://ollama.example.com/v1")
 
-    content = call_chat_completion(credential, prompt="prompt", user_content="text", max_tokens=512)
-    assert content
+    result = call_chat_completion(credential, prompt="prompt", user_content="text", max_tokens=512)
+    assert result.content
     assert len(calls) == 1
 
     with pytest.raises(LlmCallError) as exc_info:
@@ -223,9 +344,9 @@ def test_call_chat_completion_rebinding_regression_connects_to_pinned_address_no
     _install_mock_transport(monkeypatch, _json_handler(200, _choice_payload(VALID_CONTENT), calls))
     credential = _make_credential(provider="custom", base_url="https://rebind.example.com/v1")
 
-    content = call_chat_completion(credential, prompt="prompt", user_content="text", max_tokens=512)
+    result = call_chat_completion(credential, prompt="prompt", user_content="text", max_tokens=512)
 
-    assert content
+    assert result.content
     assert call_count["n"] == 1  # DNS resolved exactly once -- httpx never re-resolved
     request = calls[0]
     assert str(request.url) == "https://93.184.216.34/v1/chat/completions"
@@ -243,9 +364,9 @@ def test_call_chat_completion_preset_request_unchanged_no_host_override_or_exten
     _install_mock_transport(monkeypatch, _json_handler(200, _choice_payload(VALID_CONTENT), calls))
     credential = _make_credential(provider="openai", base_url="https://api.openai.com/v1")
 
-    content = call_chat_completion(credential, prompt="prompt", user_content="text", max_tokens=512)
+    result = call_chat_completion(credential, prompt="prompt", user_content="text", max_tokens=512)
 
-    assert content
+    assert result.content
     request = calls[0]
     assert str(request.url) == "https://api.openai.com/v1/chat/completions"
     # httpx's own auto-generated Host header from the URL -- not an override.
@@ -269,11 +390,11 @@ def test_call_chat_completion_trust_env_false_ignores_private_proxy_env_var(monk
 
     monkeypatch.setattr(llm_client.httpx, "Client", _SpyClient)
 
-    content = call_chat_completion(
+    result = call_chat_completion(
         _make_credential(), prompt="prompt", user_content="text", max_tokens=512
     )
 
-    assert content == VALID_CONTENT
+    assert result.content == VALID_CONTENT
     assert len(captured) == 1
     client = captured[0]
     assert client.trust_env is False

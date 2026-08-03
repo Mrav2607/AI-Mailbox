@@ -6,14 +6,24 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.services.ingest import outlook_ingest
+from app.services.nlp.classifier import ClassificationAttempt
+from app.services.nlp.llm_client import LlmUsage
+from app.services.nlp.providers import ClassificationRouting, LlmCredential
+
+# A real UUID string, not the old opaque "u1" placeholder -- usage recording
+# now does UsageAccumulator(uuid.UUID(user_id)) once at construction (every
+# run, whether or not anything ever gets classified), so every test driving
+# ingest_outlook_messages needs a user_id that actually parses as one.
+_USER_ID = str(uuid4())
 
 
 def _fake_provider(**overrides):
     defaults = dict(
         id=uuid4(),
-        user_id="u1",
+        user_id=_USER_ID,
         access_token="tok",
         refresh_token="rt",
         token_expiry=None,
@@ -41,8 +51,107 @@ def _no_op_removals(*_args, **_kwargs):
     return {"verified": 0, "deleted": 0, "kept": 0}
 
 
-def _upsert_stub(threads=0, messages=0, classified=0):
-    return {"threads_upserted": threads, "messages_upserted": messages, "classified": classified}
+def _upsert_stub(threads=0, messages=0, classified=0, usage_recorded=False):
+    return {
+        "threads_upserted": threads,
+        "messages_upserted": messages,
+        "classified": classified,
+        "usage_recorded": usage_recorded,
+    }
+
+
+def _make_pipeline_db(provider):
+    """A db wired for a full outlook-ingest run -- for the tests below that
+    drive the real `_upsert_page_messages` (not stubbed) end to end. Thread
+    and message upserts each return a fresh id, and no message ever has a
+    prior classification, so every message reaches the classifier instead of
+    being skipped as "already done".
+    """
+    def execute(stmt):
+        sql = str(stmt).lower()
+        result = MagicMock()
+        if "from provider_account" in sql:
+            result.scalars.return_value.first.return_value = provider
+        elif "insert into mail_thread" in sql:
+            result.scalar_one.return_value = uuid4()
+        elif "insert into mail_message" in sql:
+            result.scalar_one.return_value = uuid4()
+        elif "from classification" in sql:
+            result.scalars.return_value.first.return_value = None
+        return result
+
+    db = MagicMock()
+    db.execute.side_effect = execute
+    # Thread-reopen bookkeeping is orthogonal to every test below.
+    db.get.return_value = None
+    return db
+
+
+def _fixed_router(routing):
+    """A ClassificationRouter stand-in that always hands back the same
+    routing decision, for tests that only care what the recorder does with
+    a given mode -- not the router's own memo/refresh behavior."""
+
+    class FixedRouter:
+        def __init__(self, user_id):
+            pass
+
+        def routing_for(self, db):
+            return routing
+
+    return FixedRouter
+
+
+def _fake_classify_with_usage(usage):
+    def fake(text, *, routing):
+        return ClassificationAttempt(
+            verdict=("fyi", 0.5, "stub", "test-model"),
+            provider_call_succeeded=True,
+            usage=usage,
+        )
+
+    return fake
+
+
+def _tracing_accumulator_class(trace, records, *, fail_flush_times=0):
+    """Stands in for UsageAccumulator. Records calls into `records` and
+    appends every flush/discard/committed call onto the shared `trace` list
+    so a test can assert ORDER against db.flush/db.commit, not just that each
+    method got called somewhere.
+    """
+    state = {"fail_flush_times": fail_flush_times}
+
+    class TracingAccumulator:
+        def __init__(self, user_id):
+            self.user_id = user_id
+
+        def record(self, stage, provider, usage, *, provider_call_succeeded):
+            records.append((stage, provider, usage, provider_call_succeeded))
+
+        def flush(self, db):
+            trace.append("acc.flush")
+            if state["fail_flush_times"] > 0:
+                state["fail_flush_times"] -= 1
+                raise SQLAlchemyError("usage flush boom")
+
+        def discard(self):
+            trace.append("acc.discard")
+
+        def committed(self):
+            trace.append("acc.committed")
+
+    return TracingAccumulator
+
+
+def _wire_tracing_db(db, trace):
+    """Makes db.flush/db.commit append to `trace` too, and makes
+    `with db.begin_nested():` actually propagate exceptions raised inside it
+    (a bare MagicMock's __exit__ returns a truthy value by default, which
+    would silently swallow the SQLAlchemyError the failing-flush test raises).
+    """
+    db.flush = MagicMock(side_effect=lambda: trace.append("db.flush"))
+    db.commit = MagicMock(side_effect=lambda: trace.append("db.commit"))
+    db.begin_nested.return_value.__exit__.return_value = False
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +248,7 @@ def test_budget_exhaustion_persists_next_url_and_ends_the_run_cleanly(monkeypatc
     monkeypatch.setattr(outlook_ingest, "_apply_removals", _no_op_removals)
 
     result = outlook_ingest.ingest_outlook_messages(
-        db, "u1", provider_account_id=str(provider.id), max_results=10, max_pages=20
+        db, _USER_ID, provider_account_id=str(provider.id), max_results=10, max_pages=20
     )
 
     assert result["messages_upserted"] == 10
@@ -175,7 +284,7 @@ def test_page_failure_does_not_advance_the_cursor_and_replay_refetches_only_that
 
     with pytest.raises(RuntimeError, match="db exploded"):
         outlook_ingest.ingest_outlook_messages(
-            db, "u1", provider_account_id=str(provider.id), max_results=50, max_pages=20
+            db, _USER_ID, provider_account_id=str(provider.id), max_results=50, max_pages=20
         )
 
     # Page 1's additions + cursor advance landed; page 2's failure rolled back
@@ -196,7 +305,7 @@ def test_page_failure_does_not_advance_the_cursor_and_replay_refetches_only_that
     # page (which reaches delta_url) instead of also walking into sentitems --
     # keeps the assertions below scoped to just the inbox replay.
     outlook_ingest.ingest_outlook_messages(
-        db2, "u1", provider_account_id=str(provider.id), max_results=1, max_pages=20
+        db2, _USER_ID, provider_account_id=str(provider.id), max_results=1, max_pages=20
     )
 
     assert client.delta_page.call_args.kwargs["cursor_url"] == "https://page-2"
@@ -255,7 +364,7 @@ def test_mid_page_refresh_succeeds_but_a_later_failure_leaves_nothing_durable(mo
 
     with pytest.raises(RuntimeError, match="verification GET failed"):
         outlook_ingest.ingest_outlook_messages(
-            db, "u1", provider_account_id=str(provider.id), max_results=50, max_pages=20
+            db, _USER_ID, provider_account_id=str(provider.id), max_results=50, max_pages=20
         )
 
     # The refresh itself durably persisted through its OWN session...
@@ -301,7 +410,7 @@ def test_removal_budget_deferral_at_a_page_boundary_still_makes_forward_progress
     monkeypatch.setattr(outlook_ingest, "_apply_removals", apply_removals_mock)
 
     result = outlook_ingest.ingest_outlook_messages(
-        db, "u1", provider_account_id=str(provider.id), max_results=50, max_pages=20
+        db, _USER_ID, provider_account_id=str(provider.id), max_results=50, max_pages=20
     )
 
     # Inbox's page had 250 locally-stored removals against a 200 budget --
@@ -329,12 +438,12 @@ def test_classification_router_is_built_once_per_run_and_reused_across_pages(mon
     # revocation takes effect within a minute rather than at the end of the
     # run. This drives _upsert_page_messages for real (not stubbed) across
     # two pages so both halves of the contract are exercised together.
-    from app.services.nlp.providers import ClassificationRouting
 
     # A regression that keeps every router call intact but drops `routing=`
-    # from the `classify()` call would still pass every assertion below -- so
-    # we also need to prove this exact routing object is what `classify`
-    # actually receives, not just that routing_for got called.
+    # from the `classify_with_usage()` call would still pass every assertion
+    # below -- so we also need to prove this exact routing object is what
+    # `classify_with_usage` actually receives, not just that routing_for got
+    # called.
     SENTINEL_ROUTING = ClassificationRouting(mode="off", credential=None)
 
     router_instances = []
@@ -349,34 +458,19 @@ def test_classification_router_is_built_once_per_run_and_reused_across_pages(mon
             routed_selves.append(self)
             return SENTINEL_ROUTING
 
-    def fake_classify(text, *, routing):
+    def fake_classify_with_usage(text, *, routing):
         classify_calls.append(routing)
-        return ("other", 0.5, "stub", "test-model")
+        return ClassificationAttempt(
+            verdict=("other", 0.5, "stub", "test-model"),
+            provider_call_succeeded=False,
+            usage=None,
+        )
 
     monkeypatch.setattr(outlook_ingest, "ClassificationRouter", CountingRouter)
-    monkeypatch.setattr(outlook_ingest, "classify", fake_classify)
+    monkeypatch.setattr(outlook_ingest, "classify_with_usage", fake_classify_with_usage)
 
     provider = _fake_provider()
-
-    def execute(stmt):
-        sql = str(stmt).lower()
-        result = MagicMock()
-        if "from provider_account" in sql:
-            result.scalars.return_value.first.return_value = provider
-        elif "insert into mail_thread" in sql:
-            result.scalar_one.return_value = uuid4()
-        elif "insert into mail_message" in sql:
-            result.scalar_one.return_value = uuid4()
-        elif "from classification" in sql:
-            # Neither message has a prior classification -- both must
-            # actually reach the classifier instead of being skipped.
-            result.scalars.return_value.first.return_value = None
-        return result
-
-    db = MagicMock()
-    db.execute.side_effect = execute
-    # Thread-reopen bookkeeping is orthogonal to this contract.
-    db.get.return_value = None
+    db = _make_pipeline_db(provider)
 
     page1 = {
         "messages": [{"id": "m1", "conversationId": "t1", "subject": "s1"}],
@@ -395,7 +489,7 @@ def test_classification_router_is_built_once_per_run_and_reused_across_pages(mon
     monkeypatch.setattr(outlook_ingest, "OutlookClient", lambda token: client)
 
     result = outlook_ingest.ingest_outlook_messages(
-        db, "u1", provider_account_id=str(provider.id), max_results=2, max_pages=20
+        db, _USER_ID, provider_account_id=str(provider.id), max_results=2, max_pages=20
     )
 
     # Two delta pages actually got fetched -- otherwise "reused across pages"
@@ -404,7 +498,7 @@ def test_classification_router_is_built_once_per_run_and_reused_across_pages(mon
     assert result["messages_upserted"] == 2
     assert result["classified"] == 2
 
-    assert router_instances == ["u1"]
+    assert router_instances == [_USER_ID]
     assert len(routed_selves) == 2
     # Both calls -- one per message, one per page -- landed on the exact same
     # router object, not a lookalike rebuilt per page.
@@ -414,6 +508,158 @@ def test_classification_router_is_built_once_per_run_and_reused_across_pages(mon
     # ROUTING.
     assert len(classify_calls) == 2
     assert all(routing is SENTINEL_ROUTING for routing in classify_calls)
+
+
+# ---------------------------------------------------------------------------
+# Per-user usage recording and its flush site (docs/plans/2026-08-02-llm-
+# usage-visibility-plan.md §5) -- classify_with_usage(), UsageAccumulator,
+# and the per-delta-page commit that flushes it. Outlook's OTHER two commits
+# (delta-expiry re-baseline, mid-page token refresh) run before the page is
+# classified and never need a flush -- see outlook_ingest.py's module
+# docstring and flush_usage_then_commit()'s own docstring.
+# ---------------------------------------------------------------------------
+
+
+def test_user_paid_classification_records_usage(monkeypatch):
+    routing = ClassificationRouting(
+        mode="user",
+        credential=LlmCredential(
+            provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+        ),
+    )
+    usage = LlmUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    records = []
+    monkeypatch.setattr(outlook_ingest, "ClassificationRouter", _fixed_router(routing))
+    monkeypatch.setattr(outlook_ingest, "classify_with_usage", _fake_classify_with_usage(usage))
+    monkeypatch.setattr(
+        outlook_ingest, "UsageAccumulator", _tracing_accumulator_class([], records)
+    )
+
+    provider = _fake_provider()
+    db = _make_pipeline_db(provider)
+    page = {
+        "messages": [{"id": "m1", "conversationId": "t1", "subject": "s1"}],
+        "removed_ids": [], "next_url": None, "delta_url": "https://delta-final",
+    }
+    client = MagicMock()
+    client.delta_page = MagicMock(return_value=page)
+    monkeypatch.setattr(outlook_ingest, "OutlookClient", lambda token: client)
+
+    outlook_ingest.ingest_outlook_messages(
+        db, _USER_ID, provider_account_id=str(provider.id), max_results=1, max_pages=20
+    )
+
+    assert records == [("classification", "openai", usage, True)]
+
+
+def test_server_paid_classification_records_nothing(monkeypatch):
+    routing = ClassificationRouting(mode="server", credential=None)
+    usage = LlmUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    records = []
+    monkeypatch.setattr(outlook_ingest, "ClassificationRouter", _fixed_router(routing))
+    monkeypatch.setattr(outlook_ingest, "classify_with_usage", _fake_classify_with_usage(usage))
+    monkeypatch.setattr(
+        outlook_ingest, "UsageAccumulator", _tracing_accumulator_class([], records)
+    )
+
+    provider = _fake_provider()
+    db = _make_pipeline_db(provider)
+    page = {
+        "messages": [{"id": "m1", "conversationId": "t1", "subject": "s1"}],
+        "removed_ids": [], "next_url": None, "delta_url": "https://delta-final",
+    }
+    client = MagicMock()
+    client.delta_page = MagicMock(return_value=page)
+    monkeypatch.setattr(outlook_ingest, "OutlookClient", lambda token: client)
+
+    outlook_ingest.ingest_outlook_messages(
+        db, _USER_ID, provider_account_id=str(provider.id), max_results=1, max_pages=20
+    )
+
+    # The operator's own key paid for this call -- it must never show up in
+    # anyone's usage panel.
+    assert records == []
+
+
+def test_per_page_commit_flushes_usage_before_it_in_order_and_committed_runs_last(monkeypatch):
+    routing = ClassificationRouting(
+        mode="user",
+        credential=LlmCredential(provider="gemini", base_url="https://x", api_key="k", model="m"),
+    )
+    usage = LlmUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    trace = []
+    records = []
+    monkeypatch.setattr(outlook_ingest, "ClassificationRouter", _fixed_router(routing))
+    monkeypatch.setattr(outlook_ingest, "classify_with_usage", _fake_classify_with_usage(usage))
+    monkeypatch.setattr(
+        outlook_ingest, "UsageAccumulator", _tracing_accumulator_class(trace, records)
+    )
+
+    provider = _fake_provider()
+    db = _make_pipeline_db(provider)
+    _wire_tracing_db(db, trace)
+    page1 = {
+        "messages": [{"id": "m1", "conversationId": "t1", "subject": "s1"}],
+        "removed_ids": [], "next_url": "https://page-2", "delta_url": None,
+    }
+    page2 = {
+        "messages": [{"id": "m2", "conversationId": "t1", "subject": "s2"}],
+        "removed_ids": [], "next_url": None, "delta_url": "https://delta-final",
+    }
+    client = MagicMock()
+    client.delta_page = MagicMock(side_effect=[page1, page2])
+    monkeypatch.setattr(outlook_ingest, "OutlookClient", lambda token: client)
+
+    outlook_ingest.ingest_outlook_messages(
+        db, _USER_ID, provider_account_id=str(provider.id), max_results=2, max_pages=20
+    )
+
+    # Each page's commit: business flush, usage flush inside the SAVEPOINT,
+    # the real commit, then committed() -- only once the commit has actually
+    # returned.
+    assert trace[:4] == ["db.flush", "acc.flush", "db.commit", "acc.committed"]
+    assert trace[4:8] == ["db.flush", "acc.flush", "db.commit", "acc.committed"]
+    assert len(records) == 2
+
+
+def test_failing_usage_flush_does_not_block_the_business_commit(monkeypatch):
+    routing = ClassificationRouting(
+        mode="user",
+        credential=LlmCredential(provider="openai", base_url="https://x", api_key="k", model="m"),
+    )
+    usage = LlmUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    trace = []
+    records = []
+    monkeypatch.setattr(outlook_ingest, "ClassificationRouter", _fixed_router(routing))
+    monkeypatch.setattr(outlook_ingest, "classify_with_usage", _fake_classify_with_usage(usage))
+    monkeypatch.setattr(
+        outlook_ingest,
+        "UsageAccumulator",
+        _tracing_accumulator_class(trace, records, fail_flush_times=1),
+    )
+
+    provider = _fake_provider()
+    db = _make_pipeline_db(provider)
+    _wire_tracing_db(db, trace)
+    page = {
+        "messages": [{"id": "m1", "conversationId": "t1", "subject": "s1"}],
+        "removed_ids": [], "next_url": None, "delta_url": "https://delta-final",
+    }
+    client = MagicMock()
+    client.delta_page = MagicMock(return_value=page)
+    monkeypatch.setattr(outlook_ingest, "OutlookClient", lambda token: client)
+
+    result = outlook_ingest.ingest_outlook_messages(
+        db, _USER_ID, provider_account_id=str(provider.id), max_results=1, max_pages=20
+    )
+
+    assert result["messages_upserted"] == 1
+    # The SAVEPOINT rolled back the usage batch, but the outer commit for the
+    # mail work itself still ran -- a usage-layer failure must never take
+    # real business writes down with it.
+    assert "db.commit" in trace
+    assert "acc.discard" in trace
+    assert trace.index("acc.flush") < trace.index("acc.discard") < trace.index("db.commit")
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +689,7 @@ def test_cap_narrowing_continues_from_persisted_baseline_days_across_runs(monkey
 
     db = _make_db(provider)
     outlook_ingest.ingest_outlook_messages(
-        db, "u1", provider_account_id=str(provider.id), max_results=10, max_pages=20
+        db, _USER_ID, provider_account_id=str(provider.id), max_results=10, max_pages=20
     )
 
     cursors = outlook_ingest._load_cursors(provider)
@@ -464,7 +710,7 @@ def test_cap_narrowing_continues_from_persisted_baseline_days_across_runs(monkey
 
     db2 = _make_db(provider)
     outlook_ingest.ingest_outlook_messages(
-        db2, "u1", provider_account_id=str(provider.id), max_results=10, max_pages=20
+        db2, _USER_ID, provider_account_id=str(provider.id), max_results=10, max_pages=20
     )
 
     cursors = outlook_ingest._load_cursors(provider)
@@ -494,7 +740,7 @@ def test_cap_narrowing_accepts_and_completes_at_the_seven_day_floor(monkeypatch)
 
     db = _make_db(provider)
     outlook_ingest.ingest_outlook_messages(
-        db, "u1", provider_account_id=str(provider.id), max_results=10, max_pages=20
+        db, _USER_ID, provider_account_id=str(provider.id), max_results=10, max_pages=20
     )
 
     cursors = outlook_ingest._load_cursors(provider)
@@ -542,7 +788,7 @@ def test_expiry_resets_baseline_days_but_the_aggregate_stays_complete(monkeypatc
 
     db = _make_db(provider)
     outlook_ingest.ingest_outlook_messages(
-        db, "u1", provider_account_id=str(provider.id), max_results=50, max_pages=20
+        db, _USER_ID, provider_account_id=str(provider.id), max_results=50, max_pages=20
     )
 
     cursors = outlook_ingest._load_cursors(provider)

@@ -241,3 +241,46 @@ export interface LlmTestResult {
   latency_ms: number;
   error: string | null;
 }
+
+// Which background pipeline paid for a call. Kept as a plain union (not
+// reusing ClassifierBackend) because it mirrors the API's CHECK-constrained
+// `stage` column, not the classifier's backend selector.
+export type LlmUsageStage = "classification" | "extraction";
+
+// Shared by totals/by_stage/by_provider -- same counters, different grouping.
+// `calls_with_total_tokens` can be less than `calls`: a provider can answer
+// successfully without reporting `usage` at all, so this is never assumed to
+// equal `calls`.
+export interface LlmUsageCounters {
+  calls: number;
+  calls_with_total_tokens: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export interface LlmUsageByStage extends LlmUsageCounters {
+  stage: LlmUsageStage;
+}
+
+export interface LlmUsageByProvider extends LlmUsageCounters {
+  provider: LlmProvider;
+}
+
+export interface LlmUsageDailyPoint {
+  date: string;
+  calls: number;
+  total_tokens: number;
+}
+
+// GET /settings/llm/usage?days=N response -- account-level background usage
+// across whatever key(s) were configured over the window, never scoped to
+// "the current key" (see the plan's non-goals). A user with no usage gets
+// zeroed totals and empty arrays here, never a 404.
+export interface LlmUsage {
+  window_days: number;
+  totals: LlmUsageCounters;
+  by_stage: LlmUsageByStage[];
+  by_provider: LlmUsageByProvider[];
+  daily: LlmUsageDailyPoint[];
+}

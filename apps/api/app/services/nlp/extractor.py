@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, time as dtime, timezone
 
 from app.core.logging import logger
-from app.services.nlp.llm_client import LlmCallError, call_chat_completion
+from app.services.nlp.llm_client import LlmCallError, LlmCallResult, LlmUsage, call_chat_completion
 from app.services.nlp.providers import LlmCredential
 
 # Kept as an alias so existing importers of the old name (tests included)
@@ -64,6 +64,27 @@ class NoAction:
     which means the attempt itself failed (call/parse error) and is still
     retryable.
     """
+
+
+@dataclass(frozen=True)
+class ExtractionAttempt:
+    """
+    Everything one `_extract_attempt` call produced, including whether it
+    reached the provider at all.
+
+    `provider_call_succeeded` and `usage is not None` are NOT the same
+    question. `provider_call_succeeded` means the wire call came back --
+    the provider was reached and, for a BYOK credential, charged for it --
+    regardless of what came back afterward. `usage` is just whatever token
+    telemetry rode along on that response, which some providers omit even on
+    a perfectly good call. A response that comes back fine but fails to
+    parse still has `provider_call_succeeded=True` and possibly `usage=None`:
+    the user already paid for that call, so it must still be counted.
+    """
+
+    result: ExtractedAction | NoAction | None
+    provider_call_succeeded: bool
+    usage: LlmUsage | None
 
 
 def _build_message_text(
@@ -221,18 +242,67 @@ def _parse_extraction(content: str, *, model_version: str) -> ExtractedAction | 
     )
 
 
-def _call_llm(credential: LlmCredential, prompt: str, message_text: str) -> str:
+def _call_llm(credential: LlmCredential, prompt: str, message_text: str) -> LlmCallResult:
     """
     Thin wrapper around the shared wire call (`llm_client.call_chat_completion`)
     that adds extraction's own framing -- the "Email:" label and the 6000-char
     truncation -- around the message text. Raises `ExtractionCallError`
-    (== `LlmCallError`) on every failure, unchanged from before the wire call
-    moved to `llm_client`.
+    (== `LlmCallError`) on every failure.
+
+    Returns the full `LlmCallResult`, not just `.content` -- `_extract_attempt`
+    needs the `usage` alongside it. `test_credential` only reads `.content`
+    and deliberately drops the rest (see its docstring).
     """
     user_content = f"Email:\n{message_text[:_MESSAGE_TEXT_MAX_LEN]}"
     return call_chat_completion(
         credential, prompt=prompt, user_content=user_content, max_tokens=_MAX_TOKENS
     )
+
+
+def _extract_attempt(
+    *,
+    subject: str | None,
+    sender: str | None,
+    snippet: str | None,
+    body_text: str | None,
+    received_at: datetime | None,
+    credential: LlmCredential,
+) -> ExtractionAttempt:
+    """
+    The one real implementation behind `extract_action` and
+    `extract_action_with_usage` -- both are thin wrappers around this so
+    usage-tracking can never drift out of sync with the plain three-way
+    result again.
+
+    `provider_call_succeeded` flips `True` the moment `_call_llm` returns,
+    before any parsing happens -- a BYOK credential is charged for the call
+    whether or not its body turns out to be usable, so a parse failure must
+    still count. Only `ExtractionCallError` (the call never came back at
+    all) leaves it `False`.
+    """
+    message_text = _build_message_text(subject, sender, snippet, body_text)
+    prompt = _build_prompt(received_at)
+
+    try:
+        call_result = _call_llm(credential, prompt, message_text)
+    except ExtractionCallError as exc:
+        logger.warning(
+            "Action extraction failed for provider %s: %s", credential.provider, exc.category
+        )
+        return ExtractionAttempt(result=None, provider_call_succeeded=False, usage=None)
+
+    try:
+        result = _parse_extraction(
+            call_result.content, model_version=f"{credential.provider}:{credential.model}"
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning(
+            "Action extraction returned an unusable response for provider %s: %s",
+            credential.provider, type(exc).__name__,
+        )
+        return ExtractionAttempt(result=None, provider_call_succeeded=True, usage=call_result.usage)
+
+    return ExtractionAttempt(result=result, provider_call_succeeded=True, usage=call_result.usage)
 
 
 def extract_action(
@@ -259,26 +329,45 @@ def extract_action(
     This does not check `settings.action_extraction_enabled` itself --
     callers only reach here after `extraction_run`'s preflight, which owns
     that gate (and the credential resolution that produces `credential`).
+
+    Thin wrapper over `_extract_attempt` -- drops the usage/call-succeeded
+    bookkeeping for callers that don't need it. Production callers that bill
+    a user's key should use `extract_action_with_usage` instead so that
+    spend actually gets recorded.
     """
-    message_text = _build_message_text(subject, sender, snippet, body_text)
-    prompt = _build_prompt(received_at)
+    return _extract_attempt(
+        subject=subject,
+        sender=sender,
+        snippet=snippet,
+        body_text=body_text,
+        received_at=received_at,
+        credential=credential,
+    ).result
 
-    try:
-        content = _call_llm(credential, prompt, message_text)
-    except ExtractionCallError as exc:
-        logger.warning(
-            "Action extraction failed for provider %s: %s", credential.provider, exc.category
-        )
-        return None
 
-    try:
-        return _parse_extraction(content, model_version=f"{credential.provider}:{credential.model}")
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning(
-            "Action extraction returned an unusable response for provider %s: %s",
-            credential.provider, type(exc).__name__,
-        )
-        return None
+def extract_action_with_usage(
+    *,
+    subject: str | None,
+    sender: str | None,
+    snippet: str | None,
+    body_text: str | None,
+    received_at: datetime | None,
+    credential: LlmCredential,
+) -> ExtractionAttempt:
+    """
+    Same call and args as `extract_action`, but returns the full
+    `ExtractionAttempt` -- including `provider_call_succeeded` and `usage` --
+    for callers that need to record background usage (Wave 2b wires the
+    actual call sites; this wave only lands the contract).
+    """
+    return _extract_attempt(
+        subject=subject,
+        sender=sender,
+        snippet=snippet,
+        body_text=body_text,
+        received_at=received_at,
+        credential=credential,
+    )
 
 
 def test_credential(credential: LlmCredential) -> tuple[bool, str | None, int]:
@@ -288,16 +377,22 @@ def test_credential(credential: LlmCredential) -> tuple[bool, str | None, int]:
     Maps `ExtractionCallError.category` and a parse failure
     (`invalid_response`) directly -- the route never derives a category
     from a lossy `None`.
+
+    Deliberately does not record or return usage, even though `_call_llm`
+    carries it now -- this is an explicit v1 non-goal (plan §1): the route
+    is already rate-limited, user-initiated, and shows its result on screen
+    immediately, unlike background classification/extraction. Don't wire
+    usage in here later just because it's sitting right there.
     """
     prompt = _build_prompt(None)
     start = time.monotonic()
     try:
-        content = _call_llm(credential, prompt, _TEST_CREDENTIAL_MESSAGE)
+        call_result = _call_llm(credential, prompt, _TEST_CREDENTIAL_MESSAGE)
     except ExtractionCallError as exc:
         return False, exc.category, int((time.monotonic() - start) * 1000)
 
     try:
-        _parse_extraction(content, model_version=f"{credential.provider}:{credential.model}")
+        _parse_extraction(call_result.content, model_version=f"{credential.provider}:{credential.model}")
     except (json.JSONDecodeError, ValueError):
         return False, "invalid_response", int((time.monotonic() - start) * 1000)
 

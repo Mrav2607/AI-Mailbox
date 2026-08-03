@@ -11,6 +11,7 @@ import type {
   LlmProvider,
   LlmSettings,
   LlmTestResult,
+  LlmUsage,
   Overview,
   SearchResponse,
   ThreadDetail,
@@ -28,6 +29,7 @@ import {
   mockDeleteLlmSettings,
   mockDeleteThread,
   mockGetLlmSettings,
+  mockGetLlmUsage,
   mockIngest,
   mockListConnections,
   mockOverview,
@@ -933,6 +935,15 @@ export async function deleteLlmSettings(): Promise<void> {
     return;
   }
   await request<void>("/settings/llm", { method: "DELETE" });
+}
+
+// Account-level background usage (calls + tokens, split by stage/provider,
+// over `days`) -- separate from getLlmSettings because it carries an
+// aggregate query a plain settings read shouldn't pay for. Never claims
+// "your current key"; a user with no usage gets zeroed totals, never a 404.
+export async function getLlmUsage(days = 30): Promise<LlmUsage> {
+  if (USE_MOCK) return mockGetLlmUsage(days);
+  return request<LlmUsage>(`/settings/llm/usage?days=${days}`);
 }
 
 export { USE_MOCK };

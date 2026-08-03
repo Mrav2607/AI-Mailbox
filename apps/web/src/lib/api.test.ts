@@ -611,3 +611,60 @@ describe("deleteLlmSettings", () => {
     expect(res.provider).toBeNull();
   });
 });
+
+describe("getLlmUsage", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("requests GET /settings/llm/usage with the days param, defaulting to 30", async () => {
+    const api = await importLiveApi();
+    const body = {
+      window_days: 30,
+      totals: { calls: 12, calls_with_total_tokens: 12, prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+      by_stage: [],
+      by_provider: [],
+      daily: [],
+    };
+    const fetchMock = stubFetch(body);
+    const res = await api.getLlmUsage();
+    const url = requestedUrl(fetchMock);
+    expect(url.pathname).toBe("/api/v1/settings/llm/usage");
+    expect(url.searchParams.get("days")).toBe("30");
+    expect(res).toEqual(body);
+  });
+
+  it("passes a non-default days value through", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({
+      window_days: 7,
+      totals: { calls: 0, calls_with_total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      by_stage: [],
+      by_provider: [],
+      daily: [],
+    });
+    await api.getLlmUsage(7);
+    expect(requestedUrl(fetchMock).searchParams.get("days")).toBe("7");
+  });
+
+  it("in mock mode, returns non-zero totals so the panel has something to demo", async () => {
+    const api = await importMockApi();
+    const res = await api.getLlmUsage();
+    expect(res.window_days).toBe(30);
+    expect(res.totals.calls).toBeGreaterThan(0);
+    // Sparse on purpose -- idle days are absent, matching the real API, which
+    // only stores days that have usage.
+    expect(res.daily.length).toBeGreaterThan(0);
+    expect(res.daily.length).toBeLessThan(30);
+    expect(res.by_stage.map((s) => s.stage).sort()).toEqual(["classification", "extraction"]);
+  });
+
+  it("in mock mode, respects a non-default days window", async () => {
+    const api = await importMockApi();
+    const res = await api.getLlmUsage(7);
+    expect(res.window_days).toBe(7);
+    expect(res.daily.length).toBeGreaterThan(0);
+    expect(res.daily.length).toBeLessThanOrEqual(7);
+  });
+});

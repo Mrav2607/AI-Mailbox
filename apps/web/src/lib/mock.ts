@@ -12,6 +12,10 @@ import type {
   LlmProvider,
   LlmSettings,
   LlmTestResult,
+  LlmUsage,
+  LlmUsageByProvider,
+  LlmUsageByStage,
+  LlmUsageDailyPoint,
   Overview,
   SearchResponse,
   ThreadDetail,
@@ -711,4 +715,95 @@ export function mockDeleteLlmSettings(): void {
     classifier_backend: LLM_SETTINGS.classifier_backend,
     classification_eligible: false,
   };
+}
+
+// Deterministic multi-day demo usage so the console's usage card has real
+// volume, a real trend, and real gaps to show in preview mode -- weighted
+// toward classification, since it fires on every ingested message and
+// extraction only runs per action-bearing thread. Every 9th active day, this
+// "provider" reports usage for all but two of its classification calls, so
+// the disclosure line has something real to render against instead of only
+// ever hitting the all-or-nothing branches.
+//
+// Every 11th day is genuinely idle -- no calls at all -- and gets no `daily`
+// entry, same as the real API (it only ever returns rows for days that had
+// usage). That's what actually exercises fillDailySeries and the chart's
+// gap-filling in preview, instead of a dense series that never has a gap to
+// fill in the first place.
+function buildMockUsage(days: number): LlmUsage {
+  const provider = LLM_SETTINGS.provider ?? "openai";
+  const daily: LlmUsageDailyPoint[] = [];
+  const stageTotals = {
+    classification: { calls: 0, calls_with_total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    extraction: { calls: 0, calls_with_total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
+
+  for (let i = 0; i < days; i++) {
+    // i counts back from "today" at i=0 -- daily[] still ends up oldest-first
+    // since we push in the same order the API's own day-ascending list would.
+    const dayIndex = days - 1 - i;
+    const isWeekend = dayIndex % 7 === 5 || dayIndex % 7 === 6;
+    const isIdle = dayIndex % 11 === 0;
+
+    const classificationCalls = isIdle ? 0 : isWeekend ? 3 + (dayIndex % 3) : 14 + (dayIndex % 6);
+    const missingTokenCalls =
+      !isIdle && dayIndex % 9 === 0 ? Math.min(2, classificationCalls) : 0;
+    const classificationCallsWithTokens = classificationCalls - missingTokenCalls;
+    const classificationPromptTokens = classificationCallsWithTokens * 220;
+    const classificationCompletionTokens = classificationCallsWithTokens * 18;
+
+    const extractionCalls = isIdle || isWeekend ? 0 : dayIndex % 4 === 0 ? 2 : 1;
+    const extractionPromptTokens = extractionCalls * 640;
+    const extractionCompletionTokens = extractionCalls * 95;
+
+    stageTotals.classification.calls += classificationCalls;
+    stageTotals.classification.calls_with_total_tokens += classificationCallsWithTokens;
+    stageTotals.classification.prompt_tokens += classificationPromptTokens;
+    stageTotals.classification.completion_tokens += classificationCompletionTokens;
+    stageTotals.classification.total_tokens += classificationPromptTokens + classificationCompletionTokens;
+
+    stageTotals.extraction.calls += extractionCalls;
+    stageTotals.extraction.calls_with_total_tokens += extractionCalls;
+    stageTotals.extraction.prompt_tokens += extractionPromptTokens;
+    stageTotals.extraction.completion_tokens += extractionCompletionTokens;
+    stageTotals.extraction.total_tokens += extractionPromptTokens + extractionCompletionTokens;
+
+    const callsToday = classificationCalls + extractionCalls;
+    if (callsToday === 0) continue; // an idle day -- the API wouldn't send a row for it either
+
+    const date = new Date(Date.now() - dayIndex * 24 * 60 * 60 * 1000)
+      .toISOString()
+      .slice(0, 10);
+    daily.push({
+      date,
+      calls: callsToday,
+      total_tokens:
+        classificationPromptTokens +
+        classificationCompletionTokens +
+        extractionPromptTokens +
+        extractionCompletionTokens,
+    });
+  }
+
+  const by_stage: LlmUsageByStage[] = [
+    { stage: "classification", ...stageTotals.classification },
+    { stage: "extraction", ...stageTotals.extraction },
+  ];
+  const totals = by_stage.reduce(
+    (acc, s) => ({
+      calls: acc.calls + s.calls,
+      calls_with_total_tokens: acc.calls_with_total_tokens + s.calls_with_total_tokens,
+      prompt_tokens: acc.prompt_tokens + s.prompt_tokens,
+      completion_tokens: acc.completion_tokens + s.completion_tokens,
+      total_tokens: acc.total_tokens + s.total_tokens,
+    }),
+    { calls: 0, calls_with_total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  );
+  const by_provider: LlmUsageByProvider[] = [{ provider, ...totals }];
+
+  return { window_days: days, totals, by_stage, by_provider, daily };
+}
+
+export function mockGetLlmUsage(days = 30): LlmUsage {
+  return buildMockUsage(days);
 }

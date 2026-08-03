@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from functools import lru_cache
 
 import httpx
 
 from app.core.config import settings
 from app.core.logging import logger
-from app.services.nlp.llm_client import LlmCallError, call_chat_completion
+from app.services.nlp.llm_client import LlmCallError, LlmUsage, call_chat_completion
 from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
 LABELS = (
@@ -18,6 +19,41 @@ LABELS = (
     "security_alert",
     "spam",
 )
+
+
+@dataclass(frozen=True)
+class ClassificationAttempt:
+    """
+    One classification call's full outcome -- `classify()` keeps returning
+    just `verdict` (today's unchanged contract); `classify_with_usage()`
+    returns the whole thing so a paid call site can record what it spent.
+
+    `provider_call_succeeded` and `usage` are deliberately two separate
+    fields, not one derived from the other. `usage is None` is ambiguous on
+    its own: it's also true of every heuristic/local verdict that never
+    touched a provider, AND of a successful call whose provider simply
+    didn't report token counts (`usage` is optional in the OpenAI spec).
+    `provider_call_succeeded` answers the narrower question the usage
+    recorder actually needs -- did a request reach a provider and come back
+    at all -- and it's `True` even when the response body fails to parse and
+    we fall back to the heuristic. That case matters most: the provider
+    already answered (and, on BYOK, already billed the user) by the time
+    parsing happens, so undercounting it would recreate the exact
+    quota-blindness this feature exists to fix.
+    """
+
+    verdict: tuple[str, float, str, str]
+    provider_call_succeeded: bool
+    usage: LlmUsage | None
+
+
+def _heuristic_attempt(text: str) -> ClassificationAttempt:
+    """The heuristic never touches a provider, on any path that reaches it --
+    shared by the `backend="heuristic"` route and every LLM-path fallback
+    that decides not to call anyone (routing `off`, a missing credential)."""
+    return ClassificationAttempt(
+        verdict=_heuristic_classify(text), provider_call_succeeded=False, usage=None
+    )
 
 
 def build_classification_text(
@@ -110,18 +146,53 @@ def classify(
     caller's own credential via the shared OpenAI-compatible wire client;
     `mode="off"` classifies heuristically without calling any LLM at all, so
     neither key is spent.
+
+    This is the compatibility wrapper -- see `_classify_attempt` for the
+    actual implementation, which `classify_with_usage()` also wraps. Any
+    caller that can reach an LLM path (i.e. anywhere `routing` might resolve
+    to `"user"`) MUST use `classify_with_usage()` instead, or its usage never
+    gets recorded.
+    """
+    return _classify_attempt(text, backend, routing).verdict
+
+
+def classify_with_usage(
+    text: str,
+    backend: str | None = None,
+    routing: ClassificationRouting | None = None,
+) -> ClassificationAttempt:
+    """Same inputs and behavior as `classify()`, but returns the full
+    `ClassificationAttempt` so a paid call site can record what it spent.
+    Every production call site that can reach an LLM must call this, not
+    the bare `classify()`."""
+    return _classify_attempt(text, backend, routing)
+
+
+def _classify_attempt(
+    text: str,
+    backend: str | None = None,
+    routing: ClassificationRouting | None = None,
+) -> ClassificationAttempt:
+    """
+    The one real implementation behind `classify()` and `classify_with_usage()`
+    -- see those two docstrings for the routing/backend contract itself. Kept
+    as a single implementation with two thin wrappers on purpose: two
+    separate implementations would drift, and the drift most likely to
+    happen is one of them silently forgetting to record usage.
     """
     backend = (backend or settings.classifier_backend or "auto").lower()
 
     if backend == "heuristic":
-        return _heuristic_classify(text)
+        return _heuristic_attempt(text)
 
     if backend in ("local", "auto"):
         from app.services.nlp.local_model import try_predict
 
         result = try_predict(text)
         if result is not None:
-            return result
+            return ClassificationAttempt(
+                verdict=result, provider_call_succeeded=False, usage=None
+            )
         # local unavailable -> fall through to the LLM / heuristic path
 
     return _classify_llm(text, routing)
@@ -203,7 +274,7 @@ _CLASSIFICATION_TIMEOUT_S = 10.0
 
 def _classify_llm(
     text: str, routing: ClassificationRouting | None = None
-) -> tuple[str, float, str, str]:
+) -> ClassificationAttempt:
     """
     Dispatch to the LLM path that pays for this call, per `routing`
     (see `providers.ClassificationRouting` and `classify`'s docstring for the
@@ -213,7 +284,7 @@ def _classify_llm(
     so the operator is never billed for a message the user opted out of.
     """
     if routing is not None and routing.mode == "off":
-        return _heuristic_classify(text)
+        return _heuristic_attempt(text)
 
     if routing is not None and routing.mode == "user":
         if routing.credential is None:
@@ -225,26 +296,32 @@ def _classify_llm(
             # invariant must never silently bill the operator for a user who
             # opted in with their own key.
             logger.warning("ClassificationRouting mode='user' had no credential")
-            return _heuristic_classify(text)
+            return _heuristic_attempt(text)
         return _classify_llm_user(text, routing.credential)
 
     return _classify_llm_server(text)
 
 
-def _classify_llm_server(text: str) -> tuple[str, float, str, str]:
+def _classify_llm_server(text: str) -> ClassificationAttempt:
     """LLM-backed classifier with heuristic fallback, on the operator's
     Gemini key. Unchanged from before BYOK classification existed."""
     if not settings.gemini_api_key:
-        return _heuristic_classify(text)
+        return _heuristic_attempt(text)
 
     # Each step below catches only what it can actually fail with. The old blanket
     # `except Exception` also swallowed our own bugs -- a typo in here came back as
     # a confident heuristic answer instead of a 500, which is exactly how a broken
     # classifier hides in plain sight.
-    def fallback(reason: str, exc: Exception) -> tuple[str, float, str, str]:
+    def fallback(reason: str, exc: Exception) -> ClassificationAttempt:
+        # Every path through here never reached (or never finished talking
+        # to) Gemini, so `provider_call_succeeded` stays False.
         logger.warning("Gemini classify %s, falling back to heuristic: %s", reason, exc)
         label, confidence, rationale, _ = _heuristic_classify(text)
-        return (label, confidence, rationale, "heuristic-fallback")
+        return ClassificationAttempt(
+            verdict=(label, confidence, rationale, "heuristic-fallback"),
+            provider_call_succeeded=False,
+            usage=None,
+        )
 
     try:
         from google.genai import errors as genai_errors
@@ -259,19 +336,38 @@ def _classify_llm_server(text: str) -> tuple[str, float, str, str]:
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
     except (genai_errors.APIError, httpx.HTTPError, TimeoutError) as exc:
-        # Gemini refused, rate-limited us, or never answered.
+        # Gemini refused, rate-limited us, or never answered -- no call
+        # completed.
         return fallback("call failed", exc)
 
+    # A response came back: the call reached Gemini and completed, whatever
+    # its content turns out to be. `provider_call_succeeded` is True from
+    # here on even if the parse below fails.
     try:
         label, confidence, rationale = _parse_llm_response(response.text or "")
     except (json.JSONDecodeError, ValueError) as exc:
-        # A reply we can't map onto our taxonomy is the model's problem, not ours.
-        return fallback("returned an unusable answer", exc)
+        # A reply we can't map onto our taxonomy is the model's problem, not
+        # ours -- but the call still happened, so it still counts.
+        logger.warning("Gemini classify returned an unusable answer, falling back to heuristic: %s", exc)
+        label, confidence, rationale, _ = _heuristic_classify(text)
+        return ClassificationAttempt(
+            verdict=(label, confidence, rationale, "heuristic-fallback"),
+            provider_call_succeeded=True,
+            usage=None,
+        )
 
-    return (label, confidence, rationale, settings.gemini_model)
+    return ClassificationAttempt(
+        verdict=(label, confidence, rationale, settings.gemini_model),
+        provider_call_succeeded=True,
+        # Operator-paid usage is an explicit v1 non-goal (plan §1), and Wave
+        # 2b's recorder filters this path out via `routing.mode` anyway --
+        # parsing `response.usage_metadata` here would be dead code implying
+        # a capability we don't actually expose. Don't "fix" this.
+        usage=None,
+    )
 
 
-def _classify_llm_user(text: str, credential: LlmCredential) -> tuple[str, float, str, str]:
+def _classify_llm_user(text: str, credential: LlmCredential) -> ClassificationAttempt:
     """
     BYOK classification path: the same prompt and the same strict parse as
     the server path, wired through the shared OpenAI-compatible call instead
@@ -281,7 +377,7 @@ def _classify_llm_user(text: str, credential: LlmCredential) -> tuple[str, float
     picked, not the operator's fixed Gemini deployment.
     """
     try:
-        content = call_chat_completion(
+        result = call_chat_completion(
             credential,
             prompt=_CLASSIFICATION_PROMPT,
             user_content=f"Email:\n{text[:6000]}",
@@ -293,16 +389,31 @@ def _classify_llm_user(text: str, credential: LlmCredential) -> tuple[str, float
             "Classification call failed for provider %s: %s", credential.provider, exc.category
         )
         label, confidence, rationale, _ = _heuristic_classify(text)
-        return (label, confidence, rationale, "heuristic-fallback")
+        return ClassificationAttempt(
+            verdict=(label, confidence, rationale, "heuristic-fallback"),
+            provider_call_succeeded=False,
+            usage=None,
+        )
 
+    # The call reached the provider and came back -- it already billed the
+    # user's key by this point, so `provider_call_succeeded` is True and
+    # `usage` rides along regardless of whether the content below parses.
     try:
-        label, confidence, rationale = _parse_llm_response(content)
+        label, confidence, rationale = _parse_llm_response(result.content)
     except (json.JSONDecodeError, ValueError) as exc:
         logger.warning(
             "Classification returned an unusable response for provider %s: %s",
             credential.provider, type(exc).__name__,
         )
         label, confidence, rationale, _ = _heuristic_classify(text)
-        return (label, confidence, rationale, "heuristic-fallback")
+        return ClassificationAttempt(
+            verdict=(label, confidence, rationale, "heuristic-fallback"),
+            provider_call_succeeded=True,
+            usage=result.usage,
+        )
 
-    return (label, confidence, rationale, f"{credential.provider}:{credential.model}")
+    return ClassificationAttempt(
+        verdict=(label, confidence, rationale, f"{credential.provider}:{credential.model}"),
+        provider_call_succeeded=True,
+        usage=result.usage,
+    )

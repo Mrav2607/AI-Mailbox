@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
-import type { LlmProvider, LlmSettings, LlmTestResult } from "@/lib/types";
+import type { LlmProvider, LlmSettings, LlmTestResult, LlmUsage } from "@/lib/types";
+import { PROVIDER_LABELS } from "@/lib/usage";
 
 interface Props {
   open: boolean;
@@ -23,16 +24,20 @@ interface Props {
   testResult: LlmTestResult | null;
   onRemove: () => void;
   removing: boolean;
+  // Null while the fetch is in flight (or hasn't started) and no prior error
+  // -- fetched fresh every time this modal opens, since usage keeps moving
+  // even when the credential itself hasn't changed. Only feeds the one-line
+  // summary here; the full breakdown lives in the usage card.
+  usage: LlmUsage | null;
+  // True when the usage fetch failed. Kept separate from `usage` being null
+  // so the panel can tell "still loading" apart from "unavailable" -- an
+  // outage here must never make the rest of this modal look broken.
+  usageError: boolean;
+  // Opens the separate usage card (charts, breakdowns, dashboard links) --
+  // the cost signal belongs here where the key is configured, but the detail
+  // lives there.
+  onOpenUsage: () => void;
 }
-
-const PROVIDER_LABELS: Record<LlmProvider, string> = {
-  openai: "OpenAI",
-  gemini: "Gemini",
-  openrouter: "OpenRouter",
-  groq: "Groq",
-  mistral: "Mistral",
-  custom: "Custom endpoint",
-};
 
 // Hints only, shown as the model field's placeholder -- never submitted on
 // their own, and cleared the moment the caller types something real.
@@ -89,6 +94,9 @@ export function LlmSettingsModal({
   testResult,
   onRemove,
   removing,
+  usage,
+  usageError,
+  onOpenUsage,
 }: Props) {
   const [provider, setProvider] = useState<LlmProvider>("openai");
   const [model, setModel] = useState("");
@@ -349,6 +357,28 @@ export function LlmSettingsModal({
               last verified {new Date(settings.last_verified_at).toLocaleString()}
             </p>
           )}
+
+          {/* Just the cost signal here -- the full breakdown (charts, per-stage
+              and per-provider splits, dashboard links) lives in its own card,
+              since this modal is about the key, not the usage detail. */}
+          <div className="flex items-center justify-between gap-2 pt-2 mt-1 border-t border-border/60">
+            <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+              {usageError
+                ? "Usage isn't available right now."
+                : !usage
+                  ? "checking your usage…"
+                  : usage.totals.calls === 0
+                    ? "Your key hasn't been used yet."
+                    : `${usage.totals.calls.toLocaleString()} AI calls in the last ${usage.window_days} days.`}
+            </p>
+            <button
+              type="button"
+              onClick={onOpenUsage}
+              className="shrink-0 h-6 px-2 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[10.5px] font-mono cursor-pointer transition-colors"
+            >
+              view usage
+            </button>
+          </div>
         </form>
       </DialogContent>
     </Dialog>

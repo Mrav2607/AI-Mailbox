@@ -10,12 +10,15 @@ from uuid import UUID
 from typing import Any, Sequence
 
 from sqlalchemy import select, desc, func
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.logging import logger
 from app.db.models import MailThread, MailMessage, Classification
-from app.services.nlp.classifier import classify, build_classification_text
+from app.services.nlp.classifier import classify_with_usage, build_classification_text
 from app.services.nlp.persistence import upsert_classification
 from app.services.nlp.providers import ClassificationRouter
+from app.services.nlp.usage import UsageAccumulator
 
 
 def latest_message_ordering():
@@ -171,15 +174,18 @@ def run_backfill(
 
     # One router for the whole run -- its 60s memo keeps a mid-run opt-out
     # effective within a minute without re-resolving routing per message (see
-    # ClassificationRouter).
+    # ClassificationRouter). One usage accumulator for the whole run too --
+    # it gets flushed alongside every batch commit below, never on its own.
     classification_router = ClassificationRouter(user_id)
+    acc = UsageAccumulator(user_id)
 
     batch_size = 25
     created = 0
     pending: list[tuple[UUID, str | None, float | None, str | None, str | None]] = []
+    usage_pending = False
 
     def flush_pending() -> None:
-        nonlocal created
+        nonlocal created, usage_pending
         for message_id, label, confidence, rationale, model_version in pending:
             upsert_classification(
                 db,
@@ -189,7 +195,27 @@ def run_backfill(
                 rationale=rationale,
                 model_version=model_version,
             )
+
+        # db.flush() sits OUTSIDE the try: begin_nested() flushes pending ORM
+        # state before opening its SAVEPOINT, so a genuine business-write
+        # failure would otherwise surface inside the usage handler with the
+        # outer transaction already invalid (plan §5). Skip the block
+        # entirely when nothing was recorded this batch -- no point opening
+        # a SAVEPOINT for an empty one.
+        db.flush()
+        if usage_pending:
+            try:
+                with db.begin_nested():
+                    acc.flush(db)
+            except SQLAlchemyError:
+                logger.warning(
+                    "usage flush failed mid-backfill for user %s; discarding batch",
+                    user_id,
+                )
+                acc.discard()
+            usage_pending = False
         db.commit()
+        acc.committed()
         created += len(pending)
         pending.clear()
 
@@ -197,9 +223,23 @@ def run_backfill(
     # a late classifier failure only loses the current batch, not the whole run.
     for message_id, text_for_classification in to_classify:
         routing = classification_router.routing_for(db)
-        label, confidence, rationale, model_version = classify(
+        attempt = classify_with_usage(
             text_for_classification, backend=backend, routing=routing
         )
+        label, confidence, rationale, model_version = attempt.verdict
+        # `routing.credential` should always be set when mode is "user"
+        # (classifier.py's `_classify_llm` degrades to the heuristic if that
+        # invariant ever breaks) -- but guard it here too, same as the ingest
+        # recording sites, so a broken invariant just skips recording instead
+        # of an AttributeError after `upsert_classification` already ran.
+        if routing.mode == "user" and routing.credential is not None:
+            acc.record(
+                "classification",
+                routing.credential.provider,
+                attempt.usage,
+                provider_call_succeeded=attempt.provider_call_succeeded,
+            )
+            usage_pending = True
         pending.append((message_id, label, confidence, rationale, model_version))
         if len(pending) >= batch_size:
             flush_pending()

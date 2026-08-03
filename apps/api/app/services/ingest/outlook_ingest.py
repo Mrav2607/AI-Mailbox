@@ -25,6 +25,7 @@ page commit, and are persisted to the DB independently of it.
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -32,6 +33,7 @@ from typing import Any
 import httpx
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -45,9 +47,10 @@ from app.services.ingest.outlook_client import (
     DeltaExpiredError,
     OutlookClient,
 )
-from app.services.nlp.classifier import build_classification_text, classify
+from app.services.nlp.classifier import build_classification_text, classify_with_usage
 from app.services.nlp.persistence import upsert_classification
 from app.services.nlp.providers import ClassificationRouter
+from app.services.nlp.usage import UsageAccumulator
 
 # Inbox first: it's the folder users actually triage, so it gets first claim
 # on a bounded run's message/page budget.
@@ -295,17 +298,22 @@ def _upsert_page_messages(
     messages: list[dict[str, Any]],
     classify_messages: bool,
     classification_router: ClassificationRouter,
-) -> dict[str, int]:
+    usage_acc: UsageAccumulator,
+) -> dict[str, Any]:
     """Upsert one delta page's messages (and their threads) for one folder.
 
-    ``classification_router`` is built ONCE by the caller (`ingest_outlook_
-    messages`), not here -- this helper runs once per delta page, so
-    constructing it in here would restart the 60s memo (and re-query) every
-    page instead of once per run.
+    ``classification_router`` and ``usage_acc`` are built ONCE by the caller
+    (`ingest_outlook_messages`), not here -- this helper runs once per delta
+    page, so constructing them in here would restart the router's 60s memo
+    (and re-query) every page instead of once per run, and would silently
+    drop any usage recorded on an earlier page in this same run.
     """
     threads_upserted = 0
     messages_upserted = 0
     classified = 0
+    # Tells the caller whether this page put anything in usage_acc, since it
+    # can't see usage_acc's internal buffer state from out there.
+    usage_recorded = False
 
     for raw in messages:
         normalized = normalize_outlook_message(raw, folder_key)
@@ -382,9 +390,22 @@ def _upsert_page_messages(
                     normalized.get("body_text"),
                 )
                 routing = classification_router.routing_for(db)
-                label, confidence, rationale, model_version = classify(
+                attempt = classify_with_usage(
                     text_for_classification, routing=routing
                 )
+                label, confidence, rationale, model_version = attempt.verdict
+                # Only the user's own key gets recorded -- v1 tracks
+                # user-paid usage only (plan §1), same rule as Gmail's ingest.
+                # `routing.mode == "user"` is the single source of truth for
+                # who pays; the operator-paid server path never shows up here.
+                if routing.mode == "user" and routing.credential is not None:
+                    usage_acc.record(
+                        "classification",
+                        routing.credential.provider,
+                        attempt.usage,
+                        provider_call_succeeded=attempt.provider_call_succeeded,
+                    )
+                    usage_recorded = True
                 upsert_classification(
                     db,
                     message_id=new_message_id,
@@ -402,6 +423,7 @@ def _upsert_page_messages(
         "threads_upserted": threads_upserted,
         "messages_upserted": messages_upserted,
         "classified": classified,
+        "usage_recorded": usage_recorded,
     }
 
 
@@ -476,6 +498,35 @@ def ingest_outlook_messages(
     # _upsert_page_messages, which runs once per delta page and would
     # otherwise restart the 60s memo (and re-query routing) every page.
     classification_router = ClassificationRouter(user_id)
+    usage_acc = UsageAccumulator(uuid.UUID(user_id))
+    usage_pending = False
+
+    def flush_usage_then_commit() -> None:
+        """Wraps the per-delta-page commit below. Same contract as Gmail's
+        ingest (see gmail_ingest.py's flush_usage_then_commit) -- db.flush()
+        has to sit outside the try because begin_nested() flushes pending ORM
+        state (here, the cursor JSON and outlook_backfill_complete written by
+        _save_cursor above) before opening its SAVEPOINT. A real write
+        failure has to propagate as itself, not get caught and logged as a
+        mere usage warning while the outer transaction is already unusable.
+        """
+        nonlocal usage_pending
+        db.flush()
+        if usage_pending:
+            try:
+                with db.begin_nested():
+                    usage_acc.flush(db)
+            except SQLAlchemyError:
+                logger.warning(
+                    "outlook ingest: usage flush failed for provider %s; discarding batch",
+                    provider.id,
+                    exc_info=True,
+                )
+                usage_acc.discard()
+        db.commit()
+        if usage_pending:
+            usage_acc.committed()
+            usage_pending = False
 
     remaining = max_results
     pages_done = 0
@@ -521,6 +572,15 @@ def ingest_outlook_messages(
                 # New baseline generation for this folder -- the aggregate
                 # outlook_backfill_complete column is never touched here (it's
                 # ever-completed, not current-generation).
+                #
+                # This is a bare db.commit(), not flush_usage_then_commit() --
+                # deliberately. client.delta_page() above is the first thing
+                # this loop iteration does, so no classification has run yet
+                # this pass; both `break`s below sit before
+                # _upsert_page_messages, and the only path that reaches it
+                # always hits flush_usage_then_commit() further down, which
+                # resets usage_pending. There's never a pending batch to lose
+                # here.
                 _save_cursor(
                     db,
                     provider,
@@ -557,8 +617,10 @@ def ingest_outlook_messages(
 
             upsert_stats = _upsert_page_messages(
                 db, user_id, provider, folder_key, messages, classify_messages,
-                classification_router,
+                classification_router, usage_acc,
             )
+            if upsert_stats["usage_recorded"]:
+                usage_pending = True
             removal_stats = with_token_retry(
                 lambda deduped_removed=deduped_removed: _apply_removals(
                     db, client, provider.id, deduped_removed
@@ -626,7 +688,7 @@ def ingest_outlook_messages(
                 if inbox_done and sent_done:
                     provider.outlook_backfill_complete = True
 
-            db.commit()
+            flush_usage_then_commit()
 
             stats["threads_upserted"] += upsert_stats["threads_upserted"]
             stats["messages_upserted"] += upsert_stats["messages_upserted"]
