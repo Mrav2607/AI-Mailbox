@@ -79,7 +79,14 @@ _TRIAGE_SORTS = frozenset({"recency", "account"})
 # the "done" bucket.
 _BACKFILL_BUCKETS = _TRIAGE_BUCKETS - {"done"}
 # Classifier backends a caller may request per run (see services.nlp.classify).
-_CLASSIFIER_BACKENDS = frozenset({"local", "gemini", "heuristic", "auto"})
+# "gemini" is the old name for "llm" -- still accepted so existing deployments
+# and saved requests don't break, but it's no longer the name we document. The
+# LLM path hasn't been Gemini-only since BYOK landed: it routes to whatever
+# provider the user's credential names.
+_CLASSIFIER_BACKENDS = frozenset({"local", "llm", "gemini", "heuristic", "auto"})
+# What we tell callers about on a bad value -- the alias is accepted but not
+# advertised, so nobody learns the deprecated spelling from an error message.
+_DOCUMENTED_BACKENDS = _CLASSIFIER_BACKENDS - {"gemini"}
 # Marks a label set by a human in the console rather than a model, so it's
 # distinguishable from a real prediction and never overwritten by a backfill
 # (which only touches unclassified messages unless forced).
@@ -922,13 +929,16 @@ def backfill_classifications(
             detail=f"Invalid bucket '{bucket}'. Valid: {sorted(_BACKFILL_BUCKETS)}",
         )
     # classify() lowercases its backend anyway, but normalize here so one
-    # canonical value flows into task kwargs and logs.
+    # canonical value flows into task kwargs and logs -- including folding the
+    # "gemini" alias to "llm", so logs never show two names for one path.
     normalized_backend = backend.lower() if backend is not None else None
     if normalized_backend is not None and normalized_backend not in _CLASSIFIER_BACKENDS:
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid backend '{backend}'. Valid: {sorted(_CLASSIFIER_BACKENDS)}",
+            detail=f"Invalid backend '{backend}'. Valid: {sorted(_DOCUMENTED_BACKENDS)}",
         )
+    if normalized_backend == "gemini":
+        normalized_backend = "llm"
 
     if limit > _MAX_INLINE_BACKFILL:
         task = cast(Any, backfill_threads_for_user).delay(

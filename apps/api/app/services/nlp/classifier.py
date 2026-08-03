@@ -133,7 +133,10 @@ def classify(
     given, so callers can override the global default per request):
       - "local":     fine-tuned encoder in models/, falling back to the LLM /
                      heuristic path if the model or its deps are unavailable.
-      - "gemini":    LLM with heuristic fallback (the original behavior).
+      - "llm":       LLM with heuristic fallback. Which provider actually gets
+                     called comes from `routing`, not from this name -- it was
+                     called "gemini" before BYOK, which read as though it
+                     pinned the provider. "gemini" still works as an alias.
       - "heuristic": keyword rules only.
       - "auto":      try local, then LLM, then heuristic.
 

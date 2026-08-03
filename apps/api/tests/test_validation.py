@@ -60,6 +60,21 @@ def test_backfill_rejects_bad_bucket_and_backend(client):
     bad_backend = client.post("/api/v1/mail/classify/backfill?backend=not_a_model")
     assert bad_backend.status_code == 422
     assert "Invalid backend" in bad_backend.json()["detail"]
+    # The "gemini" alias still works, but an error must not teach it to anyone.
+    assert "gemini" not in bad_backend.json()["detail"]
+    assert "llm" in bad_backend.json()["detail"]
+
+
+def test_backfill_accepts_gemini_alias_for_llm(client):
+    # Existing .env files still say "gemini"; it has to clear validation, not
+    # 422 out from under a deployment that hasn't been renamed yet.
+    # limit stays under _MAX_INLINE_BACKFILL so this runs inline against the
+    # empty-result DB stub instead of needing a live Celery broker. Nothing
+    # matches, so no LLM call happens either.
+    for backend in ("llm", "gemini"):
+        resp = client.post(f"/api/v1/mail/classify/backfill?backend={backend}&limit=10")
+        assert resp.status_code == 200, backend
+        assert resp.json() == {"status": "ok", "created": 0, "scanned": 0}
 
 
 def test_backfill_valid_params_pass_validation(client):

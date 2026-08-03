@@ -273,10 +273,10 @@ def test_run_backfill_custom_opt_in_credential_routes_off_with_no_server_call(mo
     monkeypatch.setattr(classifier_module, "call_chat_completion", _explode)
     monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: None)
 
-    # backend="gemini" skips the local-model branch so routing (not whatever
+    # backend="llm" skips the local-model branch so routing (not whatever
     # the local encoder happens to be doing in this test env) decides the
     # outcome.
-    result = backfill.run_backfill(db, user_id, limit=10, backend="gemini")
+    result = backfill.run_backfill(db, user_id, limit=10, backend="llm")
 
     assert result["created"] == 1
 
