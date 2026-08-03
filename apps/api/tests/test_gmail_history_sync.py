@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.services.ingest import gmail_ingest
 from app.services.ingest.gmail_ingest import (
@@ -13,6 +14,15 @@ from app.services.ingest.gmail_ingest import (
     _should_reopen_thread,
     ingest_gmail_messages,
 )
+from app.services.nlp.classifier import ClassificationAttempt
+from app.services.nlp.llm_client import LlmUsage
+from app.services.nlp.providers import ClassificationRouting, LlmCredential
+
+# A real UUID string, not the old opaque "u1" placeholder -- usage recording
+# now does UsageAccumulator(uuid.UUID(user_id)) once at construction (every
+# run, whether or not anything ever gets classified), so every test driving
+# ingest_gmail_messages needs a user_id that actually parses as one.
+_USER_ID = str(uuid4())
 
 
 def test_history_sync_includes_known_threads_with_new_messages():
@@ -95,7 +105,7 @@ def test_disconnect_race_missing_account_raises_terminal_error(monkeypatch):
     db.execute.return_value.scalars.return_value.first.return_value = None
 
     with pytest.raises(ValueError, match="not connected"):
-        ingest_gmail_messages(db, "u1", provider_account_id=str(uuid4()))
+        ingest_gmail_messages(db, _USER_ID, provider_account_id=str(uuid4()))
     # Pins that the explicit account lookup ran exactly once -- with a
     # MagicMock db returning None everywhere, a buggy fallback to "oldest
     # connected account" would raise this same ValueError, so without this
@@ -130,7 +140,7 @@ def test_ingest_with_an_explicit_account_scopes_existing_thread_ids_to_it(monkey
     client.list_history.return_value = {"historyId": "110", "history": []}
     monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
 
-    ingest_gmail_messages(db, "u1", provider_account_id=str(account_id), new_only=True)
+    ingest_gmail_messages(db, _USER_ID, provider_account_id=str(account_id), new_only=True)
 
     assert "provider_account_id" in captured_thread_query["sql"]
     assert "user_id" not in captured_thread_query["sql"]
@@ -145,7 +155,7 @@ def test_new_only_with_no_baseline_at_all_returns_without_pulling():
     db.execute.return_value.scalars.return_value.first.return_value = provider
     db.execute.return_value.scalars.return_value.all.return_value = []
 
-    result = ingest_gmail_messages(db, "u1", new_only=True)
+    result = ingest_gmail_messages(db, _USER_ID, new_only=True)
 
     assert result["fetched"] == 0
     assert result["new_threads"] == 0
@@ -174,7 +184,7 @@ def test_new_only_with_a_cursor_but_no_threads_still_syncs(monkeypatch):
     client.get_thread.return_value = {"messages": []}
     monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
 
-    result = ingest_gmail_messages(db, "u1", new_only=True)
+    result = ingest_gmail_messages(db, _USER_ID, new_only=True)
 
     client.list_history.assert_called_once()
     assert result["fetched"] == 1
@@ -225,7 +235,7 @@ def _deleted_thread_setup(monkeypatch, status_code):
 def test_thread_deleted_after_history_named_it_is_skipped(monkeypatch):
     db, provider = _deleted_thread_setup(monkeypatch, 404)
 
-    result = ingest_gmail_messages(db, "u1", new_only=True)
+    result = ingest_gmail_messages(db, _USER_ID, new_only=True)
 
     assert result["threads_missing"] == 1
     assert result["threads_upserted"] == 0
@@ -237,7 +247,7 @@ def test_a_thread_fetch_failing_for_other_reasons_still_raises(monkeypatch):
     db, provider = _deleted_thread_setup(monkeypatch, 500)
 
     with pytest.raises(httpx.HTTPStatusError):
-        ingest_gmail_messages(db, "u1", new_only=True)
+        ingest_gmail_messages(db, _USER_ID, new_only=True)
 
     assert provider.gmail_history_id == "100"
 
@@ -324,18 +334,63 @@ def test_a_401_from_the_token_endpoint_is_our_problem_not_the_users(monkeypatch,
     assert paused == {}
 
 
+def _make_pipeline_db(provider):
+    """A db wired for a full gmail-ingest run: thread/message upserts each
+    return a fresh id, and no message ever has a prior classification -- so
+    every message reaches the classifier instead of being skipped as
+    "already done". Shared across the router and usage-recording tests
+    below, which all drive the real thread/message loop end to end.
+    """
+    def execute(stmt):
+        sql = str(stmt).lower()
+        result = MagicMock()
+        if "from provider_account" in sql:
+            result.scalars.return_value.first.return_value = provider
+        elif "from mail_thread" in sql and "provider_thread_id" in sql:
+            result.scalars.return_value.all.return_value = []
+        elif "insert into mail_thread" in sql:
+            result.scalar_one.return_value = uuid4()
+        elif "insert into mail_message" in sql:
+            result.scalar_one.return_value = uuid4()
+        elif "from classification" in sql:
+            result.scalars.return_value.first.return_value = None
+        return result
+
+    db = MagicMock()
+    db.execute.side_effect = execute
+    # Thread reopen bookkeeping (`db.get(MailThread, ...)`) is orthogonal to
+    # every test below -- None keeps that branch a no-op.
+    db.get.return_value = None
+    return db
+
+
+def _history_page(thread_ids):
+    """One Gmail history page naming each thread exactly once, in order."""
+    return {
+        "historyId": "9999",
+        "history": [
+            {"messagesAdded": [{"message": {"id": f"m{i}", "threadId": tid}}]}
+            for i, tid in enumerate(thread_ids)
+        ],
+    }
+
+
+def _raw_thread(tid, mid):
+    return {"messages": [{"id": mid, "threadId": tid, "payload": {"headers": []}, "snippet": "hi"}]}
+
+
 def test_classification_router_is_built_once_per_run_not_once_per_message(monkeypatch):
     # ClassificationRouter's 60s memo only pays off if one instance lives for
     # the whole run -- rebuilding it per message would restart that memo (and
     # re-query routing) on every single message instead of once a minute. The
     # other half of the contract, routing_for called per message, is what
     # lets a mid-run consent revocation take effect within a minute.
-    from app.services.nlp.providers import ClassificationRouting
 
     # A regression that keeps every router call intact but drops `routing=`
-    # from the `classify()` call would still pass every assertion above --
-    # so we also need to prove this exact routing object is what `classify`
-    # actually receives, not just that routing_for got called.
+    # from the `classify_with_usage()` call would still pass every assertion
+    # above -- so we also need to prove this exact routing object is what
+    # `classify_with_usage` actually receives, not just that routing_for got
+    # called.
     SENTINEL_ROUTING = ClassificationRouting(mode="off", credential=None)
 
     router_instances = []
@@ -350,37 +405,19 @@ def test_classification_router_is_built_once_per_run_not_once_per_message(monkey
             routing_calls.append(db)
             return SENTINEL_ROUTING
 
-    def fake_classify(text, *, routing):
+    def fake_classify_with_usage(text, *, routing):
         classify_calls.append(routing)
-        return ("other", 0.5, "stub", "test-model")
+        return ClassificationAttempt(
+            verdict=("other", 0.5, "stub", "test-model"),
+            provider_call_succeeded=False,
+            usage=None,
+        )
 
     monkeypatch.setattr(gmail_ingest, "ClassificationRouter", CountingRouter)
-    monkeypatch.setattr(gmail_ingest, "classify", fake_classify)
+    monkeypatch.setattr(gmail_ingest, "classify_with_usage", fake_classify_with_usage)
 
     provider = MagicMock(access_token="tok", token_expiry=None, gmail_history_id="4242")
-
-    def execute(stmt):
-        sql = str(stmt).lower()
-        result = MagicMock()
-        if "from provider_account" in sql:
-            result.scalars.return_value.first.return_value = provider
-        elif "from mail_thread" in sql and "provider_thread_id" in sql:
-            result.scalars.return_value.all.return_value = []
-        elif "insert into mail_thread" in sql:
-            result.scalar_one.return_value = uuid4()
-        elif "insert into mail_message" in sql:
-            result.scalar_one.return_value = uuid4()
-        elif "from classification" in sql:
-            # No prior classification for either message -- both must
-            # actually reach the classifier, not get skipped as "already done".
-            result.scalars.return_value.first.return_value = None
-        return result
-
-    db = MagicMock()
-    db.execute.side_effect = execute
-    # Thread reopen bookkeeping (`db.get(MailThread, ...)`) is orthogonal to
-    # this contract -- None keeps that branch a no-op.
-    db.get.return_value = None
+    db = _make_pipeline_db(provider)
 
     client = MagicMock()
     client.list_history.return_value = {
@@ -397,16 +434,316 @@ def test_classification_router_is_built_once_per_run_not_once_per_message(monkey
     }
     monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
 
-    result = ingest_gmail_messages(db, "u1", new_only=True)
+    result = ingest_gmail_messages(db, _USER_ID, new_only=True)
 
     assert result["messages_upserted"] == 2
     assert result["classified"] == 2
-    assert router_instances == ["u1"]
+    assert router_instances == [_USER_ID]
     assert len(routing_calls) == 2
     # Both messages' classify calls got the router's actual routing object --
     # not a dropped kwarg silently falling back to DEFAULT SERVER ROUTING.
     assert len(classify_calls) == 2
     assert all(routing is SENTINEL_ROUTING for routing in classify_calls)
+
+
+# ---------------------------------------------------------------------------
+# Per-user usage recording and its flush sites (docs/plans/2026-08-02-llm-
+# usage-visibility-plan.md §5) -- classify_with_usage(), UsageAccumulator,
+# and the three commit points that flush it.
+# ---------------------------------------------------------------------------
+
+
+def _fixed_router(routing):
+    """A ClassificationRouter stand-in that always hands back the same
+    routing decision, for tests that only care what the recorder does with
+    a given mode -- not the router's own memo/refresh behavior."""
+
+    class FixedRouter:
+        def __init__(self, user_id):
+            pass
+
+        def routing_for(self, db):
+            return routing
+
+    return FixedRouter
+
+
+def _fake_classify_with_usage(usage):
+    def fake(text, *, routing):
+        return ClassificationAttempt(
+            verdict=("fyi", 0.5, "stub", "test-model"),
+            provider_call_succeeded=True,
+            usage=usage,
+        )
+
+    return fake
+
+
+def _tracing_accumulator_class(trace, records, *, fail_flush_times=0):
+    """Stands in for UsageAccumulator. Records calls into `records` and
+    appends every flush/discard/committed call onto the shared `trace` list
+    so a test can assert ORDER against db.flush/db.commit, not just that each
+    method got called somewhere.
+    """
+    state = {"fail_flush_times": fail_flush_times}
+
+    class TracingAccumulator:
+        def __init__(self, user_id):
+            self.user_id = user_id
+
+        def record(self, stage, provider, usage, *, provider_call_succeeded):
+            records.append((stage, provider, usage, provider_call_succeeded))
+
+        def flush(self, db):
+            trace.append("acc.flush")
+            if state["fail_flush_times"] > 0:
+                state["fail_flush_times"] -= 1
+                raise SQLAlchemyError("usage flush boom")
+
+        def discard(self):
+            trace.append("acc.discard")
+
+        def committed(self):
+            trace.append("acc.committed")
+
+    return TracingAccumulator
+
+
+def _wire_tracing_db(db, trace):
+    """Makes db.flush/db.commit append to `trace` too, and makes
+    `with db.begin_nested():` actually propagate exceptions raised inside it
+    (a bare MagicMock's __exit__ returns a truthy value by default, which
+    would silently swallow the SQLAlchemyError the failing-flush test raises).
+    """
+    db.flush = MagicMock(side_effect=lambda: trace.append("db.flush"))
+    db.commit = MagicMock(side_effect=lambda: trace.append("db.commit"))
+    db.begin_nested.return_value.__exit__.return_value = False
+
+
+def test_user_paid_classification_records_usage(monkeypatch):
+    routing = ClassificationRouting(
+        mode="user",
+        credential=LlmCredential(
+            provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+        ),
+    )
+    usage = LlmUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    records = []
+    monkeypatch.setattr(gmail_ingest, "ClassificationRouter", _fixed_router(routing))
+    monkeypatch.setattr(gmail_ingest, "classify_with_usage", _fake_classify_with_usage(usage))
+    monkeypatch.setattr(
+        gmail_ingest, "UsageAccumulator", _tracing_accumulator_class([], records)
+    )
+
+    provider = MagicMock(access_token="tok", token_expiry=None, gmail_history_id="4242", id=uuid4())
+    db = _make_pipeline_db(provider)
+    client = MagicMock()
+    client.list_history.return_value = _history_page(["t1"])
+    client.get_thread.side_effect = [_raw_thread("t1", "m1")]
+    monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
+
+    ingest_gmail_messages(db, _USER_ID, new_only=True)
+
+    assert records == [("classification", "openai", usage, True)]
+
+
+def test_server_paid_classification_records_nothing(monkeypatch):
+    routing = ClassificationRouting(mode="server", credential=None)
+    usage = LlmUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    records = []
+    monkeypatch.setattr(gmail_ingest, "ClassificationRouter", _fixed_router(routing))
+    monkeypatch.setattr(gmail_ingest, "classify_with_usage", _fake_classify_with_usage(usage))
+    monkeypatch.setattr(
+        gmail_ingest, "UsageAccumulator", _tracing_accumulator_class([], records)
+    )
+
+    provider = MagicMock(access_token="tok", token_expiry=None, gmail_history_id="4242", id=uuid4())
+    db = _make_pipeline_db(provider)
+    client = MagicMock()
+    client.list_history.return_value = _history_page(["t1"])
+    client.get_thread.side_effect = [_raw_thread("t1", "m1")]
+    monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
+
+    ingest_gmail_messages(db, _USER_ID, new_only=True)
+
+    # The operator's own key paid for this call -- it must never show up in
+    # anyone's usage panel.
+    assert records == []
+
+
+def test_periodic_commit_flushes_usage_before_it_in_order_and_committed_runs_last(monkeypatch):
+    routing = ClassificationRouting(
+        mode="user",
+        credential=LlmCredential(
+            provider="gemini", base_url="https://x", api_key="k", model="m"
+        ),
+    )
+    usage = LlmUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    trace = []
+    records = []
+    monkeypatch.setattr(gmail_ingest, "ClassificationRouter", _fixed_router(routing))
+    monkeypatch.setattr(gmail_ingest, "classify_with_usage", _fake_classify_with_usage(usage))
+    monkeypatch.setattr(
+        gmail_ingest, "UsageAccumulator", _tracing_accumulator_class(trace, records)
+    )
+
+    provider = MagicMock(access_token="tok", token_expiry=None, gmail_history_id="4242", id=uuid4())
+    db = _make_pipeline_db(provider)
+    _wire_tracing_db(db, trace)
+    client = MagicMock()
+    client.list_history.return_value = _history_page(["t1", "t2"])
+    client.get_thread.side_effect = [_raw_thread("t1", "m1"), _raw_thread("t2", "m2")]
+    monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
+
+    # commit_every=1 fires the periodic commit after EVERY thread, so both
+    # threads' usage gets flushed there and the trailing final commit (below)
+    # has nothing left to flush.
+    ingest_gmail_messages(db, _USER_ID, new_only=True, commit_every=1)
+
+    # Two periodic cycles, each: business flush, then usage flush inside the
+    # SAVEPOINT, then the real commit, then committed() -- only once the
+    # commit has actually returned.
+    assert trace[:4] == ["db.flush", "acc.flush", "db.commit", "acc.committed"]
+    assert trace[4:8] == ["db.flush", "acc.flush", "db.commit", "acc.committed"]
+    # The final cursor commit still runs, but with usage already flushed
+    # twice above there's nothing pending -- it must skip the usage block
+    # entirely rather than re-flush an empty batch.
+    assert trace[8:] == ["db.flush", "db.commit"]
+    assert records == [
+        ("classification", "gemini", usage, True),
+        ("classification", "gemini", usage, True),
+    ]
+
+
+def test_final_cursor_commit_flushes_the_tail_thread_the_periodic_commit_missed(monkeypatch):
+    # commit_every=10 with 11 threads: the periodic commit fires once, after
+    # thread 10 (index 9). Thread 11 (index 10) never hits another periodic
+    # commit -- its usage only becomes durable at the final cursor commit.
+    # Losing this would silently drop the tail thread's usage on a crash.
+    routing = ClassificationRouting(
+        mode="user",
+        credential=LlmCredential(
+            provider="groq", base_url="https://x", api_key="k", model="m"
+        ),
+    )
+    usage = LlmUsage(prompt_tokens=1, completion_tokens=None, total_tokens=None)
+    trace = []
+    records = []
+    monkeypatch.setattr(gmail_ingest, "ClassificationRouter", _fixed_router(routing))
+    monkeypatch.setattr(gmail_ingest, "classify_with_usage", _fake_classify_with_usage(usage))
+    monkeypatch.setattr(
+        gmail_ingest, "UsageAccumulator", _tracing_accumulator_class(trace, records)
+    )
+
+    provider = MagicMock(access_token="tok", token_expiry=None, gmail_history_id="4242", id=uuid4())
+    db = _make_pipeline_db(provider)
+    _wire_tracing_db(db, trace)
+    thread_ids = [f"t{i}" for i in range(11)]
+    client = MagicMock()
+    client.list_history.return_value = _history_page(thread_ids)
+    client.get_thread.side_effect = [_raw_thread(tid, f"m-{tid}") for tid in thread_ids]
+    monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
+
+    ingest_gmail_messages(db, _USER_ID, new_only=True, commit_every=10)
+
+    # Exactly two flush cycles: the periodic one at thread 10, the final one
+    # for thread 11's tail.
+    assert trace.count("acc.flush") == 2
+    assert trace.count("acc.committed") == 2
+    # The final cycle is the LAST thing in the trace, and keeps the same
+    # flush-before-commit-before-committed shape as the periodic one.
+    assert trace[-4:] == ["db.flush", "acc.flush", "db.commit", "acc.committed"]
+    assert len(records) == 11
+
+
+def test_failing_usage_flush_does_not_block_the_business_commit(monkeypatch):
+    routing = ClassificationRouting(
+        mode="user",
+        credential=LlmCredential(
+            provider="openai", base_url="https://x", api_key="k", model="m"
+        ),
+    )
+    usage = LlmUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    trace = []
+    records = []
+    monkeypatch.setattr(gmail_ingest, "ClassificationRouter", _fixed_router(routing))
+    monkeypatch.setattr(gmail_ingest, "classify_with_usage", _fake_classify_with_usage(usage))
+    monkeypatch.setattr(
+        gmail_ingest,
+        "UsageAccumulator",
+        _tracing_accumulator_class(trace, records, fail_flush_times=1),
+    )
+
+    provider = MagicMock(access_token="tok", token_expiry=None, gmail_history_id="4242", id=uuid4())
+    db = _make_pipeline_db(provider)
+    _wire_tracing_db(db, trace)
+    client = MagicMock()
+    client.list_history.return_value = _history_page(["t1"])
+    client.get_thread.side_effect = [_raw_thread("t1", "m1")]
+    monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
+
+    # commit_every=10 with a single thread means the only commit is the final
+    # cursor commit -- keeps the trace to one cycle so the assertions below
+    # are unambiguous about which flush failed.
+    result = ingest_gmail_messages(db, _USER_ID, new_only=True, commit_every=10)
+
+    assert result["threads_upserted"] == 1
+    # The SAVEPOINT rolled back the usage batch, but the outer commit for the
+    # mail work itself still ran -- a usage-layer failure must never take
+    # real business writes down with it.
+    assert "db.commit" in trace
+    assert "acc.discard" in trace
+    assert trace.index("acc.flush") < trace.index("acc.discard") < trace.index("db.commit")
+
+
+def test_token_refresh_mid_run_flushes_pending_usage_before_its_own_commit(monkeypatch):
+    routing = ClassificationRouting(
+        mode="user",
+        credential=LlmCredential(
+            provider="openai", base_url="https://x", api_key="k", model="m"
+        ),
+    )
+    usage = LlmUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    trace = []
+    records = []
+    monkeypatch.setattr(gmail_ingest, "ClassificationRouter", _fixed_router(routing))
+    monkeypatch.setattr(gmail_ingest, "classify_with_usage", _fake_classify_with_usage(usage))
+    monkeypatch.setattr(
+        gmail_ingest, "UsageAccumulator", _tracing_accumulator_class(trace, records)
+    )
+    # Bypass the real OAuth exchange -- this test is about the flush ordering
+    # around refresh_client()'s commit, not the token endpoint itself.
+    monkeypatch.setattr(gmail_ingest, "_refresh_access_token", lambda provider: ("new-tok", None))
+
+    provider = MagicMock(access_token="tok", token_expiry=None, gmail_history_id="4242", id=uuid4())
+    db = _make_pipeline_db(provider)
+    _wire_tracing_db(db, trace)
+    client = MagicMock()
+    client.list_history.return_value = _history_page(["t1", "t2"])
+    unauthorized = httpx.HTTPStatusError(
+        "401", request=MagicMock(), response=MagicMock(status_code=401)
+    )
+    # t1 fetches cleanly; t2's first attempt hits a 401 (triggering the
+    # mid-run refresh and its commit), then succeeds on retry.
+    client.get_thread.side_effect = [
+        _raw_thread("t1", "m1"),
+        unauthorized,
+        _raw_thread("t2", "m2"),
+    ]
+    monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
+
+    # commit_every large enough that the periodic commit never fires on its
+    # own -- the only two commits in this run are the token-refresh one and
+    # the final cursor commit.
+    ingest_gmail_messages(db, _USER_ID, new_only=True, commit_every=10)
+
+    assert trace.count("acc.flush") == 2
+    # First cycle is the mid-run refresh commit, flushing t1's usage before
+    # its own commit lands -- exactly the ordering the plan calls out.
+    assert trace[:4] == ["db.flush", "acc.flush", "db.commit", "acc.committed"]
+    # Second cycle is the final cursor commit, flushing t2's usage.
+    assert trace[4:] == ["db.flush", "acc.flush", "db.commit", "acc.committed"]
+    assert len(records) == 2
 
 
 def test_a_non_json_400_is_not_mistaken_for_a_revoked_token(monkeypatch, google_creds):

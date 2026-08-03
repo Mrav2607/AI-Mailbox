@@ -21,12 +21,13 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.logging import logger
 from app.db.base import SessionLocal
 from app.db.models import ActionItem, Classification, MailMessage, MailThread
-from app.services.nlp.extractor import ACTION_LABELS, NoAction, extract_action
+from app.services.nlp.extractor import ACTION_LABELS, NoAction, extract_action_with_usage
 from app.services.nlp.persistence import (
     MAX_ATTEMPTS,
     PENDING_LEASE,
@@ -35,10 +36,11 @@ from app.services.nlp.persistence import (
     record_extraction,
 )
 from app.services.nlp.providers import (
-    LlmCredential,
+    CallContext,
     extraction_feature_enabled,
     resolve_extraction_credential,
 )
+from app.services.nlp.usage import UsageAccumulator
 
 _DEFAULT_SINCE_DAYS = 30
 _RESULT_BUCKETS = ("extracted", "no_action", "ineligible", "failed", "skipped")
@@ -76,6 +78,14 @@ def terminalize_expired_pending(db: Session, *, user_id: UUID | None = None) -> 
     db.commit()
 
 
+def _call_context_from_resolved(credential, source: str | None) -> CallContext:
+    """Map `ResolvedExtraction.source` onto `CallContext.payer` -- 'fallback'
+    is the operator's own key, and only a 'user' source should ever get
+    billed onto the account whose usage we're recording (plan §1, §3).
+    """
+    return CallContext(credential=credential, payer="user" if source == "user" else "operator")
+
+
 def _fence_claim_to_failed(message_id: UUID, claim_token: UUID) -> None:
     """Force an owned claim to terminal ``failed`` on a FRESH session after
     an exception between claim-commit and record-commit.
@@ -104,7 +114,8 @@ def _claim_extract_record(
     message_id: UUID,
     *,
     force: bool = False,
-    credential: LlmCredential | None = None,
+    call_context: CallContext | None = None,
+    acc: UsageAccumulator | None = None,
 ) -> tuple[str, UUID | None]:
     """One claim -> extract -> record cycle for ``message_id``.
 
@@ -114,13 +125,16 @@ def _claim_extract_record(
     or its thread has vanished), so callers can attach it to a task result
     without a second query.
 
-    ``credential`` is the already-resolved credential for a sweep's user
-    (``run_extraction_sweep`` resolves it once per run, before the loop, and
-    passes it to every call). ``None`` means the caller doesn't know the
-    user yet -- ``run_extraction_for_message``'s user id only becomes known
-    once the thread loads below -- so this function resolves it itself,
-    still before the claim; an unresolvable credential returns bucket
-    ``"unavailable"`` with zero attempts spent (no claim ever issued).
+    ``call_context`` is the already-resolved credential AND who pays for it,
+    for a sweep's user (``run_extraction_sweep`` resolves it once per run,
+    before the loop, and passes it to every call). ``None`` means the caller
+    doesn't know the user yet -- ``run_extraction_for_message``'s user id
+    only becomes known once the thread loads below -- so this function
+    resolves it itself, still before the claim; an unresolvable credential
+    returns bucket ``"unavailable"`` with zero attempts spent (no claim ever
+    issued). ``acc`` mirrors this: the sweep's one shared accumulator when
+    given, otherwise a fresh one built here once the user id is known --
+    that single call is a run of one.
     """
     message = db.get(MailMessage, message_id)
     if message is None:
@@ -144,13 +158,17 @@ def _claim_extract_record(
     received_at = message.sent_at or message.created_at
     user_id = thread.user_id
 
-    if credential is None:
-        credential = resolve_extraction_credential(db, user_id).credential
-        if credential is None:
+    if call_context is None:
+        resolved = resolve_extraction_credential(db, user_id)
+        if resolved.credential is None:
             # Nothing was claimed, so a plain commit (not a rollback) is
             # enough to release the thread lock we just took.
             db.commit()
             return "unavailable", user_id
+        call_context = _call_context_from_resolved(resolved.credential, resolved.source)
+
+    if acc is None:
+        acc = UsageAccumulator(user_id)
 
     claim_token = claim_action_item(
         db,
@@ -167,14 +185,15 @@ def _claim_extract_record(
         return "skipped", user_id
 
     try:
-        result = extract_action(
+        attempt = extract_action_with_usage(
             subject=subject,
             sender=sender,
             snippet=snippet,
             body_text=body_text,
             received_at=received_at,
-            credential=credential,
+            credential=call_context.credential,
         )
+        result = attempt.result
 
         # Lock the classification row BEFORE reading its label and hold it
         # through the record commit: a concurrent reclassify-back upserts
@@ -204,9 +223,45 @@ def _claim_extract_record(
             thread_done=current_done_at is not None,
             label_still_actionable=label_still_actionable,
         )
+
+        # Only a "user" payer gets recorded -- the operator's fallback key
+        # is an explicit v1 non-goal (plan §1), and billing it onto the
+        # user's readout would be exactly the wrong-payer bug this contract
+        # exists to prevent.
+        usage_recorded = call_context.payer == "user"
+        if usage_recorded:
+            acc.record(
+                "extraction",
+                call_context.credential.provider,
+                attempt.usage,
+                provider_call_succeeded=attempt.provider_call_succeeded,
+            )
+
+        # db.flush() sits OUTSIDE the try: begin_nested() flushes pending ORM
+        # state before opening its SAVEPOINT, so a genuine business-write
+        # failure would otherwise surface inside the usage handler with the
+        # outer transaction already invalid (plan §5). Skip the block
+        # entirely when nothing was recorded -- no point opening a SAVEPOINT
+        # for an empty batch.
+        db.flush()
+        if usage_recorded:
+            try:
+                with db.begin_nested():
+                    acc.flush(db)
+            except SQLAlchemyError:
+                logger.warning(
+                    "usage flush failed for message %s; discarding batch",
+                    message.id,
+                )
+                acc.discard()
         db.commit()
+        acc.committed()
     except Exception as exc:
         db.rollback()
+        # A rolled-back batch must never survive into the next flush --
+        # otherwise it gets double-counted alongside whatever this run
+        # records next.
+        acc.discard()
         try:
             _fence_claim_to_failed(message.id, claim_token)
         except Exception as fencing_exc:
@@ -376,15 +431,20 @@ def run_extraction_sweep(
     any of the above (terminalization included) -- a credential-less user
     (BYOK-only mode with no stored row, or a stored-but-policy-blocked
     custom row) burns zero attempts and gets the same ``disabled`` shape as
-    the flag being off. The resolved credential then threads through every
-    ``_claim_extract_record`` call this sweep makes.
+    the flag being off. The resolved credential (wrapped in a ``CallContext``
+    alongside who pays for it) and one shared ``UsageAccumulator`` for the
+    whole run then thread through every ``_claim_extract_record`` call this
+    sweep makes.
     """
     if not extraction_feature_enabled():
         return _disabled_result()
 
-    credential = resolve_extraction_credential(db, user_id).credential
-    if credential is None:
+    resolved = resolve_extraction_credential(db, user_id)
+    if resolved.credential is None:
         return _disabled_result()
+
+    call_context = _call_context_from_resolved(resolved.credential, resolved.source)
+    acc = UsageAccumulator(user_id)
 
     terminalize_expired_pending(db, user_id=user_id)
 
@@ -400,7 +460,7 @@ def run_extraction_sweep(
         counts["processed"] += 1
         try:
             bucket, _user_id = _claim_extract_record(
-                db, message_id, force=force, credential=credential
+                db, message_id, force=force, call_context=call_context, acc=acc
             )
         except Exception:
             # _claim_extract_record already fences its OWN pre-claim/

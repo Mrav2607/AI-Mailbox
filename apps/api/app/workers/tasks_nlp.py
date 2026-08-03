@@ -3,13 +3,14 @@ from __future__ import annotations
 from uuid import UUID
 
 from celery.exceptions import SoftTimeLimitExceeded
+from sqlalchemy.exc import SQLAlchemyError
 
 from .celery_app import celery_app
 from app.core.logging import logger
 from app.db.base import SessionLocal
 from app.db.models import MailThread, MailMessage
 from app.services.nlp.backfill import run_backfill
-from app.services.nlp.classifier import classify, build_classification_text
+from app.services.nlp.classifier import classify_with_usage, build_classification_text
 from app.services.nlp.extraction_run import (
     run_extraction_for_message,
     run_extraction_sweep,
@@ -19,6 +20,7 @@ from app.services.nlp.extraction_run import (
 )
 from app.services.nlp.persistence import upsert_classification
 from app.services.nlp.providers import extraction_feature_enabled, resolve_classification_routing
+from app.services.nlp.usage import UsageAccumulator
 
 # Sweep cap for each recovery-tick pass -- generous enough to drain a normal
 # backlog in one tick, cheap enough that a tick never runs long even for a
@@ -41,9 +43,8 @@ def classify_message(message_id: str) -> dict:
         # A single message, so no per-run router (and its memo) is needed --
         # resolve once, directly.
         routing = resolve_classification_routing(db, thread.user_id) if thread else None
-        label, confidence, rationale, model_version = classify(
-            text_for_classification, routing=routing
-        )
+        attempt = classify_with_usage(text_for_classification, routing=routing)
+        label, confidence, rationale, model_version = attempt.verdict
         upsert_classification(
             db,
             message_id=message.id,
@@ -52,7 +53,40 @@ def classify_message(message_id: str) -> dict:
             rationale=rationale,
             model_version=model_version,
         )
+
+        # Only a resolved "user" payer gets recorded -- operator-paid usage
+        # is an explicit v1 non-goal (plan §1), and a threadless message has
+        # no user to attribute it to anyway.
+        usage_recorded = thread is not None and routing is not None and routing.mode == "user"
+        if usage_recorded:
+            acc = UsageAccumulator(thread.user_id)
+            acc.record(
+                "classification",
+                routing.credential.provider,
+                attempt.usage,
+                provider_call_succeeded=attempt.provider_call_succeeded,
+            )
+
+        # db.flush() sits OUTSIDE the try: begin_nested() flushes pending ORM
+        # state before opening its SAVEPOINT, so a genuine business-write
+        # failure would otherwise surface inside the usage handler with the
+        # outer transaction already invalid (plan §5). Skip the block
+        # entirely when nothing was recorded -- no point opening a SAVEPOINT
+        # for an empty batch.
+        db.flush()
+        if usage_recorded:
+            try:
+                with db.begin_nested():
+                    acc.flush(db)
+            except SQLAlchemyError:
+                logger.warning(
+                    "usage flush failed for message %s; discarding batch",
+                    message_id,
+                )
+                acc.discard()
         db.commit()
+        if usage_recorded:
+            acc.committed()
         return {"message_id": message_id, "label": label, "confidence": confidence}
 
 

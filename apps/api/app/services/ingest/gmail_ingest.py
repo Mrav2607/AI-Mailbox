@@ -8,16 +8,19 @@ from typing import Any
 import httpx
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db.base import SessionLocal
 from app.db.models import MailThread, MailMessage, ProviderAccount, Classification
 from app.core.config import settings
+from app.core.logging import logger
 from app.services.ingest.gmail_client import GmailClient
 from app.services.ingest.normalizer import normalize_message
-from app.services.nlp.classifier import classify, build_classification_text
+from app.services.nlp.classifier import classify_with_usage, build_classification_text
 from app.services.nlp.persistence import upsert_classification
 from app.services.nlp.providers import ClassificationRouter
+from app.services.nlp.usage import UsageAccumulator
 
 
 def _collect_history_thread_ids(
@@ -187,6 +190,50 @@ def ingest_gmail_messages(
 
     client = GmailClient(access_token)
 
+    # Built here, before refresh_client()/with_token_retry() below, rather
+    # than down by the per-thread loop where a bare ClassificationRouter would
+    # naturally sit -- refresh_client()'s mid-run commit can fire during the
+    # history/listing calls that happen before that loop even starts, and it
+    # needs to flush whatever usage_acc holds. Constructing these any later
+    # would leave that closure reading a name that isn't bound yet on an
+    # early 401.
+    classification_router = ClassificationRouter(user_id)
+    usage_acc = UsageAccumulator(uuid.UUID(user_id))
+    usage_pending = False
+
+    def flush_usage_then_commit() -> None:
+        """Run at every commit point downstream of classification: the
+        periodic per-thread commit, the final cursor commit, and the mid-run
+        token-refresh commit below.
+
+        `db.flush()` sits outside the try on purpose. `begin_nested()`
+        flushes pending ORM state itself before opening its SAVEPOINT, and by
+        the time this runs, `provider.access_token` / `gmail_history_id` /
+        `gmail_backfill_complete` are dirty on `provider`. If the explicit
+        flush lived inside the try, a genuine business-write failure would
+        get caught here and logged as a mere usage warning while the outer
+        transaction was already unusable -- so it has to propagate on its
+        own, and `usage_acc.discard()` only ever drops the usage batch, never
+        the mail work riding alongside it.
+        """
+        nonlocal usage_pending
+        db.flush()
+        if usage_pending:
+            try:
+                with db.begin_nested():
+                    usage_acc.flush(db)
+            except SQLAlchemyError:
+                logger.warning(
+                    "gmail ingest: usage flush failed for provider %s; discarding batch",
+                    provider.id,
+                    exc_info=True,
+                )
+                usage_acc.discard()
+        db.commit()
+        if usage_pending:
+            usage_acc.committed()
+            usage_pending = False
+
     # Existing IDs serve two purposes: historical backfill skips them, while
     # incremental history sync deliberately re-fetches them when Gmail reports
     # a new message in an existing conversation.
@@ -282,14 +329,20 @@ def ingest_gmail_messages(
         return new_ids[:kept], head_new, recent_ids, exhausted
 
     def refresh_client() -> bool:
-        """Refresh the access token and rebuild the client. Returns success."""
+        """Refresh the access token and rebuild the client. Returns success.
+
+        Commits via flush_usage_then_commit(), not a bare db.commit() -- this
+        can fire mid-run on a 401, and any classification usage buffered
+        since the last flush needs to land in the same transaction as the
+        refreshed token, not get silently dropped on a later crash.
+        """
         nonlocal client
         refreshed_token, token_expiry = _refresh_access_token(provider)
         if not refreshed_token:
             return False
         provider.access_token = refreshed_token
         provider.token_expiry = token_expiry
-        db.commit()
+        flush_usage_then_commit()
         client = GmailClient(refreshed_token)
         return True
 
@@ -368,12 +421,6 @@ def ingest_gmail_messages(
     classified = 0
     threads_reopened = 0
     threads_missing = 0
-
-    # One router per run, built once before the thread loop -- its 60s memo
-    # (see ClassificationRouter) means routing_for(db) below is ~free per
-    # message, while still letting a mid-run revocation take effect within a
-    # minute instead of only at the next run.
-    classification_router = ClassificationRouter(user_id)
 
     for index, tid in enumerate(thread_ids):
         try:
@@ -494,9 +541,23 @@ def ingest_gmail_messages(
                         normalized.get("body_text"),
                     )
                     routing = classification_router.routing_for(db)
-                    label, confidence, rationale, model_version = classify(
+                    attempt = classify_with_usage(
                         text_for_classification, routing=routing
                     )
+                    label, confidence, rationale, model_version = attempt.verdict
+                    # Only the user's own key gets recorded -- v1 tracks
+                    # user-paid usage only (plan §1). `routing.mode == "user"`
+                    # is the single source of truth for who pays; the
+                    # operator-paid server path must never show up in
+                    # someone's usage panel.
+                    if routing.mode == "user" and routing.credential is not None:
+                        usage_acc.record(
+                            "classification",
+                            routing.credential.provider,
+                            attempt.usage,
+                            provider_call_succeeded=attempt.provider_call_succeeded,
+                        )
+                        usage_pending = True
                     upsert_classification(
                         db,
                         message_id=new_message_id,
@@ -518,7 +579,7 @@ def ingest_gmail_messages(
         # Commit per thread so a late failure (e.g. token death mid-pull) keeps
         # every thread fetched so far instead of rolling the whole run back.
         if commit_every and (index + 1) % commit_every == 0:
-            db.commit()
+            flush_usage_then_commit()
         if progress:
             progress()
 
@@ -529,7 +590,11 @@ def ingest_gmail_messages(
     # runs never flip the backfill flag.
     if skip_existing and should_list and listing_exhausted and not new_only:
         provider.gmail_backfill_complete = True
-    db.commit()
+    # A distinct flush site from the periodic commit above, not a duplicate
+    # of it: with commit_every=10, the tail thread's work (and its usage)
+    # only becomes durable here, so relying on the periodic flush alone would
+    # lose it on a later crash.
+    flush_usage_then_commit()
     return {
         "threads_upserted": threads_upserted,
         "messages_upserted": messages_upserted,
