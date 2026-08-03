@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from celery.exceptions import SoftTimeLimitExceeded
+from sqlalchemy import delete
 from sqlalchemy.exc import SQLAlchemyError
 
 from .celery_app import celery_app
 from app.core.logging import logger
 from app.db.base import SessionLocal
-from app.db.models import MailThread, MailMessage
+from app.db.models import LlmUsageDaily, MailThread, MailMessage
 from app.services.nlp.backfill import run_backfill
 from app.services.nlp.classifier import classify_with_usage, build_classification_text
 from app.services.nlp.extraction_run import (
@@ -26,6 +28,11 @@ from app.services.nlp.usage import UsageAccumulator
 # backlog in one tick, cheap enough that a tick never runs long even for a
 # user with a lot of retryable work.
 _RECOVERY_SWEEP_LIMIT = 25
+
+# 400 days, not the usual 90 -- a user comparing this August to last August
+# needs both Augusts still on the table. Don't "tidy" this down to 90; that
+# would quietly break year-over-year usage comparisons (plan §8).
+_USAGE_RETENTION = timedelta(days=400)
 
 
 @celery_app.task
@@ -277,3 +284,35 @@ def extraction_recovery_tick() -> dict:
         "row_driven_users": row_driven_swept,
         "message_driven_users": message_driven_swept,
     }
+
+
+@celery_app.task(ignore_result=True, time_limit=300, soft_time_limit=270)
+def prune_llm_usage_daily() -> dict:
+    """Beat-scheduled retention sweep (daily -- celery_app.py) for
+    `llm_usage_daily`. This is housekeeping, not a recovery tick, so it
+    doesn't need extraction_recovery_tick's 900s cadence -- a day-old
+    straggler row costs nothing, and a daily-granularity table doesn't need
+    finer-grained pruning.
+
+    Deletes on `usage_date < cutoff`, served by the standalone `usage_date`
+    index (plan §4/§8) -- the unique constraint leads with `user_id` and
+    can't serve this range scan.
+
+    One bad run must never take down the beat worker: catch, roll back, log,
+    and let tomorrow's tick retry. No autoretry -- same reasoning as
+    extraction_recovery_tick, the next scheduled run is the retry.
+    """
+    cutoff = (datetime.now(timezone.utc) - _USAGE_RETENTION).date()
+    try:
+        with SessionLocal() as db:
+            result = db.execute(
+                delete(LlmUsageDaily).where(LlmUsageDaily.usage_date < cutoff)
+            )
+            deleted = result.rowcount or 0
+            db.commit()
+    except SQLAlchemyError:
+        logger.exception("llm_usage_daily retention sweep failed")
+        return {"status": "error"}
+
+    logger.info("llm_usage_daily retention sweep deleted %d row(s)", deleted)
+    return {"status": "ok", "deleted": deleted}

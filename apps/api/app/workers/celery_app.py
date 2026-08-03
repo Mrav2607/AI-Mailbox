@@ -46,6 +46,13 @@ celery_app.conf.beat_schedule = {
         "schedule": 900.0,
         "options": {"expires": 900},
     },
+    # Retention housekeeping, not a recovery tick -- a day-granularity table
+    # doesn't need finer-grained sweeping, so daily is plenty.
+    "prune-llm-usage-daily": {
+        "task": "app.workers.tasks_nlp.prune_llm_usage_daily",
+        "schedule": 86400.0,
+        "options": {"expires": 86400},
+    },
 }
 
 if settings.scheduled_sync_interval_seconds > 0:

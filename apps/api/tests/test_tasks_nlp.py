@@ -4,12 +4,15 @@ these tests only cover the task wiring around it.
 """
 
 from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
 
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.db.models import LlmUsageDaily
 from app.services.nlp.classifier import ClassificationAttempt
 from app.services.nlp.llm_client import LlmUsage
 from app.services.nlp.providers import ClassificationRouting, LlmCredential
@@ -288,3 +291,71 @@ def test_classify_message_failing_usage_flush_does_not_block_business_commit(mon
     assert result["label"] == "fyi"  # the business write still landed
     db.commit.assert_called_once()  # never skipped despite the flush failure
     assert fake_acc.calls.index("discard") < fake_acc.calls.index("committed")
+
+
+# ---------------------------------------------------------------------------
+# prune_llm_usage_daily: the retention sweep behind llm_usage_daily's
+# standalone usage_date index (plan §8).
+# ---------------------------------------------------------------------------
+
+
+class _FixedNow:
+    """Stands in for tasks_nlp's `datetime` import so the cutoff is
+    deterministic -- no freezegun in this repo, matching test_usage.py's
+    fake-datetime-class pattern.
+    """
+
+    _FIXED = datetime(2026, 8, 3, 12, 0, 0, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, _tz):
+        return cls._FIXED
+
+
+def _compiled(stmt):
+    return str(
+        stmt.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+    )
+
+
+def test_prune_llm_usage_daily_cutoff_is_400_days_not_some_other_number(monkeypatch):
+    db = MagicMock()
+    db.execute.return_value = MagicMock(rowcount=0)
+    monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(db))
+    monkeypatch.setattr(tasks_nlp, "datetime", _FixedNow)
+
+    tasks_nlp.prune_llm_usage_daily.run()
+
+    stmt = db.execute.call_args[0][0]
+    expected_cutoff = _FixedNow._FIXED.date() - timedelta(days=400)
+    assert str(expected_cutoff) in _compiled(stmt)
+    # 90 would be the wrong number to "tidy" this down to -- guard against it
+    # explicitly rather than only asserting the right value.
+    assert str(_FixedNow._FIXED.date() - timedelta(days=90)) not in _compiled(stmt)
+
+
+def test_prune_llm_usage_daily_targets_only_that_table(monkeypatch):
+    # The failure mode worth guarding against: a retention sweep that
+    # quietly deletes from the wrong table.
+    db = MagicMock()
+    db.execute.return_value = MagicMock(rowcount=0)
+    monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(db))
+    monkeypatch.setattr(tasks_nlp, "datetime", _FixedNow)
+
+    tasks_nlp.prune_llm_usage_daily.run()
+
+    stmt = db.execute.call_args[0][0]
+    assert stmt.table.name == LlmUsageDaily.__tablename__
+    assert "llm_usage_daily" in _compiled(stmt)
+
+
+def test_prune_llm_usage_daily_commits_and_reports_the_deleted_count(monkeypatch):
+    db = MagicMock()
+    db.execute.return_value = MagicMock(rowcount=7)
+    monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(db))
+    monkeypatch.setattr(tasks_nlp, "datetime", _FixedNow)
+
+    result = tasks_nlp.prune_llm_usage_daily.run()
+
+    db.commit.assert_called_once()
+    assert result == {"status": "ok", "deleted": 7}
