@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Iterable
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from sqlalchemy import func, select, update
+from sqlalchemy import ColumnElement, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -133,7 +135,7 @@ _USAGE_COUNTER_COLUMNS = (
 )
 
 
-def _usage_sums(*columns):
+def _usage_sums(*columns: ColumnElement[int]) -> list[ColumnElement[int]]:
     """`SUM` alone returns SQL `NULL` over zero matching rows -- coalescing
     to 0 here is what lets an unused account get zeroed totals back instead
     of nulls.
@@ -141,7 +143,7 @@ def _usage_sums(*columns):
     return [func.coalesce(func.sum(column), 0) for column in columns]
 
 
-def _usage_counters_dict(counters) -> dict:
+def _usage_counters_dict(counters: Iterable[Decimal | int]) -> dict[str, int]:
     """Postgres returns `SUM(bigint)` as `numeric`, which arrives as
     `Decimal` -- cast every counter to `int` here so nothing downstream
     (the response schema, the UI's JSON parsing) has to special-case that.

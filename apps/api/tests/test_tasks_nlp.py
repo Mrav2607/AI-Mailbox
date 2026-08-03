@@ -359,3 +359,17 @@ def test_prune_llm_usage_daily_commits_and_reports_the_deleted_count(monkeypatch
 
     db.commit.assert_called_once()
     assert result == {"status": "ok", "deleted": 7}
+
+
+def test_prune_llm_usage_daily_swallows_db_error_instead_of_taking_down_beat(monkeypatch):
+    # The whole point of the try/except here: a bad sweep must report
+    # "error" and let tomorrow's tick retry, not blow up the beat worker.
+    db = MagicMock()
+    db.execute.side_effect = SQLAlchemyError("boom")
+    monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(db))
+    monkeypatch.setattr(tasks_nlp, "datetime", _FixedNow)
+
+    result = tasks_nlp.prune_llm_usage_daily.run()
+
+    assert result == {"status": "error"}
+    db.commit.assert_not_called()

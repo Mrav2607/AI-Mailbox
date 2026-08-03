@@ -227,7 +227,12 @@ def run_backfill(
             text_for_classification, backend=backend, routing=routing
         )
         label, confidence, rationale, model_version = attempt.verdict
-        if routing.mode == "user":
+        # `routing.credential` should always be set when mode is "user"
+        # (classifier.py's `_classify_llm` degrades to the heuristic if that
+        # invariant ever breaks) -- but guard it here too, same as the ingest
+        # recording sites, so a broken invariant just skips recording instead
+        # of an AttributeError after `upsert_classification` already ran.
+        if routing.mode == "user" and routing.credential is not None:
             acc.record(
                 "classification",
                 routing.credential.provider,

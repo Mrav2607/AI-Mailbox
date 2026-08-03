@@ -535,8 +535,8 @@ def test_classify_with_usage_user_mode_success_carries_usage_through(monkeypatch
 def test_classify_with_usage_user_mode_counts_the_call_even_when_content_is_unparseable(monkeypatch):
     """The one a future refactor is most likely to break: the provider
     answered (and billed the user) even though its content didn't parse, so
-    this must still count as a completed call -- just with no verdict usage
-    (there's nothing to attribute the label to; the fallback ran instead)."""
+    the provider-reported usage still has to survive on `attempt.usage` --
+    only the verdict falls back to the heuristic label."""
     from app.services.nlp import classifier
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "gemini")

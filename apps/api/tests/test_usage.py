@@ -23,9 +23,11 @@ USER_ID = uuid4()
 
 @dataclass(frozen=True)
 class _Usage:
-    """Local stand-in for the real `LlmUsage` dataclass (landing in
-    llm_client.py in a later wave) -- `UsageAccumulator` only relies on the
-    three attribute names, never imports the real class.
+    """Local stand-in for the real `LlmUsage` dataclass in llm_client.py --
+    kept separate (rather than importing the real one) so these tests can
+    hand `UsageAccumulator` hostile values (strings, bools, negatives) that
+    the real frozen dataclass wouldn't naturally carry. `UsageAccumulator`
+    only relies on the three attribute names, so the stand-in works either way.
     """
 
     prompt_tokens: int | None

@@ -572,6 +572,15 @@ def ingest_outlook_messages(
                 # New baseline generation for this folder -- the aggregate
                 # outlook_backfill_complete column is never touched here (it's
                 # ever-completed, not current-generation).
+                #
+                # This is a bare db.commit(), not flush_usage_then_commit() --
+                # deliberately. client.delta_page() above is the first thing
+                # this loop iteration does, so no classification has run yet
+                # this pass; both `break`s below sit before
+                # _upsert_page_messages, and the only path that reaches it
+                # always hits flush_usage_then_commit() further down, which
+                # resets usage_pending. There's never a pending batch to lose
+                # here.
                 _save_cursor(
                     db,
                     provider,
