@@ -621,6 +621,19 @@ export default function Console() {
     setLlmTestResult(null);
     setClassifierMix(null);
     setClassifierMixError(false);
+    // Close both panels too. They're plain booleans that nothing else resets,
+    // so without this the next person to sign in lands with an AI panel open
+    // that they never opened.
+    setLlmSettingsOpen(false);
+    setLlmUsageOpen(false);
+    // NOTE ON TIMING: this is a post-commit effect, so it clears AFTER the
+    // first render for a new user. That's only safe because every path that
+    // installs a user runs while the previous one is already null -- signing
+    // out sets null first, and the login screens only ever fire from there.
+    // So this has already run once on the way down to null. If an in-app
+    // account SWITCH is ever added (A straight to B, no null in between),
+    // that assumption dies and this must move to a synchronous reset before
+    // setUser, or B's first frame renders A's credential.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id]);
 
