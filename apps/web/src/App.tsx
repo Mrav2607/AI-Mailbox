@@ -343,6 +343,14 @@ export default function Console() {
   // discards its response if this has moved on, so a stale result never
   // renders against a credential it didn't actually test.
   const llmCredentialGenRef = useRef(0);
+  // The stored settings themselves get a counter too, and it is bumped ONLY on
+  // an account change -- never by a save or remove. Those two write settings
+  // deliberately, so sharing the credential counter would make each save
+  // discard its own response. What this guards is narrower: a getLlmSettings()
+  // already in flight for the previous account resolving after the switch and
+  // repopulating the panel with that account's credential (openLlmSettings
+  // only refetches `if (!llmSettings)`, so it would then stick).
+  const llmSettingsGenRef = useRef(0);
   // Usage fetches get their OWN counter. They share the credential's
   // invalidation reasons (a save or remove bumps both), but they also have
   // one of their own -- switching the card's 7/30/90 range -- and that must
@@ -604,6 +612,7 @@ export default function Console() {
     // old account, which would otherwise land after this clear and put the same
     // data straight back.
     llmCredentialGenRef.current++;
+    llmSettingsGenRef.current++;
     llmUsageGenRef.current++;
     llmMixGenRef.current++;
     setLlmSettings(null);
@@ -676,8 +685,11 @@ export default function Console() {
   }, [handleSessionExpired]);
 
   const refreshLlmSettings = useCallback(async () => {
+    const generation = llmSettingsGenRef.current;
     try {
-      setLlmSettings(await getLlmSettings());
+      const next = await getLlmSettings();
+      if (generation !== llmSettingsGenRef.current) return; // account changed -- discard
+      setLlmSettings(next);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) handleSessionExpired();
     }
@@ -755,8 +767,11 @@ export default function Console() {
     void refreshLlmUsage(llmUsageDays);
     void refreshClassifierMix();
     if (!llmSettings) {
+      const generation = llmSettingsGenRef.current;
       try {
-        setLlmSettings(await getLlmSettings());
+        const next = await getLlmSettings();
+        if (generation !== llmSettingsGenRef.current) return; // account changed -- discard
+        setLlmSettings(next);
       } catch (e) {
         if (e instanceof ApiError && e.status === 401) {
           handleSessionExpired();
@@ -804,8 +819,14 @@ export default function Console() {
     }) => {
       setLlmSaving(true);
       let saved = false;
+      // Guarded on the settings counter, not the credential one: a save is
+      // meant to write settings, so it must not invalidate itself. This only
+      // discards the response if the ACCOUNT changed while the PUT was in
+      // flight, in which case it belongs to someone else's panel.
+      const generation = llmSettingsGenRef.current;
       try {
         const next = await putLlmSettings(input);
+        if (generation !== llmSettingsGenRef.current) return; // account changed -- discard
         setLlmSettings(next);
         setLlmTestResult(null);
         toast.success("AI settings saved");
