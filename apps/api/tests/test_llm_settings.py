@@ -211,6 +211,10 @@ def test_get_unconfigured_returns_nulls_and_flags(monkeypatch, user):
     monkeypatch.setattr(settings, "llm_custom_endpoints_enabled", False)
     monkeypatch.setattr(settings, "llm_private_endpoints_enabled", False)
     monkeypatch.setattr(settings, "classifier_backend", "local")
+    # Pinned, not assumed: classification_llm_usable falls back to the operator
+    # key, so a developer with GEMINI_API_KEY in their environment would flip
+    # this expectation without touching the code under test.
+    monkeypatch.setattr(settings, "gemini_api_key", None)
     monkeypatch.setattr(
         llm_settings, "resolve_extraction_credential",
         lambda db_, uid: _resolved(stored=False, source=None),

@@ -585,9 +585,11 @@ export function mockBackfill(opts: BackfillOptions): BackfillResult {
     backend === "local"
       ? "local:email-classifier"
       : backend === "llm"
-        ? // The real API stamps whichever model the resolved credential names;
-          // the mock's configured provider is Gemini, so mirror that.
-          "gemini-2.5-flash"
+        ? // The real API stamps whichever model the resolved credential names,
+          // so read the currently-configured one rather than a fixed string --
+          // otherwise a backfill run after changing the model in settings would
+          // still report the old one.
+          (LLM_SETTINGS.model ?? "llm")
         : "heuristic-v1";
 
   let created = 0;
