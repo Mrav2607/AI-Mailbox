@@ -60,6 +60,13 @@ class LlmSettingsOut(Response):
     # local encoder handles a message or the backend is heuristic -- so this
     # is never renamed "active", which would overclaim.
     classification_eligible: bool
+    # Would picking the "llm" backend for a run actually reach an LLM? True
+    # when this user's own key is eligible OR the operator has a server key.
+    # Derived here rather than in the UI because `classification_eligible`
+    # alone can't answer it: false means "the operator pays" on a deployment
+    # with a server key, but "silently degrades to keyword rules" without
+    # one, and those look identical from the client.
+    classification_llm_usable: bool
 
 
 class LlmTestResultOut(Response):

@@ -2862,6 +2862,9 @@ export default function Console() {
           onConnectOutlook={outlookEnabled ? handleConnectOutlook : undefined}
           onDisconnect={handleDisconnect}
           onOpenLlmSettings={openLlmSettings}
+          // null until the settings fetch lands, so the backfill form leaves
+          // the LLM option alone rather than disabling it on a guess.
+          llmUsable={llmSettings?.classification_llm_usable ?? null}
           ingestLocked={lockedPopover === "ingest"}
           accountsLocked={lockedPopover === "accounts"}
           onLogout={async () => {

@@ -234,6 +234,7 @@ def test_get_unconfigured_returns_nulls_and_flags(monkeypatch, user):
         "classifier_uses_llm": True,
         "classifier_backend": "local",
         "classification_eligible": False,
+        "classification_llm_usable": False,
     }
 
 
@@ -341,6 +342,50 @@ def test_get_classification_eligible_true_when_routing_says_user(monkeypatch, us
     body = resp.json()
     assert body["classification_byok"] is True
     assert body["classification_eligible"] is True
+
+
+def test_get_llm_usable_true_on_operator_key_even_when_user_is_not_eligible(monkeypatch, user):
+    """The whole reason this field exists apart from classification_eligible.
+    Not eligible means "your key won't be used" -- but with an operator key
+    configured the LLM path still runs (operator-paid), so a client that
+    disabled the LLM option on eligibility alone would wrongly hide a working
+    backend on every server-key deployment."""
+    row = _make_row(user_id=user.id, provider="openai", classification_byok=False)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=True, source="user"),
+    )
+    monkeypatch.setattr(
+        llm_settings, "resolve_classification_routing",
+        lambda db_, uid: ClassificationRouting(mode="server", credential=None),
+    )
+    monkeypatch.setattr(llm_settings.settings, "gemini_api_key", "operator-key")
+    body = TestClient(app).get("/api/v1/settings/llm").json()
+    assert body["classification_eligible"] is False
+    assert body["classification_llm_usable"] is True
+
+
+def test_get_llm_usable_false_when_neither_user_nor_operator_has_a_key(monkeypatch, user):
+    """The reported case: picking the LLM backend for a backfill silently
+    classified with keyword rules instead. Nothing to call, so the client has
+    to be told the option is dead rather than let it no-op."""
+    row = _make_row(user_id=user.id, provider="openai", classification_byok=False)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=True, source="user"),
+    )
+    monkeypatch.setattr(
+        llm_settings, "resolve_classification_routing",
+        lambda db_, uid: ClassificationRouting(mode="server", credential=None),
+    )
+    monkeypatch.setattr(llm_settings.settings, "gemini_api_key", None)
+    body = TestClient(app).get("/api/v1/settings/llm").json()
+    assert body["classification_eligible"] is False
+    assert body["classification_llm_usable"] is False
 
 
 def test_get_classification_eligible_false_for_out_of_band_custom_opt_in_row(monkeypatch, user):
