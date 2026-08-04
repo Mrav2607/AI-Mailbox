@@ -15,6 +15,7 @@ const FIXTURE_SELECTORS = [
   "topbar-sync",
   "bucket-sidebar",
   "bucket-needs_reply",
+  "agenda-entry",
   "thread-list",
   "search",
   "sort",
@@ -23,6 +24,7 @@ const FIXTURE_SELECTORS = [
   "layout",
   "accounts",
   "accounts-panel",
+  "llm-settings",
   "ingest-panel",
 ];
 
@@ -36,8 +38,12 @@ function mountFixtures(): HTMLElement[] {
 }
 
 const ACCOUNTS_INDEX = TOUR_STEPS.findIndex((step) => step.slug === "accounts");
+const AI_SETTINGS_INDEX = TOUR_STEPS.findIndex((step) => step.slug === "ai-settings");
 const INGEST_INDEX = TOUR_STEPS.findIndex((step) => step.slug === "ingest");
 const SEARCH_INDEX = TOUR_STEPS.findIndex((step) => step.slug === "search");
+const AGENDA_INDEX = TOUR_STEPS.findIndex((step) => step.slug === "agenda");
+const THREADS_INDEX = TOUR_STEPS.findIndex((step) => step.slug === "threads");
+const FOCUS_BUCKET_INDEX = TOUR_STEPS.findIndex((step) => step.slug === "focus-bucket");
 
 describe("useOnboardingTour rendered lifecycle", () => {
   let root: Root;
@@ -82,6 +88,7 @@ describe("useOnboardingTour rendered lifecycle", () => {
       setBucket: (bucket) => calls.push(`bucket:${bucket}`),
       setIngestOpen: (open) => calls.push(`ingest:${open}`),
       setAccountsOpen: (open) => calls.push(`accounts:${open}`),
+      showBucketsView: () => calls.push("view:buckets"),
       snapshotPanels: vi.fn<() => Panels>(
         () => ({ sidebar: true, detail: true, prediction: true }),
       ),
@@ -136,6 +143,62 @@ describe("useOnboardingTour rendered lifecycle", () => {
     goTo(ACCOUNTS_INDEX, -1);
     expect(calls).toEqual(["ingest:false", "accounts:true"]);
     expect(api!.lockedPopover).toBe("accounts");
+  });
+
+  it("accounts <-> ai-settings share the open-accounts popover in both directions, never re-closing it", () => {
+    start();
+    goTo(ACCOUNTS_INDEX);
+    calls.length = 0;
+
+    goTo(AI_SETTINGS_INDEX);
+    expect(calls).toEqual(["ingest:false", "accounts:true"]);
+    expect(calls).not.toContain("accounts:false");
+    expect(api!.lockedPopover).toBe("accounts");
+
+    calls.length = 0;
+    goTo(ACCOUNTS_INDEX, -1);
+    expect(calls).toEqual(["ingest:false", "accounts:true"]);
+    expect(calls).not.toContain("accounts:false");
+    expect(api!.lockedPopover).toBe("accounts");
+
+    calls.length = 0;
+    goTo(AI_SETTINGS_INDEX);
+    expect(calls).toEqual(["ingest:false", "accounts:true"]);
+    expect(calls).not.toContain("accounts:false");
+    expect(api!.lockedPopover).toBe("accounts");
+  });
+
+  it("entering threads closes both popovers and switches to buckets view", () => {
+    start();
+    goTo(SEARCH_INDEX);
+    calls.length = 0;
+
+    goTo(THREADS_INDEX, -1);
+    expect(calls).toEqual(["ingest:false", "accounts:false", "view:buckets"]);
+  });
+
+  it("entering agenda closes both popovers and shows the sidebar", () => {
+    start();
+    goTo(ACCOUNTS_INDEX);
+    calls.length = 0;
+
+    goTo(AGENDA_INDEX, -1);
+    expect(calls).toEqual(["ingest:false", "accounts:false", "show:sidebar"]);
+  });
+
+  it("entering focus-bucket closes both popovers, shows the sidebar, switches to buckets view, and selects needs_reply", () => {
+    start();
+    goTo(ACCOUNTS_INDEX);
+    calls.length = 0;
+
+    goTo(FOCUS_BUCKET_INDEX, -1);
+    expect(calls).toEqual([
+      "ingest:false",
+      "accounts:false",
+      "show:sidebar",
+      "view:buckets",
+      "bucket:needs_reply",
+    ]);
   });
 
   it("skipTour closes both popovers and writes TOUR_VERSION", () => {

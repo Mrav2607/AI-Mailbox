@@ -392,6 +392,7 @@ export default function Console() {
       setBucket,
       setIngestOpen,
       setAccountsOpen,
+      showBucketsView: () => setView("buckets"),
       snapshotPanels,
       restorePanels,
     }),

@@ -16,10 +16,10 @@ import {
 
 // Literal pin (not TOUR_VERSION - 1 derived below): the point of this test is
 // to fail loudly if a future bump to layout.ts's TOUR_VERSION isn't matched
-// by a real version-2 tour update.
+// by a real version-3 tour update.
 describe("TOUR_VERSION", () => {
-  it("is pinned at 2 for the multi-account tour update", () => {
-    expect(TOUR_VERSION).toBe(2);
+  it("is pinned at 3 for the agenda/AI-settings tour update", () => {
+    expect(TOUR_VERSION).toBe(3);
   });
 });
 
@@ -49,9 +49,14 @@ describe("shouldAutoStartTour", () => {
 
   // Literal values, not TOUR_VERSION-derived, so a forgotten version bump
   // (the exact class of bug the version gate exists to prevent) fails here.
-  it("starts for a tourVersion: 1 user and not for a tourVersion: 2 user", () => {
-    expect(shouldAutoStartTour({ ...ready, tourVersion: 1 })).toBe(true);
-    expect(shouldAutoStartTour({ ...ready, tourVersion: 2 })).toBe(false);
+  it.each([
+    { tourVersion: 0, expected: true },
+    { tourVersion: 1, expected: true },
+    { tourVersion: 2, expected: true },
+    { tourVersion: 3, expected: false },
+    { tourVersion: 4, expected: false },
+  ])("stored tourVersion $tourVersion starts=$expected", ({ tourVersion, expected }) => {
+    expect(shouldAutoStartTour({ ...ready, tourVersion })).toBe(expected);
   });
 });
 
@@ -68,6 +73,7 @@ function makeDeps(calls: string[]): TourDeps {
     setBucket: (bucket) => calls.push(`bucket:${bucket}`),
     setIngestOpen: (open) => calls.push(`ingest:${open}`),
     setAccountsOpen: (open) => calls.push(`accounts:${open}`),
+    showBucketsView: () => calls.push("view:buckets"),
     snapshotPanels: vi.fn<() => Panels>(() => ({
       sidebar: true,
       detail: true,
@@ -88,14 +94,40 @@ describe("tour preconditions", () => {
     expect(calls).toEqual(["ingest:false", "accounts:false", "show:detail", "show:prediction"]);
   });
 
-  it("closes both popovers for a step that declares neither", () => {
+  it("closes both popovers and switches to buckets view for the search step", () => {
     const calls: string[] = [];
     const deps = makeDeps(calls);
     const search = TOUR_STEPS.find((step) => step.slug === "search");
 
     enforceTourPreconditions(search?.preconditions ?? [], deps);
 
-    expect(calls).toEqual(["ingest:false", "accounts:false"]);
+    expect(calls).toEqual(["ingest:false", "accounts:false", "view:buckets"]);
+  });
+
+  it("enforces the focus-bucket step in declaration order: sidebar, buckets view, then bucket select", () => {
+    const calls: string[] = [];
+    const deps = makeDeps(calls);
+    const focusBucket = TOUR_STEPS.find((step) => step.slug === "focus-bucket");
+
+    enforceTourPreconditions(focusBucket?.preconditions ?? [], deps);
+
+    expect(calls).toEqual([
+      "ingest:false",
+      "accounts:false",
+      "show:sidebar",
+      "view:buckets",
+      "bucket:needs_reply",
+    ]);
+  });
+
+  it("enforces the agenda step: sidebar visible, no buckets-view switch", () => {
+    const calls: string[] = [];
+    const deps = makeDeps(calls);
+    const agenda = TOUR_STEPS.find((step) => step.slug === "agenda");
+
+    enforceTourPreconditions(agenda?.preconditions ?? [], deps);
+
+    expect(calls).toEqual(["ingest:false", "accounts:false", "show:sidebar"]);
   });
 
   it("opens accounts and closes ingest for the accounts step", () => {
@@ -145,8 +177,8 @@ describe("tourLockedPopover", () => {
 });
 
 describe("resolveTourTarget", () => {
-  it("keeps the approved map at 12 auto-placed steps", () => {
-    expect(TOUR_STEPS).toHaveLength(12);
+  it("keeps the approved map at 14 auto-placed steps", () => {
+    expect(TOUR_STEPS).toHaveLength(14);
     expect(TOUR_STEPS.every((step) => step.placement === "auto")).toBe(true);
   });
 
@@ -191,5 +223,53 @@ describe("resolveTourTarget", () => {
 
     expect(resolveTourTarget(sidebar!, () => false)).toEqual({ kind: "skip" });
     expect(resolveTourTarget(welcome!, () => false)).toEqual({ kind: "center" });
+  });
+
+  describe("agenda fallback chain", () => {
+    const agenda = TOUR_STEPS.find((step) => step.slug === "agenda")!;
+
+    it("targets the agenda entry when present", () => {
+      expect(resolveTourTarget(agenda, () => true)).toEqual({
+        kind: "target",
+        selector: '[data-tour="agenda-entry"]',
+      });
+    });
+
+    it("falls back to the bucket sidebar when the agenda entry is missing", () => {
+      expect(
+        resolveTourTarget(
+          agenda,
+          (selector) => selector === '[data-tour="bucket-sidebar"]',
+        ),
+      ).toEqual({ kind: "target", selector: '[data-tour="bucket-sidebar"]' });
+    });
+
+    it("skips when both the agenda entry and the sidebar are missing", () => {
+      expect(resolveTourTarget(agenda, () => false)).toEqual({ kind: "skip" });
+    });
+  });
+
+  describe("ai-settings fallback chain", () => {
+    const aiSettings = TOUR_STEPS.find((step) => step.slug === "ai-settings")!;
+
+    it("targets the llm-settings button when present", () => {
+      expect(resolveTourTarget(aiSettings, () => true)).toEqual({
+        kind: "target",
+        selector: '[data-tour="llm-settings"]',
+      });
+    });
+
+    it("falls back to the accounts panel when llm-settings is missing", () => {
+      expect(
+        resolveTourTarget(
+          aiSettings,
+          (selector) => selector === '[data-tour="accounts-panel"]',
+        ),
+      ).toEqual({ kind: "target", selector: '[data-tour="accounts-panel"]' });
+    });
+
+    it("centers when both llm-settings and the accounts panel are missing", () => {
+      expect(resolveTourTarget(aiSettings, () => false)).toEqual({ kind: "center" });
+    });
   });
 });
