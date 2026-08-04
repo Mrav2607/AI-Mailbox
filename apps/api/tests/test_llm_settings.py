@@ -1876,9 +1876,9 @@ def test_classifier_mix_each_preset_prefix_maps_to_user_key(user, preset):
 
 
 def test_classifier_mix_bare_operator_model_name_maps_to_operator_key(user):
-    # No colon at all -- the operator-paid path stamps a bare
-    # `settings.gemini_model` (classifier.py:362), never a "provider:model"
-    # pair, and it must not be confused with a BYOK row.
+    # No colon at all -- the operator-paid path (`_classify_llm_server` in
+    # classifier.py) stamps a bare `settings.gemini_model`, never a
+    # "provider:model" pair, and it must not be confused with a BYOK row.
     db = _mix_db([("gemini-3.5-flash-lite", 86)])
     _override(user, db)
     resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")

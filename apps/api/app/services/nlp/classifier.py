@@ -141,8 +141,11 @@ def classify(
                      called "gemini" before BYOK, which read as though it
                      pinned the provider. "gemini" still works as an alias.
       - "heuristic": keyword rules only.
-      - "auto":      try local, then LLM, then heuristic. Behaves the same
-                     whether passed explicitly or left as the default.
+      - "auto":      try local, then LLM, then heuristic -- but only when
+                     passed explicitly. Left as the global default it follows
+                     the same opt-in rule as "local" below, so an opted-in
+                     caller reaches the LLM BEFORE the encoder. The two are
+                     not interchangeable for `mode="user"`.
 
     `routing` (see `providers.ClassificationRouting`) decides WHO PAYS if and
     only if the LLM path is actually reached. `None` and `mode="server"` are

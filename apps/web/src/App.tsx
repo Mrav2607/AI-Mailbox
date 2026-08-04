@@ -589,6 +589,13 @@ export default function Console() {
     // user refreshes.
     seenRef.current = user ? loadSeen(user.id) : new Map();
     setSeenVersion((v) => v + 1);
+    // The classifier mix counts THIS account's mail, so it must not survive a
+    // switch to another one. Bumping the ref too discards any fetch already in
+    // flight for the previous account, which would otherwise land afterwards
+    // and render the old account's numbers.
+    llmMixGenRef.current++;
+    setClassifierMix(null);
+    setClassifierMixError(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id]);
 
@@ -696,7 +703,11 @@ export default function Console() {
   // is ingested and classified. Guards on llmMixGenRef, its own counter --
   // see that ref's comment for why it can't share llmUsageGenRef.
   const refreshClassifierMix = useCallback(async () => {
-    const generation = llmMixGenRef.current;
+    // Claim a new generation up front rather than reading the current one:
+    // two refreshes can overlap (open, close, reopen), and without this both
+    // read the same value, so an older response landing second overwrites a
+    // newer one. Bumping here makes the most recent caller the only winner.
+    const generation = ++llmMixGenRef.current;
     try {
       const mix = await getClassifierMix();
       if (generation !== llmMixGenRef.current) return; // superseded mid-flight -- discard
