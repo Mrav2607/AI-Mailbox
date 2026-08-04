@@ -348,9 +348,11 @@ def _classify_llm(
     local encoder on this call before reaching here. It only matters for
     `mode="user"`: `_classify_llm_user`'s failure paths fall back to the
     encoder (D2), and threading this through stops them from attempting it a
-    second time (D2a) -- the encoder's load path is expensive enough
-    (unbounded torch/transformers import + model load, see local_model.py)
-    that a second attempt in the same request is a real cost, not a formality.
+    second time (D2a). What a second attempt actually costs is a redundant
+    inference plus up to 5s waiting on an inference slot (local_model.py) --
+    NOT another torch import, since both the loaded model and the "can't
+    load" verdict are memoized per process. Still worth skipping, but it's
+    slot contention we're avoiding here, not a cold start.
     """
     if routing is not None and routing.mode == "off":
         return _heuristic_attempt(text)
