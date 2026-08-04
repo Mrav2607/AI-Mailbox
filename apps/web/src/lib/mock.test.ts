@@ -6,6 +6,7 @@ import {
   mockCounts,
   mockDeleteConnection,
   mockDeleteLlmSettings,
+  mockGetClassifierMix,
   mockGetLlmSettings,
   mockGetLlmUsage,
   mockIngest,
@@ -251,6 +252,23 @@ describe("mock llm usage", () => {
     expect(usage.by_provider).toHaveLength(1);
     expect(usage.by_provider[0].provider).toBe(mockGetLlmSettings().provider);
     expect(usage.by_provider[0].calls).toBe(usage.totals.calls);
+  });
+});
+
+describe("mock classifier mix", () => {
+  it("returns a non-empty mix with no duplicate kinds and only positive counts", () => {
+    const { classifier_mix } = mockGetClassifierMix();
+    expect(classifier_mix.length).toBeGreaterThan(0);
+    const kinds = classifier_mix.map((entry) => entry.kind);
+    expect(new Set(kinds).size).toBe(kinds.length);
+    for (const entry of classifier_mix) {
+      expect(entry.count).toBeGreaterThan(0);
+    }
+  });
+
+  it("never includes 'unknown' -- the demo has no unclassified rows to show", () => {
+    const { classifier_mix } = mockGetClassifierMix();
+    expect(classifier_mix.some((entry) => entry.kind === "unknown")).toBe(false);
   });
 });
 

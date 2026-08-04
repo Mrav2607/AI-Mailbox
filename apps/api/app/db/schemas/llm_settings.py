@@ -55,17 +55,27 @@ class LlmSettingsOut(Response):
     # UI explains local-first behavior honestly instead of guessing from the
     # raw (unconstrained) config string.
     classifier_backend: str
-    # ELIGIBILITY, not observed usage: `resolve_classification_routing(...)
-    # .mode == "user"`. An eligible credential still isn't called when the
-    # local encoder handles a message or the backend is heuristic -- so this
-    # is never renamed "active", which would overclaim.
+    # ELIGIBILITY on the DEFAULT path, not observed usage: `resolve_
+    # classification_routing(...).mode == "user"` AND `classifier_uses_llm`.
+    # The routing check alone isn't enough -- `CLASSIFIER_BACKEND=heuristic`
+    # returns keyword rules before routing is ever read (classifier.py), so
+    # without the second half this would report "your key would be used"
+    # on a deployment where it provably never is. Never renamed "active",
+    # which would overclaim: an eligible credential still isn't called when
+    # the local encoder handles a message.
     classification_eligible: bool
-    # Would picking the "llm" backend for a run actually reach an LLM? True
-    # when this user's own key is eligible OR the operator has a server key.
-    # Derived here rather than in the UI because `classification_eligible`
-    # alone can't answer it: false means "the operator pays" on a deployment
-    # with a server key, but "silently degrades to keyword rules" without
-    # one, and those look identical from the client.
+    # Would picking the EXPLICIT "llm" backend for a run actually reach an
+    # LLM? True when this user's own key routes ("user") OR the operator has
+    # a server key AND routing didn't resolve to "off". Deliberately NOT
+    # gated on `classifier_uses_llm` the way `classification_eligible` is --
+    # an explicit per-run backend override (e.g. a backfill request) bypasses
+    # a global `heuristic` default, so the two fields diverge on purpose. Do
+    # not "fix" them back to matching; see llm_settings.py's formula comment.
+    # `mode="off"` (an opted-in `custom` credential, or the resolver's
+    # concurrent-state-change branch) must report False even with an
+    # operator key configured -- that was a shipped bug (PR #18): the UI
+    # offered the LLM option and the run silently fell back to keyword
+    # rules.
     classification_llm_usable: bool
 
 
@@ -146,3 +156,31 @@ class LlmUsageOut(Response):
     by_stage: list[LlmUsageByStage]
     by_provider: list[LlmUsageByProvider]
     daily: list[LlmUsageDailyPoint]
+
+
+# The closed set `Classification.model_version` maps onto, server-side --
+# plan §7. `custom` deliberately has no kind of its own: a `custom`
+# credential can never route classification (presets-only, see
+# providers.py), so no row can ever be stamped with one.
+ClassifierMixKind = Literal["local", "user_key", "operator_key", "heuristic", "manual", "unknown"]
+
+
+class ClassifierMixEntry(Response):
+    """One row of `GET /settings/llm/classifier-mix` -- a `kind` summed
+    across every `model_version` that maps onto it (plan §7's "sum after
+    mapping" rule), never one row per raw `model_version`.
+    """
+
+    kind: ClassifierMixKind
+    count: int
+
+
+class ClassifierMixOut(Response):
+    """`GET /settings/llm/classifier-mix` response: which classifier
+    produced the mail a user currently has, not a time-windowed history (see
+    the route's own docstring for why). Zero classifications yields
+    `{"classifier_mix": []}` through the inner joins -- a 200, never a 404,
+    same convention as `LlmUsageOut`.
+    """
+
+    classifier_mix: list[ClassifierMixEntry]

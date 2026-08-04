@@ -291,3 +291,33 @@ export interface LlmUsage {
   by_provider: LlmUsageByProvider[];
   daily: LlmUsageDailyPoint[];
 }
+
+// The closed set `Classification.model_version` maps onto, server-side (plan
+// §7). `custom` deliberately has no kind of its own -- a `custom` credential
+// can never route classification (presets-only), so no row can ever be
+// stamped with one.
+export type ClassifierMixKind =
+  | "local"
+  | "user_key"
+  | "operator_key"
+  | "heuristic"
+  | "manual"
+  | "unknown";
+
+// One row of GET /settings/llm/classifier-mix -- a `kind` summed across
+// every `model_version` that maps onto it, never one row per raw
+// `model_version`.
+export interface ClassifierMixEntry {
+  kind: ClassifierMixKind;
+  count: number;
+}
+
+// GET /settings/llm/classifier-mix response: which classifier produced the
+// mail this user CURRENTLY has -- point-in-time state, not a time-windowed
+// history (classification rows are upserted in place on reclassification
+// without touching a timestamp, so a "last N days" view would silently omit
+// exactly the reclassified messages that matter). Zero classifications
+// yields an empty array, never a 404.
+export interface ClassifierMix {
+  classifier_mix: ClassifierMixEntry[];
+}

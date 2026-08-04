@@ -29,8 +29,21 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.ratelimit import user_rate_limit
 from app.deps import get_current_user, get_db
-from app.db.models import AppUser, LlmUsageDaily, UserLlmCredential
-from app.db.schemas.llm_settings import LlmSettingsOut, LlmTestResultOut, LlmUsageOut
+from app.db.models import (
+    AppUser,
+    Classification,
+    LlmUsageDaily,
+    MailMessage,
+    MailThread,
+    UserLlmCredential,
+)
+from app.db.schemas.llm_settings import (
+    ClassifierMixKind,
+    ClassifierMixOut,
+    LlmSettingsOut,
+    LlmTestResultOut,
+    LlmUsageOut,
+)
 from app.services.nlp.extractor import test_credential
 from app.services.nlp.providers import (
     PROVIDER_PRESETS,
@@ -72,18 +85,49 @@ def _settings_payload(
     row: UserLlmCredential | None,
     resolved: ResolvedExtraction,
     *,
-    classification_eligible: bool,
+    routing_is_user: bool,
+    routing_mode: str,
 ) -> dict:
     """The shared GET response shape. ``row`` carries every field that
     ``ResolvedExtraction`` doesn't (last_verified_at, the display fields) --
     ``resolved`` is still the ONE source for coverage-derived fields
     (``fallback_active``, ``custom_blocked``) so this never re-derives
     coverage from partial signals the way ``ResolvedExtraction``'s own
-    docstring warns against. ``classification_eligible`` is likewise the
-    caller's ONE source (``resolve_classification_routing(...).mode ==
-    "user"``) -- eligibility, not observed usage.
+    docstring warns against.
+
+    ``routing_is_user``/``routing_mode`` both come from a SINGLE
+    ``resolve_classification_routing(...)`` call at the caller -- this never
+    re-resolves routing itself, so a mid-request state change can't produce
+    two different answers within one response.
+
+    ``classification_eligible`` and ``classification_llm_usable`` read
+    similarly but answer different questions, and they diverge ON PURPOSE:
+
+    - ``classification_eligible`` describes the DEFAULT path (no per-run
+      override), which is why it's gated on ``classifier_uses_llm`` too --
+      `CLASSIFIER_BACKEND=heuristic` returns keyword rules before routing is
+      even read (classifier.py), so eligibility without that gate would lie
+      about a deployment where the LLM path is provably dead.
+    - ``classification_llm_usable`` describes an EXPLICIT "llm" backend
+      override (e.g. a backfill request), which bypasses a global
+      `heuristic` default entirely -- so it is NOT gated on
+      `classifier_uses_llm`. It's true when this user's key routes, or when
+      routing resolved to "server" and an operator key exists. It must stay
+      false for `mode="off"` even with an operator key configured -- that
+      was a shipped bug (PR #18): `off` (an opted-in `custom` credential, or
+      the resolver's concurrent-state-change branch) still reports "usable"
+      under `routing_is_user or bool(gemini_api_key)`, and the UI would offer
+      an LLM option that silently runs keyword rules.
+
+    Do not collapse these back into one formula; that's re-introducing the
+    bug this fixed.
     """
     backend = _effective_backend()
+    classifier_uses_llm = backend != "heuristic"
+    classification_eligible = routing_is_user and classifier_uses_llm
+    classification_llm_usable = routing_is_user or (
+        routing_mode == "server" and bool(settings.gemini_api_key)
+    )
     return {
         "configured": row is not None,
         "provider": row.provider if row is not None else None,
@@ -98,13 +142,10 @@ def _settings_payload(
         "private_endpoints_enabled": bool(settings.llm_private_endpoints_enabled),
         "custom_blocked": resolved.blocked_reason is not None,
         "classification_byok": bool(row.classification_byok) if row is not None else False,
-        "classifier_uses_llm": backend != "heuristic",
+        "classifier_uses_llm": classifier_uses_llm,
         "classifier_backend": backend,
         "classification_eligible": classification_eligible,
-        # Mirrors `_classify_llm`'s own precedence: the user's key when their
-        # routing resolves to "user", otherwise the operator's server key,
-        # otherwise nothing to call and the path degrades to heuristic.
-        "classification_llm_usable": classification_eligible or bool(settings.gemini_api_key),
+        "classification_llm_usable": classification_llm_usable,
     }
 
 
@@ -118,7 +159,9 @@ def get_llm_settings(
     ).scalar_one_or_none()
     resolved = resolve_extraction_credential(db, current_user.id)
     routing = resolve_classification_routing(db, current_user.id)
-    return _settings_payload(row, resolved, classification_eligible=routing.mode == "user")
+    return _settings_payload(
+        row, resolved, routing_is_user=routing.mode == "user", routing_mode=routing.mode
+    )
 
 
 # `days` bounds: a 400-day cap matches the retention tick (plan §8), so the
@@ -242,6 +285,82 @@ def get_llm_usage(
         "by_provider": by_provider,
         "daily": daily,
     }
+
+
+def _classifier_mix_kind(model_version: str | None) -> ClassifierMixKind:
+    """Maps a raw ``classification.model_version`` string onto the closed
+    set of kinds the UI renders (plan §7). Matched against literal prefixes
+    and the specific values each code path actually stamps -- never against
+    "any string with a colon" -- so a `custom`-credential quirk or an
+    operator's oddly-named `GEMINI_MODEL` can't be misfiled by accident of
+    string shape alone. This is the ONE place that mapping lives; the SQL
+    aggregate below groups by `model_version`, but every response row is by
+    `kind`, so a second copy of this logic would be how the two silently
+    drift.
+    """
+    if model_version is None:
+        return "unknown"
+    if model_version.startswith("local:"):
+        return "local"
+    if model_version in ("heuristic-v1", "heuristic-fallback"):
+        return "heuristic"
+    if model_version == "user-override":
+        return "manual"
+    preset, sep, _rest = model_version.partition(":")
+    if sep and preset in PROVIDER_PRESETS:
+        return "user_key"
+    # Everything else is a bare operator-paid model name (settings.gemini_model,
+    # classifier.py:362) -- `custom` is excluded from PROVIDER_PRESETS on
+    # purpose (providers.py), so no row this router can ever see was stamped
+    # by one.
+    return "operator_key"
+
+
+@router.get("/classifier-mix", response_model=ClassifierMixOut)
+def get_classifier_mix(
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Which classifier labeled the mail this user CURRENTLY has -- point-in-
+    time state, not a time-windowed history. `classification` rows are
+    upserted in place on reclassification without touching a timestamp
+    (persistence.py), so a "last N days by created_at" view would silently
+    omit exactly the reclassified messages that matter (plan §7). This is
+    its own endpoint, not a field on `LlmSettingsOut`: that schema is shared
+    verbatim by GET and PUT, and a required new field here would force PUT
+    to run this aggregate too or fail response validation.
+
+    No rate limit, matching `/usage`'s precedent -- only `/test` is limited,
+    because it alone makes a live outbound call. Cost grows with the user's
+    total mail (R5 in the plan), but that's confined to this endpoint, which
+    only runs when the panel showing it is open.
+
+    `:uid` is always `current_user.id`, never a caller-supplied parameter --
+    there is no router-level auth dependency in this file, so every route
+    (this one included) declares and scopes its own.
+
+    Zero classifications yields `{"classifier_mix": []}` through the inner
+    joins -- a 200, matching `/usage`'s empty state, never a 404.
+    """
+    rows = db.execute(
+        select(Classification.model_version, func.count())
+        .select_from(Classification)
+        .join(MailMessage, MailMessage.id == Classification.message_id)
+        .join(MailThread, MailThread.id == MailMessage.thread_id)
+        .where(MailThread.user_id == current_user.id)
+        .group_by(Classification.model_version)
+    ).all()
+
+    # Summed AFTER mapping, not before: the mapping is many-to-one (e.g.
+    # `heuristic-v1` and `heuristic-fallback` both land on `heuristic`), so a
+    # naive row-per-model_version response would emit duplicate rows for one
+    # kind and the UI would double-print a category.
+    counts: dict[ClassifierMixKind, int] = {}
+    for model_version, count in rows:
+        kind = _classifier_mix_kind(model_version)
+        counts[kind] = counts.get(kind, 0) + int(count)
+
+    return {"classifier_mix": [{"kind": kind, "count": count} for kind, count in counts.items()]}
 
 
 async def _read_bounded_body(request: Request) -> bytes:
@@ -476,12 +595,25 @@ async def put_llm_settings(
     # its 3s DNS budget -- the exact thing being async here is meant to
     # avoid. Nothing here needs re-deriving: a row we just wrote is always
     # `configured`, never fallback-covered, and (having just passed
-    # validation, custom included) never blocked. Eligibility follows the
-    # same rule `resolve_classification_routing` applies -- opted in AND a
-    # preset provider -- and both are already guaranteed above (a `custom`
-    # provider always leaves `classification_byok` false here).
+    # validation, custom included) never blocked. `routing_is_user` follows
+    # the same rule `resolve_classification_routing` applies -- opted in AND
+    # a preset provider -- and both are already guaranteed above (a `custom`
+    # provider always leaves `classification_byok` false here). Unlike the
+    # GET path, there's no third `mode="off"` case to reconstruct here: a row
+    # that isn't `routing_is_user` was either never opted in or opted in on
+    # `custom` (force-cleared above), which resolve_classification_routing's
+    # own "no row, or opted out -> server" branch treats as `mode="server"`
+    # -- never `"off"`. That's what makes `classification_llm_usable` below
+    # safe to fall straight to the operator-key check without a separate
+    # mode read.
     backend = _effective_backend()
-    eligible = bool(row.classification_byok) and row.provider in PROVIDER_PRESETS
+    classifier_uses_llm = backend != "heuristic"
+    routing_is_user = bool(row.classification_byok) and row.provider in PROVIDER_PRESETS
+    eligible = routing_is_user and classifier_uses_llm
+    # Deliberately NOT gated on `classifier_uses_llm` -- same divergence as
+    # `_settings_payload`'s, spelled out there. Do not "fix" this to match
+    # `eligible`.
+    llm_usable = routing_is_user or bool(settings.gemini_api_key)
     return {
         "configured": True,
         "provider": row.provider,
@@ -495,12 +627,10 @@ async def put_llm_settings(
         "private_endpoints_enabled": bool(settings.llm_private_endpoints_enabled),
         "custom_blocked": False,
         "classification_byok": bool(row.classification_byok),
-        "classifier_uses_llm": backend != "heuristic",
+        "classifier_uses_llm": classifier_uses_llm,
         "classifier_backend": backend,
         "classification_eligible": eligible,
-        # Same precedence as _settings_payload's: this user's key, else the
-        # operator's, else nothing to call.
-        "classification_llm_usable": eligible or bool(settings.gemini_api_key),
+        "classification_llm_usable": llm_usable,
     }
 
 

@@ -418,6 +418,32 @@ def test_get_classification_eligible_false_for_out_of_band_custom_opt_in_row(mon
     assert body["classification_eligible"] is False
 
 
+def test_get_llm_usable_false_for_off_routing_even_with_an_operator_key(monkeypatch, user):
+    """The shipped bug (PR #18), fixed: `routing_is_user or bool(gemini_api_key)`
+    reported True for `mode="off"` whenever an operator key existed --
+    `classifier.py` returns heuristics for `off` before either key is even
+    considered, so the UI offered an LLM option that silently ran keyword
+    rules. `mode="off"` must report False regardless of the operator key.
+    """
+    row = _make_row(
+        user_id=user.id, provider="custom", base_url="https://llm.internal/v1",
+        classification_byok=True,
+    )
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=True, source="user"),
+    )
+    monkeypatch.setattr(
+        llm_settings, "resolve_classification_routing",
+        lambda db_, uid: ClassificationRouting(mode="off", credential=None),
+    )
+    monkeypatch.setattr(llm_settings.settings, "gemini_api_key", "operator-key")
+    body = TestClient(app).get("/api/v1/settings/llm").json()
+    assert body["classification_llm_usable"] is False
+
+
 @pytest.mark.parametrize(
     "raw_backend, expected_backend, expected_uses_llm",
     [
@@ -1159,7 +1185,11 @@ def test_put_response_carries_every_new_field_on_create(monkeypatch, user):
     assert body["classification_byok"] is True
     assert body["classifier_uses_llm"] is False
     assert body["classifier_backend"] == "heuristic"
-    assert body["classification_eligible"] is True
+    # A heuristic-only backend has no LLM path for this opt-in to pay for --
+    # `classification_eligible` is gated on `classifier_uses_llm` (plan §6),
+    # so an opted-in preset credential still isn't eligible here even though
+    # routing itself would resolve to "user".
+    assert body["classification_eligible"] is False
 
 
 def test_put_response_carries_every_new_field_on_update(monkeypatch, user):
@@ -1805,3 +1835,141 @@ def test_delete_two_user_isolation():
     assert resp.status_code == 204
     assert user_a.id.hex not in db.rows
     assert user_b.id.hex in db.rows
+
+
+# ---------------------------------------------------------------------------
+# GET /classifier-mix -- plan §7 + §5.1 (cases 15-24)
+#
+# Same offline idiom as `_usage_db`: `db.execute(...)` is stubbed with one
+# canned `(model_version, count)` row set, since the actual GROUP BY
+# correctness is Postgres's job (proven live), not this suite's. What these
+# tests own is the route's OWN contract: the server-side model_version ->
+# kind mapping, summing after mapping (not before), auth, and per-user
+# scoping.
+# ---------------------------------------------------------------------------
+
+
+def _mix_db(rows):
+    result = MagicMock()
+    result.all = MagicMock(return_value=rows)
+    db = MagicMock()
+    db.execute = MagicMock(return_value=result)
+    return db
+
+
+def test_classifier_mix_local_prefix_maps_to_local(user):
+    db = _mix_db([("local:email-classifier-v3", 809)])
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    assert resp.status_code == 200
+    assert resp.json() == {"classifier_mix": [{"kind": "local", "count": 809}]}
+
+
+@pytest.mark.parametrize(
+    "preset", ["openai", "gemini", "openrouter", "groq", "mistral"],
+)
+def test_classifier_mix_each_preset_prefix_maps_to_user_key(user, preset):
+    db = _mix_db([(f"{preset}:some-model", 5)])
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    assert resp.json() == {"classifier_mix": [{"kind": "user_key", "count": 5}]}
+
+
+def test_classifier_mix_bare_operator_model_name_maps_to_operator_key(user):
+    # No colon at all -- the operator-paid path (`_classify_llm_server` in
+    # classifier.py) stamps a bare `settings.gemini_model`, never a
+    # "provider:model" pair, and it must not be confused with a BYOK row.
+    db = _mix_db([("gemini-3.5-flash-lite", 86)])
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    assert resp.json() == {"classifier_mix": [{"kind": "operator_key", "count": 86}]}
+
+
+def test_classifier_mix_heuristic_v1_and_heuristic_fallback_both_map_to_heuristic(user):
+    db = _mix_db([("heuristic-v1", 11), ("heuristic-fallback", 3)])
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    assert resp.json() == {"classifier_mix": [{"kind": "heuristic", "count": 14}]}
+
+
+def test_classifier_mix_user_override_maps_to_manual(user):
+    db = _mix_db([("user-override", 1)])
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    assert resp.json() == {"classifier_mix": [{"kind": "manual", "count": 1}]}
+
+
+def test_classifier_mix_null_model_version_maps_to_unknown(user):
+    db = _mix_db([(None, 2)])
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    assert resp.json() == {"classifier_mix": [{"kind": "unknown", "count": 2}]}
+
+
+def test_classifier_mix_sums_distinct_versions_of_one_kind_into_a_single_row(user):
+    # `local:v1`, `local:v2`, `local:v3` are three DIFFERENT model_versions
+    # (three GROUP BY rows from Postgres) that all map to `local`. A naive
+    # row-per-model_version response would emit three `local` rows here;
+    # the contract is exactly one, with counts summed AFTER mapping.
+    db = _mix_db(
+        [
+            ("local:v1", 100),
+            ("local:v2", 50),
+            ("local:v3", 9),
+            ("openai:gpt-4o-mini", 4),
+        ]
+    )
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    body = resp.json()
+    assert body["classifier_mix"] == [
+        {"kind": "local", "count": 159},
+        {"kind": "user_key", "count": 4},
+    ]
+    # Never more than one row per kind.
+    kinds = [entry["kind"] for entry in body["classifier_mix"]]
+    assert len(kinds) == len(set(kinds))
+
+
+def test_classifier_mix_empty_state_is_200_not_404(user):
+    db = _mix_db([])
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    assert resp.status_code == 200
+    assert resp.json() == {"classifier_mix": []}
+
+
+def test_classifier_mix_unauthenticated_is_rejected():
+    # No dependency override for get_current_user -- the real dependency
+    # runs and must reject a request carrying no bearer token at all.
+    resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    assert resp.status_code == 401
+
+
+def test_classifier_mix_filters_by_current_users_id(user):
+    db = _mix_db([("local:v1", 1)])
+    _override(user, db)
+    TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    compiled = _compiled(db.execute.call_args_list[0].args[0])
+    assert f"mail_thread.user_id = '{user.id.hex}'" in compiled
+
+
+def test_classifier_mix_two_user_isolation_each_gets_their_own_scoped_query():
+    user_a = MagicMock(id=uuid4())
+    user_b = MagicMock(id=uuid4())
+
+    db_a = _mix_db([("local:v1", 3)])
+    _override(user_a, db_a)
+    resp_a = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    assert resp_a.json() == {"classifier_mix": [{"kind": "local", "count": 3}]}
+    compiled_a = _compiled(db_a.execute.call_args_list[0].args[0])
+    assert f"mail_thread.user_id = '{user_a.id.hex}'" in compiled_a
+    assert user_b.id.hex not in compiled_a
+
+    db_b = _mix_db([("openai:gpt-4o-mini", 7)])
+    _override(user_b, db_b)
+    resp_b = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    assert resp_b.json() == {"classifier_mix": [{"kind": "user_key", "count": 7}]}
+    compiled_b = _compiled(db_b.execute.call_args_list[0].args[0])
+    assert f"mail_thread.user_id = '{user_b.id.hex}'" in compiled_b
+    assert user_a.id.hex not in compiled_b

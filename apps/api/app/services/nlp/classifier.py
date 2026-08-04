@@ -131,24 +131,45 @@ def classify(
 
     Routed by `backend` (falling back to settings.classifier_backend when not
     given, so callers can override the global default per request):
-      - "local":     fine-tuned encoder in models/, falling back to the LLM /
-                     heuristic path if the model or its deps are unavailable.
+      - "local":     fine-tuned encoder in models/. If unavailable, an
+                     explicit `backend="local"` stops at the heuristic --
+                     never an LLM (see D1a below). Left as the global
+                     default (`backend=None`), it still falls through to the
+                     LLM / heuristic path.
       - "llm":       LLM with heuristic fallback. Which provider actually gets
                      called comes from `routing`, not from this name -- it was
                      called "gemini" before BYOK, which read as though it
                      pinned the provider. "gemini" still works as an alias.
       - "heuristic": keyword rules only.
-      - "auto":      try local, then LLM, then heuristic.
+      - "auto":      try local, then LLM, then heuristic -- but only when
+                     passed explicitly. Left as the global default it follows
+                     the same opt-in rule as "local" below, so an opted-in
+                     caller reaches the LLM BEFORE the encoder. The two are
+                     not interchangeable for `mode="user"`.
 
     `routing` (see `providers.ClassificationRouting`) decides WHO PAYS if and
-    only if the LLM path is actually reached -- it never overrides `backend`
-    and never bypasses a locally-available encoder, since local inference is
-    free for everyone and spending anyone's key instead would be strictly
-    worse. `None` and `mode="server"` are byte-identical to the pre-BYOK
-    behavior (the operator's key or heuristic); `mode="user"` spends the
-    caller's own credential via the shared OpenAI-compatible wire client;
-    `mode="off"` classifies heuristically without calling any LLM at all, so
-    neither key is spent.
+    only if the LLM path is actually reached. `None` and `mode="server"` are
+    byte-identical to the pre-BYOK behavior (the operator's key or
+    heuristic); `mode="off"` classifies heuristically without calling any LLM
+    at all, so neither key is spent.
+
+    `mode="user"` (an opted-in BYOK caller) is where `backend` and the global
+    default genuinely diverge:
+      - `backend` passed explicitly -> honored verbatim. A local encoder that
+        can serve still wins over the user's key -- local inference is free,
+        and an explicit `backend="local"` must never spend anyone's key at
+        all (D1a). Only `auto` retains the local-first, LLM-on-failure order.
+      - `backend` left as the global default (`None`) -> the opt-in itself
+        wins: the user's key is tried BEFORE the local encoder is even
+        consulted, so a deployment defaulting to `local`/`auto` (today's
+        `CLASSIFIER_BACKEND` default) still honors the opt-in instead of
+        silently classifying opted-in mail for free on the encoder.
+
+    A failed BYOK call (`_classify_llm_user`) now falls back to the local
+    encoder before keyword rules, so a transient provider error doesn't hand
+    an opted-in user worse labels than someone who never opted in -- see
+    `_classify_attempt` and the `local_tried` plumbing through
+    `_classify_llm`/`_classify_llm_user`.
 
     This is the compatibility wrapper -- see `_classify_attempt` for the
     actual implementation, which `classify_with_usage()` also wraps. Any
@@ -182,23 +203,58 @@ def _classify_attempt(
     as a single implementation with two thin wrappers on purpose: two
     separate implementations would drift, and the drift most likely to
     happen is one of them silently forgetting to record usage.
-    """
-    backend = (backend or settings.classifier_backend or "auto").lower()
 
-    if backend == "heuristic":
+    This is the normative precedence trace from the plan (§4.1 there is the
+    tiebreaker if this and that table ever disagree):
+
+        explicit = backend is not None
+        effective = (backend or settings.classifier_backend or "auto").lower()
+
+        if effective == "heuristic":            -> keyword rules
+        if effective in ("local", "auto"):
+            if not explicit and routing is not None and routing.mode == "user":
+                -> _classify_llm(text, routing, local_tried=False)
+            result = try_predict(text)
+            if result is not None:              -> return it
+            if explicit and effective == "local":
+                -> keyword rules                # D1a: never an LLM
+            -> _classify_llm(text, routing, local_tried=True)
+        -> _classify_llm(text, routing, local_tried=False)
+    """
+    explicit = backend is not None
+    effective = (backend or settings.classifier_backend or "auto").lower()
+
+    if effective == "heuristic":
         return _heuristic_attempt(text)
 
-    if backend in ("local", "auto"):
+    if effective in ("local", "auto"):
         from app.services.nlp.local_model import try_predict
+
+        # An opted-in user on the GLOBAL default (backend not passed for this
+        # run) gets their key before the encoder is even tried -- otherwise a
+        # deployment defaulting to local/auto (today's CLASSIFIER_BACKEND
+        # default) would classify their mail for free and never honor the
+        # opt-in they paid for. An explicit backend for this run always wins
+        # verbatim instead (D1): the caller asked for the encoder, so the
+        # encoder gets first shot even for an opted-in user.
+        if not explicit and routing is not None and routing.mode == "user":
+            return _classify_llm(text, routing, local_tried=False)
 
         result = try_predict(text)
         if result is not None:
             return ClassificationAttempt(
                 verdict=result, provider_call_succeeded=False, usage=None
             )
-        # local unavailable -> fall through to the LLM / heuristic path
 
-    return _classify_llm(text, routing)
+        # Local unavailable. An explicit backend="local" stops here --
+        # never an LLM (D1a): the caller asked specifically for free local
+        # inference, not "local, or spend a key if that fails".
+        if explicit and effective == "local":
+            return _heuristic_attempt(text)
+
+        return _classify_llm(text, routing, local_tried=True)
+
+    return _classify_llm(text, routing, local_tried=False)
 
 
 @lru_cache(maxsize=1)
@@ -276,7 +332,9 @@ _CLASSIFICATION_TIMEOUT_S = 10.0
 
 
 def _classify_llm(
-    text: str, routing: ClassificationRouting | None = None
+    text: str,
+    routing: ClassificationRouting | None = None,
+    local_tried: bool = False,
 ) -> ClassificationAttempt:
     """
     Dispatch to the LLM path that pays for this call, per `routing`
@@ -285,6 +343,16 @@ def _classify_llm(
     google-genai path; `mode="user"` is the OpenAI-compatible BYOK path;
     `mode="off"` never calls either -- straight to the heuristic classifier,
     so the operator is never billed for a message the user opted out of.
+
+    `local_tried` says whether `_classify_attempt` already attempted the
+    local encoder on this call before reaching here. It only matters for
+    `mode="user"`: `_classify_llm_user`'s failure paths fall back to the
+    encoder (D2), and threading this through stops them from attempting it a
+    second time (D2a). What a second attempt actually costs is a redundant
+    inference plus up to 5s waiting on an inference slot (local_model.py) --
+    NOT another torch import, since both the loaded model and the "can't
+    load" verdict are memoized per process. Still worth skipping, but it's
+    slot contention we're avoiding here, not a cold start.
     """
     if routing is not None and routing.mode == "off":
         return _heuristic_attempt(text)
@@ -300,7 +368,7 @@ def _classify_llm(
             # opted in with their own key.
             logger.warning("ClassificationRouting mode='user' had no credential")
             return _heuristic_attempt(text)
-        return _classify_llm_user(text, routing.credential)
+        return _classify_llm_user(text, routing.credential, local_tried)
 
     return _classify_llm_server(text)
 
@@ -370,7 +438,47 @@ def _classify_llm_server(text: str) -> ClassificationAttempt:
     )
 
 
-def _classify_llm_user(text: str, credential: LlmCredential) -> ClassificationAttempt:
+def _llm_user_failure_fallback(
+    text: str,
+    local_tried: bool,
+    *,
+    provider_call_succeeded: bool,
+    usage: LlmUsage | None,
+) -> ClassificationAttempt:
+    """
+    Shared by both `_classify_llm_user` failure paths (D2): try the local
+    encoder before keyword rules, unless it was already tried this call
+    (`local_tried`, D2a) or is unavailable, in which case fall back to
+    keyword rules like before.
+
+    `provider_call_succeeded`/`usage` describe whether the LLM call itself
+    reached the provider, not what produced the verdict -- they're passed
+    through unchanged regardless of which fallback ends up serving (D3):
+    a malformed-but-received response still billed the user even if the
+    encoder, not the heuristic, ends up supplying the label.
+    """
+    if not local_tried:
+        from app.services.nlp.local_model import try_predict
+
+        result = try_predict(text)
+        if result is not None:
+            return ClassificationAttempt(
+                verdict=result,
+                provider_call_succeeded=provider_call_succeeded,
+                usage=usage,
+            )
+
+    label, confidence, rationale, _ = _heuristic_classify(text)
+    return ClassificationAttempt(
+        verdict=(label, confidence, rationale, "heuristic-fallback"),
+        provider_call_succeeded=provider_call_succeeded,
+        usage=usage,
+    )
+
+
+def _classify_llm_user(
+    text: str, credential: LlmCredential, local_tried: bool = False
+) -> ClassificationAttempt:
     """
     BYOK classification path: the same prompt and the same strict parse as
     the server path, wired through the shared OpenAI-compatible call instead
@@ -378,6 +486,10 @@ def _classify_llm_user(text: str, credential: LlmCredential) -> ClassificationAt
     deliberately different attribution from the server path's bare model
     name, since a BYOK verdict can come from any provider/model the user
     picked, not the operator's fixed Gemini deployment.
+
+    `local_tried` (D2/D2a): both failure paths below try the local encoder
+    before keyword rules, but only once per call -- see
+    `_llm_user_failure_fallback`.
     """
     try:
         result = call_chat_completion(
@@ -391,11 +503,8 @@ def _classify_llm_user(text: str, credential: LlmCredential) -> ClassificationAt
         logger.warning(
             "Classification call failed for provider %s: %s", credential.provider, exc.category
         )
-        label, confidence, rationale, _ = _heuristic_classify(text)
-        return ClassificationAttempt(
-            verdict=(label, confidence, rationale, "heuristic-fallback"),
-            provider_call_succeeded=False,
-            usage=None,
+        return _llm_user_failure_fallback(
+            text, local_tried, provider_call_succeeded=False, usage=None
         )
 
     # The call reached the provider and came back -- it already billed the
@@ -408,11 +517,8 @@ def _classify_llm_user(text: str, credential: LlmCredential) -> ClassificationAt
             "Classification returned an unusable response for provider %s: %s",
             credential.provider, type(exc).__name__,
         )
-        label, confidence, rationale, _ = _heuristic_classify(text)
-        return ClassificationAttempt(
-            verdict=(label, confidence, rationale, "heuristic-fallback"),
-            provider_call_succeeded=True,
-            usage=result.usage,
+        return _llm_user_failure_fallback(
+            text, local_tried, provider_call_succeeded=True, usage=result.usage
         )
 
     return ClassificationAttempt(
