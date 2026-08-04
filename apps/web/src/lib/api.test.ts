@@ -668,3 +668,31 @@ describe("getLlmUsage", () => {
     expect(res.daily.length).toBeLessThanOrEqual(7);
   });
 });
+
+describe("getClassifierMix", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("requests GET /settings/llm/classifier-mix and returns the body verbatim", async () => {
+    const api = await importLiveApi();
+    const body = {
+      classifier_mix: [
+        { kind: "local", count: 809 },
+        { kind: "user_key", count: 86 },
+      ],
+    };
+    const fetchMock = stubFetch(body);
+    const res = await api.getClassifierMix();
+    const url = requestedUrl(fetchMock);
+    expect(url.pathname).toBe("/api/v1/settings/llm/classifier-mix");
+    expect(res).toEqual(body);
+  });
+
+  it("in mock mode, returns a non-empty mix", async () => {
+    const api = await importMockApi();
+    const res = await api.getClassifierMix();
+    expect(res.classifier_mix.length).toBeGreaterThan(0);
+  });
+});

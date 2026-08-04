@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
-import type { LlmProvider, LlmSettings, LlmTestResult, LlmUsage } from "@/lib/types";
+import type {
+  ClassifierMixEntry,
+  ClassifierMixKind,
+  LlmProvider,
+  LlmSettings,
+  LlmTestResult,
+  LlmUsage,
+} from "@/lib/types";
 import { PROVIDER_LABELS } from "@/lib/usage";
 
 interface Props {
@@ -37,6 +44,13 @@ interface Props {
   // the cost signal belongs here where the key is configured, but the detail
   // lives there.
   onOpenUsage: () => void;
+  // Which classifier labeled the mail this user currently has (plan §7) --
+  // point-in-time state, not a time-windowed history. Same null-while-in-
+  // flight / real payload / separate error flag contract as `usage` above.
+  // Rendered regardless of whether this user has a credential at all -- see
+  // the render site below for why it can't live behind the BYOK gate.
+  classifierMix: ClassifierMixEntry[] | null;
+  classifierMixError: boolean;
 }
 
 // Hints only, shown as the model field's placeholder -- never submitted on
@@ -79,6 +93,34 @@ function testErrorMessage(error: string): string {
   return "Something went wrong testing this credential.";
 }
 
+// Labels for the closed set of classifier-mix kinds (plan §7). `user_key`
+// and `operator_key` are deliberately two different labels -- "your key" is
+// only true when THIS account's own credential paid for a row, and
+// conflating the two would misattribute an operator-paid message to a key
+// the user never spent. `unknown` (a NULL model_version, i.e. not yet
+// classified) has no label because it's filtered out before this is used.
+const CLASSIFIER_MIX_LABELS: Record<ClassifierMixKind, string> = {
+  local: "built-in model",
+  user_key: "your key",
+  operator_key: "shared key",
+  heuristic: "keyword rules",
+  manual: "you",
+  unknown: "",
+};
+
+// One line describing which classifier produced the mail this user
+// currently has. Rendered OUTSIDE the BYOK opt-in gate below on purpose --
+// it's true for every user, not just an opted-in one, so gating it the same
+// way would hide it from exactly the people it's for: anyone with no
+// credential at all, anyone on `server`/`off` routing, and any heuristic-
+// only deployment that still has local/manual/heuristic history.
+function classifierMixSummary(mix: ClassifierMixEntry[]): string {
+  const parts = mix
+    .filter((entry) => entry.kind !== "unknown" && entry.count > 0)
+    .map((entry) => `${CLASSIFIER_MIX_LABELS[entry.kind]} ${entry.count.toLocaleString()}`);
+  return parts.length > 0 ? `Sorting your mail: ${parts.join(", ")}` : "nothing sorted yet";
+}
+
 const fieldLabel = "font-mono text-[11px] text-muted-foreground";
 const control =
   "w-full bg-[var(--color-panel)] border border-border rounded px-2 py-1 text-[12px] font-mono text-foreground";
@@ -97,6 +139,8 @@ export function LlmSettingsModal({
   usage,
   usageError,
   onOpenUsage,
+  classifierMix,
+  classifierMixError,
 }: Props) {
   const [provider, setProvider] = useState<LlmProvider>("openai");
   const [model, setModel] = useState("");
@@ -146,6 +190,17 @@ export function LlmSettingsModal({
         <p className="text-[11px] font-mono text-muted-foreground leading-relaxed">
           save your own API key and CortexMail uses it to pull deadlines and
           to-dos out of your mail.
+        </p>
+
+        {/* Which classifier is doing the work, for THIS user, regardless of
+            whether they hold a key -- see classifierMixSummary's comment for
+            why this can't move behind the BYOK checkbox below. */}
+        <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+          {classifierMixError
+            ? "Couldn't load how your mail is being sorted right now."
+            : !classifierMix
+              ? "checking how your mail is sorted…"
+              : classifierMixSummary(classifierMix)}
         </p>
 
         {settings.custom_blocked && (
@@ -298,15 +353,6 @@ export function LlmSettingsModal({
                   used instead.
                 </p>
               )}
-              {settings.classification_byok &&
-                settings.classification_eligible &&
-                (settings.classifier_backend === "local" ||
-                  settings.classifier_backend === "auto") && (
-                  <p className="text-[10.5px] font-mono text-muted-foreground leading-snug pl-[18px]">
-                    The built-in model sorts most mail on its own -- your key is only used
-                    when it can&apos;t.
-                  </p>
-                )}
             </div>
           )}
 

@@ -5,6 +5,7 @@ import type {
   BackfillResult,
   BucketKey,
   Classification,
+  ClassifierMix,
   Connection,
   CountsResponse,
   Label,
@@ -28,6 +29,7 @@ import {
   mockDeleteConnection,
   mockDeleteLlmSettings,
   mockDeleteThread,
+  mockGetClassifierMix,
   mockGetLlmSettings,
   mockGetLlmUsage,
   mockIngest,
@@ -944,6 +946,15 @@ export async function deleteLlmSettings(): Promise<void> {
 export async function getLlmUsage(days = 30): Promise<LlmUsage> {
   if (USE_MOCK) return mockGetLlmUsage(days);
   return request<LlmUsage>(`/settings/llm/usage?days=${days}`);
+}
+
+// Which classifier labeled the mail this user CURRENTLY has -- point-in-time
+// state, not a time-windowed history (plan §7). Its own endpoint, same
+// reasons as usage above: a plain settings read shouldn't drag this
+// aggregate along, and it only runs while the panel showing it is open.
+export async function getClassifierMix(): Promise<ClassifierMix> {
+  if (USE_MOCK) return mockGetClassifierMix();
+  return request<ClassifierMix>("/settings/llm/classifier-mix");
 }
 
 export { USE_MOCK };

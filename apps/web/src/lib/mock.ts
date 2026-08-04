@@ -6,6 +6,8 @@ import type {
   BackfillOptions,
   BackfillResult,
   BucketKey,
+  ClassifierMix,
+  ClassifierMixEntry,
   Connection,
   CountsResponse,
   Label,
@@ -816,4 +818,22 @@ function buildMockUsage(days: number): LlmUsage {
 
 export function mockGetLlmUsage(days = 30): LlmUsage {
   return buildMockUsage(days);
+}
+
+// Which classifier labeled the mail this demo account "currently has" (plan
+// §7) -- point-in-time state, not a history. Mirrors the plan's own measured
+// production distribution rather than made-up round numbers. Deliberately
+// static and NOT derived from ALL's classification.model_version values --
+// those (makeItems above) don't follow the real classifier's model_version
+// format, so mapping them through the real prefix rules would misfile them.
+// A kind with zero rows is simply absent, same as the real endpoint (a
+// GROUP BY never emits an empty group).
+export function mockGetClassifierMix(): ClassifierMix {
+  const classifier_mix: ClassifierMixEntry[] = [
+    { kind: "local", count: 809 },
+    { kind: "user_key", count: 86 },
+    { kind: "heuristic", count: 11 },
+    { kind: "manual", count: 1 },
+  ];
+  return { classifier_mix };
 }

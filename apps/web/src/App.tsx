@@ -18,6 +18,7 @@ import {
   deleteThread,
   flushDeleteThread,
   getActions,
+  getClassifierMix,
   getCounts,
   getLlmSettings,
   getLlmUsage,
@@ -58,6 +59,7 @@ import type {
   ActionStatus,
   BackfillOptions,
   BucketKey,
+  ClassifierMixEntry,
   Connection,
   IngestOptions,
   Label,
@@ -235,6 +237,13 @@ export default function Console() {
   // background usage keeps moving even when the stored credential hasn't.
   const [llmUsage, setLlmUsage] = useState<LlmUsage | null>(null);
   const [llmUsageError, setLlmUsageError] = useState(false);
+  // Classifier mix (plan §7): which classifier labeled the mail this user
+  // currently has. Same tri-state contract as usage above -- null while in
+  // flight or not yet fetched, a real payload once one lands, a separate
+  // error flag on failure so an outage here never makes the rest of the
+  // settings modal look broken.
+  const [classifierMix, setClassifierMix] = useState<ClassifierMixEntry[] | null>(null);
+  const [classifierMixError, setClassifierMixError] = useState(false);
   // The usage card's own dialog + range selector -- separate from the
   // settings modal above, since it opens independently (palette, or the
   // settings modal's "view usage" button).
@@ -341,6 +350,14 @@ export default function Console() {
   // during an in-flight Test discarded the test's response: no result, no
   // error, just the button settling silently.
   const llmUsageGenRef = useRef(0);
+  // The classifier-mix fetch gets its OWN counter, separate from BOTH of the
+  // above -- reusing llmUsageGenRef here would repeat exactly the bug that
+  // ref's own comment describes (a usage range click silently voiding an
+  // in-flight credential test), just with the mix fetch as the new victim.
+  // A credential save/remove genuinely invalidates an in-flight mix fetch
+  // (the thing being summarized just changed), so those two bump this ref
+  // too -- but nothing else does.
+  const llmMixGenRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const liveSearchRef = useRef<LiveSearchController | null>(null);
 
@@ -673,6 +690,31 @@ export default function Console() {
     [handleSessionExpired],
   );
 
+  // Which classifier labeled the mail this user currently has -- point-in-
+  // time state (plan §7), so unlike usage above there's no "range" to pass
+  // through; always re-fetched on open since it can change any time new mail
+  // is ingested and classified. Guards on llmMixGenRef, its own counter --
+  // see that ref's comment for why it can't share llmUsageGenRef.
+  const refreshClassifierMix = useCallback(async () => {
+    const generation = llmMixGenRef.current;
+    try {
+      const mix = await getClassifierMix();
+      if (generation !== llmMixGenRef.current) return; // superseded mid-flight -- discard
+      setClassifierMix(mix.classifier_mix);
+      setClassifierMixError(false);
+    } catch (e) {
+      if (generation !== llmMixGenRef.current) return; // ditto for a stale failure
+      if (e instanceof ApiError && e.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      // Same rule as usage's own outage handling -- a failure here must never
+      // make the rest of the settings modal look broken.
+      setClassifierMix(null);
+      setClassifierMixError(true);
+    }
+  }, [handleSessionExpired]);
+
   // Opening always starts the modal from a clean test result -- otherwise a
   // stale ok/error from a previous visit would flash before the user does
   // anything this time. If the post-login fetch never landed (settings is
@@ -684,6 +726,7 @@ export default function Console() {
   const openLlmSettings = useCallback(async () => {
     setLlmTestResult(null);
     void refreshLlmUsage(llmUsageDays);
+    void refreshClassifierMix();
     if (!llmSettings) {
       try {
         setLlmSettings(await getLlmSettings());
@@ -697,7 +740,7 @@ export default function Console() {
       }
     }
     setLlmSettingsOpen(true);
-  }, [llmSettings, handleSessionExpired, refreshLlmUsage, llmUsageDays]);
+  }, [llmSettings, handleSessionExpired, refreshLlmUsage, llmUsageDays, refreshClassifierMix]);
 
   // Opens the usage card directly (palette, or the settings modal's "view
   // usage" button) -- same "always refetch, never stale-safe to skip" rule
@@ -743,19 +786,26 @@ export default function Console() {
       } catch (e) {
         toast.error((e as Error).message || "could not save these settings");
       } finally {
-        // The credential may have changed either way -- bump both so any test
-        // AND any usage fetch that started before this save discards its
-        // response when it lands.
+        // The credential may have changed either way -- bump all three so
+        // any test, usage fetch, AND mix fetch that started before this save
+        // discards its response when it lands. A credential change genuinely
+        // invalidates an in-flight mix fetch (the thing it summarizes just
+        // changed), so it's grouped with the credential/usage bumps here --
+        // never with a usage-range-only change.
         llmCredentialGenRef.current++;
         llmUsageGenRef.current++;
+        llmMixGenRef.current++;
         setLlmSaving(false);
       }
       // Refetch only on success, and only after the bump above -- otherwise
       // this fetch would capture the pre-bump generation and immediately
       // discard its own result once the finally block ran.
-      if (saved) void refreshLlmUsage(llmUsageDays);
+      if (saved) {
+        void refreshLlmUsage(llmUsageDays);
+        void refreshClassifierMix();
+      }
     },
-    [refreshLlmUsage, llmUsageDays],
+    [refreshLlmUsage, llmUsageDays, refreshClassifierMix],
   );
 
   const doTestLlmSettings = useCallback(async () => {
@@ -789,16 +839,20 @@ export default function Console() {
     } catch (e) {
       toast.error((e as Error).message || "could not remove this credential");
     } finally {
-      // Same as the save path: a removal invalidates an in-flight test and an
-      // in-flight usage fetch alike.
+      // Same as the save path: a removal invalidates an in-flight test, an
+      // in-flight usage fetch, and an in-flight mix fetch alike.
       llmCredentialGenRef.current++;
       llmUsageGenRef.current++;
+      llmMixGenRef.current++;
       setLlmRemoving(false);
     }
     // Same ordering rule as doSaveLlmSettings: refetch after the generation
     // bump above, and only once the remove actually went through.
-    if (removed) void refreshLlmUsage(llmUsageDays);
-  }, [refreshLlmSettings, refreshLlmUsage, llmUsageDays]);
+    if (removed) {
+      void refreshLlmUsage(llmUsageDays);
+      void refreshClassifierMix();
+    }
+  }, [refreshLlmSettings, refreshLlmUsage, llmUsageDays, refreshClassifierMix]);
 
   // The page-0 reset: always starts over at offset 0 under the current
   // sort/account filter (read from refs so this callback's identity — and
@@ -2953,6 +3007,8 @@ export default function Console() {
           usage={llmUsage}
           usageError={llmUsageError}
           onOpenUsage={openLlmUsage}
+          classifierMix={classifierMix}
+          classifierMixError={classifierMixError}
         />
         <LlmUsageCard
           open={llmUsageOpen}
