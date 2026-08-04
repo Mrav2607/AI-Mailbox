@@ -163,6 +163,7 @@ export default function OnboardingTour({
               : (definition.target ?? "body"),
           placement: resolution?.kind === "center" ? "center" : definition.placement,
           skipBeacon: true,
+          blockTargetInteraction: definition.blockInteraction ?? false,
         };
       }),
     [emptyDetail, emptyThreadList, stepIndex, targetResolution],

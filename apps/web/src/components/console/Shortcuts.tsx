@@ -11,7 +11,7 @@ const ROWS: [string, string][] = [
   ["l then 1 – 6", "relabel focused thread"],
   ["o", "open focused thread in Gmail (Gmail accounts only)"],
   ["/", "search threads (↵ = all buckets)"],
-  ["c", "sort by confidence (asc ↔ desc)"],
+  ["c", "cycle sort: recent · conf ↑ · conf ↓ · account"],
   ["[ / ]", "toggle sidebar / detail pane"],
   ["#", "delete focused thread"],
   ["r", "re-fetch list + overview (clears the new-mail pill)"],

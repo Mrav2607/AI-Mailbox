@@ -18,6 +18,7 @@ export interface TourDeps {
   setBucket: (slug: BucketKey) => void;
   setIngestOpen: (open: boolean) => void;
   setAccountsOpen: (open: boolean) => void;
+  showBucketsView: () => void;
   snapshotPanels: () => Panels;
   restorePanels: (snapshot: Panels) => void;
 }
@@ -58,6 +59,9 @@ export function enforceTourPreconditions(
     switch (precondition) {
       case "show-sidebar":
         deps.showPanel("sidebar");
+        break;
+      case "show-buckets-view":
+        deps.showBucketsView();
         break;
       case "select-needs-reply":
         deps.setBucket("needs_reply");

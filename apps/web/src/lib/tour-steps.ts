@@ -1,5 +1,6 @@
 export type TourPrecondition =
   | "show-sidebar"
+  | "show-buckets-view"
   | "select-needs-reply"
   | "show-detail"
   | "show-prediction"
@@ -21,6 +22,10 @@ export interface TourStepDefinition {
   preconditions: TourPrecondition[];
   fallback: TourFallback;
   placement: "auto";
+  // Maps to Joyride's per-step blockTargetInteraction — OnboardingTour.tsx
+  // consumes it. Only set where clicking the spotlighted target would jump
+  // the app out from under the step.
+  blockInteraction?: boolean;
 }
 
 export type TourTargetResolution =
@@ -52,7 +57,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
     title: "Focus a bucket",
     body: "Needs reply is the default starting point. Select any bucket here, or use the number keys for a faster jump.",
     target: '[data-tour="bucket-needs_reply"]',
-    preconditions: ["show-sidebar", "select-needs-reply"],
+    preconditions: ["show-sidebar", "show-buckets-view", "select-needs-reply"],
     fallback: {
       kind: "target",
       selector: '[data-tour="bucket-sidebar"]',
@@ -61,12 +66,26 @@ export const TOUR_STEPS: TourStepDefinition[] = [
     placement: "auto",
   },
   {
+    slug: "agenda",
+    title: "Your agenda",
+    body: "CortexMail pulls real to-dos out of your mail — deadlines, payments, RSVPs — and lines them up here across all your accounts, most urgent first. After the tour, use the 0 key to flip between the agenda and your buckets.",
+    target: '[data-tour="agenda-entry"]',
+    preconditions: ["show-sidebar"],
+    fallback: {
+      kind: "target",
+      selector: '[data-tour="bucket-sidebar"]',
+      otherwise: "skip",
+    },
+    placement: "auto",
+    blockInteraction: true,
+  },
+  {
     slug: "threads",
     title: "Your threads",
-    body: "Threads in the selected bucket appear here. Move through them with j and k, then press Enter to open the focused conversation.",
+    body: "Threads in the selected bucket appear here. Move through them with j and k, then press Enter to open the focused conversation. Unread conversations render bold, and x selects several threads at once for batch actions.",
     emptyBody: "Once you ingest mail, threads in the selected bucket land here. You can move through them with j and k.",
     target: '[data-tour="thread-list"]',
-    preconditions: [],
+    preconditions: ["show-buckets-view"],
     fallback: { kind: "center" },
     placement: "auto",
   },
@@ -75,7 +94,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
     title: "Search & filter",
     body: "Typing filters the loaded bucket immediately, then searches every bucket after a short pause. Press Enter to search now — across all accounts, or only the one you've filtered to.",
     target: '[data-tour="search"]',
-    preconditions: [],
+    preconditions: ["show-buckets-view"],
     fallback: { kind: "skip" },
     placement: "auto",
   },
@@ -84,7 +103,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
     title: "Sort",
     body: "Cycle between recent-first, confidence, and by-account order here, or press c while the console has focus.",
     target: '[data-tour="sort"]',
-    preconditions: [],
+    preconditions: ["show-buckets-view"],
     fallback: { kind: "skip" },
     placement: "auto",
   },
@@ -119,7 +138,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
   {
     slug: "layout-theme",
     title: "Layout & theme",
-    body: "Move the sidebar and reading pane with Layout. The adjacent theme control cycles system, light, and dark modes.",
+    body: "Move the sidebar and reading pane with Layout. Row density and text size live in the same popover. The adjacent theme control cycles system, light, and dark modes.",
     target: '[data-tour="layout"]',
     preconditions: [],
     fallback: { kind: "center" },
@@ -133,6 +152,19 @@ export const TOUR_STEPS: TourStepDefinition[] = [
     preferredTarget: '[data-tour="accounts-panel"]',
     preconditions: ["open-accounts"],
     fallback: { kind: "center" },
+    placement: "auto",
+  },
+  {
+    slug: "ai-settings",
+    title: "AI extraction & your key",
+    body: "The agenda is powered by an AI model. After the tour, this is where you add your own key from OpenAI, Gemini, OpenRouter, Groq, or Mistral, see how much it gets used, and — where your server supports it — let it sort incoming mail too.",
+    target: '[data-tour="llm-settings"]',
+    preconditions: ["open-accounts"],
+    fallback: {
+      kind: "target",
+      selector: '[data-tour="accounts-panel"]',
+      otherwise: "center",
+    },
     placement: "auto",
   },
   {

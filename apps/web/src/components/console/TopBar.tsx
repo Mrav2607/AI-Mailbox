@@ -418,6 +418,7 @@ function AccountsMenu({
   onConnectGmail,
   onConnectOutlook,
   onOpenLlmSettings,
+  actionsLocked,
 }: {
   connections: Connection[];
   health: SyncHealth | null;
@@ -425,13 +426,17 @@ function AccountsMenu({
   onConnectGmail: () => void;
   onConnectOutlook?: () => void;
   onOpenLlmSettings: () => void;
+  // Mirrors the popover's own lockOpen: while the tour is anchored here, a
+  // click on any of these buttons must not stack a modal or fire an
+  // OAuth redirect / disconnect underneath it.
+  actionsLocked?: boolean;
 }) {
   // Two-step confirm: first click arms it, second fires. Armed state lives
   // here (not lifted) so it resets for free whenever the popover closes.
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const accounts = health?.accounts ?? [];
   return (
-    <div className="space-y-2.5">
+    <div className="flex flex-col max-h-[min(60vh,calc(100vh-8rem))] space-y-2.5">
       <div className={fieldLabel}>connected accounts</div>
       {connections.length === 0 ? (
         <p className="text-[11px] text-muted-foreground font-mono">
@@ -439,7 +444,7 @@ function AccountsMenu({
         </p>
       ) : (
         <ul
-          className="space-y-1.5"
+          className="min-h-0 flex-1 overflow-y-auto space-y-1.5"
           // Escape hatch: a click anywhere else in the list disarms an armed
           // confirm. The disconnect button stops its own click from bubbling
           // here, so arming/confirming a row doesn't immediately undo itself.
@@ -469,6 +474,7 @@ function AccountsMenu({
                   </span>
                   <button
                     type="button"
+                    disabled={actionsLocked}
                     onClick={(e) => {
                       // Don't let this reach the list's onClick, which
                       // disarms on any click outside the button itself.
@@ -512,6 +518,7 @@ function AccountsMenu({
       )}
       <button
         type="button"
+        disabled={actionsLocked}
         onClick={onConnectGmail}
         className="w-full h-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
       >
@@ -520,6 +527,7 @@ function AccountsMenu({
       {onConnectOutlook && (
         <button
           type="button"
+          disabled={actionsLocked}
           onClick={onConnectOutlook}
           className="w-full h-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
         >
@@ -528,6 +536,8 @@ function AccountsMenu({
       )}
       <button
         type="button"
+        data-tour="llm-settings"
+        disabled={actionsLocked}
         onClick={onOpenLlmSettings}
         className="w-full h-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
       >
@@ -747,6 +757,7 @@ export function TopBar({
             onConnectGmail={onConnectGmail}
             onConnectOutlook={onConnectOutlook}
             onOpenLlmSettings={onOpenLlmSettings}
+            actionsLocked={accountsLocked}
           />
         </Popover>
       </div>

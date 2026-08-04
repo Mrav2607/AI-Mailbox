@@ -7,7 +7,7 @@ Rules for reviewing changes in this repo, human or automated. The goal is precis
 - Only report findings with a concrete failure scenario (inputs/state → wrong outcome). Cite `file:line`. Rank by severity.
 - No style commentary — ruff and oxlint are enforced; if they pass, style is settled.
 - Verify a suspected bug against actual call sites before reporting it. Most "bugs" here are documented invariants (below).
-- Don't propose rewrites of working code, cursor pagination, new dependencies, or component-render test infra (none exists; web tests are lib-module tests by design).
+- Don't propose rewrites of working code, cursor pagination, or a testing-library dependency — the web repo's render tests are plain jsdom + `react-dom/client` (see `use-onboarding-tour.render.test.tsx`, `Popover.test.tsx`), not testing-library, by design.
 - Tests are deterministic and offline: MagicMock/monkeypatch doubles, compiled-statement string assertions, no DB or network fixtures. Do NOT request integration/DB tests; live migration round-trips are run outside CI.
 
 ## Deliberate designs — do not flag these as defects
