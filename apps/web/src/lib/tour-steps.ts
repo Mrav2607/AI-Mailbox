@@ -85,14 +85,18 @@ export const TOUR_STEPS: TourStepDefinition[] = [
     body: "Threads in the selected bucket appear here. Move through them with j and k, then press Enter to open the focused conversation. Unread conversations render bold, and x selects several threads at once for batch actions.",
     emptyBody: "Once you ingest mail, threads in the selected bucket land here. You can move through them with j and k.",
     target: '[data-tour="thread-list"]',
-    preconditions: ["show-buckets-view"],
+    // show-detail isn't about the reading pane yet — with it closed the thread
+    // list fills the viewport, and a spotlight that big leaves no side for the
+    // tooltip, which ends up pushed off-screen. Opening the pane restores the
+    // layout this copy narrates; the panel snapshot puts it back at tour end.
+    preconditions: ["show-buckets-view", "show-detail"],
     fallback: { kind: "center" },
     placement: "auto",
   },
   {
     slug: "search",
     title: "Search & filter",
-    body: "Typing filters the loaded bucket immediately, then searches every bucket after a short pause. Press Enter to search now — across all accounts, or only the one you've filtered to.",
+    body: "Typing filters the loaded bucket immediately, then searches every bucket after a short pause. Press Enter to search across all accounts, or only the one you've filtered to.",
     target: '[data-tour="search"]',
     preconditions: ["show-buckets-view"],
     fallback: { kind: "skip" },
@@ -157,7 +161,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
   {
     slug: "ai-settings",
     title: "AI extraction & your key",
-    body: "The agenda is powered by an AI model. After the tour, this is where you add your own key from OpenAI, Gemini, OpenRouter, Groq, or Mistral, see how much it gets used, and — where your server supports it — let it sort incoming mail too.",
+    body: "The agenda is powered by an AI model. After the tour, this is where you add your own key from OpenAI, Gemini, OpenRouter, Groq, or Mistral, see how much it gets used, and optionally let it sort incoming mail too.",
     target: '[data-tour="llm-settings"]',
     preconditions: ["open-accounts"],
     fallback: {
