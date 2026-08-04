@@ -224,7 +224,7 @@ def test_classify_backend_gemini_is_an_alias_for_llm(monkeypatch):
 
     reached = []
 
-    def _spy(text, routing=None):
+    def _spy(text, routing=None, local_tried=False):
         reached.append(text)
         return ClassificationAttempt(
             verdict=("fyi", 0.9, "spy", "spy-v1"),
@@ -351,9 +351,12 @@ def test_classify_routing_user_mode_with_no_credential_falls_back_to_heuristic(m
 
 
 def test_classify_routing_user_mode_falls_back_to_heuristic_on_call_error(monkeypatch):
-    from app.services.nlp import classifier
+    # Forces the encoder unavailable so this pins the "nothing can serve"
+    # tail of D2's fallback chain -- case 9 covers the encoder-available half.
+    from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
     credential = LlmCredential(
         provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
     )
@@ -371,9 +374,12 @@ def test_classify_routing_user_mode_falls_back_to_heuristic_on_call_error(monkey
 
 
 def test_classify_routing_user_mode_falls_back_to_heuristic_on_unparseable_response(monkeypatch):
-    from app.services.nlp import classifier
+    # Forces the encoder unavailable so this pins the "nothing can serve"
+    # tail of D2's fallback chain -- case 10 covers the encoder-available half.
+    from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
     credential = LlmCredential(
         provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
     )
@@ -577,10 +583,12 @@ def test_classify_with_usage_user_mode_counts_the_call_even_when_content_is_unpa
     """The one a future refactor is most likely to break: the provider
     answered (and billed the user) even though its content didn't parse, so
     the provider-reported usage still has to survive on `attempt.usage` --
-    only the verdict falls back to the heuristic label."""
-    from app.services.nlp import classifier
+    regardless of whether the fallback verdict ends up served by the local
+    encoder or (forced unavailable here) keyword rules, per D3."""
+    from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
     credential = LlmCredential(
         provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
     )
@@ -615,3 +623,350 @@ def test_classify_with_usage_server_path_success_reports_call_but_no_usage(monke
         assert attempt.provider_call_succeeded is True
         assert attempt.usage is None
         assert attempt.verdict[3] == "gemini-2.5-flash"
+
+
+# ---------------------------------------------------------------------------
+# BYOK classification precedence plan (2026-08-04), §5 cases 1-14: explicit
+# vs. default `backend`, D1a's "explicit local never reaches an LLM", and
+# D2/D2a's local-encoder-before-heuristic failure fallback gated by
+# `local_tried` so the encoder is never attempted twice in one call.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_default_backend_user_mode_never_consults_local_encoder(monkeypatch):
+    """Case 1: the global default (backend not passed for this run) sends an
+    opted-in user straight to their key -- the local encoder is never even
+    asked, so a deployment defaulting to local/auto (today's
+    CLASSIFIER_BACKEND default) still honors the opt-in instead of
+    classifying that mail for free."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(local_model, "try_predict", _explode)
+
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+    )
+    content = json.dumps({"label": "fyi", "confidence": 0.8, "rationale": "r"})
+    monkeypatch.setattr(
+        classifier, "call_chat_completion", lambda *a, **k: LlmCallResult(content=content, usage=None)
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify("hi", routing=routing)
+    assert model_version == "openai:gpt-4o-mini"
+
+
+def test_classify_default_backend_server_mode_uses_encoder(monkeypatch):
+    """Case 2 (regression guard, already holds today): default backend +
+    mode="server" still prefers a healthy local encoder over the operator's
+    key."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(
+        local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test")
+    )
+    monkeypatch.setattr(classifier, "_genai_client", _explode)
+
+    routing = ClassificationRouting(mode="server", credential=None)
+    label, confidence, rationale, model_version = classify("hi", routing=routing)
+    assert model_version == "local:test"
+
+
+def test_classify_default_backend_off_mode_uses_encoder(monkeypatch):
+    """Case 3 (regression guard, already holds today): default backend +
+    mode="off" still uses the encoder and never calls an LLM."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(
+        local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test")
+    )
+    monkeypatch.setattr(classifier, "call_chat_completion", _explode)
+    monkeypatch.setattr(classifier, "_genai_client", _explode)
+
+    routing = ClassificationRouting(mode="off", credential=None)
+    label, confidence, rationale, model_version = classify("hi", routing=routing)
+    assert model_version == "local:test"
+
+
+def test_classify_default_backend_no_routing_uses_encoder(monkeypatch):
+    """Case 4 (regression guard, pre-BYOK parity): default backend +
+    routing=None (a caller that never passes routing at all) still uses the
+    encoder."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(
+        local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test")
+    )
+    monkeypatch.setattr(classifier, "call_chat_completion", _explode)
+
+    label, confidence, rationale, model_version = classify("hi")
+    assert model_version == "local:test"
+
+
+def test_classify_explicit_local_user_mode_encoder_available_never_spends_key(monkeypatch):
+    """Case 5: explicit backend="local" always tries the encoder first, even
+    for an opted-in user -- it's available here, so the key is never
+    touched."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(
+        local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test")
+    )
+    monkeypatch.setattr(classifier, "call_chat_completion", _explode)
+
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify("hi", backend="local", routing=routing)
+    assert model_version == "local:test"
+
+
+def test_classify_explicit_local_user_mode_encoder_unavailable_stops_at_heuristic(monkeypatch):
+    """Case 6 (D1a -- the blocker case v2's test set missed): explicit
+    backend="local" with an unavailable encoder must stop at keyword rules,
+    opted-in user or not -- it must NEVER reach an LLM. model_version is the
+    direct "heuristic-v1" stamp, not "-fallback", since no call was ever
+    attempted."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
+    monkeypatch.setattr(classifier, "call_chat_completion", _explode)
+    monkeypatch.setattr(classifier, "_genai_client", _explode)
+
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify(
+        "Security alert: new login detected", backend="local", routing=routing
+    )
+    assert label == "security_alert"
+    assert model_version == "heuristic-v1"
+
+
+def test_classify_explicit_auto_encoder_unavailable_user_mode_reaches_llm(monkeypatch):
+    """Case 7: unlike explicit "local", explicit backend="auto" retains the
+    local-first, LLM-on-failure order. With the encoder unavailable, it
+    falls through to the user's key -- and threads local_tried=True into
+    the LLM dispatch, since the encoder was already tried once (D2a). Spies
+    on `_classify_llm`'s own call signature rather than the end-to-end
+    result: with the encoder already unavailable, main's dispatch and this
+    fix's dispatch reach the LLM the same way on a *success*, so only the
+    `local_tried` flag distinguishes them -- a plain result-equality
+    assertion here would pass on unfixed code too and prove nothing."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
+    credential = LlmCredential(
+        provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
+    )
+    captured = {}
+
+    def spy(text, routing=None, local_tried=False):
+        captured["local_tried"] = local_tried
+        captured["routing"] = routing
+        return ClassificationAttempt(
+            verdict=("promotional", 0.7, "sale", "spy-v1"),
+            provider_call_succeeded=True,
+            usage=None,
+        )
+
+    monkeypatch.setattr(classifier, "_classify_llm", spy)
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify(
+        "50% off this weekend!", backend="auto", routing=routing
+    )
+    assert model_version == "spy-v1"
+    assert captured["routing"] is routing
+    assert captured["local_tried"] is True
+
+
+def test_classify_explicit_llm_user_mode_calls_the_key(monkeypatch):
+    """Case 8 (regression guard, already holds today): explicit
+    backend="llm" + mode="user" behaves exactly as before -- straight to the
+    user's key."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier, "_genai_client", _explode)
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+    )
+    content = json.dumps({"label": "spam", "confidence": 0.9, "rationale": "scam"})
+    monkeypatch.setattr(
+        classifier, "call_chat_completion", lambda *a, **k: LlmCallResult(content=content, usage=None)
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify(
+        "You won a prize!", backend="llm", routing=routing
+    )
+    assert label == "spam"
+    assert model_version == "openai:gpt-4o-mini"
+
+
+def test_classify_user_key_call_error_falls_back_to_encoder_not_heuristic(monkeypatch):
+    """Case 9 (D2): a transient provider error on a BYOK call now falls back
+    to the local encoder, not straight to keyword rules -- an opted-in user
+    with a flaky provider shouldn't get worse labels than someone who never
+    opted in."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(
+        local_model, "try_predict", lambda text: ("fyi", 0.6, "local rationale", "local:test")
+    )
+
+    def failing_call(*args, **kwargs):
+        raise LlmCallError("connection_failed", None)
+
+    monkeypatch.setattr(classifier, "call_chat_completion", failing_call)
+    credential = LlmCredential(
+        provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    attempt = classify_with_usage(
+        "Security alert: new login detected", backend="llm", routing=routing
+    )
+    assert attempt.verdict == ("fyi", 0.6, "local rationale", "local:test")
+    assert attempt.provider_call_succeeded is False  # the call never reached the provider
+    assert attempt.usage is None
+
+
+def test_classify_user_key_malformed_response_falls_back_to_encoder(monkeypatch):
+    """Case 10 (D2): a malformed BYOK response also falls back to the local
+    encoder before keyword rules. provider_call_succeeded/usage still
+    reflect that the provider answered and billed the user (D3) -- only the
+    verdict's source changes."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(
+        local_model, "try_predict",
+        lambda text: ("action_required", 0.6, "local rationale", "local:test"),
+    )
+    usage = LlmUsage(prompt_tokens=50, completion_tokens=None, total_tokens=None)
+    monkeypatch.setattr(
+        classifier, "call_chat_completion",
+        lambda *a, **k: LlmCallResult(content="not json at all", usage=usage),
+    )
+    credential = LlmCredential(
+        provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    attempt = classify_with_usage("Invoice #1842 is due Friday", backend="llm", routing=routing)
+    assert attempt.verdict == ("action_required", 0.6, "local rationale", "local:test")
+    assert attempt.provider_call_succeeded is True
+    assert attempt.usage is usage
+
+
+def test_classify_user_key_failure_with_encoder_unavailable_uses_heuristic_fallback(monkeypatch):
+    """Case 11 (regression guard, already holds today): when the encoder
+    can't serve either, the failure paths land on keyword rules exactly as
+    before, stamped "heuristic-fallback" -- the encoder attempt happened but
+    came up empty, unlike case 6's "never even attempted" heuristic-v1."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
+
+    def failing_call(*args, **kwargs):
+        raise LlmCallError("connection_failed", None)
+
+    monkeypatch.setattr(classifier, "call_chat_completion", failing_call)
+    credential = LlmCredential(
+        provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify(
+        "Security alert: new login detected", backend="llm", routing=routing
+    )
+    assert label == "security_alert"
+    assert model_version == "heuristic-fallback"
+
+
+def test_classify_explicit_auto_failure_path_tries_local_encoder_at_most_once(monkeypatch):
+    """Case 12 (D2a): under explicit backend="auto" the encoder is already
+    attempted once before the LLM call. If the LLM call then also fails, the
+    failure handler must NOT attempt the encoder a second time -- its load
+    path is expensive (unbounded torch/transformers import + model load) and
+    D2a says never twice per call."""
+    from app.services.nlp import classifier, local_model
+
+    calls = []
+
+    def counting_try_predict(text):
+        calls.append(1)
+        return None
+
+    monkeypatch.setattr(local_model, "try_predict", counting_try_predict)
+
+    def failing_call(*args, **kwargs):
+        raise LlmCallError("connection_failed", None)
+
+    monkeypatch.setattr(classifier, "call_chat_completion", failing_call)
+    credential = LlmCredential(
+        provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify(
+        "Security alert: new login detected", backend="auto", routing=routing
+    )
+    assert model_version == "heuristic-fallback"
+    assert len(calls) == 1
+
+
+def test_classify_with_usage_provider_call_succeeded_matches_whether_provider_answered(monkeypatch):
+    """Case 13 (D3, regression guard): provider_call_succeeded/usage reflect
+    whether the LLM call reached the provider, not what ultimately produced
+    the verdict. usage.py returns early when provider_call_succeeded is
+    False, so an LlmCallError never emits a usage row while a malformed
+    response does -- unaffected by whether the encoder or keyword rules
+    served the fallback label."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
+    credential = LlmCredential(
+        provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+
+    def failing_call(*args, **kwargs):
+        raise LlmCallError("connection_failed", None)
+
+    monkeypatch.setattr(classifier, "call_chat_completion", failing_call)
+    attempt = classify_with_usage(
+        "Security alert: new login detected", backend="llm", routing=routing
+    )
+    assert attempt.provider_call_succeeded is False
+    assert attempt.usage is None
+
+    usage = LlmUsage(prompt_tokens=50, completion_tokens=None, total_tokens=None)
+    monkeypatch.setattr(
+        classifier, "call_chat_completion",
+        lambda *a, **k: LlmCallResult(content="not json at all", usage=usage),
+    )
+    attempt = classify_with_usage("Invoice #1842 is due Friday", backend="llm", routing=routing)
+    assert attempt.provider_call_succeeded is True
+    assert attempt.usage is usage
+
+
+def test_classify_explicit_auto_user_mode_encoder_available_wins_over_key(monkeypatch):
+    """Case 14: explicit backend="auto" with a HEALTHY encoder wins over an
+    opted-in user's key -- this is the case that distinguishes the default
+    path (case 1, where the opt-in always wins) from an explicit per-run
+    "auto" override, which retains the local-first order even for an
+    opted-in user. The existing suite never covered the encoder-AVAILABLE
+    half of this; it only had the encoder-unavailable fallthrough."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(
+        local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test")
+    )
+    monkeypatch.setattr(classifier, "call_chat_completion", _explode)
+
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify("hi", backend="auto", routing=routing)
+    assert model_version == "local:test"
