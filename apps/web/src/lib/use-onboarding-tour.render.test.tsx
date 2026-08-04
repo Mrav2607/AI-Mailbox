@@ -168,13 +168,18 @@ describe("useOnboardingTour rendered lifecycle", () => {
     expect(api!.lockedPopover).toBe("accounts");
   });
 
-  it("entering threads closes both popovers and switches to buckets view", () => {
+  it("entering threads closes both popovers, switches to buckets view, and opens the detail pane", () => {
     start();
     goTo(SEARCH_INDEX);
     calls.length = 0;
 
     goTo(THREADS_INDEX, -1);
-    expect(calls).toEqual(["ingest:false", "accounts:false", "view:buckets"]);
+    expect(calls).toEqual([
+      "ingest:false",
+      "accounts:false",
+      "view:buckets",
+      "show:detail",
+    ]);
   });
 
   it("entering agenda closes both popovers and shows the sidebar", () => {
