@@ -115,8 +115,10 @@ export interface ActionsResponse {
 }
 
 // Classifier backends an operator can pick per run. "local" = fine-tuned
-// encoder, "gemini" = hosted LLM, "heuristic" = keyword rules.
-export type ClassifierBackend = "local" | "gemini" | "heuristic";
+// encoder, "llm" = whichever provider the routing resolves to (the user's own
+// key when they've opted in, otherwise the operator's), "heuristic" = keyword
+// rules. Was "gemini"; the API still accepts that spelling as an alias.
+export type ClassifierBackend = "local" | "llm" | "heuristic";
 
 export interface IngestOptions {
   maxResults: number;
@@ -231,6 +233,11 @@ export interface LlmSettings {
   // credential still isn't called when the local encoder handles a message
   // or the backend is heuristic.
   classification_eligible: boolean;
+  // Would picking the "llm" backend for a run actually reach an LLM? True when
+  // this user's key is eligible OR the operator has a server key. Server-derived
+  // because `classification_eligible` alone can't tell "the operator pays" from
+  // "this silently falls back to keyword rules".
+  classification_llm_usable: boolean;
 }
 
 // POST /settings/llm/test response. `error` is one of the extractor's

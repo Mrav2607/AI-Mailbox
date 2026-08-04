@@ -101,6 +101,10 @@ def _settings_payload(
         "classifier_uses_llm": backend != "heuristic",
         "classifier_backend": backend,
         "classification_eligible": classification_eligible,
+        # Mirrors `_classify_llm`'s own precedence: the user's key when their
+        # routing resolves to "user", otherwise the operator's server key,
+        # otherwise nothing to call and the path degrades to heuristic.
+        "classification_llm_usable": classification_eligible or bool(settings.gemini_api_key),
     }
 
 
@@ -477,6 +481,7 @@ async def put_llm_settings(
     # preset provider -- and both are already guaranteed above (a `custom`
     # provider always leaves `classification_byok` false here).
     backend = _effective_backend()
+    eligible = bool(row.classification_byok) and row.provider in PROVIDER_PRESETS
     return {
         "configured": True,
         "provider": row.provider,
@@ -492,9 +497,10 @@ async def put_llm_settings(
         "classification_byok": bool(row.classification_byok),
         "classifier_uses_llm": backend != "heuristic",
         "classifier_backend": backend,
-        "classification_eligible": (
-            bool(row.classification_byok) and row.provider in PROVIDER_PRESETS
-        ),
+        "classification_eligible": eligible,
+        # Same precedence as _settings_payload's: this user's key, else the
+        # operator's, else nothing to call.
+        "classification_llm_usable": eligible or bool(settings.gemini_api_key),
     }
 
 

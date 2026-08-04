@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   BrainCircuit,
   Loader2,
@@ -70,6 +70,10 @@ interface Props {
   onConnectOutlook?: () => void;
   onDisconnect: (connectionId: string) => void;
   onOpenLlmSettings: () => void;
+  // Would picking the "llm" backend actually reach an LLM? null while the
+  // settings fetch is in flight -- an unloaded fetch must not disable the
+  // option, since "we don't know yet" isn't "you can't".
+  llmUsable: boolean | null;
   // Set while the tour is anchored to the matching popover — user-originated
   // closes are ignored until the tour itself moves on.
   ingestLocked?: boolean;
@@ -84,7 +88,7 @@ const THEME_ICONS: Record<ThemePref, typeof Sun> = {
 
 const BACKENDS: { value: ClassifierBackend; label: string }[] = [
   { value: "local", label: "local encoder" },
-  { value: "gemini", label: "gemini (LLM)" },
+  { value: "llm", label: "LLM" },
   { value: "heuristic", label: "heuristic" },
 ];
 
@@ -261,10 +265,14 @@ function BackfillForm({
   busy,
   currentBucket,
   onSubmit,
+  llmUsable,
+  onOpenLlmSettings,
 }: {
   busy: boolean;
   currentBucket: BucketKey;
   onSubmit: (o: BackfillOptions) => void;
+  llmUsable: boolean | null;
+  onOpenLlmSettings: () => void;
 }) {
   // Same string-state trick as IngestForm: parse/clamp on submit so a cleared
   // field never submits NaN.
@@ -273,6 +281,13 @@ function BackfillForm({
     currentBucket === "done" ? "all" : currentBucket,
   );
   const [backend, setBackend] = useState<ClassifierBackend>("local");
+  // Only false disables -- null means the settings fetch hasn't landed.
+  const llmBlocked = llmUsable === false;
+  // If settings land after the user already picked LLM, snap back rather than
+  // submit a run that would silently classify with keyword rules instead.
+  useEffect(() => {
+    if (llmBlocked && backend === "llm") setBackend("local");
+  }, [llmBlocked, backend]);
   const labeled = bucket !== "unclassified" && bucket !== "all";
   // A labeled bucket is already classified, so re-running it needs force.
   const [force, setForce] = useState(labeled);
@@ -313,11 +328,28 @@ function BackfillForm({
           className={control}
         >
           {BACKENDS.map((b) => (
-            <option key={b.value} value={b.value}>
-              {b.label}
+            <option
+              key={b.value}
+              value={b.value}
+              disabled={b.value === "llm" && llmBlocked}
+            >
+              {b.value === "llm" && llmBlocked ? "LLM (needs your key)" : b.label}
             </option>
           ))}
         </select>
+        {llmBlocked && (
+          <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+            The LLM needs a key. Add yours and turn on mail sorting in{" "}
+            <button
+              type="button"
+              onClick={onOpenLlmSettings}
+              className="text-primary underline underline-offset-2 cursor-pointer"
+            >
+              AI settings
+            </button>
+            .
+          </p>
+        )}
       </label>
       <label className="block space-y-1">
         <span className={fieldLabel}>how many (1–500)</span>
@@ -538,6 +570,7 @@ export function TopBar({
   onConnectOutlook,
   onDisconnect,
   onOpenLlmSettings,
+  llmUsable,
   ingestLocked,
   accountsLocked,
 }: Props) {
@@ -637,6 +670,11 @@ export function TopBar({
           <BackfillForm
             busy={backfilling}
             currentBucket={currentBucket}
+            llmUsable={llmUsable}
+            onOpenLlmSettings={() => {
+              onBackfillOpenChange(false);
+              onOpenLlmSettings();
+            }}
             onSubmit={(o) => {
               onBackfillOpenChange(false);
               onBackfill(o);

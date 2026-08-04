@@ -431,6 +431,10 @@ describe("mock llm settings", () => {
     // deleting a credential.
     expect(settings.classification_byok).toBe(false);
     expect(settings.classification_eligible).toBe(false);
+    // Preview has no operator key, so removing the credential leaves nothing
+    // for the LLM backend to call -- the backfill form reads this to disable
+    // that option instead of letting it silently fall back to keyword rules.
+    expect(settings.classification_llm_usable).toBe(false);
     expect(settings.classifier_uses_llm).toBe(true);
     expect(settings.classifier_backend).toBe("auto");
   });

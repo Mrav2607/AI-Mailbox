@@ -584,8 +584,12 @@ export function mockBackfill(opts: BackfillOptions): BackfillResult {
   const version =
     backend === "local"
       ? "local:email-classifier"
-      : backend === "gemini"
-        ? "gemini-2.5-flash"
+      : backend === "llm"
+        ? // The real API stamps whichever model the resolved credential names,
+          // so read the currently-configured one rather than a fixed string --
+          // otherwise a backfill run after changing the model in settings would
+          // still report the old one.
+          (LLM_SETTINGS.model ?? "llm")
         : "heuristic-v1";
 
   let created = 0;
@@ -635,6 +639,10 @@ let LLM_SETTINGS: LlmSettings = {
   classifier_uses_llm: true,
   classifier_backend: "auto",
   classification_eligible: true,
+  // Preview has no operator key, so this tracks eligibility exactly -- which
+  // also lets the demo show the backfill form's disabled-LLM state when you
+  // untick the classification opt-in.
+  classification_llm_usable: true,
 };
 
 export function mockGetLlmSettings(): LlmSettings {
@@ -680,6 +688,7 @@ export function mockPutLlmSettings(input: {
     fallback_active: false,
     classification_byok: classificationByok,
     classification_eligible: input.provider === "custom" ? false : classificationByok,
+    classification_llm_usable: input.provider === "custom" ? false : classificationByok,
   };
   return { ...LLM_SETTINGS };
 }
@@ -714,6 +723,7 @@ export function mockDeleteLlmSettings(): void {
     classifier_uses_llm: LLM_SETTINGS.classifier_uses_llm,
     classifier_backend: LLM_SETTINGS.classifier_backend,
     classification_eligible: false,
+    classification_llm_usable: false,
   };
 }
 

@@ -188,8 +188,8 @@ export function LlmUsageCard({ open, onOpenChange, usage, usageError, days, onDa
           AI usage
         </DialogTitle>
         <p className="text-[11px] font-mono text-muted-foreground leading-relaxed">
-          Usage, not billing — calls and tokens your account's background AI
-          use made, across whatever key or provider was configured at the time.
+          Your account&apos;s background AI usage, tracked across whatever key
+          or provider was configured at the time.
         </p>
 
         <div className="flex items-center gap-1" role="group" aria-label="usage window">
