@@ -589,11 +589,27 @@ export default function Console() {
     // user refreshes.
     seenRef.current = user ? loadSeen(user.id) : new Map();
     setSeenVersion((v) => v + 1);
-    // The classifier mix counts THIS account's mail, so it must not survive a
-    // switch to another one. Bumping the ref too discards any fetch already in
-    // flight for the previous account, which would otherwise land afterwards
-    // and render the old account's numbers.
+    // Every piece of LLM state below belongs to ONE account, so none of it may
+    // survive a switch to another. Logging out is setToken(null)+setUser(null)
+    // with no reload and Console never remounts, so without this the next
+    // person to sign in on this tab inherits it all.
+    //
+    // llmSettings is the one that actually bites: openLlmSettings only fetches
+    // `if (!llmSettings)`, so a stale value isn't a brief flash before the real
+    // one lands -- it's what the panel shows until a save, remove, or test
+    // happens to refresh it. That panel renders `key_suffix`, the last four
+    // characters of the previous account's API key.
+    //
+    // Bumping each generation ref discards any fetch already in flight for the
+    // old account, which would otherwise land after this clear and put the same
+    // data straight back.
+    llmCredentialGenRef.current++;
+    llmUsageGenRef.current++;
     llmMixGenRef.current++;
+    setLlmSettings(null);
+    setLlmUsage(null);
+    setLlmUsageError(false);
+    setLlmTestResult(null);
     setClassifierMix(null);
     setClassifierMixError(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
