@@ -155,7 +155,12 @@ export function useLlmPanel({ userId, deps }: UseLlmPanelOptions) {
   // range click reaching into an unrelated in-flight credential test.
   const refreshLlmUsage = useCallback(
     async (days: number) => {
-      const generation = llmUsageGenRef.current;
+      // Claim a new generation up front rather than reading the current one:
+      // openLlmSettings and openLlmUsage (or the post-save refetch) can start
+      // overlapping usage fetches, and without this both would read the same
+      // value, so an older response landing second overwrites a newer one.
+      // Bumping here makes the most recent caller the only winner.
+      const generation = ++llmUsageGenRef.current;
       try {
         const usage = await deps.getLlmUsage(days);
         if (generation !== llmUsageGenRef.current) return; // superseded mid-flight -- discard

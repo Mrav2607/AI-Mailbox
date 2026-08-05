@@ -2,6 +2,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
+import { ApiError } from "@/lib/api";
 import type {
   ClassifierMixEntry,
   LlmProvider,
@@ -159,6 +160,40 @@ describe("useLlmPanel rendered lifecycle", () => {
     expect(api!.llmTesting).toBe(false);
   });
 
+  it("an overlapping refreshLlmUsage call resolving last does not overwrite the newer result", async () => {
+    const older = deferred<LlmUsage>();
+    const newer = deferred<LlmUsage>();
+    const usageCalls = [older, newer];
+    let usageCallIndex = 0;
+    deps.getLlmUsage = vi.fn(() => usageCalls[usageCallIndex++]!.promise);
+
+    // Two overlapping fetches, e.g. openLlmSettings' own usage fetch
+    // followed by openLlmUsage's before the first settles.
+    await act(async () => {
+      void api!.refreshLlmUsage(30);
+    });
+    await act(async () => {
+      void api!.refreshLlmUsage(7);
+    });
+
+    // The newer call settles first.
+    await act(async () => {
+      newer.resolve(makeUsage({ window_days: 7 }));
+      await newer.promise;
+    });
+    expect(api!.llmUsage).toEqual(makeUsage({ window_days: 7 }));
+
+    // The older call settling last must not clobber the newer snapshot --
+    // if refreshLlmUsage read llmUsageGenRef.current instead of claiming its
+    // own generation, both calls would share the same generation number and
+    // this stale response would win.
+    await act(async () => {
+      older.resolve(makeUsage({ window_days: 30 }));
+      await older.promise;
+    });
+    expect(api!.llmUsage).toEqual(makeUsage({ window_days: 7 }));
+  });
+
   it("an account change discards an in-flight settings fetch instead of applying it", async () => {
     const settingsFetch = deferred<LlmSettings>();
     deps.getLlmSettings = vi.fn(() => settingsFetch.promise);
@@ -224,13 +259,105 @@ describe("useLlmPanel rendered lifecycle", () => {
     expect(api!.classifierMix).toBeNull();
   });
 
+  it("refreshLlmUsage rejecting with a non-401 sets llmUsageError without a toast", async () => {
+    deps.getLlmUsage = vi.fn(() => Promise.reject(new Error("usage outage")));
+
+    await act(async () => {
+      await api!.refreshLlmUsage(30);
+    });
+
+    // A usage outage must stay quiet -- the panel renders its own fallback,
+    // so no toast should fire for this one.
+    expect(api!.llmUsageError).toBe(true);
+    expect(api!.llmUsage).toBeNull();
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("refreshClassifierMix rejecting with a non-401 sets classifierMixError without a toast", async () => {
+    deps.getClassifierMix = vi.fn(() => Promise.reject(new Error("mix outage")));
+
+    await act(async () => {
+      await api!.refreshClassifierMix();
+    });
+
+    expect(api!.classifierMixError).toBe(true);
+    expect(api!.classifierMix).toBeNull();
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("refreshLlmUsage rejecting with a 401 calls onSessionExpired instead of setting an error", async () => {
+    deps.getLlmUsage = vi.fn(() => Promise.reject(new ApiError(401, "expired")));
+
+    await act(async () => {
+      await api!.refreshLlmUsage(30);
+    });
+
+    expect(onSessionExpired).toHaveBeenCalledTimes(1);
+    expect(api!.llmUsageError).toBe(false);
+  });
+
+  it("refreshClassifierMix rejecting with a 401 calls onSessionExpired instead of setting an error", async () => {
+    deps.getClassifierMix = vi.fn(() => Promise.reject(new ApiError(401, "expired")));
+
+    await act(async () => {
+      await api!.refreshClassifierMix();
+    });
+
+    expect(onSessionExpired).toHaveBeenCalledTimes(1);
+    expect(api!.classifierMixError).toBe(false);
+  });
+
+  it("a stale refreshLlmUsage rejection is discarded by the generation guard", async () => {
+    const usageFetch = deferred<LlmUsage>();
+    deps.getLlmUsage = vi.fn(() => usageFetch.promise);
+
+    await act(async () => {
+      void api!.refreshLlmUsage(30);
+    });
+    expect(api!.llmUsageError).toBe(false);
+
+    // Bumps llmUsageGenRef -- the fetch above belongs to the previous
+    // generation and its rejection landing below must not touch state,
+    // same as a stale success would be discarded.
+    render("user-b");
+
+    await act(async () => {
+      usageFetch.reject(new Error("stale failure"));
+      await usageFetch.promise.catch(() => {});
+    });
+
+    expect(api!.llmUsageError).toBe(false);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("a stale refreshClassifierMix rejection is discarded by the generation guard", async () => {
+    const mixFetch = deferred<{ classifier_mix: ClassifierMixEntry[] }>();
+    deps.getClassifierMix = vi.fn(() => mixFetch.promise);
+
+    await act(async () => {
+      void api!.refreshClassifierMix();
+    });
+    expect(api!.classifierMixError).toBe(false);
+
+    render("user-b");
+
+    await act(async () => {
+      mixFetch.reject(new Error("stale failure"));
+      await mixFetch.promise.catch(() => {});
+    });
+
+    expect(api!.classifierMixError).toBe(false);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
   it("a save does not discard its own write, even if a concurrent remove bumps the credential generation", async () => {
     const save = deferred<LlmSettings>();
     deps.putLlmSettings = vi.fn(() => save.promise);
 
-    const savePromise = act(async () => {
-      void api!.doSaveLlmSettings({ provider: "openai", model: "gpt-4o-mini" });
-    });
+    // Started outside act -- storing the raw promise, not an act() scope's
+    // promise, so the remove's act below and the resolve's act further down
+    // never overlap with an unflushed one still pending from this call.
+    const savePromise = api!.doSaveLlmSettings({ provider: "openai", model: "gpt-4o-mini" });
 
     // A concurrent remove finishing bumps llmCredentialGenRef (and
     // llmUsageGenRef/llmMixGenRef) in its own finally block -- but NOT
@@ -244,9 +371,8 @@ describe("useLlmPanel rendered lifecycle", () => {
     const newSettings = makeSettings({ provider: "gemini", model: "gemini-2.0-flash" });
     await act(async () => {
       save.resolve(newSettings);
-      await save.promise;
+      await savePromise;
     });
-    await savePromise;
 
     expect(api!.llmSettings).toEqual(newSettings);
     expect(toastSuccess).toHaveBeenCalledWith("AI settings saved");
