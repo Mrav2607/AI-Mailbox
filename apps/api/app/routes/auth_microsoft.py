@@ -387,6 +387,11 @@ def microsoft_auth_callback(
             # outlook-login account starts exactly as unverified as any other
             # signup without a proven address.
         try:
+            if existing_account is None:
+                # id/token_version defaults only fire at flush, and this session
+                # runs with autoflush=False -- without this, user.id is still
+                # None when _upsert_outlook_account builds the ProviderAccount row.
+                db.flush()
             _upsert_outlook_account(
                 db,
                 user,

@@ -109,10 +109,17 @@ class _DB:
         return _Query(self, model)
 
     def add(self, row):
-        if isinstance(row, AppUser):
-            row.id = uuid4()
-            row.token_version = 0
         self.pending.append(row)
+
+    def flush(self):
+        # Real SQLAlchemy only fires column defaults (like AppUser.id's
+        # uuid4) at flush time, not at add() -- mirror that here so a route
+        # that forgets to flush before reading a pending user's id fails the
+        # same way it would against a real session.
+        for row in self.pending:
+            if isinstance(row, AppUser) and row.id is None:
+                row.id = uuid4()
+                row.token_version = 0
 
     def commit(self):
         if self.commit_error is not None:
@@ -495,6 +502,33 @@ def test_callback_creates_user_by_display_email_when_no_existing_account(monkeyp
     # Microsoft's mail/UPN claim isn't verified the way Google's is (nOAuth) --
     # a fresh outlook-login account must not come out pre-verified from it.
     assert db.users[0].email_verified_at is None
+
+
+def test_first_login_flushes_new_user_before_provider_insert(monkeypatch):
+    """A first-ever Outlook login must flush the new AppUser before building
+    its ProviderAccount -- otherwise the account row commits with a NULL
+    user_id, which then blocks every later login for that identity."""
+    _configure_microsoft(monkeypatch)
+    db = _DB()
+    monkeypatch.setattr(
+        auth_microsoft,
+        "_consume_state",
+        lambda state: {"mode": "login", "pkce_verifier": "v"},
+    )
+    monkeypatch.setattr(
+        auth_microsoft,
+        "_exchange_code",
+        lambda *args: _exchange(display_email="new@outlook.example"),
+    )
+
+    response = auth_microsoft.microsoft_auth_callback("code", "state", db)
+
+    assert len(db.users) == 1
+    created_user = db.users[0]
+    assert created_user.id is not None
+    assert len(db.accounts) == 1
+    assert db.accounts[0].user_id == created_user.id
+    assert response["user"]["id"] == str(created_user.id)
 
 
 def test_callback_refuses_unlinked_identity_matching_an_existing_users_email(monkeypatch):

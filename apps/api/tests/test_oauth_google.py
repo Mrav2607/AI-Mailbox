@@ -89,10 +89,17 @@ class _DB:
         return _Query(self, model)
 
     def add(self, row):
-        if isinstance(row, AppUser):
-            row.id = uuid4()
-            row.token_version = 0
         self.pending.append(row)
+
+    def flush(self):
+        # Real SQLAlchemy only fires column defaults (like AppUser.id's
+        # uuid4) at flush time, not at add() -- mirror that here so a route
+        # that forgets to flush before reading a pending user's id fails the
+        # same way it would against a real session.
+        for row in self.pending:
+            if isinstance(row, AppUser) and row.id is None:
+                row.id = uuid4()
+                row.token_version = 0
 
     def commit(self):
         if self.commit_error is not None:
@@ -479,6 +486,28 @@ def test_connect_rejects_mailbox_connected_by_a_different_user_before_insert(mon
         == "That Gmail account belongs to a different account — sign in with Google instead."
     )
     assert db.pending == []
+
+
+def test_first_login_flushes_new_user_before_provider_insert(monkeypatch):
+    """A first-ever Google login must flush the new AppUser before building
+    its ProviderAccount -- otherwise the account row commits with a NULL
+    user_id, which then blocks every later login for that identity."""
+    db = _DB()
+    monkeypatch.setattr(
+        auth_google,
+        "_consume_state",
+        lambda state: {"mode": "login", "pkce_verifier": "v"},
+    )
+    monkeypatch.setattr(auth_google, "_exchange_code", lambda *args: _exchange())
+
+    response = auth_google.google_auth_callback("code", "state", db)
+
+    assert len(db.users) == 1
+    created_user = db.users[0]
+    assert created_user.id is not None
+    assert len(db.accounts) == 1
+    assert db.accounts[0].user_id == created_user.id
+    assert response["user"]["id"] == str(created_user.id)
 
 
 def test_login_provider_failure_rolls_back_new_user(monkeypatch):
