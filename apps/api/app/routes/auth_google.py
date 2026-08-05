@@ -289,6 +289,11 @@ def google_auth_callback(
         if user.email_verified_at is None:
             user.email_verified_at = datetime.now(timezone.utc)
         try:
+            if created_user:
+                # id/token_version defaults only fire at flush, and this session
+                # runs with autoflush=False -- without this, user.id is still
+                # None when _upsert_gmail_account builds the ProviderAccount row.
+                db.flush()
             _upsert_gmail_account(
                 db,
                 user,
