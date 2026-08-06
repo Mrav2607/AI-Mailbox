@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import TIMESTAMP, ForeignKey
+from sqlalchemy import TIMESTAMP, ForeignKey, text
 from sqlalchemy.dialects.postgresql import UUID, ARRAY, FLOAT
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,5 +23,5 @@ class MessageEmbedding(Base):
     )
     embedding: Mapped[list[float] | None] = mapped_column(ARRAY(FLOAT()))
     created_at: Mapped[TIMESTAMP] = mapped_column(
-        TIMESTAMP(timezone=True), server_default="now()"
+        TIMESTAMP(timezone=True), server_default=text("now()")
     )

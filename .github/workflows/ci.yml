@@ -2,7 +2,9 @@ name: CI
 
 # Runs on PRs and feature-branch pushes, and is called by deploy.yml so a push to
 # main gates the deploy on the exact same checks. The offline test suite stubs
-# Postgres and Redis (see apps/api/tests/conftest.py), so no service containers.
+# Postgres and Redis (see apps/api/tests/conftest.py), so the `api` job needs no
+# service containers -- but `db-integration` spins up a real Postgres to run the
+# migration chain and integration tests that stubs can't cover.
 on:
   pull_request:
   push:
@@ -36,6 +38,46 @@ jobs:
         continue-on-error: true
       - name: Test (pytest)
         run: pytest -q
+
+  db-integration:
+    name: DB (migration chain · schema drift · integration)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/api
+    services:
+      postgres:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ai_mailbox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/ai_mailbox_test
+      TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/ai_mailbox_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: apps/api/pyproject.toml
+      - run: pip install -e ".[dev]"
+      - name: Migrate from scratch (alembic upgrade head)
+        run: alembic upgrade head
+      - name: Schema drift gate (alembic check)
+        run: alembic check
+      # Real-DB auth integration tests -- the offline suite above stubs Postgres,
+      # so this is the only job that exercises the actual schema end to end.
+      - name: Test (auth integration)
+        run: pytest -q tests/test_auth_integration.py
 
   web:
     name: Web (lint · type · test · build)
