@@ -79,12 +79,14 @@ def load_eval_set(paths: list[str], labels: list[str]) -> tuple[list[str], list[
 
     for p in paths:
         path = Path(p)
-        if not path.exists():
-            print(f"  WARNING: {p} not found, skipping")
-            continue
+        if not path.is_file():
+            sys.exit(f"error: --data file not found: {p} -- refusing to produce a partial report")
         file_rows = load_jsonl(path)
         kept = 0
         for row in file_rows:
+            if not isinstance(row, dict):
+                skipped += 1
+                continue
             text = (row.get("text") or "").strip()
             label = row.get("label")
             if not text or label not in label_set:

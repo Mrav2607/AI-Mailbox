@@ -2,7 +2,7 @@
 # Download the fine-tuned email classifier and unpack it into
 # ./models/email-classifier, so `CLASSIFIER_BACKEND=local` has something to
 # serve. The model is git-ignored (~1GB, trained on private email data), so it
-# ships as chunked assets on the `model-v1` GitHub Release instead.
+# ships as chunked assets on the `model-v2` GitHub Release instead.
 #
 # Usage:
 #   ./fetch-model.sh

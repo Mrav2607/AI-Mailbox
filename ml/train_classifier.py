@@ -139,6 +139,9 @@ def _read_and_validate(path: Path) -> tuple[list[tuple[str, int]], int]:
         except json.JSONDecodeError:
             bad += 1
             continue
+        if not isinstance(obj, dict):
+            bad += 1
+            continue
         label = obj.get("label")
         text = (obj.get("text") or "").strip()
         if not text or label not in LABEL2ID:
