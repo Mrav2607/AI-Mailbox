@@ -18,10 +18,37 @@ import json
 import logging
 import logging.config
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from app.core.config import settings
 
+if TYPE_CHECKING:
+    from sqlalchemy.exc import IntegrityError
+
 logger = logging.getLogger("ai-mailbox")
+
+
+def integrity_error_detail(exc: IntegrityError) -> str:
+    """Pull the violated constraint name out of an `IntegrityError` for logging.
+
+    With psycopg 3, the driver exception lives at `exc.orig` and carries
+    `.diag.constraint_name` -- e.g. `uq_provider_account_provider_external_user`
+    -- which is far more useful in a log line than the generic exception type.
+    Falls back to `type(exc.orig).__name__` (matching what callers used to log
+    directly) whenever the constraint name isn't available, such as in tests
+    that construct `IntegrityError` with a plain `Exception` as `orig`, or if
+    `orig` is missing entirely. Never raises -- a logging helper crashing is
+    worse than a slightly less specific log line.
+    """
+    orig = getattr(exc, "orig", None)
+    if orig is None:
+        return type(exc).__name__
+    diag = getattr(orig, "diag", None)
+    constraint_name = getattr(diag, "constraint_name", None)
+    if constraint_name:
+        return constraint_name
+    return type(orig).__name__
+
 
 _TEXT_FORMAT = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 

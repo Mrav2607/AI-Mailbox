@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Index, Text, ForeignKey, UniqueConstraint, text
+from sqlalchemy import DateTime, ForeignKey, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID, ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -18,20 +18,16 @@ class MailMessage(Base):
     __tablename__ = "mail_message"
     __table_args__ = (
         UniqueConstraint("thread_id", "provider_message_id", name="uq_msg_provider"),
-        # Serves the latest-message-per-thread lookup used by triage.
-        Index(
-            "ix_mail_message_thread_recency",
-            "thread_id",
-            text("sent_at DESC NULLS LAST"),
-            text("created_at DESC"),
-        ),
+        # The latest-message-per-thread lookup is served by the migration-only
+        # coalesced variant, ix_mail_message_thread_recency_coalesced -- see
+        # alembic/env.py's allowlist. No model-side index needed here.
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
-        server_default="gen_random_uuid()",
+        server_default=text("gen_random_uuid()"),
     )
     thread_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("mail_thread.id", ondelete="CASCADE")
@@ -47,5 +43,5 @@ class MailMessage(Base):
     body_html: Mapped[str | None] = mapped_column(Text)
     headers: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default="now()"
+        DateTime(timezone=True), server_default=text("now()")
     )

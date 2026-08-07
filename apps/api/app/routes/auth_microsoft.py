@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.logging import logger
+from app.core.logging import integrity_error_detail, logger
 from app.core.ratelimit import user_rate_limit
 from app.core.security import create_access_token, normalize_email
 from app.db.models import AppUser, ProviderAccount
@@ -406,7 +406,7 @@ def microsoft_auth_callback(
             break
         except IntegrityError as exc:
             db.rollback()
-            logger.warning("Microsoft account upsert failed: %s", type(exc).__name__)
+            logger.warning("Microsoft account upsert failed: %s", integrity_error_detail(exc))
             # Retry once, but only if the identity itself won a genuine
             # same-login race (a concurrent request for this exact tid:oid
             # already committed its own user+account pair) -- never fall
@@ -533,7 +533,7 @@ def outlook_connect_callback(
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        logger.warning("Outlook connect upsert failed: %s", type(exc).__name__)
+        logger.warning("Outlook connect upsert failed: %s", integrity_error_detail(exc))
         conflict = _connect_conflict(db, current_user, display_email, external_user_id)
         if conflict:
             raise conflict

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Text, TIMESTAMP, ForeignKey
+from sqlalchemy import Text, TIMESTAMP, ForeignKey, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -20,7 +20,7 @@ class ActionLog(Base):
         UUID(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
-        server_default="gen_random_uuid()",
+        server_default=text("gen_random_uuid()"),
     )
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("app_user.id", ondelete="CASCADE")
@@ -31,5 +31,5 @@ class ActionLog(Base):
     action: Mapped[str | None] = mapped_column(Text)
     payload: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[TIMESTAMP] = mapped_column(
-        TIMESTAMP(timezone=True), server_default="now()"
+        TIMESTAMP(timezone=True), server_default=text("now()")
     )

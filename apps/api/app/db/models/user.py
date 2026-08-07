@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, Text
+from sqlalchemy import DateTime, Integer, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -21,9 +21,12 @@ class AppUser(Base):
         UUID(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
-        server_default="gen_random_uuid()",
+        server_default=text("gen_random_uuid()"),
     )
-    email: Mapped[str] = mapped_column(Text, unique=True, nullable=False, index=True)
+    # No unique=True/index=True here -- the real uniqueness constraint is the
+    # migration-only functional index ux_app_user_email_lower on lower(email),
+    # so lookups stay case-insensitive. See alembic/env.py's allowlist.
+    email: Mapped[str] = mapped_column(Text, nullable=False)
     display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     email_verified_at: Mapped[datetime | None] = mapped_column(
@@ -40,4 +43,7 @@ class AppUser(Base):
     # to disagree about.
     token_version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
