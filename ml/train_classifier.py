@@ -16,15 +16,24 @@ synthetic for scarce classes), and ``import_manual_emails.py`` ->
 ``labelsheet_to_eval.py`` / ``import_eval_emails.py``) is kept strictly disjoint
 and scored via --eval-file.
 
+Before any of that runs, a fail-closed preflight (``run_input_guards``) checks
+--data against the guard set (--guard-files plus --eval-file, if given): every
+guard path must exist and parse cleanly, no --data row may share normalized
+text with a guard row, and no two kept --data rows may share text under
+different labels. Any violation exits immediately, before the tokenizer or
+model loads -- --guard-files is how a frozen test set (e.g. data/test_v2.jsonl)
+gets a hard guarantee it never leaks into training.
+
 Blend in-distribution inbox data with synthetic intent examples for the scarce
 classes, and score against the real hand-labeled set:
     python ml/train_classifier.py \
         --data data/real_train.jsonl data/synthetic.jsonl \
-        --eval-file data/eval.jsonl
+        --eval-file data/eval.jsonl --guard-files data/test_v2.jsonl
 
 Then try the stronger encoder once it works end-to-end:
     python ml/train_classifier.py --model-name answerdotai/ModernBERT-base --epochs 4 \
-        --data data/real_train.jsonl data/synthetic.jsonl --eval-file data/eval.jsonl
+        --data data/real_train.jsonl data/synthetic.jsonl \
+        --eval-file data/eval.jsonl --guard-files data/test_v2.jsonl
 """
 
 from __future__ import annotations
@@ -92,8 +101,7 @@ def load_many(paths: list[str], cap_per_label: int | None = None) -> tuple[list[
     for p in paths:
         path = Path(p)
         if not path.exists():
-            print(f"  WARNING: {p} not found, skipping")
-            continue
+            sys.exit(f"error: --data file {p} not found")
         t, y = load_jsonl(path)
         kept = capped = 0
         for text_value, label_id in zip(t, y):
@@ -113,6 +121,140 @@ def load_many(paths: list[str], cap_per_label: int | None = None) -> tuple[list[
         print(f"  {p}: {len(t)} rows -> {kept} kept after dedup{suffix}")
     print("Label mix:", {label: per_label.get(label, 0) for label in LABELS})
     return texts, labels
+
+
+def _read_and_validate(path: Path) -> tuple[list[tuple[str, int]], int]:
+    """Read a jsonl file for the guards and validate every row: a row with an
+    unknown label, empty text, or that doesn't parse as JSON is a hard
+    failure, not a silent drop (the trainer expects data-prep scripts to hand
+    it clean input). Returns the valid ``(text, label_id)`` rows plus how many
+    rows failed."""
+    rows: list[tuple[str, int]] = []
+    bad = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            bad += 1
+            continue
+        label = obj.get("label")
+        text = (obj.get("text") or "").strip()
+        if not text or label not in LABEL2ID:
+            bad += 1
+            continue
+        rows.append((text, LABEL2ID[label]))
+    return rows, bad
+
+
+def run_input_guards(data_paths: list[str], guard_paths: list[str]) -> None:
+    """Fail-closed preflight over ``--data`` and the guard set, run before any
+    tokenizer/model loading so a bad input layout fails in seconds instead of
+    after training setup.
+
+    ``guard_paths`` is ``--guard-files`` plus ``--eval-file`` (already merged
+    by the caller): files whose rows must never appear in ``--data``. Paths
+    are canonicalized with ``Path.resolve()`` first, so the same file listed
+    twice (e.g. also passed to ``--guard-files`` by habit) collapses to one
+    guard entry rather than being checked -- and reported -- twice.
+
+    Exits the process (does not return) on:
+      - a missing or unreadable ``--data`` or guard path
+      - a ``--data`` or guard row with an unknown label, empty text, or
+        malformed JSON
+      - two kept ``--data`` rows with identical normalized text
+        (``text.strip().lower()``) but different labels, checked *before*
+        dedup/capping -- dedup would otherwise just silently pick whichever
+        row came first
+      - any normalized-text overlap between a ``--data`` file and a guard
+        file, or between two guard files (a file is never compared against
+        itself)
+
+    On success, returns ``None`` and ``main()`` proceeds to ``load_many()``.
+    """
+    guard_resolved: dict[Path, str] = {}
+    for p in guard_paths:
+        guard_resolved.setdefault(Path(p).resolve(), p)
+
+    data_entries = [(Path(p), p) for p in data_paths]
+    guard_entries = [(path, label) for path, label in guard_resolved.items()]
+
+    missing = []
+    for path, label in data_entries + guard_entries:
+        if not path.is_file():
+            missing.append(label)
+            continue
+        try:
+            path.read_text(encoding="utf-8")
+        except OSError:
+            missing.append(label)
+    if missing:
+        sys.exit(
+            "error: missing or unreadable input file(s):\n"
+            + "\n".join(f"  - {m}" for m in missing)
+        )
+
+    data_rows: dict[str, list[tuple[str, int]]] = {}
+    guard_rows: dict[str, list[tuple[str, int]]] = {}
+    bad_counts: dict[str, int] = {}
+    for path, label in data_entries:
+        rows, bad = _read_and_validate(path)
+        data_rows[label] = rows
+        if bad:
+            bad_counts[label] = bad
+    for path, label in guard_entries:
+        rows, bad = _read_and_validate(path)
+        guard_rows[label] = rows
+        if bad:
+            bad_counts[label] = bad
+    if bad_counts:
+        sys.exit(
+            "error: row(s) with an unknown label, empty text, or malformed JSON:\n"
+            + "\n".join(f"  - {name}: {count} bad row(s)" for name, count in bad_counts.items())
+        )
+
+    # Label conflicts: same normalized text, different labels, across --data
+    # rows only -- checked before load_many's dedup/cap even runs.
+    text_labels: dict[str, set[int]] = {}
+    for rows in data_rows.values():
+        for text, label_id in rows:
+            text_labels.setdefault(text.strip().lower(), set()).add(label_id)
+    conflicts = {key: ids for key, ids in text_labels.items() if len(ids) > 1}
+    if conflicts:
+        lines = [
+            f"  - {key!r}: labels {sorted(LABELS[i] for i in ids)}"
+            for key, ids in conflicts.items()
+        ]
+        sys.exit(
+            "error: --data rows with identical text but conflicting labels:\n"
+            + "\n".join(lines)
+        )
+
+    # Pairwise disjointness by normalized text: every --data file vs. every
+    # guard file, and every guard file vs. every other guard file.
+    def text_set(rows: list[tuple[str, int]]) -> set[str]:
+        return {text.strip().lower() for text, _ in rows}
+
+    overlaps = []
+    for data_label, rows in data_rows.items():
+        data_texts = text_set(rows)
+        for guard_label, grows in guard_rows.items():
+            overlap = data_texts & text_set(grows)
+            if overlap:
+                overlaps.append((data_label, guard_label, len(overlap)))
+    guard_labels = list(guard_rows.keys())
+    for i, a in enumerate(guard_labels):
+        for b in guard_labels[i + 1:]:
+            overlap = text_set(guard_rows[a]) & text_set(guard_rows[b])
+            if overlap:
+                overlaps.append((a, b, len(overlap)))
+    if overlaps:
+        lines = [f"  - {a} <-> {b}: {n} colliding row(s)" for a, b, n in overlaps]
+        sys.exit(
+            "error: --data/guard files are not disjoint (guard-file rows leaked into --data):\n"
+            + "\n".join(lines)
+        )
 
 
 def _split(texts, labels, test_size, seed):
@@ -181,6 +323,9 @@ def main() -> None:
                         help="max rows per label across all --data files (list real "
                              "files first so synthetic only tops up scarce classes)")
     parser.add_argument("--eval-file", default=None, help="optional hand-labeled jsonl for an honest OOD score")
+    parser.add_argument("--guard-files", nargs="*", default=[],
+                        help="jsonl files whose rows must never appear in --data (e.g. a frozen "
+                             "test set); combined with --eval-file into one guard set")
     parser.add_argument("--model-name", default="distilbert-base-uncased")
     parser.add_argument("--out", default="models/email-classifier")
     parser.add_argument("--epochs", type=float, default=3.0)
@@ -189,6 +334,9 @@ def main() -> None:
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    guard_paths = list(args.guard_files) + ([args.eval_file] if args.eval_file else [])
+    run_input_guards(args.data, guard_paths)
 
     print(f"Loading data from: {', '.join(args.data)}")
     texts, labels = load_many(args.data, args.cap_per_label)

@@ -12,7 +12,7 @@
 #   gh auth login
 set -euo pipefail
 
-TAG="${MODEL_RELEASE_TAG:-model-v1}"
+TAG="${MODEL_RELEASE_TAG:-model-v2}"
 DEST="models/email-classifier"
 SENTINEL="$DEST/model.safetensors"
 
