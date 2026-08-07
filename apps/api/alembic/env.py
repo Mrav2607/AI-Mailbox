@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 from alembic import context
+from alembic.runtime.environment import NameFilterParentNames, NameFilterType
 from sqlalchemy import engine_from_config, pool
 
 # Ensure app package is importable when running alembic from the apps/api directory
@@ -45,7 +46,9 @@ MIGRATION_ONLY_INDEXES = {
 }
 
 
-def include_name(name, type_, parent_names):
+def include_name(
+    name: str | None, type_: NameFilterType, parent_names: NameFilterParentNames
+) -> bool:
     if type_ == "index" and name in MIGRATION_ONLY_INDEXES:
         return False
     return True
