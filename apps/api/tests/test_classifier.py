@@ -245,6 +245,17 @@ def test_load_calibration_rejects_non_six_label_schema_even_when_labels_match(tm
         ({"schema": 1, "kind": "temperature", "labels": _SIX_LABELS_SWAPPED, "params": {"T": 2.0}}, "labels"),
         ({"schema": 1, "kind": "temperature", "labels": _SIX_LABELS, "params": {"T": 0.0}}, "temperature"),
         ({"schema": 1, "kind": "temperature", "labels": _SIX_LABELS, "params": {"T": -1.0}}, "temperature"),
+        ({"schema": 1, "kind": "temperature", "labels": _SIX_LABELS, "params": {"T": float("nan")}}, "temperature"),
+        ({"schema": 1, "kind": "temperature", "labels": _SIX_LABELS, "params": {"T": float("inf")}}, "temperature"),
+        (
+            {
+                "schema": 1,
+                "kind": "vector",
+                "labels": _SIX_LABELS,
+                "params": {"w": [1.0, float("nan"), 1.0, 1.0, 1.0, 1.0], "b": [0.0] * 6},
+            },
+            "vector params",
+        ),
         (
             {
                 "schema": 1,
@@ -271,6 +282,9 @@ def test_load_calibration_rejects_non_six_label_schema_even_when_labels_match(tm
         "label-mismatch",
         "temperature-zero",
         "temperature-negative",
+        "temperature-nan",
+        "temperature-infinity",
+        "vector-nan-w",
         "vector-wrong-length-w",
         "vector-nonpositive-w",
     ],

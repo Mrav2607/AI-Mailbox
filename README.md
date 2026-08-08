@@ -205,7 +205,9 @@ train/eval disjointness via `--guard-files`) and score it with
 `python ml/eval_classifier.py --model <dir> --data <eval.jsonl>` (per-class
 report, confusion matrix, confidence and calibration metrics).
 `ml/fit_calibration.py` fits an optional post-hoc confidence calibration and
-writes the `calibration.json` the serving path understands.
+writes the `calibration.json` the serving path understands — but only after
+its holdout gate passes: without `--holdout` the run is report-only and no
+file is written.
 
 ## Agenda (action extraction)
 

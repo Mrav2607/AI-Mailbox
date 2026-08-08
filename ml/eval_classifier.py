@@ -151,7 +151,10 @@ def load_calibration(model_dir: Path, labels: list[str]):
     config_path = model_dir / "config.json"
     calibration_required = False
     if config_path.exists():
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            sys.exit(f"error: can't read {config_path} while resolving calibration ({exc})")
         calibration_required = bool(config.get("calibration_required"))
 
     calibration_path = model_dir / "calibration.json"
