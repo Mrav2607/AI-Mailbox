@@ -65,15 +65,51 @@ describe("LandingPage sections", () => {
     );
   });
 
-  it("renders the how-it-works, features, quick-start and taxonomy copy", () => {
+  it("renders the how-it-works, labels, agenda, features and quick-start copy", () => {
     renderLanding();
 
     const text = container.textContent ?? "";
-    expect(text).toContain("Pulls your Gmail over OAuth into your own Postgres.");
+    expect(text).toContain(
+      "Connect multiple Gmail and Outlook accounts; every message lands in one place, sorted into the six labels.",
+    );
+    expect(text).toContain("Six labels. A closed set: the model never invents a seventh.");
+    expect(text).toContain(
+      "Action items get pulled out of every account you connect and collected into one list, sorted by due date.",
+    );
     expect(text).toContain("Keyboard-first console");
     expect(text).toContain("Running in two commands");
-    expect(text).toContain("Six labels. A closed set: the model never invents a seventh.");
     expect(text).toContain("CortexMail: self-hosted email triage.");
+  });
+
+  it("shows only the six primary labels in the labels section, no agenda/all/unclassified/done", () => {
+    renderLanding();
+
+    const labelsSection = container.querySelector("#taxonomy-heading")?.closest("section");
+    expect(labelsSection).not.toBeNull();
+    const text = labelsSection!.textContent ?? "";
+
+    for (const name of ["needs reply", "action req", "fyi", "promo", "security", "spam"]) {
+      expect(text).toContain(name);
+    }
+    for (const name of ["agenda", "all", "unclassified", "done"]) {
+      expect(text).not.toContain(name);
+    }
+  });
+
+  it("renders the sections in order: how it works, labels, agenda, features, quick start", () => {
+    renderLanding();
+
+    const headingIds = Array.from(
+      container.querySelectorAll("main section[aria-labelledby]"),
+    ).map((section) => section.getAttribute("aria-labelledby"));
+
+    expect(headingIds).toEqual([
+      "how-it-works-heading",
+      "taxonomy-heading",
+      "agenda-heading",
+      "features-heading",
+      "quick-start-heading",
+    ]);
   });
 
   it("renders the console mockup as decorative with a visible caption", () => {

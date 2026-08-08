@@ -1,10 +1,10 @@
 import { Check, Copy, Github, Monitor, Moon, Sun } from "lucide-react";
 import { useState } from "react";
 
-import { BUCKET_KEYS, LABEL_META, bucketLabel } from "@/lib/labels";
+import { LABEL_META } from "@/lib/labels";
 import { THEME_PREFS } from "@/lib/theme";
 import type { ThemePref } from "@/lib/theme";
-import type { BucketKey, Label } from "@/lib/types";
+import type { Label } from "@/lib/types";
 
 import { LandingConsoleMockup } from "./LandingConsoleMockup";
 
@@ -16,11 +16,16 @@ const THEME_ICONS: Record<ThemePref, typeof Sun> = {
   dark: Moon,
 };
 
+// The six labels in fixed keyboard order (1-6), same order the console binds
+// them to. LABEL_META's keys are already this set -- no separate list to
+// keep in sync.
+const LABELS = Object.keys(LABEL_META) as Label[];
+
 const HOW_IT_WORKS = [
   {
     step: "01",
-    title: "INGEST",
-    body: "Pulls your Gmail over OAuth into your own Postgres.",
+    title: "CONNECT",
+    body: "Connect multiple Gmail and Outlook accounts; every message lands in one place, sorted into the six labels.",
   },
   {
     step: "02",
@@ -54,18 +59,6 @@ const FEATURES = [
 ];
 
 const QUICK_START_COMMANDS = ["cp deploy/local.env.example deploy/.env", "docker compose up --build"];
-
-// Everything the console binds to a number key, in key order: the six
-// classifier labels (from LABEL_META) plus the three fixed buckets (from
-// BUCKET_KEYS) that sit alongside them. Agenda (key 0) lives in neither
-// export, so it's the one hardcoded entry.
-const BUCKET_KEY_ENTRIES = (Object.entries(BUCKET_KEYS) as [BucketKey, string][]).sort(
-  (a, b) => Number(a[1]) - Number(b[1]),
-);
-
-function isLabelBucket(b: BucketKey): b is Label {
-  return b in LABEL_META;
-}
 
 export function LandingPage(props: {
   onSignIn: () => void;
@@ -106,9 +99,10 @@ export function LandingPage(props: {
   return (
     <div className="min-h-screen w-full bg-background text-foreground">
       <header className="border-b border-border bg-[var(--panel)] panel-lift">
-        <nav className="mx-auto flex h-14 max-w-6xl flex-wrap items-center gap-2 px-4">
-          <span className="font-mono text-[14px] font-semibold tracking-tight text-primary">
-            ▮ CORTEXMAIL
+        <nav className="mx-auto flex h-14 max-w-7xl flex-wrap items-center gap-2 px-4">
+          <span className="flex items-center gap-2 font-mono text-[14px] font-semibold tracking-tight text-primary">
+            <img src="/appicon.svg" alt="" width={48} height={48} className="h-6 w-6" />
+            CORTEXMAIL
           </span>
           <div className="flex-1" />
           <a
@@ -137,7 +131,7 @@ export function LandingPage(props: {
       </header>
 
       <main>
-        <section className="mx-auto max-w-6xl px-4 py-14 sm:py-20">
+        <section className="mx-auto max-w-7xl px-4 py-14 sm:py-20">
           <div className="mx-auto max-w-2xl text-center">
             <h1
               className={`text-balance font-mono text-[clamp(30px,5vw,52px)] font-semibold leading-[1.12] tracking-tight ${reveal}`}
@@ -171,14 +165,14 @@ export function LandingPage(props: {
         </section>
 
         <section aria-labelledby="how-it-works-heading" className="border-t border-border">
-          <div className="mx-auto max-w-6xl px-4 py-12">
+          <div className="mx-auto max-w-7xl px-4 py-12">
             <h2
               id="how-it-works-heading"
               className="text-balance text-center font-mono text-[17px] font-semibold tracking-tight"
             >
               How it works
             </h2>
-            <div className="mx-auto mt-8 grid max-w-4xl grid-cols-1 gap-8 sm:grid-cols-3">
+            <div className="mx-auto mt-8 grid max-w-5xl grid-cols-1 gap-8 sm:grid-cols-3">
               {HOW_IT_WORKS.map((step) => (
                 <div key={step.step}>
                   <div className="font-mono text-[13px] font-semibold text-primary">
@@ -193,8 +187,47 @@ export function LandingPage(props: {
           </div>
         </section>
 
+        <section aria-labelledby="taxonomy-heading" className="border-t border-border">
+          <div className="mx-auto max-w-7xl px-4 py-12 text-center">
+            <h2 id="taxonomy-heading" className="font-mono text-[13px] font-medium text-foreground/90">
+              Six labels. A closed set: the model never invents a seventh.
+            </h2>
+            <div className="mx-auto mt-5 flex max-w-3xl flex-wrap items-center justify-center gap-2.5">
+              {LABELS.map((label) => {
+                const meta = LABEL_META[label];
+                return (
+                  <span
+                    key={label}
+                    className="flex items-center gap-1.5 rounded border border-border bg-[var(--panel)] px-2 py-1 font-mono text-[11px]"
+                  >
+                    <span className="kbd">{meta.key}</span>
+                    <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${meta.dot}`} />
+                    <span className={meta.text}>{meta.name}</span>
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+
+        <section aria-labelledby="agenda-heading" className="border-t border-border">
+          <div className="mx-auto max-w-7xl px-4 py-12 text-center">
+            <h2
+              id="agenda-heading"
+              className="text-center font-mono text-[17px] font-semibold tracking-tight"
+            >
+              Agenda
+            </h2>
+            <p className="mx-auto mt-4 max-w-2xl text-[13.5px] leading-relaxed text-muted-foreground">
+              Action items get pulled out of every account you connect and collected into one
+              list, sorted by due date. Press <span className="kbd">0</span> in the console to
+              jump to it.
+            </p>
+          </div>
+        </section>
+
         <section aria-labelledby="features-heading" className="border-t border-border">
-          <div className="mx-auto max-w-6xl px-4 py-12">
+          <div className="mx-auto max-w-7xl px-4 py-12">
             <h2
               id="features-heading"
               className="text-center font-mono text-[17px] font-semibold tracking-tight"
@@ -215,7 +248,7 @@ export function LandingPage(props: {
         </section>
 
         <section id="quick-start" aria-labelledby="quick-start-heading" className="border-t border-border">
-          <div className="mx-auto max-w-6xl px-4 py-12">
+          <div className="mx-auto max-w-7xl px-4 py-12">
             <h2
               id="quick-start-heading"
               className="text-center font-mono text-[17px] font-semibold tracking-tight"
@@ -246,39 +279,10 @@ export function LandingPage(props: {
             </div>
           </div>
         </section>
-
-        <section aria-labelledby="taxonomy-heading" className="border-t border-border">
-          <div className="mx-auto max-w-6xl px-4 py-12 text-center">
-            <h2 id="taxonomy-heading" className="font-mono text-[13px] font-medium text-foreground/90">
-              Six labels. A closed set: the model never invents a seventh.
-            </h2>
-            <div className="mx-auto mt-5 flex max-w-3xl flex-wrap items-center justify-center gap-2.5">
-              <span className="flex items-center gap-1.5 rounded border border-border bg-[var(--panel)] px-2 py-1 font-mono text-[11px]">
-                <span className="kbd">0</span>
-                <span className="text-muted-foreground">agenda</span>
-              </span>
-              {BUCKET_KEY_ENTRIES.map(([bucket, key]) => {
-                const meta = isLabelBucket(bucket) ? LABEL_META[bucket] : null;
-                return (
-                  <span
-                    key={bucket}
-                    className="flex items-center gap-1.5 rounded border border-border bg-[var(--panel)] px-2 py-1 font-mono text-[11px]"
-                  >
-                    <span className="kbd">{key}</span>
-                    {meta && <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${meta.dot}`} />}
-                    <span className={meta ? meta.text : "text-muted-foreground"}>
-                      {bucketLabel(bucket)}
-                    </span>
-                  </span>
-                );
-              })}
-            </div>
-          </div>
-        </section>
       </main>
 
       <footer className="border-t border-border">
-        <div className="mx-auto max-w-6xl px-4 py-6 text-center font-mono text-[11.5px] text-muted-foreground">
+        <div className="mx-auto max-w-7xl px-4 py-6 text-center font-mono text-[11.5px] text-muted-foreground">
           CortexMail: self-hosted email triage.
         </div>
       </footer>
