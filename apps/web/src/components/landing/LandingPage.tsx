@@ -92,15 +92,15 @@ export function LandingPage(props: {
   }
 
   const ghostButton =
-    "h-8 px-3 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12.5px] font-mono cursor-pointer transition-colors";
+    "h-8 px-3 rounded border border-border bg-[var(--panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12.5px] font-mono cursor-pointer transition-colors";
   const primaryButton =
     "h-9 px-4 rounded bg-primary text-primary-foreground font-mono text-[13px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-[filter] hover:brightness-110 phosphor";
   const secondaryAnchor =
-    "h-9 px-4 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-foreground/90 font-mono text-[13px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors";
+    "h-9 px-4 rounded border border-border bg-[var(--panel-hi)] hover:bg-accent text-foreground/90 font-mono text-[13px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors";
 
   return (
     <div className="min-h-screen w-full bg-background text-foreground">
-      <header className="border-b border-border bg-[var(--color-panel)] panel-lift">
+      <header className="border-b border-border bg-[var(--panel)] panel-lift">
         <nav className="mx-auto flex h-14 max-w-6xl flex-wrap items-center gap-2 px-4">
           <span className="font-mono text-[14px] font-semibold tracking-tight text-primary">
             ▮ CORTEXMAIL
@@ -121,7 +121,7 @@ export function LandingPage(props: {
             onClick={() => onTheme(nextTheme)}
             aria-label={`Theme: ${theme}. Switch to ${nextTheme}.`}
             title={`theme: ${theme} → ${nextTheme}`}
-            className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded border border-border bg-[var(--color-panel-hi)] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded border border-border bg-[var(--panel-hi)] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <ThemeIcon className="h-3.5 w-3.5" />
           </button>
@@ -171,7 +171,7 @@ export function LandingPage(props: {
               {HOW_IT_WORKS.map((step) => (
                 <div
                   key={step.step}
-                  className="rounded-lg border border-border bg-[var(--color-panel)] p-4 panel-lift"
+                  className="rounded-lg border border-border bg-[var(--panel)] p-4 panel-lift"
                 >
                   <div className="font-mono text-[12px] font-semibold text-primary">
                     {step.step} {step.title}
@@ -215,7 +215,11 @@ export function LandingPage(props: {
               Running in two commands
             </h2>
             <div className="mx-auto mt-6 max-w-lg">
-              <pre className="scrollbar-thin overflow-x-auto rounded-lg border border-border bg-[var(--color-panel)] p-3 font-mono text-[12.5px] leading-relaxed text-foreground/90 panel-lift">
+              {/* The code block is a terminal, not a page panel -- it stays
+                  dark even on the light "paper terminal" palette, same as
+                  the console mockup above. See LandingConsoleMockup for how
+                  the `dark` scoping trick works. */}
+              <pre className="dark scrollbar-thin overflow-x-auto rounded-lg border border-border bg-[var(--panel)] p-3 font-mono text-[12.5px] leading-relaxed text-foreground/90 panel-lift">
                 <code>{QUICK_START_COMMANDS.join("\n")}</code>
               </pre>
               <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -241,7 +245,7 @@ export function LandingPage(props: {
               Six labels. A closed set — the model never invents a seventh.
             </h2>
             <div className="mx-auto mt-5 flex max-w-3xl flex-wrap items-center justify-center gap-2.5">
-              <span className="flex items-center gap-1.5 rounded border border-border bg-[var(--color-panel)] px-2 py-1 font-mono text-[11px]">
+              <span className="flex items-center gap-1.5 rounded border border-border bg-[var(--panel)] px-2 py-1 font-mono text-[11px]">
                 <span className="kbd">0</span>
                 <span className="text-muted-foreground">agenda</span>
               </span>
@@ -250,7 +254,7 @@ export function LandingPage(props: {
                 return (
                   <span
                     key={bucket}
-                    className="flex items-center gap-1.5 rounded border border-border bg-[var(--color-panel)] px-2 py-1 font-mono text-[11px]"
+                    className="flex items-center gap-1.5 rounded border border-border bg-[var(--panel)] px-2 py-1 font-mono text-[11px]"
                   >
                     <span className="kbd">{key}</span>
                     {meta && <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${meta.dot}`} />}

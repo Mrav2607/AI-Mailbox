@@ -53,15 +53,23 @@ const ROWS: {
  */
 export function LandingConsoleMockup() {
   return (
+    // This is a screenshot-style preview of the real console, which always
+    // runs the dark "phosphor terminal" palette -- it stays dark on purpose
+    // even when the landing page itself is in light "paper terminal" mode.
+    // `dark` re-scopes index.css's `.dark { --var: ... }` block for this
+    // subtree. Note this only re-scopes the RAW vars (--panel, --border,
+    // etc.) -- the `--color-*` names from `@theme inline` alias to `var(--x)`
+    // and resolve once at :root, so any arbitrary-value class here has to
+    // reference the raw var directly or it'll stay stuck on the light value.
     <div
       aria-hidden="true"
-      className="w-full max-w-full select-none overflow-hidden rounded-lg border border-border bg-[var(--color-panel)] elevated"
+      className="dark w-full max-w-full select-none overflow-hidden rounded-lg border border-border bg-[var(--panel)] text-foreground elevated"
     >
-      <div className="flex flex-wrap items-center gap-1.5 border-b border-border bg-[var(--color-panel-hi)] px-3 py-2">
+      <div className="flex flex-wrap items-center gap-1.5 border-b border-border bg-[var(--panel-hi)] px-3 py-2">
         {STATS.map((s) => (
           <div
             key={s.label}
-            className="flex items-center gap-1.5 rounded border border-border bg-[var(--color-panel)] px-2 py-1 font-mono"
+            className="flex items-center gap-1.5 rounded border border-border bg-[var(--panel)] px-2 py-1 font-mono"
           >
             <s.icon className="h-3 w-3 shrink-0 text-muted-foreground/80" />
             <span className="text-[10px] text-muted-foreground">{s.label}</span>
@@ -83,7 +91,7 @@ export function LandingConsoleMockup() {
               className={[
                 "flex items-center gap-2.5 border-l-2 px-3 py-2",
                 row.selected
-                  ? "border-primary bg-[var(--color-panel-hi)]"
+                  ? "border-primary bg-[var(--panel-hi)]"
                   : "border-transparent",
               ].join(" ")}
             >
