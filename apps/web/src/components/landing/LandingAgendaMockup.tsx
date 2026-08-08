@@ -93,8 +93,11 @@ export function LandingAgendaMockup() {
   return (
     <div
       aria-hidden="true"
-      className="dark w-full max-w-full select-none overflow-hidden rounded-lg border border-border bg-[var(--panel)] text-foreground elevated"
+      className="dark relative isolate w-full max-w-full select-none overflow-hidden rounded-lg border border-border bg-[var(--panel)] text-foreground elevated"
     >
+      {/* CRT scanline texture, see LandingConsoleMockup for why this needs
+          `isolate` + a negative z-index to land below the real content. */}
+      <div className="landing-scanlines pointer-events-none absolute inset-0 -z-10" />
       <div className="flex items-center gap-2 border-b border-border bg-[var(--panel-hi)] px-3 py-2">
         <ListTodo className="h-3.5 w-3.5 shrink-0 text-muted-foreground/80" />
         <span className="font-mono text-[11px] text-muted-foreground">agenda</span>

@@ -103,7 +103,15 @@ export function LandingConsoleMockup() {
           inline` alias to `var(--x)` and resolve once at :root, so any
           arbitrary-value class here has to reference the raw var directly or
           it'll stay stuck on the light value. */}
-      <div className="dark w-full max-w-full select-none overflow-hidden rounded-lg border border-border bg-[var(--panel)] text-foreground">
+      <div className="dark relative isolate w-full max-w-full select-none overflow-hidden rounded-lg border border-border bg-[var(--panel)] text-foreground">
+        {/* CRT scanline texture, -z-10'd inside this `isolate` context so it
+            paints above the panel bg but below every real row/chip below --
+            positioned descendants otherwise stack above in-flow content
+            regardless of DOM order. */}
+        <div
+          aria-hidden="true"
+          className="landing-scanlines pointer-events-none absolute inset-0 -z-10"
+        />
         <div
           aria-hidden="true"
           className="flex flex-wrap items-center gap-1.5 border-b border-border bg-[var(--panel-hi)] px-3 py-2"

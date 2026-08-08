@@ -161,6 +161,12 @@ export function LandingPage(props: {
                   Run it yourself ↓
                 </a>
               </div>
+              <p
+                className={`mt-5 font-mono text-[12px] text-muted-foreground ${reveal} [animation-delay:280ms]`}
+              >
+                <span className="text-primary">$</span> cortexmail up — 3 accounts · 128 threads ·
+                model local:email-classifier
+              </p>
             </div>
             <div
               className={`mx-auto mt-12 max-w-3xl lg:mx-0 lg:mt-0 lg:max-w-none lg:min-w-[480px] ${reveal} [animation-delay:340ms]`}
@@ -178,7 +184,7 @@ export function LandingPage(props: {
           <div className="mx-auto max-w-7xl px-4 py-12">
             <h2
               id="how-it-works-heading"
-              className="text-balance text-center font-mono text-[17px] font-semibold tracking-tight"
+              className="text-balance text-center font-mono text-[clamp(22px,2.5vw,28px)] font-semibold tracking-tight"
             >
               How it works
             </h2>
@@ -224,7 +230,7 @@ export function LandingPage(props: {
           <div className="mx-auto max-w-7xl px-4 py-12 text-center">
             <h2
               id="agenda-heading"
-              className="text-center font-mono text-[17px] font-semibold tracking-tight"
+              className="text-center font-mono text-[clamp(22px,2.5vw,28px)] font-semibold tracking-tight"
             >
               Agenda
             </h2>
@@ -243,11 +249,11 @@ export function LandingPage(props: {
           <div className="mx-auto max-w-7xl px-4 py-12">
             <h2
               id="features-heading"
-              className="text-center font-mono text-[17px] font-semibold tracking-tight"
+              className="font-mono text-[clamp(22px,2.5vw,28px)] font-semibold tracking-tight"
             >
               Built for the operator
             </h2>
-            <div className="mx-auto mt-8 max-w-3xl divide-y divide-border">
+            <div className="mt-8 max-w-3xl divide-y divide-border">
               {FEATURES.map((f) => (
                 <div key={f.title} className="flex flex-col gap-1 py-3.5 sm:flex-row sm:gap-4">
                   <div className="font-mono text-[13px] font-semibold text-foreground sm:w-56 sm:shrink-0">
@@ -264,7 +270,7 @@ export function LandingPage(props: {
           <div className="mx-auto max-w-7xl px-4 py-12">
             <h2
               id="quick-start-heading"
-              className="text-center font-mono text-[17px] font-semibold tracking-tight"
+              className="text-center font-mono text-[clamp(22px,2.5vw,28px)] font-semibold tracking-tight"
             >
               Running in two commands
             </h2>

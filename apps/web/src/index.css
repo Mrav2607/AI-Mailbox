@@ -373,6 +373,17 @@ body.pane-dragging * {
   animation: landing-cursor-blink 1.1s steps(1, jump-none) infinite;
 }
 
+/* CRT scanline texture, scoped to the console/agenda mockup panels only --
+   never the page background. Kept faint (4% line alpha) so it reads as
+   terminal texture without touching legibility. */
+.landing-scanlines {
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent 0 2px,
+    color-mix(in oklab, var(--foreground) 4%, transparent) 2px 3px
+  );
+}
+
 @media (prefers-reduced-motion: reduce) {
   .landing-row-in,
   .landing-bar-fill {

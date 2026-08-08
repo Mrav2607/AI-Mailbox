@@ -204,6 +204,16 @@ describe("LandingPage sections", () => {
     expect(text).toContain("RSVP: team offsite Thursday");
   });
 
+  it("shows the operator section heading and the hero boot line", () => {
+    renderLanding();
+
+    const text = container.textContent ?? "";
+    expect(text).toContain("Built for the operator");
+    expect(text).toContain(
+      "cortexmail up — 3 accounts · 128 threads · model local:email-classifier",
+    );
+  });
+
   it("shows two distinct account chips on the agenda mockup", () => {
     renderLanding();
 
