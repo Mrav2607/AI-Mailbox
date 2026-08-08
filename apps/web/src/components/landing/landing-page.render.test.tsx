@@ -122,6 +122,73 @@ describe("LandingPage sections", () => {
     );
   });
 
+  it("renders six console rows, one per label", () => {
+    renderLanding();
+
+    const rows = container.querySelectorAll('ul[aria-hidden="true"] > li');
+    expect(rows).toHaveLength(6);
+    const text = container.textContent ?? "";
+    expect(text).toContain("New sign-in from Chrome on Ubuntu");
+    expect(text).toContain("You've been selected for a $500 reward");
+  });
+
+  it("exposes the console's label filter bar as real, focusable buttons", () => {
+    renderLanding();
+
+    const chips = container.querySelectorAll(
+      '[aria-label="Preview: filter the console by label"] button',
+    );
+    expect(chips).toHaveLength(6);
+    for (const chip of Array.from(chips)) {
+      expect(chip.getAttribute("aria-pressed")).toBe("false");
+    }
+  });
+
+  it("highlights the matching console row on chip focus and toggles it sticky on click", () => {
+    renderLanding();
+
+    const chip = container.querySelector(
+      'button[aria-label="Filter preview by spam"]',
+    ) as HTMLButtonElement | null;
+    expect(chip).not.toBeNull();
+
+    const rows = Array.from(container.querySelectorAll('ul[aria-hidden="true"] > li'));
+    const spamRow = rows.find((li) => li.textContent?.includes("$500 reward")) as
+      | HTMLLIElement
+      | undefined;
+    const otherRow = rows.find((li) => li.textContent?.includes("Sprint notes")) as
+      | HTMLLIElement
+      | undefined;
+    expect(spamRow).toBeDefined();
+    expect(otherRow).toBeDefined();
+
+    // Keyboard focus stands in for hover here -- this test harness has no
+    // testing-library fireEvent helpers, and React's onMouseEnter is
+    // polyfilled from bubbling mouseover/mouseout rather than a real
+    // "mouseenter" event, so a raw dispatchEvent wouldn't reach it. Focus is
+    // the other input the spec calls out ("hovering OR keyboard-focusing")
+    // and exercises the same activeLabel state.
+    act(() => {
+      chip!.focus();
+    });
+    expect(spamRow!.className).toContain("ring-1");
+    expect(otherRow!.className).toContain("opacity-45");
+
+    act(() => {
+      chip!.blur();
+    });
+    expect(spamRow!.className).not.toContain("ring-1");
+    expect(otherRow!.className).not.toContain("opacity-45");
+
+    click(chip!);
+    expect(chip!.getAttribute("aria-pressed")).toBe("true");
+    expect(spamRow!.className).toContain("ring-1");
+
+    click(chip!);
+    expect(chip!.getAttribute("aria-pressed")).toBe("false");
+    expect(spamRow!.className).not.toContain("ring-1");
+  });
+
   it("renders the agenda mockup inside the agenda section with a due-group header and sample items", () => {
     renderLanding();
 

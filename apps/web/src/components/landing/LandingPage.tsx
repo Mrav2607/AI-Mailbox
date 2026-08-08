@@ -133,35 +133,44 @@ export function LandingPage(props: {
 
       <main>
         <section className="mx-auto max-w-7xl px-4 py-14 sm:py-20">
-          <div className="mx-auto max-w-2xl text-center">
-            <h1
-              className={`text-balance font-mono text-[clamp(30px,5vw,52px)] font-semibold leading-[1.12] tracking-tight ${reveal}`}
-            >
-              Your inbox, triaged by your own model.
-            </h1>
-            <p
-              className={`mt-5 text-pretty text-[15px] leading-relaxed text-muted-foreground sm:text-[16px] ${reveal} [animation-delay:120ms]`}
-            >
-              Self-hosted email triage: your mail sorted into six buckets you review at
-              keyboard speed.
-            </p>
-            <div
-              className={`mt-7 flex flex-wrap items-center justify-center gap-3 ${reveal} [animation-delay:220ms]`}
-            >
-              <button type="button" onClick={onSignIn} className={primaryButton}>
-                Sign in →
-              </button>
-              <a href="#quick-start" className={secondaryAnchor}>
-                Run it yourself ↓
-              </a>
+          {/* Below `lg:` this stays the original stacked, centered layout --
+              only `lg:` variants change the shape. At `lg:` it splits into a
+              roughly 45/55 grid (copy left-aligned, console right and grown
+              to fill its column) so the console reads as the hero, not a
+              screenshot bolted under the pitch. */}
+          <div className="lg:grid lg:grid-cols-[45fr_55fr] lg:items-center lg:gap-10">
+            <div className="mx-auto max-w-2xl text-center lg:mx-0 lg:max-w-none lg:text-left">
+              <h1
+                className={`text-balance font-mono text-[clamp(30px,5vw,52px)] font-semibold leading-[1.12] tracking-tight ${reveal}`}
+              >
+                Your inbox, triaged by your own model.
+              </h1>
+              <p
+                className={`mt-5 text-pretty text-[15px] leading-relaxed text-muted-foreground sm:text-[16px] ${reveal} [animation-delay:120ms]`}
+              >
+                Self-hosted email triage: your mail sorted into six buckets you review at
+                keyboard speed.
+              </p>
+              <div
+                className={`mt-7 flex flex-wrap items-center justify-center gap-3 lg:justify-start ${reveal} [animation-delay:220ms]`}
+              >
+                <button type="button" onClick={onSignIn} className={primaryButton}>
+                  Sign in →
+                </button>
+                <a href="#quick-start" className={secondaryAnchor}>
+                  Run it yourself ↓
+                </a>
+              </div>
             </div>
-          </div>
-          <div className={`mx-auto mt-12 max-w-3xl ${reveal} [animation-delay:340ms]`}>
-            <LandingConsoleMockup />
-            <p className="mt-3 text-center text-[11.5px] text-muted-foreground">
-              The triage console: every thread labeled, with the model's confidence next to
-              it.
-            </p>
+            <div
+              className={`mx-auto mt-12 max-w-3xl lg:mx-0 lg:mt-0 lg:max-w-none lg:min-w-[480px] ${reveal} [animation-delay:340ms]`}
+            >
+              <LandingConsoleMockup />
+              <p className="mt-3 text-center text-[11.5px] text-muted-foreground lg:text-left">
+                The triage console: every thread labeled, with the model's confidence next to
+                it.
+              </p>
+            </div>
           </div>
         </section>
 
