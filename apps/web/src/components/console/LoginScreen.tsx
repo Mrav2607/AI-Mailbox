@@ -21,11 +21,12 @@ import type { User } from "@/lib/types";
 
 interface Props {
   onAuthed: (user: User) => void;
+  onBack?: () => void;
 }
 
 type Mode = "login" | "signup" | "signup_sent" | "forgot" | "forgot_sent";
 
-export function LoginScreen({ onAuthed }: Props) {
+export function LoginScreen({ onAuthed, onBack }: Props) {
   const [mode, setMode] = useState<Mode>("login");
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
@@ -217,6 +218,15 @@ export function LoginScreen({ onAuthed }: Props) {
         }}
       />
       <div className="relative z-10 w-full max-w-sm rounded-lg border border-border bg-[var(--color-panel)] p-6 shadow-xl">
+        {onBack && mode === "login" && (
+          <button
+            type="button"
+            onClick={onBack}
+            className="mb-4 text-[11px] font-mono text-muted-foreground hover:text-foreground cursor-pointer"
+          >
+            ← Back to CortexMail
+          </button>
+        )}
         <div className="flex items-center gap-3 mb-1.5">
           <div className="h-10 w-10 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor text-primary">
             <Mark className="h-8 w-8" />

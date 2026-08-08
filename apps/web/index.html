@@ -6,20 +6,38 @@
     <link rel="icon" type="image/svg+xml" href="/appicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CortexMail</title>
+    <meta
+      name="description"
+      content="CortexMail: self-hosted email triage. Your mail sorted into six buckets by your own model, reviewed at keyboard speed."
+    />
+    <meta property="og:title" content="CortexMail" />
+    <meta
+      property="og:description"
+      content="Self-hosted email triage: your mail sorted into six buckets you review at keyboard speed."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary" />
     <script>
-      // Set the theme class before first paint so dark users never see a
-      // light flash. lib/theme.ts owns this logic once the app is running.
+      // Set the theme class before first paint so users never see a flash of
+      // the wrong theme. lib/theme.ts owns this logic once the app is running.
+      // Dark is the default: only an explicit "light" or "system" preference
+      // in storage should produce anything else.
       (function () {
         try {
           var ui = JSON.parse(localStorage.getItem("ai_mailbox_ui") || "{}") || {};
           var dark =
-            ui.theme === "dark" ||
-            (ui.theme !== "light" &&
-              window.matchMedia("(prefers-color-scheme: dark)").matches);
+            ui.theme === "light"
+              ? false
+              : ui.theme === "system"
+                ? window.matchMedia("(prefers-color-scheme: dark)").matches
+                : true;
           document.documentElement.classList.toggle("dark", dark);
           document.documentElement.style.colorScheme = dark ? "dark" : "light";
         } catch (e) {
-          /* no storage — system default applies via matchMedia below the app */
+          // Storage read/parse failed — fall back to the dark default rather
+          // than leaving the light (unstyled) class in place.
+          document.documentElement.classList.add("dark");
+          document.documentElement.style.colorScheme = "dark";
         }
       })();
     </script>

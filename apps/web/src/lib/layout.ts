@@ -107,7 +107,7 @@ export const DEFAULT_UI: UiState = {
   sidebar: true,
   detail: true,
   prediction: true,
-  theme: "system",
+  theme: "dark",
   arrangement: DEFAULT_ARRANGEMENT,
   paneSizes: {},
   autoSync: 180,
