@@ -121,6 +121,35 @@ describe("LandingPage sections", () => {
       "The triage console: every thread labeled, with the model's confidence next to it.",
     );
   });
+
+  it("renders the agenda mockup inside the agenda section with a due-group header and sample items", () => {
+    renderLanding();
+
+    const agendaSection = container.querySelector("#agenda-heading")?.closest("section");
+    expect(agendaSection).not.toBeNull();
+
+    const mockups = agendaSection!.querySelectorAll('[aria-hidden="true"]');
+    expect(mockups.length).toBeGreaterThan(0);
+
+    const text = agendaSection!.textContent ?? "";
+    expect(text).toContain("Overdue");
+    expect(text).toContain("Pay fall tuition installment");
+    expect(text).toContain("RSVP: team offsite Thursday");
+  });
+
+  it("shows two distinct account chips on the agenda mockup", () => {
+    renderLanding();
+
+    const agendaSection = container.querySelector("#agenda-heading")?.closest("section");
+    expect(agendaSection).not.toBeNull();
+
+    const workChip = agendaSection!.querySelector('[title="work@acme.io"]');
+    const personalChip = agendaSection!.querySelector('[title="personal@gmail.com"]');
+    expect(workChip).not.toBeNull();
+    expect(personalChip).not.toBeNull();
+    expect(workChip?.textContent).toBe("work");
+    expect(personalChip?.textContent).toBe("personal");
+  });
 });
 
 describe("LandingPage sign-in", () => {

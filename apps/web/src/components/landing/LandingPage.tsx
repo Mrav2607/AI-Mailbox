@@ -6,6 +6,7 @@ import { THEME_PREFS } from "@/lib/theme";
 import type { ThemePref } from "@/lib/theme";
 import type { Label } from "@/lib/types";
 
+import { LandingAgendaMockup } from "./LandingAgendaMockup";
 import { LandingConsoleMockup } from "./LandingConsoleMockup";
 
 const GITHUB_URL = "https://github.com/Mrav2607/AI-Mailbox";
@@ -223,6 +224,9 @@ export function LandingPage(props: {
               list, sorted by due date. Press <span className="kbd">0</span> in the console to
               jump to it.
             </p>
+            <div className="mx-auto mt-8 max-w-2xl">
+              <LandingAgendaMockup />
+            </div>
           </div>
         </section>
 
