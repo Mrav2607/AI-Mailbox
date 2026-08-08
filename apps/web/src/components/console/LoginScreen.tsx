@@ -364,7 +364,7 @@ export function LoginScreen({ onAuthed, onBack }: Props) {
             </details>
             {USE_MOCK && (
               <div className="mt-4 text-[11px] text-muted-foreground font-mono leading-relaxed">
-                no VITE_API_BASE_URL configured — running with in-memory mock data
+                no VITE_API_BASE_URL configured; running with in-memory mock data
                 matching the real API shape.
               </div>
             )}
@@ -443,7 +443,7 @@ export function LoginScreen({ onAuthed, onBack }: Props) {
         {mode === "signup_sent" && (
           <div className="font-mono">
             <p className="text-sm text-foreground">
-              check your inbox — the link expires in 24 hours
+              check your inbox; the link expires in 24 hours
             </p>
             <p className="mt-2 text-[12px] leading-relaxed text-muted-foreground">
               we sent a verification link to {email}.

@@ -545,7 +545,7 @@ export default function Console() {
     setToken(null);
     setUser(null);
     setSignedOutView("login");
-    toast.error("session expired — please sign in again");
+    toast.error("session expired. please sign in again");
   }, []);
 
   // ---- seen/unread (feature 9) ----------------------------------------------

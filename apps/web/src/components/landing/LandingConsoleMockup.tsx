@@ -21,7 +21,7 @@ const ROWS: {
   {
     label: "needs_reply",
     confidence: 0.93,
-    subject: "Re: contract redline — final pass?",
+    subject: "Re: contract redline, final pass?",
     time: "2m",
     selected: true,
   },
@@ -34,7 +34,7 @@ const ROWS: {
   {
     label: "fyi",
     confidence: 0.74,
-    subject: "Sprint notes — nothing blocking",
+    subject: "Sprint notes, nothing blocking",
     time: "3h",
   },
   {

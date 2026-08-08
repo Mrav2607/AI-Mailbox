@@ -72,8 +72,8 @@ describe("LandingPage sections", () => {
     expect(text).toContain("Pulls your Gmail over OAuth into your own Postgres.");
     expect(text).toContain("Keyboard-first console");
     expect(text).toContain("Running in two commands");
-    expect(text).toContain("Six labels. A closed set — the model never invents a seventh.");
-    expect(text).toContain("CortexMail — self-hosted email triage.");
+    expect(text).toContain("Six labels. A closed set: the model never invents a seventh.");
+    expect(text).toContain("CortexMail: self-hosted email triage.");
   });
 
   it("renders the console mockup as decorative with a visible caption", () => {

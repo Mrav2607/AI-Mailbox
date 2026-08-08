@@ -37,7 +37,7 @@ const HOW_IT_WORKS = [
 const FEATURES = [
   {
     title: "Keyboard-first console",
-    body: "j/k move, ⌘K palette, 1–9 buckets, 0 agenda",
+    body: "j/k move, ⌘K palette, 1-9 buckets, 0 agenda",
   },
   {
     title: "Confidence you can see",
@@ -49,7 +49,7 @@ const FEATURES = [
   },
   {
     title: "Self-hosted stack",
-    body: "FastAPI · Postgres/pgvector · Redis · one docker compose — self-host your mailbox data and choose which model processes it",
+    body: "FastAPI · Postgres/pgvector · Redis · one docker compose. Self-host your mailbox data and choose which model processes it.",
   },
 ];
 
@@ -87,16 +87,21 @@ export function LandingPage(props: {
       window.setTimeout(() => setCopied(false), 2000);
     } catch {
       setCopied(false);
-      setCopyAnnouncement("Couldn't copy — copy the commands manually.");
+      setCopyAnnouncement("Couldn't copy. Select the commands and copy them manually.");
     }
   }
 
   const ghostButton =
-    "h-8 px-3 rounded border border-border bg-[var(--panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12.5px] font-mono cursor-pointer transition-colors";
+    "h-9 px-3 rounded border border-border bg-[var(--panel-hi)] hover:bg-accent flex items-center gap-1.5 text-[12.5px] font-mono cursor-pointer transition-colors";
   const primaryButton =
-    "h-9 px-4 rounded bg-primary text-primary-foreground font-mono text-[13px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-[filter] hover:brightness-110 phosphor";
+    "h-10 px-5 rounded bg-primary text-primary-foreground font-mono text-[13px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-[filter] hover:brightness-110 phosphor";
   const secondaryAnchor =
-    "h-9 px-4 rounded border border-border bg-[var(--panel-hi)] hover:bg-accent text-foreground/90 font-mono text-[13px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors";
+    "h-10 px-5 rounded border border-border bg-[var(--panel-hi)] hover:bg-accent text-foreground/90 font-mono text-[13px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-colors";
+  // One orchestrated page-load reveal in the hero; everything else stays still.
+  // CSS animations (not class-gated transitions) so content is never stuck
+  // hidden, and motion-reduce turns the whole thing off.
+  const reveal =
+    "animate-in fade-in slide-in-from-bottom-2 duration-700 [animation-fill-mode:both] motion-reduce:animate-none";
 
   return (
     <div className="min-h-screen w-full bg-background text-foreground">
@@ -121,7 +126,7 @@ export function LandingPage(props: {
             onClick={() => onTheme(nextTheme)}
             aria-label={`Theme: ${theme}. Switch to ${nextTheme}.`}
             title={`theme: ${theme} → ${nextTheme}`}
-            className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded border border-border bg-[var(--panel-hi)] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded border border-border bg-[var(--panel-hi)] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <ThemeIcon className="h-3.5 w-3.5" />
           </button>
@@ -134,14 +139,20 @@ export function LandingPage(props: {
       <main>
         <section className="mx-auto max-w-6xl px-4 py-14 sm:py-20">
           <div className="mx-auto max-w-2xl text-center">
-            <h1 className="font-mono text-[28px] font-semibold leading-tight tracking-tight sm:text-4xl">
+            <h1
+              className={`text-balance font-mono text-[clamp(30px,5vw,52px)] font-semibold leading-[1.12] tracking-tight ${reveal}`}
+            >
               Your inbox, triaged by your own model.
             </h1>
-            <p className="mt-4 text-[14px] leading-relaxed text-muted-foreground sm:text-[15px]">
+            <p
+              className={`mt-5 text-pretty text-[15px] leading-relaxed text-muted-foreground sm:text-[16px] ${reveal} [animation-delay:120ms]`}
+            >
               Self-hosted email triage: your mail sorted into six buckets you review at
               keyboard speed.
             </p>
-            <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+            <div
+              className={`mt-7 flex flex-wrap items-center justify-center gap-3 ${reveal} [animation-delay:220ms]`}
+            >
               <button type="button" onClick={onSignIn} className={primaryButton}>
                 Sign in →
               </button>
@@ -150,7 +161,7 @@ export function LandingPage(props: {
               </a>
             </div>
           </div>
-          <div className="mx-auto mt-12 max-w-3xl">
+          <div className={`mx-auto mt-12 max-w-3xl ${reveal} [animation-delay:340ms]`}>
             <LandingConsoleMockup />
             <p className="mt-3 text-center text-[11.5px] text-muted-foreground">
               The triage console: every thread labeled, with the model's confidence next to
@@ -163,20 +174,17 @@ export function LandingPage(props: {
           <div className="mx-auto max-w-6xl px-4 py-12">
             <h2
               id="how-it-works-heading"
-              className="text-center font-mono text-[12px] font-semibold uppercase tracking-widest text-muted-foreground"
+              className="text-balance text-center font-mono text-[17px] font-semibold tracking-tight"
             >
               How it works
             </h2>
-            <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <div className="mx-auto mt-8 grid max-w-4xl grid-cols-1 gap-8 sm:grid-cols-3">
               {HOW_IT_WORKS.map((step) => (
-                <div
-                  key={step.step}
-                  className="rounded-lg border border-border bg-[var(--panel)] p-4 panel-lift"
-                >
-                  <div className="font-mono text-[12px] font-semibold text-primary">
+                <div key={step.step}>
+                  <div className="font-mono text-[13px] font-semibold text-primary">
                     {step.step} {step.title}
                   </div>
-                  <p className="mt-1.5 text-[13px] leading-relaxed text-foreground/85">
+                  <p className="mt-2 text-[13.5px] leading-relaxed text-foreground/85">
                     {step.body}
                   </p>
                 </div>
@@ -189,11 +197,11 @@ export function LandingPage(props: {
           <div className="mx-auto max-w-6xl px-4 py-12">
             <h2
               id="features-heading"
-              className="text-center font-mono text-[12px] font-semibold uppercase tracking-widest text-muted-foreground"
+              className="text-center font-mono text-[17px] font-semibold tracking-tight"
             >
-              Features
+              Built for the operator
             </h2>
-            <div className="mx-auto mt-6 max-w-3xl divide-y divide-border">
+            <div className="mx-auto mt-8 max-w-3xl divide-y divide-border">
               {FEATURES.map((f) => (
                 <div key={f.title} className="flex flex-col gap-1 py-3.5 sm:flex-row sm:gap-4">
                   <div className="font-mono text-[13px] font-semibold text-foreground sm:w-56 sm:shrink-0">
@@ -210,7 +218,7 @@ export function LandingPage(props: {
           <div className="mx-auto max-w-6xl px-4 py-12">
             <h2
               id="quick-start-heading"
-              className="text-center font-mono text-[16px] font-semibold tracking-tight"
+              className="text-center font-mono text-[17px] font-semibold tracking-tight"
             >
               Running in two commands
             </h2>
@@ -232,8 +240,8 @@ export function LandingPage(props: {
                 </span>
               </div>
               <p className="mt-4 text-[12.5px] leading-relaxed text-muted-foreground">
-                open <code className="font-mono text-foreground/85">localhost:8080</code> — demo
-                login, no Google account needed.
+                open <code className="font-mono text-foreground/85">localhost:8080</code> and use
+                the demo login. No Google account needed.
               </p>
             </div>
           </div>
@@ -242,7 +250,7 @@ export function LandingPage(props: {
         <section aria-labelledby="taxonomy-heading" className="border-t border-border">
           <div className="mx-auto max-w-6xl px-4 py-12 text-center">
             <h2 id="taxonomy-heading" className="font-mono text-[13px] font-medium text-foreground/90">
-              Six labels. A closed set — the model never invents a seventh.
+              Six labels. A closed set: the model never invents a seventh.
             </h2>
             <div className="mx-auto mt-5 flex max-w-3xl flex-wrap items-center justify-center gap-2.5">
               <span className="flex items-center gap-1.5 rounded border border-border bg-[var(--panel)] px-2 py-1 font-mono text-[11px]">
@@ -271,7 +279,7 @@ export function LandingPage(props: {
 
       <footer className="border-t border-border">
         <div className="mx-auto max-w-6xl px-4 py-6 text-center font-mono text-[11.5px] text-muted-foreground">
-          CortexMail — self-hosted email triage.
+          CortexMail: self-hosted email triage.
         </div>
       </footer>
     </div>
