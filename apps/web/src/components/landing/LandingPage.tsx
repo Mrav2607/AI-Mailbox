@@ -249,11 +249,11 @@ export function LandingPage(props: {
           <div className="mx-auto max-w-7xl px-4 py-12">
             <h2
               id="features-heading"
-              className="font-mono text-[clamp(22px,2.5vw,28px)] font-semibold tracking-tight"
+              className="text-balance text-center font-mono text-[clamp(22px,2.5vw,28px)] font-semibold tracking-tight"
             >
               Built for the operator
             </h2>
-            <div className="mt-8 max-w-3xl divide-y divide-border">
+            <div className="mx-auto mt-8 max-w-3xl divide-y divide-border">
               {FEATURES.map((f) => (
                 <div key={f.title} className="flex flex-col gap-1 py-3.5 sm:flex-row sm:gap-4">
                   <div className="font-mono text-[13px] font-semibold text-foreground sm:w-56 sm:shrink-0">
