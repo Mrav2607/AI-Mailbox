@@ -228,9 +228,7 @@ export function LoginScreen({ onAuthed, onBack }: Props) {
           </button>
         )}
         <div className="flex items-center gap-3 mb-1.5">
-          <div className="h-10 w-10 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor text-primary">
-            <Mark className="h-8 w-8" />
-          </div>
+          <Mark className="h-10 w-10 shrink-0" />
           <h1 className="font-mono text-2xl font-semibold tracking-tight">
             CortexMail
           </h1>
