@@ -115,7 +115,7 @@ def test_warmup_is_a_noop_when_already_loaded(monkeypatch):
     from app.services.nlp import local_model
 
     local_model.reset()
-    monkeypatch.setattr(local_model, "_state", ("tok", "model", ["a"], "cpu", "v1"))
+    monkeypatch.setattr(local_model, "_state", ("tok", "model", ["a"], "cpu", "v1", None))
     monkeypatch.setattr(local_model, "_load", lambda: pytest.fail("must not reload"))
     local_model.warmup()
     assert local_model._unavailable is False
@@ -146,7 +146,7 @@ def test_try_predict_fast_path_skips_the_load_lock(monkeypatch):
         def __exit__(self, *args):
             return False
 
-    state = (fake_tokenizer, lambda **enc: FakeOutput(), ["a", "b", "c"], "cpu", "test")
+    state = (fake_tokenizer, lambda **enc: FakeOutput(), ["a", "b", "c"], "cpu", "test", None)
     monkeypatch.setattr(local_model, "_state", state)
     monkeypatch.setattr(local_model, "_lock", ExplodingLock())
 
@@ -169,12 +169,234 @@ def test_try_predict_falls_back_when_all_infer_slots_are_busy(monkeypatch):
 
     local_model.reset()
     monkeypatch.setattr(
-        local_model, "_state", ("tok", "model", ["a"], "cpu", "test")
+        local_model, "_state", ("tok", "model", ["a"], "cpu", "test", None)
     )
     monkeypatch.setattr(local_model, "_infer_slots", Semaphore(0))
     monkeypatch.setattr(local_model, "_SLOT_TIMEOUT_S", 0.01)
 
     assert local_model.try_predict("hello") is None
+
+
+# ---------------------------------------------------------------------------
+# calibration.json loading/validation and application before softmax
+# (plan: docs/plans/2026-08-07-model-v21-calibration-plan.md §2).
+# ---------------------------------------------------------------------------
+
+
+# The frozen v2.1 schema is pinned to exactly six labels -- these tests use
+# the real served label order (`app.services.nlp.classifier.LABELS`) rather
+# than an arbitrary short list, so the six-label pin is exercised for real.
+_SIX_LABELS = list(LABELS)
+_SIX_LABELS_SWAPPED = [_SIX_LABELS[1], _SIX_LABELS[0], *_SIX_LABELS[2:]]  # same set, wrong order
+
+
+def _write_model_dir(tmp_path, *, required=False, calibration=None):
+    """Write just the pieces `_load_calibration` reads -- no real HF model
+    files needed since it never touches the tokenizer/model."""
+    config = {"calibration_required": True} if required else {}
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    if calibration is not None:
+        (tmp_path / "calibration.json").write_text(json.dumps(calibration), encoding="utf-8")
+    return tmp_path
+
+
+def test_load_calibration_absent_file_is_identity(tmp_path):
+    # No marker, no file -- legacy v1/v2 dirs get plain identity.
+    from app.services.nlp import local_model
+
+    model_dir = _write_model_dir(tmp_path, required=False)
+    assert local_model._load_calibration(model_dir, _SIX_LABELS, torch=None, device="cpu") is None
+
+
+def test_load_calibration_required_but_missing_raises(tmp_path):
+    # A v2.1-marked dir missing its calibration.json must fail loudly, not
+    # silently serve uncalibrated confidences under the v2.1 label.
+    from app.services.nlp import local_model
+
+    model_dir = _write_model_dir(tmp_path, required=True)
+    with pytest.raises(ValueError, match="calibration_required"):
+        local_model._load_calibration(model_dir, _SIX_LABELS, torch=None, device="cpu")
+
+
+def test_load_calibration_rejects_non_six_label_schema_even_when_labels_match(tmp_path):
+    # The frozen schema is pinned to exactly six labels, full stop -- a
+    # calibration file must be rejected for a hypothetical 3-label model
+    # even when its "labels" list matches the served labels exactly.
+    from app.services.nlp import local_model
+
+    three_labels = _SIX_LABELS[:3]
+    calibration = {
+        "schema": 1,
+        "kind": "temperature",
+        "labels": three_labels,
+        "params": {"T": 2.0},
+    }
+    model_dir = _write_model_dir(tmp_path, calibration=calibration)
+    with pytest.raises(ValueError, match="exactly"):
+        local_model._load_calibration(model_dir, three_labels, torch=None, device="cpu")
+
+
+@pytest.mark.parametrize(
+    "calibration, match",
+    [
+        ({"schema": 2, "kind": "temperature", "labels": _SIX_LABELS, "params": {"T": 2.0}}, "schema"),
+        ({"schema": True, "kind": "temperature", "labels": _SIX_LABELS, "params": {"T": 2.0}}, "schema"),
+        ({"schema": 1, "kind": "bogus", "labels": _SIX_LABELS, "params": {}}, "kind"),
+        ({"schema": 1, "kind": "temperature", "labels": _SIX_LABELS_SWAPPED, "params": {"T": 2.0}}, "labels"),
+        ({"schema": 1, "kind": "temperature", "labels": _SIX_LABELS, "params": {"T": 0.0}}, "temperature"),
+        ({"schema": 1, "kind": "temperature", "labels": _SIX_LABELS, "params": {"T": -1.0}}, "temperature"),
+        ({"schema": 1, "kind": "temperature", "labels": _SIX_LABELS, "params": {"T": float("nan")}}, "temperature"),
+        ({"schema": 1, "kind": "temperature", "labels": _SIX_LABELS, "params": {"T": float("inf")}}, "temperature"),
+        (
+            {
+                "schema": 1,
+                "kind": "vector",
+                "labels": _SIX_LABELS,
+                "params": {"w": [1.0, float("nan"), 1.0, 1.0, 1.0, 1.0], "b": [0.0] * 6},
+            },
+            "vector params",
+        ),
+        (
+            {
+                "schema": 1,
+                "kind": "vector",
+                "labels": _SIX_LABELS,
+                "params": {"w": [1.0, 1.0], "b": [0.0] * 6},
+            },
+            "vector params",
+        ),
+        (
+            {
+                "schema": 1,
+                "kind": "vector",
+                "labels": _SIX_LABELS,
+                "params": {"w": [1.0, -1.0, 1.0, 1.0, 1.0, 1.0], "b": [0.0] * 6},
+            },
+            "non-positive",
+        ),
+    ],
+    ids=[
+        "bad-schema",
+        "schema-boolean-true",
+        "bad-kind",
+        "label-mismatch",
+        "temperature-zero",
+        "temperature-negative",
+        "temperature-nan",
+        "temperature-infinity",
+        "vector-nan-w",
+        "vector-wrong-length-w",
+        "vector-nonpositive-w",
+    ],
+)
+def test_load_calibration_malformed_raises(tmp_path, calibration, match):
+    # Any schema/param violation is a definitive load failure -- never
+    # silently ignored.
+    from app.services.nlp import local_model
+
+    model_dir = _write_model_dir(tmp_path, calibration=calibration)
+    with pytest.raises(ValueError, match=match):
+        local_model._load_calibration(model_dir, _SIX_LABELS, torch=None, device="cpu")
+
+
+def test_warmup_marks_unavailable_when_calibration_fails_validation(monkeypatch, tmp_path):
+    # Wiring check: a `_load_calibration` failure propagates through `_load`'s
+    # existing exception handling into `_unavailable`, exactly like any other
+    # definitive load failure (missing deps, corrupt files, ...).
+    from app.services.nlp import local_model
+
+    local_model.reset()
+    model_dir = _write_model_dir(tmp_path, required=True)  # marked required, no calibration.json
+
+    monkeypatch.setattr(
+        local_model,
+        "_load",
+        lambda: local_model._load_calibration(model_dir, _SIX_LABELS, torch=None, device="cpu"),
+    )
+    local_model.warmup()
+    assert local_model._unavailable is True
+    local_model.reset()
+
+
+def test_try_predict_temperature_calibration_changes_confidence_not_argmax(monkeypatch):
+    # Same fake-logits double as the fast-path test above. Softening with
+    # T=2 must shrink the winning confidence but never flip which label wins
+    # -- scalar temperature preserves argmax by construction.
+    torch = pytest.importorskip("torch")
+    from app.services.nlp import local_model
+
+    local_model.reset()
+
+    class Encoding(dict):
+        def to(self, device):
+            return self
+
+    class FakeOutput:
+        logits = torch.tensor([[0.1, 5.0, 0.2]])
+
+    def fake_tokenizer(text, **kwargs):
+        return Encoding(input_ids=torch.tensor([[1, 2]]))
+
+    labels = ["a", "b", "c"]
+    uncalibrated_state = (fake_tokenizer, lambda **enc: FakeOutput(), labels, "cpu", "test", None)
+    calibrated_state = (
+        fake_tokenizer,
+        lambda **enc: FakeOutput(),
+        labels,
+        "cpu",
+        "test",
+        {"kind": "temperature", "T": 2.0},
+    )
+
+    monkeypatch.setattr(local_model, "_state", uncalibrated_state)
+    uncal_label, uncal_conf, *_ = local_model.try_predict("hello")
+
+    monkeypatch.setattr(local_model, "_state", calibrated_state)
+    cal_label, cal_conf, *_ = local_model.try_predict("hello")
+
+    assert cal_label == uncal_label == "b"
+    assert cal_conf < uncal_conf
+    local_model.reset()
+
+
+def test_try_predict_vector_calibration_is_numerically_correct(monkeypatch):
+    # Fixed logits/w/b -- expected transformed logits, softmax, and argmax
+    # are hand-computed (not by re-deriving the implementation's own
+    # formula) so this actually catches an order-of-operations bug, not
+    # just mirrors it.
+    torch = pytest.importorskip("torch")
+    from app.services.nlp import local_model
+
+    local_model.reset()
+
+    class Encoding(dict):
+        def to(self, device):
+            return self
+
+    class FakeOutput:
+        logits = torch.tensor([[0.1, 5.0, 0.2]])
+
+    def fake_tokenizer(text, **kwargs):
+        return Encoding(input_ids=torch.tensor([[1, 2]]))
+
+    w = [1.0, 0.5, 2.0]
+    b = [0.0, -1.0, 0.5]
+    # transformed = logits * w + b = [0.1, 1.5, 0.9]; softmax peaks at index 1
+    # (label "b") with confidence 0.557 -- computed independently in Python.
+    state = (
+        fake_tokenizer,
+        lambda **enc: FakeOutput(),
+        ["a", "b", "c"],
+        "cpu",
+        "test",
+        {"kind": "vector", "w": torch.tensor(w), "b": torch.tensor(b)},
+    )
+    monkeypatch.setattr(local_model, "_state", state)
+
+    label, confidence, *_ = local_model.try_predict("hello")
+    assert label == "b"
+    assert confidence == pytest.approx(0.557, abs=1e-3)
+    local_model.reset()
 
 
 def test_genai_client_is_cached_across_calls(monkeypatch):
