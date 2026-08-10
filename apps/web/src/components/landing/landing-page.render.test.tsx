@@ -70,9 +70,9 @@ describe("LandingPage sections", () => {
 
     const text = container.textContent ?? "";
     expect(text).toContain(
-      "Connect multiple Gmail and Outlook accounts; every message lands in one place, sorted into the six labels.",
+      "Connect multiple Gmail and Outlook accounts. Every message lands in one place, sorted into the six labels.",
     );
-    expect(text).toContain("Six labels. A closed set: the model never invents a seventh.");
+    expect(text).toContain("The model categorizes each message into a fixed set of six labels.");
     expect(text).toContain(
       "Action items get pulled out of every account you connect and collected into one list, sorted by due date.",
     );
@@ -118,7 +118,7 @@ describe("LandingPage sections", () => {
     const mockup = container.querySelector('[aria-hidden="true"]');
     expect(mockup).not.toBeNull();
     expect(container.textContent).toContain(
-      "The triage console: every thread labeled, with the model's confidence next to it.",
+      "The triage console has every thread labeled, with the model's confidence next to it.",
     );
   });
 

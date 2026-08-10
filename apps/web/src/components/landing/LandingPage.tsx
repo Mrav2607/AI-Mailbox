@@ -26,7 +26,7 @@ const HOW_IT_WORKS = [
   {
     step: "01",
     title: "CONNECT",
-    body: "Connect multiple Gmail and Outlook accounts; every message lands in one place, sorted into the six labels.",
+    body: "Connect multiple Gmail and Outlook accounts. Every message lands in one place, sorted into the six labels.",
   },
   {
     step: "02",
@@ -36,7 +36,7 @@ const HOW_IT_WORKS = [
   {
     step: "03",
     title: "TRIAGE",
-    body: "Review buckets at keyboard speed; correct labels as you triage.",
+    body: "Review buckets at keyboard speed and correct labels as you triage.",
   },
 ];
 
@@ -51,7 +51,7 @@ const FEATURES = [
   },
   {
     title: "Your model, your keys",
-    body: "supports a locally fine-tuned encoder or bring-your-own LLM key; quick-start ships with a heuristic baseline",
+    body: "use the built-in classifier, bring-your-own LLM key, or simply get started with the heuristic baseline",
   },
   {
     title: "Self-hosted stack",
@@ -173,8 +173,7 @@ export function LandingPage(props: {
             >
               <LandingConsoleMockup />
               <p className="mt-3 text-center text-[11.5px] text-muted-foreground lg:text-left">
-                The triage console: every thread labeled, with the model's confidence next to
-                it.
+                The triage console has every thread labeled, with the model's confidence next to it.
               </p>
             </div>
           </div>
@@ -206,7 +205,7 @@ export function LandingPage(props: {
         <section aria-labelledby="taxonomy-heading" className="border-t border-border">
           <div className="mx-auto max-w-7xl px-4 py-12 text-center">
             <h2 id="taxonomy-heading" className="font-mono text-[13px] font-medium text-foreground/90">
-              Six labels. A closed set: the model never invents a seventh.
+              The model categorizes each message into a fixed set of six labels.
             </h2>
             <div className="mx-auto mt-5 flex max-w-3xl flex-wrap items-center justify-center gap-2.5">
               {LABELS.map((label) => {
