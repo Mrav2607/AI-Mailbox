@@ -36,6 +36,39 @@ describe("loadUi tourVersion", () => {
   });
 });
 
+describe("loadUi theme", () => {
+  beforeEach(() => window.localStorage.clear());
+
+  it.each(["dark", "light", "system"] as const)(
+    "preserves a stored value of %s",
+    (theme) => {
+      window.localStorage.setItem(
+        UI_KEY,
+        JSON.stringify({ ...DEFAULT_UI, theme }),
+      );
+      expect(loadUi().theme).toBe(theme);
+    },
+  );
+
+  it.each(["blue", 1, null, undefined])(
+    "falls back to dark for an invalid value (%s)",
+    (theme) => {
+      window.localStorage.setItem(
+        UI_KEY,
+        JSON.stringify({ ...DEFAULT_UI, theme }),
+      );
+      expect(loadUi().theme).toBe("dark");
+    },
+  );
+
+  it("falls back to dark when an older blob has no theme", () => {
+    const { theme: _theme, ...oldUi } = DEFAULT_UI;
+    window.localStorage.setItem(UI_KEY, JSON.stringify(oldUi));
+
+    expect(loadUi().theme).toBe("dark");
+  });
+});
+
 describe("loadUi density", () => {
   beforeEach(() => window.localStorage.clear());
 

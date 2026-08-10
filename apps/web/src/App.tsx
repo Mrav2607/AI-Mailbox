@@ -24,6 +24,7 @@ import {
   getLlmUsage,
   getMe,
   getSyncHealth,
+  getToken,
   googleAuthCallback,
   googleConnectCallback,
   googleConnectStart,
@@ -73,6 +74,7 @@ import { toast } from "sonner";
 import { createLiveSearch, type LiveSearchController } from "@/lib/live-search";
 import { emailLocalPart } from "@/lib/sender";
 
+import { LandingPage } from "@/components/landing/LandingPage";
 import { AgendaList } from "@/components/console/AgendaList";
 import { BucketSidebar } from "@/components/console/BucketSidebar";
 import { ThreadList } from "@/components/console/ThreadList";
@@ -171,6 +173,14 @@ function formatSyncTime(iso: string | null): string {
 export default function Console() {
   const [user, setUser] = useState<User | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  // Which screen a signed-out visitor sees. Starts on the marketing landing
+  // page; anything that implies they've already tried to sign in (a failed
+  // restore, a session expiring, an interrupted OAuth round-trip) sends them
+  // to the login screen instead — see the restore effect below for the
+  // token-snapshot rule that decides "tokenless visitor" vs "rejected token".
+  const [signedOutView, setSignedOutView] = useState<"landing" | "login">(
+    "landing",
+  );
   const pathname = window.location.pathname;
   const isEmailAuthScreen =
     pathname === "/auth/verify-email" || pathname === "/auth/reset-password";
@@ -415,6 +425,7 @@ export default function Console() {
         if (!binding || binding.state !== state) {
           window.history.replaceState({}, "", "/");
           toast.error("sign-in was interrupted — try again");
+          setSignedOutView("login");
         } else {
           try {
             if (oauthError || !code) {
@@ -448,6 +459,7 @@ export default function Console() {
                   : (e as Error).message || "google sign-in failed",
               );
             }
+            if (binding.mode === "login") setSignedOutView("login");
           } finally {
             window.history.replaceState({}, "", "/");
           }
@@ -467,6 +479,7 @@ export default function Console() {
         if (!binding || binding.state !== state) {
           window.history.replaceState({}, "", "/");
           toast.error("sign-in was interrupted — try again");
+          setSignedOutView("login");
         } else {
           try {
             if (oauthError || !code) {
@@ -500,12 +513,19 @@ export default function Console() {
                   : (e as Error).message || "microsoft sign-in failed",
               );
             }
+            if (binding.mode === "login") setSignedOutView("login");
           } finally {
             window.history.replaceState({}, "", "/");
           }
         }
       }
 
+      // getMe() throws an identical 401 whether no token exists or a stored
+      // one was rejected -- and the api layer clears the token on 401 before
+      // this catch runs, so the token can't be inspected after the fact.
+      // Snapshot it first: only a rejected *existing* token sends a visitor
+      // to the login screen, a tokenless one stays on the landing page.
+      const hadToken = getToken() != null;
       try {
         const me = await getMe();
         setUser(me);
@@ -514,6 +534,7 @@ export default function Console() {
           setToken(null);
         }
         setUser(null);
+        if (hadToken) setSignedOutView("login");
       } finally {
         setAuthChecked(true);
       }
@@ -523,7 +544,8 @@ export default function Console() {
   const handleSessionExpired = useCallback(() => {
     setToken(null);
     setUser(null);
-    toast.error("session expired — please sign in again");
+    setSignedOutView("login");
+    toast.error("session expired. please sign in again");
   }, []);
 
   // ---- seen/unread (feature 9) ----------------------------------------------
@@ -2283,11 +2305,20 @@ export default function Console() {
   if (!user) {
     return (
       <>
-        <LoginScreen
-          onAuthed={(u) => {
-            setUser(u);
-          }}
-        />
+        {signedOutView === "landing" ? (
+          <LandingPage
+            onSignIn={() => setSignedOutView("login")}
+            theme={theme}
+            onTheme={setTheme}
+          />
+        ) : (
+          <LoginScreen
+            onAuthed={(u) => {
+              setUser(u);
+            }}
+            onBack={() => setSignedOutView("landing")}
+          />
+        )}
         <Toaster theme={resolvedTheme} />
       </>
     );
@@ -2721,6 +2752,7 @@ export default function Console() {
             } finally {
               setToken(null);
               setUser(null);
+              setSignedOutView("landing");
             }
           }}
         />
