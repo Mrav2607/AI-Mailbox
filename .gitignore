@@ -53,3 +53,5 @@ apps/web/_shot*.mjs
 
 # Internal documentation
 /docs
+.superpowers/
+apps/api/uv.lock
