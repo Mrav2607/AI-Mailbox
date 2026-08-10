@@ -22,12 +22,23 @@ The summary block also reports calibration: expected calibration error (ECE,
 10 equal-width confidence bins) and multiclass Brier score, so a v2 model
 can be checked against the "confidence quality didn't regress" gate, not
 just accuracy.
+
+If ``--model``'s directory has a ``calibration.json`` (written by
+``ml/fit_calibration.py``, schema: `docs/plans/2026-08-07-model-v21-
+calibration-plan.md` §2), it's loaded, validated, and applied to logits
+before softmax -- same as serving (`app/services/nlp/local_model.py`) -- so
+offline and served confidences agree. A model dir whose ``config.json``
+marks ``"calibration_required": true`` (the v2.1 re-pack marker) with no
+``calibration.json`` present is a hard error, not a silent identity
+fallback; that fallback is reserved for legacy v1/v2 dirs with no marker.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import sys
 from collections import Counter
 from pathlib import Path
@@ -105,11 +116,117 @@ def load_eval_set(paths: list[str], labels: list[str]) -> tuple[list[str], list[
     return texts, gold, rows, skipped
 
 
-def predict_all(model, tokenizer, texts, labels, max_length, batch_size, device):
+CALIBRATION_LABEL_COUNT = 6  # the v2.1 taxonomy is frozen at 6 labels -- not "however many the model has"
+
+
+def _is_finite_number(value) -> bool:
+    """True for a plain int/float that's finite -- excludes bool (an int
+    subclass in Python) so a stray `true`/`false` in calibration.json can't
+    silently pass as 1.0/0.0. Mirrors
+    ``app/services/nlp/local_model.py``'s validator so offline and serving
+    agree on what counts as a valid param."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def load_calibration(model_dir: Path, labels: list[str]):
+    """Load and validate the optional ``calibration.json`` in ``model_dir``
+    against the v2.1 schema (``docs/plans/2026-08-07-model-v21-calibration-
+    plan.md`` §2): ``{"schema": 1, "kind": "temperature"|"vector",
+    "labels": [...], "params": {...}}``.
+
+    Returns ``None`` if the file is absent and the model dir doesn't mark
+    itself ``calibration_required`` (legacy v1/v2 behavior: identity,
+    unchanged). Otherwise returns ``(kind, params, sha256_hex)``.
+
+    Hard-exits (not a warning) on: a required-but-missing file, unsupported
+    schema/kind (``schema`` must be the int ``1`` -- ``True`` doesn't count,
+    even though ``True == 1``), a ``labels`` list whose length isn't exactly
+    ``CALIBRATION_LABEL_COUNT`` (the frozen taxonomy size -- an internally
+    consistent 3-label artifact is still rejected), a label-order mismatch
+    against ``labels``, or invalid params (T must be finite and > 0; vector
+    w/b must be finite length-``CALIBRATION_LABEL_COUNT`` lists, with every
+    w entry > 0 to preserve per-class monotonicity). Silently serving
+    miscalibrated confidences would be worse than crashing here.
+    """
+    config_path = model_dir / "config.json"
+    calibration_required = False
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            sys.exit(f"error: can't read {config_path} while resolving calibration ({exc})")
+        calibration_required = bool(config.get("calibration_required"))
+
+    calibration_path = model_dir / "calibration.json"
+    if not calibration_path.exists():
+        if calibration_required:
+            sys.exit(
+                f"error: {model_dir}/config.json sets calibration_required but "
+                f"{calibration_path} is missing"
+            )
+        return None
+
+    raw_bytes = calibration_path.read_bytes()
+    sha256_hex = hashlib.sha256(raw_bytes).hexdigest()
+    try:
+        raw = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        sys.exit(f"error: malformed {calibration_path} ({exc})")
+
+    schema_val = raw.get("schema")
+    if isinstance(schema_val, bool) or schema_val != 1:
+        sys.exit(f"error: {calibration_path} has unsupported schema {schema_val!r} (expected 1)")
+
+    kind = raw.get("kind")
+    if kind not in ("temperature", "vector"):
+        sys.exit(f"error: {calibration_path} has unsupported kind {kind!r}")
+
+    calib_labels = raw.get("labels")
+    if not isinstance(calib_labels, list) or len(calib_labels) != CALIBRATION_LABEL_COUNT:
+        sys.exit(
+            f"error: {calibration_path} labels must be a length-{CALIBRATION_LABEL_COUNT} list "
+            f"(the frozen v2.1 taxonomy), got {calib_labels!r}"
+        )
+    if calib_labels != labels:
+        sys.exit(
+            f"error: {calibration_path} labels {calib_labels!r} don't match "
+            f"model labels {labels!r}"
+        )
+
+    params = raw.get("params")
+    if not isinstance(params, dict):
+        sys.exit(f"error: {calibration_path} has non-dict params {params!r}")
+
+    if kind == "temperature":
+        t = params.get("T")
+        if not _is_finite_number(t) or t <= 0:
+            sys.exit(f"error: {calibration_path} temperature T must be a finite number > 0, got {t!r}")
+    else:
+        n = CALIBRATION_LABEL_COUNT
+        w, b = params.get("w"), params.get("b")
+        w_ok = isinstance(w, list) and len(w) == n and all(_is_finite_number(x) for x in w)
+        b_ok = isinstance(b, list) and len(b) == n and all(_is_finite_number(x) for x in b)
+        if not w_ok or not b_ok:
+            sys.exit(
+                f"error: {calibration_path} vector params need exactly {n} finite entries each, "
+                f"got w={w!r} b={b!r}"
+            )
+        if any(x <= 0 for x in w):
+            sys.exit(f"error: {calibration_path} has non-positive w entries: {w!r}")
+
+    return kind, params, sha256_hex
+
+
+def predict_all(model, tokenizer, texts, labels, max_length, batch_size, device, calibration=None):
     """Run batched inference and return (predicted_labels, confidences,
     class_probs), all parallel to ``texts``. ``class_probs`` is the full
     softmax vector per row (same label order as ``labels``) -- the Brier
-    score needs the whole distribution, not just the argmax confidence."""
+    score needs the whole distribution, not just the argmax confidence.
+
+    ``calibration``, if given, is a validated ``(kind, params)`` pair from
+    ``load_calibration``. It's applied to the raw logits BEFORE softmax,
+    same as ``app/services/nlp/local_model.py`` does at serving time, so
+    this script reports the confidences a request would actually see."""
     import torch
 
     preds: list[str] = []
@@ -123,6 +240,14 @@ def predict_all(model, tokenizer, texts, labels, max_length, batch_size, device)
         ).to(device)
         with torch.no_grad():
             logits = model(**enc).logits
+            if calibration is not None:
+                kind, params = calibration
+                if kind == "temperature":
+                    logits = logits / params["T"]
+                else:
+                    w = torch.tensor(params["w"], dtype=logits.dtype, device=logits.device)
+                    b = torch.tensor(params["b"], dtype=logits.dtype, device=logits.device)
+                    logits = logits * w + b
             probs = torch.softmax(logits, dim=-1)
             conf, idx = torch.max(probs, dim=-1)
         preds.extend(labels[int(i)] for i in idx)
@@ -287,6 +412,13 @@ def main() -> None:
     except (FileNotFoundError, ValueError, KeyError) as exc:
         sys.exit(f"error: couldn't resolve labels for {model_dir} ({exc})")
 
+    calibration_info = load_calibration(model_dir, labels)
+    calibration = None
+    if calibration_info is not None:
+        cal_kind, cal_params, cal_sha256 = calibration_info
+        calibration = (cal_kind, cal_params)
+        print(f"calibration: {cal_kind} loaded (sha256 {cal_sha256[:16]})")
+
     print(f"Loading eval data from: {', '.join(args.data)}")
     texts, gold, rows, skipped = load_eval_set(args.data, labels)
     if not texts:
@@ -310,7 +442,9 @@ def main() -> None:
     model.eval()
     model.to(device)
 
-    preds, confidences, class_probs = predict_all(model, tokenizer, texts, labels, args.max_length, args.batch_size, device)
+    preds, confidences, class_probs = predict_all(
+        model, tokenizer, texts, labels, args.max_length, args.batch_size, device, calibration=calibration
+    )
 
     if dump_path is not None:
         written = dump_misclassified(dump_path, rows, gold, preds, confidences)

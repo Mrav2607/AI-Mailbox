@@ -40,8 +40,8 @@ The `migrate` service runs first and the app waits on health checks, so a single
 **Classifier:** the default build is lean and uses the keyword `heuristic`
 backend — no model or API keys required, which is enough to test the app end to
 end. To serve the actual fine-tuned encoder, you need the model artifact. It's
-git-ignored (~1GB, trained on private data), so it ships as chunked assets on
-the `model-v1` GitHub Release. Fetch it (needs the [GitHub CLI](https://cli.github.com),
+git-ignored (~256MB, trained on private data), so it ships as chunked assets on
+the `model-v2` GitHub Release. Fetch it (needs the [GitHub CLI](https://cli.github.com),
 `gh auth login`), then build with the torch deps:
 
 ```bash
@@ -49,7 +49,7 @@ the `model-v1` GitHub Release. Fetch it (needs the [GitHub CLI](https://cli.gith
 INSTALL_LOCAL_CLASSIFIER=true CLASSIFIER_BACKEND=local docker compose up --build
 ```
 
-No repo access to the release? Set `GEMINI_API_KEY` and `CLASSIFIER_BACKEND=gemini`
+No repo access to the release? Set `GEMINI_API_KEY` and `CLASSIFIER_BACKEND=llm`
 for real LLM classification without any download.
 
 **Gmail (optional):** to ingest real mail, fill `GOOGLE_CLIENT_ID` /
@@ -186,16 +186,28 @@ chosen by `CLASSIFIER_BACKEND` in `.env`:
 
 - `local` (default) — a fine-tuned encoder loaded from `CLASSIFIER_MODEL_PATH`
   (default `models/email-classifier`). Needs the `local-classifier` extra. If
-  torch or the model files are missing, it falls back automatically to the
-  gemini/heuristic path, so the API still runs without a trained model.
-- `gemini` — Google Gemini (needs `GEMINI_API_KEY`), with a keyword-heuristic
-  fallback.
+  torch or the model files are missing, it falls back to the heuristic, so the
+  API still runs without a trained model. If the model directory contains a
+  `calibration.json`, the encoder applies that confidence calibration at load
+  time (absent file = raw confidences; a dir whose `config.json` marks
+  `"calibration_required": true` refuses to serve uncalibrated).
+- `llm` — an LLM classifies each message. Users who saved their own provider
+  key and opted in are served on their key; otherwise the operator's
+  `GEMINI_API_KEY` is used, with a keyword-heuristic fallback.
 - `heuristic` — keyword rules only, no extra dependencies.
+- `auto` — the local encoder when it can serve, else the LLM path, else the
+  heuristic. (Opted-in users with their own key are served on it first.)
 
-The trained model is **not** committed (`models/` is git-ignored). To produce
-one, train it with the pipeline in `ml/` (`python ml/train_classifier.py ...`)
-and point `CLASSIFIER_MODEL_PATH` at the output directory. Until then, run with
-`CLASSIFIER_BACKEND=heuristic` (zero deps) or `gemini` (with an API key).
+The trained model is **not** committed (`models/` is git-ignored) — fetch it
+from the `model-v2` release with `./fetch-model.sh`, or train your own with the
+pipeline in `ml/` (`python ml/train_classifier.py ...`, which enforces
+train/eval disjointness via `--guard-files`) and score it with
+`python ml/eval_classifier.py --model <dir> --data <eval.jsonl>` (per-class
+report, confusion matrix, confidence and calibration metrics).
+`ml/fit_calibration.py` fits an optional post-hoc confidence calibration and
+writes the `calibration.json` the serving path understands — but only after
+its holdout gate passes: without `--holdout` the run is report-only and no
+file is written.
 
 ## Agenda (action extraction)
 
