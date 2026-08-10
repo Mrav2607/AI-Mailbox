@@ -601,9 +601,7 @@ export function TopBar({
   return (
     <header className="h-11 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center gap-3 px-3">
       <div className="flex items-center gap-2 mr-1">
-        <div className="h-5 w-5 rounded bg-primary/15 border border-primary/40 flex items-center justify-center phosphor text-primary">
-          <Mark className="h-3.5 w-3.5" />
-        </div>
+        <Mark className="h-5 w-5 shrink-0" />
         <span className="max-[360px]:hidden font-mono text-[13px] font-semibold tracking-tight">
           CortexMail
         </span>
