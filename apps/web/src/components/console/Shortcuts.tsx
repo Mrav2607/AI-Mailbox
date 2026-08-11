@@ -18,7 +18,7 @@ const ROWS: [string, string, boolean?][] = [
   ["c", "cycle sort: recent · conf ↑ · conf ↓ · account", true],
   ["[ / ]", "toggle sidebar / detail pane"],
   ["#", "delete focused thread", true],
-  ["r", "re-fetch list + overview"],
+  ["r", "refresh the current view"],
   ["⌘ K / Ctrl K", "command palette"],
   ["Shift ?", "this cheatsheet"],
   ["Esc", "clear search · close overlay"],

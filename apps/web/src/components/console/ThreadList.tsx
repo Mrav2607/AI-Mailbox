@@ -289,7 +289,11 @@ export function ThreadList({
                   <div className={`${CONF_BAR_TRACK} w-11`}>
                     <div
                       className={`${CONF_BAR_FILL} ${confidenceColor(conf)}`}
-                      style={{ width: confPct ? `max(2px, ${confPct}%)` : "0%" }}
+                      // Floor keys off the raw confidence, not the rounded
+                      // percent: anything under 0.005 rounds to 0 and would
+                      // fall back to a zero-width bar, which is the very
+                      // thing the floor exists to prevent.
+                      style={{ width: conf ? `max(2px, ${confPct}%)` : "0%" }}
                     />
                   </div>
                   <span

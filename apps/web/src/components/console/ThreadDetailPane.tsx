@@ -335,7 +335,9 @@ export function ThreadDetailPane({
                 <div className={`${CONF_BAR_TRACK} w-24`}>
                   <div
                     className={`${CONF_BAR_FILL} ${confidenceColor(conf)}`}
-                    style={{ width: confPct ? `max(2px, ${confPct}%)` : "0%" }}
+                    // Raw confidence, not the rounded percent — under 0.005 it
+                    // rounds to 0 and would lose the 2px floor entirely.
+                    style={{ width: conf ? `max(2px, ${confPct}%)` : "0%" }}
                   />
                 </div>
                 <span className={`text-xs font-mono tabular-nums ${confidenceText(conf)}`}>

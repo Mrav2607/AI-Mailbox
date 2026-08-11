@@ -648,19 +648,26 @@ export default function Console() {
         // otherwise a deleted thread's agenda rows come right back.
         const rows = res.items.filter((a) => !pendingDeletes.current.has(a.thread_id));
         setActions(rows);
-        if (!quiet) {
-          setSelectedActionId((prev) =>
-            prev && rows.some((a) => a.id === prev) ? prev : (rows[0]?.id ?? null),
-          );
-        }
+        // Runs on quiet refreshes too. A background refresh shouldn't move the
+        // cursor for its own sake, and it doesn't — this only rewrites the
+        // selection when the row it was pointing at is gone. Leaving it
+        // dangling instead makes focusedAction null, which silently kills
+        // Enter/e/x until the operator clicks a row.
+        setSelectedActionId((prev) =>
+          prev && rows.some((a) => a.id === prev) ? prev : (rows[0]?.id ?? null),
+        );
       } catch (e) {
         if (e instanceof ApiError && e.status === 401) {
           handleSessionExpired();
           return;
         }
+        // A stale request's failure must not overwrite a newer one's state.
+        if (generation !== actionsGenRef.current) return;
         setActionsError((e as Error).message ?? "failed to load");
       } finally {
-        if (!quiet) setActionsLoading(false);
+        // Same reason: an older request finishing must not clear the spinner
+        // a newer one is still waiting on.
+        if (!quiet && generation === actionsGenRef.current) setActionsLoading(false);
       }
     },
     [handleSessionExpired],
@@ -2909,7 +2916,15 @@ export default function Console() {
   // list) — fall back to whatever thread is actually loaded so the
   // prediction bar and the done/delete buttons still work for a thread
   // opened from there.
-  const detailThreadId = focusedItem?.thread_id ?? thread?.thread.id;
+  //
+  // The fallback only counts while the loaded thread IS the selected one.
+  // getThread keeps the previous thread on screen until the next one lands,
+  // so without this check the pane's buttons would act on the thread the
+  // operator just navigated away from — and disagree with the `e`/`#`
+  // hotkeys, which go through selectedId.
+  const detailThreadId =
+    focusedItem?.thread_id ??
+    (thread && thread.thread.id === selectedId ? thread.thread.id : undefined);
   const detailPane = (
     <ThreadDetailPane
       data={thread}

@@ -208,7 +208,9 @@ export function LandingConsoleMockup() {
                       <span
                         className={`landing-bar-fill block ${CONF_BAR_FILL} ${confidenceColor(row.confidence)}`}
                         style={{
-                          width: pct ? `max(2px, ${pct}%)` : "0%",
+                          // Raw confidence, not the rounded percent — under
+                          // 0.005 it rounds to 0 and loses the 2px floor.
+                          width: row.confidence ? `max(2px, ${pct}%)` : "0%",
                           animationDelay: `${barDelay}ms`,
                         }}
                       />

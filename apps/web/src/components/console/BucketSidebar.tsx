@@ -121,7 +121,7 @@ export function BucketSidebar({
             <span className="kbd">Shift ?</span> shortcuts
           </span>
           <span>
-            <span className="kbd">⌘K</span> palette
+            <span className="kbd">⌘K / Ctrl K</span> palette
           </span>
         </div>
       )}
