@@ -241,7 +241,7 @@ export function ThreadDetailPane({
           </div>
           {showAccountBadge && (
             <span
-              className="shrink-0 font-mono text-[10px] text-muted-foreground/60 px-1 py-0.5 rounded border border-border/50 truncate max-w-[110px]"
+              className="shrink-0 font-mono text-[10px] text-muted-foreground px-1 py-0.5 rounded border border-border/50 truncate max-w-[110px]"
               title={data.thread.account_email}
             >
               {emailLocalPart(data.thread.account_email)}
@@ -377,8 +377,16 @@ export function ThreadDetailPane({
         )}
       </section>
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto scrollbar-thin flex flex-col">
+      {/* Messages. tabIndex + role/aria-label make this reachable and
+          nameable for keyboard/AT users -- a long thread scrolls but had
+          no focusable child and no name, so a keyboard-only user had no
+          way to scroll it at all. */}
+      <div
+        role="region"
+        aria-label="Thread messages"
+        tabIndex={0}
+        className="flex-1 overflow-y-auto scrollbar-thin flex flex-col"
+      >
         {data.messages.map((m) => (
           <article
             key={m.id}

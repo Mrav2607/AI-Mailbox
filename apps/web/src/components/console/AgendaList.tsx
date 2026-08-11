@@ -54,7 +54,7 @@ function formatDue(item: ActionItem): string | null {
 function AccountChip({ email }: { email: string }) {
   return (
     <span
-      className="shrink-0 font-mono text-[10px] text-muted-foreground/60 px-1 py-0.5 rounded border border-border/50 truncate max-w-[64px]"
+      className="shrink-0 font-mono text-[10px] text-muted-foreground px-1 py-0.5 rounded border border-border/50 truncate max-w-[64px]"
       title={email}
     >
       {emailLocalPart(email)}
@@ -85,20 +85,26 @@ function AgendaRow({
   // just not worth trusting blindly.
   const unverified = item.source_confidence != null && item.source_confidence < 0.6;
   const sender = senderName(item.sender);
+  const rowTitle = item.title ?? "(untitled action)";
   return (
-    <li>
+    // The row highlight and the focus rail live on the <li>, not on the row
+    // button: the done/dismiss controls are siblings now, so a background on
+    // the button alone would stop short of them and leave a dead strip at the
+    // right of a focused row.
+    <li
+      className={[
+        "group flex items-center gap-2.5 pr-2 border-l-2 transition-colors duration-150",
+        focused
+          ? "border-primary bg-[var(--color-panel-hi)]"
+          : "border-transparent hover:bg-[var(--color-panel-hi)]/45",
+      ].join(" ")}
+    >
       <button
         data-action-row={item.id}
         onClick={() => onSelect(item)}
         onDoubleClick={onRowDoubleClick}
         aria-current={focused ? "true" : undefined}
-        className={[
-          "group relative w-full text-left pl-3 pr-2 py-[7px] flex items-center gap-2.5 text-[12.5px] cursor-pointer select-none",
-          "border-l-2 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset focus-visible:bg-[var(--color-panel-hi)]",
-          focused
-            ? "border-primary bg-[var(--color-panel-hi)]"
-            : "border-transparent hover:bg-[var(--color-panel-hi)]/45",
-        ].join(" ")}
+        className="relative flex-1 min-w-0 self-stretch text-left pl-3 py-[7px] flex items-center gap-2.5 text-[12.5px] cursor-pointer select-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset focus-visible:bg-[var(--color-panel-hi)]"
       >
         <span
           className="shrink-0 w-[64px] truncate font-mono text-[11px] text-muted-foreground"
@@ -113,12 +119,11 @@ function AgendaRow({
           ].join(" ")}
         >
           {due ?? "no due date"}
+          {groupKey === "overdue" && <span className="sr-only"> (overdue)</span>}
         </span>
 
         <div className="min-w-0 flex-1 flex items-baseline gap-2 overflow-hidden">
-          <span className="truncate text-foreground/90 font-medium">
-            {item.title ?? "(untitled action)"}
-          </span>
+          <span className="truncate text-foreground/90 font-medium">{rowTitle}</span>
           <span className="truncate text-muted-foreground text-[12px]">
             {item.thread_subject ?? ""}
             {sender ? ` · ${sender}` : ""}
@@ -126,55 +131,47 @@ function AgendaRow({
         </div>
 
         {unverified && (
-          <span className="shrink-0 text-[10px] text-muted-foreground/70 border border-border/50 rounded px-1">
+          <span className="shrink-0 text-[10px] text-muted-foreground border border-border/50 rounded px-1">
             unverified
           </span>
         )}
         {showAccount && <AccountChip email={item.account_email} />}
-
-        <span className="shrink-0 flex items-center gap-1">
-          <span
-            role="button"
-            tabIndex={-1}
-            aria-label="Mark action done"
-            title="mark done"
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              onStatusChange(item.id, "done");
-            }}
-            onDoubleClick={(e) => e.stopPropagation()}
-            className="h-5 w-5 rounded border border-border flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer transition-colors"
-          >
-            <Check className="h-3 w-3" />
-          </span>
-          <span
-            role="button"
-            tabIndex={-1}
-            aria-label="Dismiss action"
-            title="dismiss"
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              onStatusChange(item.id, "dismissed");
-            }}
-            onDoubleClick={(e) => e.stopPropagation()}
-            className="h-5 w-5 rounded border border-border flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer transition-colors"
-          >
-            <X className="h-3 w-3" />
-          </span>
-        </span>
       </button>
+
+      {/* Real sibling buttons, not nested inside the row <button> — interactive
+          content inside a button is invalid and axe flags it as nested-interactive.
+          tabIndex={-1} keeps them out of the tab order: the documented keyboard
+          path is the e/x hotkeys (see Shortcuts.tsx), not tabbing through every
+          row twice. */}
+      <span className="shrink-0 flex items-center gap-1">
+        <button
+          type="button"
+          tabIndex={-1}
+          aria-label={`Mark "${rowTitle}" done`}
+          title="mark done"
+          onClick={() => onStatusChange(item.id, "done")}
+          className="h-5 w-5 rounded border border-border flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer transition-colors"
+        >
+          <Check className="h-3 w-3" />
+        </button>
+        <button
+          type="button"
+          tabIndex={-1}
+          aria-label={`Dismiss "${rowTitle}"`}
+          title="dismiss"
+          onClick={() => onStatusChange(item.id, "dismissed")}
+          className="h-5 w-5 rounded border border-border flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer transition-colors"
+        >
+          <X className="h-3 w-3" />
+        </button>
+      </span>
     </li>
   );
 }
 
 function GroupHeader({ label, count }: { label: string; count: number }) {
   return (
-    <li
-      aria-hidden="true"
-      className="sticky top-0 z-10 bg-background px-3 py-1 text-[10.5px] font-mono uppercase tracking-wide text-muted-foreground flex items-center justify-between"
-    >
+    <li className="sticky top-0 z-10 bg-background px-3 py-1 text-[10.5px] font-mono uppercase tracking-wide text-muted-foreground flex items-center justify-between">
       <span>{label}</span>
       <span className="tabular-nums normal-case">{count}</span>
     </li>

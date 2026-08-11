@@ -22,6 +22,7 @@
   --color-popover-foreground: var(--popover-foreground);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
+  --color-primary-tint-foreground: var(--primary-tint-foreground);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
@@ -62,13 +63,22 @@
   --popover-foreground: oklch(0.22 0 0);
   --primary: oklch(0.55 0.13 80);
   --primary-foreground: oklch(0.98 0.02 80);
+  /* Darker amber for text sitting on a primary/15 tint (e.g. the backfill
+     button) -- plain --primary only clears ~3.9:1 there, short of 4.5:1.
+     .dark below just points this back at --primary since the dark tint
+     already passes on its own. */
+  --primary-tint-foreground: oklch(0.5 0.13 80);
   --secondary: oklch(0.92 0 0);
   --secondary-foreground: oklch(0.25 0 0);
   --muted: oklch(0.92 0 0);
   --muted-foreground: oklch(0.45 0 0);
   --accent: oklch(0.92 0 0);
   --accent-foreground: oklch(0.15 0 0);
-  --destructive: oklch(0.55 0.2 25);
+  /* Nudged darker so it clears 4.5:1 as TEXT on every surface it lands on --
+     overdue agenda dates, error alerts, the bulk delete button's tinted pill.
+     It measured 4.31:1 on a selected row before. Still reads as the same red
+     against a fill, where it's only ever paired with near-white. */
+  --destructive: oklch(0.53 0.2 25);
   --destructive-foreground: oklch(0.98 0 0);
   --border: oklch(0.87 0 0);
   --input: oklch(0.87 0 0);
@@ -144,13 +154,16 @@
   --popover-foreground: oklch(0.925 0 0);
   --primary: oklch(0.82 0.145 80);
   --primary-foreground: oklch(0.18 0.03 80);
+  --primary-tint-foreground: var(--primary);
   --secondary: oklch(0.26 0 0);
   --secondary-foreground: oklch(0.92 0 0);
   --muted: oklch(0.235 0 0);
   --muted-foreground: oklch(0.63 0 0);
   --accent: oklch(0.26 0 0);
   --accent-foreground: oklch(0.95 0 0);
-  --destructive: oklch(0.62 0.2 25);
+  /* Same reason as the light block: lifted so destructive text clears 4.5:1
+     on the dark row and on its own tinted pill (was 4.16:1). */
+  --destructive: oklch(0.645 0.2 25);
   --destructive-foreground: oklch(0.98 0 0);
   --border: oklch(0.275 0 0);
   --input: oklch(0.275 0 0);

@@ -38,7 +38,6 @@ interface Props {
 function GroupHeader({ label }: { label: DateGroup }) {
   return (
     <li
-      aria-hidden="true"
       className="sticky top-0 z-10 bg-background px-3 py-1 text-[10.5px] font-mono uppercase tracking-wide text-muted-foreground"
     >
       {label}
@@ -49,7 +48,7 @@ function GroupHeader({ label }: { label: DateGroup }) {
 function AccountBadge({ email }: { email: string }) {
   return (
     <span
-      className="shrink-0 font-mono text-[10px] text-muted-foreground/60 px-1 py-0.5 rounded border border-border/50 truncate max-w-[64px]"
+      className="shrink-0 font-mono text-[10px] text-muted-foreground px-1 py-0.5 rounded border border-border/50 truncate max-w-[64px]"
       title={email}
     >
       {emailLocalPart(email)}
@@ -214,44 +213,48 @@ export function ThreadList({
         return (
           <Fragment key={it.thread_id}>
             {header}
-            <li>
+            <li
+              className={[
+                "group relative flex items-center gap-2.5 pl-3 pr-3 text-[12.5px] cursor-pointer select-none",
+                rowPadY,
+                "border-l-2 transition-colors duration-150",
+                isSel
+                  ? "border-primary bg-[var(--color-panel-hi)]"
+                  : "border-transparent hover:bg-[var(--color-panel-hi)]/45",
+                isBulkSelected ? "bg-primary/10" : "",
+              ].join(" ")}
+            >
+              {onToggleBulk && (
+                // A real button, not the row's nested checkbox it used to be —
+                // <button> inside <button> is invalid HTML and axe flags it
+                // (nested-interactive) once per row. tabIndex={-1} keeps it out
+                // of tab order on purpose: the documented keyboard path for
+                // bulk-select is the `x` hotkey (see Shortcuts.tsx), and a real
+                // tab stop here would add 68+ stops on a full bucket.
+                <button
+                  type="button"
+                  aria-pressed={isBulkSelected}
+                  aria-label={`Select thread: ${it.subject ?? "(no subject)"}`}
+                  tabIndex={-1}
+                  onClick={() => onToggleBulk(it.thread_id)}
+                  className={[
+                    "shrink-0 h-3.5 w-3.5 rounded-sm border flex items-center justify-center cursor-pointer transition-opacity",
+                    isBulkSelected
+                      ? "opacity-100 bg-primary border-primary"
+                      : "opacity-0 group-hover:opacity-100 border-border",
+                  ].join(" ")}
+                >
+                  {isBulkSelected && <Check className="h-2.5 w-2.5 text-primary-foreground" />}
+                </button>
+              )}
+
               <button
                 data-thread-row={it.thread_id}
                 onClick={() => onSelect(it.thread_id)}
                 onDoubleClick={onRowDoubleClick}
                 aria-current={isSel ? "true" : undefined}
-                className={[
-                  "group relative w-full text-left pl-3 pr-3 flex items-center gap-2.5 text-[12.5px] cursor-pointer select-none",
-                  rowPadY,
-                  "border-l-2 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset focus-visible:bg-[var(--color-panel-hi)]",
-                  isSel
-                    ? "border-primary bg-[var(--color-panel-hi)]"
-                    : "border-transparent hover:bg-[var(--color-panel-hi)]/45",
-                  isBulkSelected ? "bg-primary/10" : "",
-                ].join(" ")}
+                className="relative min-w-0 flex-1 self-stretch text-left flex items-center gap-2.5 cursor-pointer select-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset focus-visible:bg-[var(--color-panel-hi)]"
               >
-                {onToggleBulk && (
-                  <span
-                    role="checkbox"
-                    aria-checked={isBulkSelected}
-                    aria-label="select thread"
-                    tabIndex={-1}
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      onToggleBulk(it.thread_id);
-                    }}
-                    className={[
-                      "shrink-0 h-3.5 w-3.5 rounded-sm border flex items-center justify-center cursor-pointer transition-opacity",
-                      isBulkSelected
-                        ? "opacity-100 bg-primary border-primary"
-                        : "opacity-0 group-hover:opacity-100 border-border",
-                    ].join(" ")}
-                  >
-                    {isBulkSelected && <Check className="h-2.5 w-2.5 text-primary-foreground" />}
-                  </span>
-                )}
-
                 {showLabel ? (
                   <span
                     className="shrink-0 w-[92px] flex items-center gap-1.5 font-mono"
