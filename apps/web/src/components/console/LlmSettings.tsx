@@ -348,7 +348,7 @@ export function LlmSettingsModal({
                   : "Sorting runs on every email you receive, so it uses far more of your quota than the Agenda does. Off by default."}
               </p>
               {settings.classification_byok && !settings.classification_eligible && (
-                <p className="text-[11px] font-mono text-amber-500 leading-snug pl-[18px]">
+                <p className="text-[11px] font-mono text-primary-tint-foreground leading-snug pl-[18px]">
                   Your key isn&apos;t set up to sort your mail — the built-in rules are being
                   used instead.
                 </p>
@@ -360,7 +360,7 @@ export function LlmSettingsModal({
             <button
               type="submit"
               disabled={saving || modelBlank || baseUrlBlank}
-              className="h-7 px-3 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+              className="h-7 px-3 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
               {saving ? "saving…" : "save"}
             </button>
@@ -388,7 +388,7 @@ export function LlmSettingsModal({
             <p
               className={
                 testResult.ok
-                  ? "text-[11px] font-mono text-emerald-500"
+                  ? "text-[11px] font-mono text-[var(--success)]"
                   : "text-[11px] font-mono text-destructive"
               }
             >

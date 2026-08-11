@@ -61,7 +61,7 @@ export function BucketSidebar({
             agendaActive
               ? "border-primary bg-[var(--color-panel-hi)] text-foreground"
               : overdue > 0
-                ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20"
+                ? "border-primary/40 bg-primary/10 text-primary-tint-foreground hover:bg-primary/20"
                 : "border-border text-muted-foreground hover:bg-[var(--color-panel-hi)]/60 hover:text-foreground",
           ].join(" ")}
         >

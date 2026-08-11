@@ -111,7 +111,7 @@ function DailyBarChart({ usage }: { usage: LlmUsage }) {
           third axis tick. */}
       <div className="flex items-baseline justify-between">
         <span className={fieldLabel}>calls per day</span>
-        <span className="text-[10px] font-mono text-muted-foreground/70">
+        <span className="text-[10px] font-mono text-muted-foreground">
           peak {max.toLocaleString()}/day
         </span>
       </div>
@@ -206,7 +206,7 @@ export function LlmUsageCard({ open, onOpenChange, usage, usageError, days, onDa
                 // focused one, so the card looked like it was showing 7 days
                 // while actually showing 30.
                 days === d
-                  ? "border-primary bg-primary text-[var(--color-background)] font-medium"
+                  ? "border-primary bg-primary text-primary-foreground font-medium"
                   : "border-border bg-[var(--color-panel-hi)] text-muted-foreground hover:text-foreground",
               ].join(" ")}
             >
