@@ -317,6 +317,10 @@ export default function Console() {
   // Bumped on every page-0 reset so a loadMore response that resolves after a
   // newer reset started can be told apart from the page it thinks it's for.
   const pagingGenRef = useRef(0);
+  // Same idea for the agenda, but bumped by local mutations too, not just by
+  // refetches: resolving an action removes it optimistically, and a fetch that
+  // was already in flight would otherwise land afterwards and put it back.
+  const actionsGenRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const liveSearchRef = useRef<LiveSearchController | null>(null);
 
@@ -632,9 +636,13 @@ export default function Console() {
       const quiet = opts?.quiet ?? false;
       if (!quiet) setActionsLoading(true);
       setActionsError(null);
+      const generation = ++actionsGenRef.current;
       try {
         // 500 is the API's `le` cap for this param -- request it explicitly.
         const res = await getActions("open", 500);
+        // Superseded by a newer refetch, or by a local resolve that happened
+        // while this was in flight — either way this payload is already stale.
+        if (generation !== actionsGenRef.current) return;
         // A thread mid-undo-window is already gone from the UI but not yet
         // from the server — same masking the triage/search paths already do,
         // otherwise a deleted thread's agenda rows come right back.
@@ -1292,9 +1300,13 @@ export default function Console() {
         const next = flattenedAgenda[flatIdx + 1] ?? flattenedAgenda[flatIdx - 1] ?? null;
         setSelectedActionId(next?.id ?? null);
       }
+      // Invalidate any agenda fetch already in flight — it read this action as
+      // still open, and letting it land would undo the removal below.
+      actionsGenRef.current += 1;
       setActions((prev) => prev.filter((a) => a.id !== id));
 
       const restore = () => {
+        actionsGenRef.current += 1;
         setActions((prev) => {
           const copy = [...prev];
           copy.splice(Math.min(idx, copy.length), 0, removed);
@@ -2149,11 +2161,21 @@ export default function Console() {
       // "next key is a digit" exception, get dropped by the modifier guard
       // below, and leave the prefix armed for the next bare digit — which
       // would then relabel instead of switching bucket.
+      // Relabelling is bucket-view only (the cheatsheet says so), so the prefix
+      // only ever arms there. Without that, `l` in the agenda armed a prefix
+      // the agenda can't spend: its bucket digits are navigation, so `l`, `1`,
+      // `1` would switch view on the first digit and relabel on the second.
       const bareKey = !e.metaKey && !e.ctrlKey && !e.altKey;
-      if (e.key === "l" && bareKey) {
+      const inBuckets = view === "buckets";
+      if (e.key === "l" && bareKey && inBuckets) {
         lPressedAt.current = Date.now();
       } else if (
-        !(bareKey && Date.now() - lPressedAt.current < 800 && /^[1-6]$/.test(e.key))
+        !(
+          inBuckets &&
+          bareKey &&
+          Date.now() - lPressedAt.current < 800 &&
+          /^[1-6]$/.test(e.key)
+        )
       ) {
         lPressedAt.current = 0;
       }
