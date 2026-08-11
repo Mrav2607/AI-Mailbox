@@ -30,15 +30,19 @@ export function useHotkeys(handler: Handler, deps: unknown[] = []) {
       if (t?.closest('[role="dialog"]')) return;
 
       const tag = t?.tagName;
+      // Always allow Cmd/Ctrl-K, from anywhere — the palette is the one
+      // shortcut that has to work no matter what holds focus.
+      const isPalette =
+        (e.key === "k" || e.key === "K") && (e.metaKey || e.ctrlKey);
+
       // A <select> owns arrows, type-ahead letters, Enter, and Escape
-      // outright — no carve-out here like the one below for text inputs.
-      if (tag === "SELECT") return;
+      // outright. Unlike the text-input case below there's no Escape
+      // carve-out either: Escape closes the native dropdown, and that's the
+      // behavior the user is asking for.
+      if (tag === "SELECT" && !isPalette) return;
 
       const isTyping =
         tag === "INPUT" || tag === "TEXTAREA" || t?.isContentEditable;
-      // Always allow Cmd/Ctrl-K and Escape even while typing
-      const isPalette =
-        (e.key === "k" || e.key === "K") && (e.metaKey || e.ctrlKey);
       if (isTyping && !isPalette && e.key !== "Escape") return;
 
       // Let Enter/Space activate a focused button, link, or summary

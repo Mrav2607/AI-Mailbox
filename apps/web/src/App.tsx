@@ -1923,10 +1923,14 @@ export default function Console() {
           (bucket !== "all" && bucket !== "done" && bucket !== label));
       const bucketIdx = items.findIndex((i) => i.thread_id === id);
       const removed = bucketIdx >= 0 ? items[bucketIdx] : null;
+      // Same rule as doDone/doDelete: advancing the selection is a bucket-view
+      // behaviour. A thread reclassified from the agenda is usually still on
+      // the loaded bucket page, so without the view gate this would jump the
+      // reading pane off the agenda's thread onto a neighbouring bucket row.
       const vi = visibleItems.findIndex((i) => i.thread_id === id);
       const next =
         visibleItems[vi + 1] ?? (leavesBucket ? visibleItems[vi - 1] : null);
-      if (vi >= 0 && (next || leavesBucket)) {
+      if (view === "buckets" && vi >= 0 && (next || leavesBucket)) {
         setSelectedId(next?.thread_id ?? null);
       }
 
@@ -2002,7 +2006,7 @@ export default function Console() {
         toast.error((e as Error).message ?? "reclassify failed");
       }
     },
-    [selectedId, bucket, items, searchMode, visibleItems, refreshCounts, thread, refreshActions],
+    [selectedId, bucket, view, items, searchMode, visibleItems, refreshCounts, thread, refreshActions],
   );
 
   // Batch reclassify: same optimistic-override-then-roll-back-on-failure
@@ -2140,9 +2144,17 @@ export default function Console() {
       // next keystroke — any other key here disarms the prefix, so changing
       // your mind mid-sequence can't relabel the wrong thread. `l` itself
       // re-arms instead of disarming, so a doubled `l` still works.
-      if (e.key === "l") {
+      // Both halves of the chord have to be unmodified. A modified digit still
+      // reads as e.key "1"-"6", so without this check Alt+1 would satisfy the
+      // "next key is a digit" exception, get dropped by the modifier guard
+      // below, and leave the prefix armed for the next bare digit — which
+      // would then relabel instead of switching bucket.
+      const bareKey = !e.metaKey && !e.ctrlKey && !e.altKey;
+      if (e.key === "l" && bareKey) {
         lPressedAt.current = Date.now();
-      } else if (!(Date.now() - lPressedAt.current < 800 && /^[1-6]$/.test(e.key))) {
+      } else if (
+        !(bareKey && Date.now() - lPressedAt.current < 800 && /^[1-6]$/.test(e.key))
+      ) {
         lPressedAt.current = 0;
       }
 
