@@ -12,7 +12,6 @@ import {
   ApiError,
   backfillActions,
   classifyBackfill,
-  classifyQueue,
   deleteConnection,
   deleteLlmSettings,
   deleteThread,
@@ -1189,6 +1188,14 @@ export default function Console() {
     return [...bulkIds].filter((id) => visibleIds.has(id));
   }, [bulkIds, visibleItems]);
 
+  // Selects every row currently on screen for batch triage — wide bucket
+  // view only. Narrow has no bulk UI and the agenda has no bulk selection at
+  // all (see the bulkIds-clearing effects above), so this is a no-op there.
+  const selectAllVisible = useCallback(() => {
+    if (isNarrow || view === "agenda" || visibleItems.length === 0) return;
+    setBulkIds(new Set(visibleItems.map((i) => i.thread_id)));
+  }, [isNarrow, view, visibleItems]);
+
   const isUnseenFor = useCallback(
     (item: TriageItem) => isUnseen(seenRef.current, item.thread_id, item.last_message_at),
     // seenVersion bumping is the signal that seenRef.current changed; the ref
@@ -1211,6 +1218,18 @@ export default function Console() {
     [user, visibleItems],
   );
 
+  // Shared by moveSelection and the gg/G jumps below — a plain setSelectedId
+  // doesn't scroll, so without this the selection can land off the visible
+  // rows and the operator loses track of where they are.
+  const scrollThreadIntoView = useCallback((id: string) => {
+    requestAnimationFrame(() => {
+      const el = document.querySelector(`[data-thread-row="${id}"]`);
+      if (el && "scrollIntoView" in el) {
+        (el as HTMLElement).scrollIntoView({ block: "nearest" });
+      }
+    });
+  }, []);
+
   const moveSelection = useCallback(
     (delta: number) => {
       if (visibleItems.length === 0) return;
@@ -1219,18 +1238,21 @@ export default function Console() {
       const target = visibleItems[next];
       setSelectedId(target.thread_id);
       markThreadSeen(target.thread_id);
-      // scroll into view
-      requestAnimationFrame(() => {
-        const el = document.querySelector(
-          `[data-thread-row="${target.thread_id}"]`,
-        );
-        if (el && "scrollIntoView" in el) {
-          (el as HTMLElement).scrollIntoView({ block: "nearest" });
-        }
-      });
+      scrollThreadIntoView(target.thread_id);
     },
-    [visibleItems, selectedIndex, markThreadSeen],
+    [visibleItems, selectedIndex, markThreadSeen, scrollThreadIntoView],
   );
+
+  // Shared by moveAgendaSelection and the gg/G jumps below — same idea as
+  // scrollThreadIntoView, just for action rows instead of thread rows.
+  const scrollActionRowIntoView = useCallback((id: string) => {
+    requestAnimationFrame(() => {
+      const el = document.querySelector(`[data-action-row="${id}"]`);
+      if (el && "scrollIntoView" in el) {
+        (el as HTMLElement).scrollIntoView({ block: "nearest" });
+      }
+    });
+  }, []);
 
   // Agenda's j/k cursor — only moves focus. Unlike moveSelection it does NOT
   // also open the thread in the detail pane; Enter does that separately (the
@@ -1242,14 +1264,9 @@ export default function Console() {
       const next = Math.max(0, Math.min(flattenedAgenda.length - 1, cur + delta));
       const target = flattenedAgenda[next];
       setSelectedActionId(target.id);
-      requestAnimationFrame(() => {
-        const el = document.querySelector(`[data-action-row="${target.id}"]`);
-        if (el && "scrollIntoView" in el) {
-          (el as HTMLElement).scrollIntoView({ block: "nearest" });
-        }
-      });
+      scrollActionRowIntoView(target.id);
     },
-    [flattenedAgenda, selectedActionIndex],
+    [flattenedAgenda, selectedActionIndex, scrollActionRowIntoView],
   );
 
   // Marks an action item done/dismissed (or, via its undo toast, reopens it)
@@ -1373,11 +1390,18 @@ export default function Console() {
       const resultIdx = searchResults.findIndex((i) => i.thread_id === id);
       const removedFromResults = resultIdx >= 0 ? searchResults[resultIdx] : null;
 
-      // Advance selection to a neighbour in the visible list before removing.
-      if (selectedId === id) {
+      // Advance selection to a neighbour in the visible list before removing —
+      // that's a bucket-view behaviour. The agenda's open thread usually
+      // isn't the bucket list's selected row at all, so acting on it there
+      // must never yank the reading pane onto some unrelated bucket row.
+      // `vi >= 0` still guards the case where the selected thread legitimately
+      // isn't in the filtered list even in bucket view.
+      if (view === "buckets" && selectedId === id) {
         const vi = visibleItems.findIndex((i) => i.thread_id === id);
-        const next = visibleItems[vi + 1] ?? visibleItems[vi - 1] ?? null;
-        setSelectedId(next?.thread_id ?? null);
+        if (vi >= 0) {
+          const next = visibleItems[vi + 1] ?? visibleItems[vi - 1] ?? null;
+          setSelectedId(next?.thread_id ?? null);
+        }
       }
       setItems((prev) => prev.filter((i) => i.thread_id !== id));
       setSearchResults((prev) => prev.filter((i) => i.thread_id !== id));
@@ -1423,7 +1447,7 @@ export default function Console() {
         duration: UNDO_MS,
       });
     },
-    [selectedId, items, searchResults, visibleItems, refreshAll],
+    [selectedId, items, searchResults, visibleItems, refreshAll, view],
   );
 
   // Deletes still inside their undo window must survive the page going away —
@@ -1545,8 +1569,11 @@ export default function Console() {
     (idArg?: string) => {
       const id = idArg ?? selectedId;
       if (!id) return;
-      // In the done bucket the same action restores the thread instead.
-      const marking = bucket !== "done";
+      // In the done bucket the same action restores the thread instead. But
+      // a thread reached from the agenda isn't necessarily in the current
+      // bucket list at all — when the loaded thread IS the one being acted
+      // on, trust its own `done` flag instead of guessing from `bucket`.
+      const marking = thread?.thread.id === id ? !thread.thread.done : bucket !== "done";
 
       // Snapshot the row so undo (or a rejected call) can put it back exactly.
       const bucketIdx = items.findIndex((i) => i.thread_id === id);
@@ -1554,11 +1581,17 @@ export default function Console() {
 
       // Flow mode: hand focus to a neighbour before the row disappears. In
       // search mode the row stays (done threads remain searchable), so the
-      // selection stays put too.
-      if (selectedId === id && !searchMode) {
+      // selection stays put too. This is a bucket-view behaviour only — the
+      // agenda's open thread is usually still sitting on the loaded bucket
+      // page (needs_reply is the default bucket AND the default agenda
+      // filter), so without the view gate this would jump the reading pane
+      // to an unrelated bucket row.
+      if (view === "buckets" && selectedId === id && !searchMode) {
         const vi = visibleItems.findIndex((i) => i.thread_id === id);
-        const next = visibleItems[vi + 1] ?? visibleItems[vi - 1] ?? null;
-        setSelectedId(next?.thread_id ?? null);
+        if (vi >= 0) {
+          const next = visibleItems[vi + 1] ?? visibleItems[vi - 1] ?? null;
+          setSelectedId(next?.thread_id ?? null);
+        }
       }
       setItems((prev) => prev.filter((i) => i.thread_id !== id));
 
@@ -1610,7 +1643,7 @@ export default function Console() {
         }
       })();
     },
-    [selectedId, bucket, items, searchMode, visibleItems, refreshCounts],
+    [selectedId, bucket, items, searchMode, visibleItems, refreshCounts, thread, view],
   );
 
   // Batch done/restore: mirrors doDone, fanned out with per-item failure
@@ -1838,21 +1871,6 @@ export default function Console() {
     [trackTask, refreshAll],
   );
 
-  const doQueue = useCallback(async () => {
-    try {
-      const r = await classifyQueue(200, false);
-      await trackTask(
-        r.task_id,
-        "classify",
-        (res) =>
-          `classify complete · ${res.created ?? 0} new labels · ` +
-          `${res.processed ?? 0} processed`,
-      );
-    } catch (e) {
-      toast.error((e as Error).message ?? "queue failed");
-    }
-  }, [trackTask]);
-
   // Queues an action-extraction sweep off the request path — same
   // wait-for-the-worker tail every other queued job uses.
   const doBackfillActions = useCallback(async () => {
@@ -1914,10 +1932,25 @@ export default function Console() {
         return leavesBucket ? mapped.filter((it) => it.thread_id !== id) : mapped;
       });
       setSearchResults((prev) => prev.map(applyOverride));
+      // The loaded thread's own `classification` field (ThreadDetail.classification)
+      // is a separate copy from the row in `items` — it's what the detail pane
+      // falls back to when the agenda has no bucket-list row to read from, so
+      // it needs the row's optimistic-write/rollback treatment too.
+      const prevThreadClassification = thread?.classification ?? null;
       try {
         await reclassify(id, label);
+        setThread((prev) =>
+          prev && prev.thread.id === id
+            ? { ...prev, classification: { label, confidence: 1, model_version: "user-override" } }
+            : prev,
+        );
         toast.success(`label → ${label}`);
         refreshCounts();
+        // The API only lists agenda actions whose message is still
+        // needs_reply/action_required — a relabel can drop this thread's
+        // actions off the agenda server-side, so the row needs a refetch,
+        // not just a count bump.
+        refreshActions({ quiet: true });
       } catch (e) {
         // Restore the pre-optimistic label (and the row itself, if flow mode
         // dropped it from the bucket) so nothing keeps a change the server
@@ -1940,11 +1973,16 @@ export default function Console() {
             prev.map((it) => (it.thread_id === id ? restored : it)),
           );
         }
+        setThread((prev) =>
+          prev && prev.thread.id === id
+            ? { ...prev, classification: prevThreadClassification }
+            : prev,
+        );
         setSelectedId(id);
         toast.error((e as Error).message ?? "reclassify failed");
       }
     },
-    [selectedId, bucket, items, searchMode, visibleItems, refreshCounts],
+    [selectedId, bucket, items, searchMode, visibleItems, refreshCounts, thread, refreshActions],
   );
 
   // Batch reclassify: same optimistic-override-then-roll-back-on-failure
@@ -1990,9 +2028,29 @@ export default function Console() {
       setSearchResults((prev) => prev.map((it) => applyOverride(it, prevResults)));
       setBulkIds(new Set());
 
+      // Same optimistic-write/rollback the row gets, but for the loaded
+      // thread's own `classification` field — only relevant if the open
+      // thread happens to be one of the ids being relabelled.
+      const loadedId = thread?.thread.id;
+      const prevThreadClassification = thread?.classification ?? null;
+
       const settled = await Promise.allSettled(ids.map((id) => reclassify(id, label)));
       const succeededIds = ids.filter((_, i) => settled[i].status === "fulfilled");
       const failedIds = ids.filter((_, i) => settled[i].status === "rejected");
+
+      if (loadedId && succeededIds.includes(loadedId)) {
+        setThread((prev) =>
+          prev && prev.thread.id === loadedId
+            ? { ...prev, classification: { label, confidence: 1, model_version: "user-override" } }
+            : prev,
+        );
+      } else if (loadedId && failedIds.includes(loadedId)) {
+        setThread((prev) =>
+          prev && prev.thread.id === loadedId
+            ? { ...prev, classification: prevThreadClassification }
+            : prev,
+        );
+      }
 
       if (failedIds.length > 0) {
         const failedSet = new Set(failedIds);
@@ -2024,10 +2082,14 @@ export default function Console() {
       }
       if (succeededIds.length > 0) {
         toast.success(`${succeededIds.length} → ${label}`);
+        // Relabelling can drop these threads off the agenda server-side
+        // (only needs_reply/action_required messages surface there), so the
+        // sidebar count alone would leave a stale, still-clickable row.
+        refreshActions({ quiet: true });
       }
       refreshCounts();
     },
-    [selectedId, bucket, items, searchMode, visibleItems, refreshCounts],
+    [selectedId, bucket, items, searchMode, visibleItems, refreshCounts, thread, refreshActions],
   );
 
   // ---- hotkeys -------------------------------------------------------------
@@ -2050,6 +2112,14 @@ export default function Console() {
       // bulk selection is next, then search clears (works even while the
       // search box has focus, since useHotkeys lets Escape through).
       if (e.key === "Escape") {
+        // The caret sitting in an empty search box shouldn't trap the
+        // operator there — Escape backs out of it before anything else gets
+        // a turn.
+        if (document.activeElement === searchInputRef.current) {
+          e.preventDefault();
+          clearSearch();
+          return;
+        }
         if (bulkIds.size > 0) {
           e.preventDefault();
           setBulkIds(new Set());
@@ -2068,6 +2138,17 @@ export default function Console() {
         setPaletteOpen(true);
         return;
       }
+      // ⌘/Ctrl A selects every visible row for batch triage — wide bucket
+      // view only. Elsewhere this just returns without preventDefault so the
+      // browser's own select-all still works (and useHotkeys already
+      // short-circuits while typing in an input, so this can't steal ⌘A
+      // from the search box).
+      if ((e.key === "a" || e.key === "A") && (e.metaKey || e.ctrlKey)) {
+        if (isNarrow || view === "agenda") return;
+        e.preventDefault();
+        selectAllVisible();
+        return;
+      }
       if (e.key === "?") {
         e.preventDefault();
         setShortcutsOpen(true);
@@ -2080,39 +2161,11 @@ export default function Console() {
         setView((v) => (v === "agenda" ? "buckets" : "agenda"));
         return;
       }
-      // Agenda view early-return: its j/k/Enter/e/x mean something different
-      // here (rows, not threads) than the bucket bindings below, so this has
-      // to take over completely rather than let e.g. the thread-done `e` or
-      // the bulk-select `x` fall through and act on stale bucket state.
-      if (view === "agenda") {
-        if (e.key === "j") {
-          e.preventDefault();
-          moveAgendaSelection(1);
-        } else if (e.key === "k") {
-          e.preventDefault();
-          moveAgendaSelection(-1);
-        } else if (e.key === "Enter") {
-          e.preventDefault();
-          if (focusedAction) {
-            setSelectedId(focusedAction.thread_id);
-            markThreadSeen(focusedAction.thread_id);
-            if (isNarrow) setNarrowPane("reading");
-          }
-        } else if (e.key === "e") {
-          e.preventDefault();
-          if (focusedAction) doActionStatus(focusedAction.id, "done");
-        } else if (e.key === "x") {
-          e.preventDefault();
-          if (focusedAction) doActionStatus(focusedAction.id, "dismissed");
-        }
-        return;
-      }
-      // panels + search + delete
-      if (e.key === "/") {
-        e.preventDefault();
-        searchInputRef.current?.focus();
-        return;
-      }
+      // Panel toggles, open-in-Gmail, and refresh don't care which list
+      // view is showing — the agenda has a sidebar, a detail pane, and (once
+      // something's focused) a loaded thread too — so these are hoisted
+      // above the agenda's early return instead of sitting with the
+      // bucket-only bindings below.
       if (e.key === "[") {
         e.preventDefault();
         togglePanel("sidebar");
@@ -2121,6 +2174,104 @@ export default function Console() {
       if (e.key === "]") {
         e.preventDefault();
         togglePanel("detail");
+        return;
+      }
+      if (e.key === "o") {
+        e.preventDefault();
+        openInGmail();
+        return;
+      }
+      if (e.key === "r") {
+        if (view === "agenda") {
+          // The agenda isn't looking at a bucket page, so refetch its own
+          // list instead of one the operator can't even see.
+          refreshActions();
+          refreshCounts();
+        } else {
+          clearNew();
+          refreshList(bucket);
+          refreshOverview();
+          refreshCounts();
+        }
+        return;
+      }
+      // Agenda view early-return: its j/k/Enter/e/x mean something different
+      // here (rows, not threads) than the bucket bindings below, so this has
+      // to take over completely rather than let e.g. the thread-done `e` or
+      // the bulk-select `x` fall through and act on stale bucket state.
+      if (view === "agenda") {
+        if (e.key === "j" || e.key === "ArrowDown") {
+          e.preventDefault();
+          moveAgendaSelection(1);
+        } else if (e.key === "k" || e.key === "ArrowUp") {
+          e.preventDefault();
+          moveAgendaSelection(-1);
+        } else if (e.key === "Enter") {
+          e.preventDefault();
+          if (focusedAction) {
+            if (isNarrow) {
+              if (narrowPane !== "reading") {
+                setSelectedId(focusedAction.thread_id);
+                markThreadSeen(focusedAction.thread_id);
+                setNarrowPane("reading");
+              } else {
+                setNarrowPane("list");
+              }
+            } else if (!panels.detail || selectedId !== focusedAction.thread_id) {
+              // Opening, or already open on a different thread: (re)point
+              // the detail pane at this action's thread without closing it
+              // if it happened to already be open.
+              setSelectedId(focusedAction.thread_id);
+              markThreadSeen(focusedAction.thread_id);
+              showPanel("detail");
+            } else {
+              togglePanel("detail");
+            }
+          }
+        } else if (e.key === "e") {
+          e.preventDefault();
+          if (focusedAction) doActionStatus(focusedAction.id, "done");
+        } else if (e.key === "x") {
+          e.preventDefault();
+          if (focusedAction) doActionStatus(focusedAction.id, "dismissed");
+        } else if (e.key === "G") {
+          e.preventDefault();
+          if (flattenedAgenda.length) {
+            const target = flattenedAgenda[flattenedAgenda.length - 1];
+            setSelectedActionId(target.id);
+            scrollActionRowIntoView(target.id);
+          }
+        } else if (e.key === "g") {
+          const now = Date.now();
+          if (now - gPressedAt.current < 400) {
+            if (flattenedAgenda.length) {
+              const target = flattenedAgenda[0];
+              setSelectedActionId(target.id);
+              scrollActionRowIntoView(target.id);
+            }
+            gPressedAt.current = 0;
+          } else {
+            gPressedAt.current = now;
+          }
+        } else {
+          // Bucket digits still work from here — same escape hatch clicking a
+          // bucket in the sidebar gives you, so the one merged cheatsheet
+          // doesn't have to carve out an exception for the agenda.
+          for (const [b, key] of Object.entries(BUCKET_KEYS)) {
+            if (e.key === key) {
+              e.preventDefault();
+              setView("buckets");
+              setBucket(b as BucketKey);
+              break;
+            }
+          }
+        }
+        return;
+      }
+      // panels + search + delete
+      if (e.key === "/") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
         return;
       }
       if (e.key === "#") {
@@ -2133,11 +2284,6 @@ export default function Console() {
         e.preventDefault();
         if (!isNarrow && bulkIds.size > 0) doDoneBatch(batchTargets());
         else doDone();
-        return;
-      }
-      if (e.key === "o") {
-        e.preventDefault();
-        openInGmail();
         return;
       }
       // Toggles bulk-select on the focused row — wide layout only, mirrors
@@ -2169,10 +2315,10 @@ export default function Console() {
           return;
         }
       }
-      if (e.key === "j") {
+      if (e.key === "j" || e.key === "ArrowDown") {
         e.preventDefault();
         moveSelection(1);
-      } else if (e.key === "k") {
+      } else if (e.key === "k" || e.key === "ArrowUp") {
         e.preventDefault();
         moveSelection(-1);
       } else if (e.key === "G") {
@@ -2181,6 +2327,7 @@ export default function Console() {
           const target = visibleItems[visibleItems.length - 1];
           setSelectedId(target.thread_id);
           markThreadSeen(target.thread_id);
+          scrollThreadIntoView(target.thread_id);
         }
       } else if (e.key === "g") {
         const now = Date.now();
@@ -2189,35 +2336,32 @@ export default function Console() {
             const target = visibleItems[0];
             setSelectedId(target.thread_id);
             markThreadSeen(target.thread_id);
+            scrollThreadIntoView(target.thread_id);
           }
           gPressedAt.current = 0;
         } else {
           gPressedAt.current = now;
         }
       } else if (e.key === "Enter") {
-        // already selected; this is a no-op besides ensuring scroll
+        e.preventDefault();
         if (focusedItem) {
           if (isNarrow) {
-            setNarrowPane("reading");
+            if (narrowPane !== "reading") {
+              setNarrowPane("reading");
+              markThreadSeen(focusedItem.thread_id);
+            } else {
+              setNarrowPane("list");
+            }
+          } else if (!panels.detail) {
+            togglePanel("detail");
             markThreadSeen(focusedItem.thread_id);
+            scrollThreadIntoView(focusedItem.thread_id);
+          } else {
+            togglePanel("detail");
           }
-          document
-            .querySelector(`[data-thread-row="${focusedItem.thread_id}"]`)
-            ?.scrollIntoView({ block: "nearest" });
         }
       } else if (e.key === "c") {
         setSortMode(nextSortMode);
-      } else if (e.key === "r") {
-        clearNew();
-        refreshList(bucket);
-        refreshOverview();
-        refreshCounts();
-      } else if (e.key === "i") {
-        doIngest({ maxResults: 100, classify: true, refreshExisting: false });
-      } else if (e.key === "b") {
-        doBackfill({ limit: 200, bucket, backend: "local", force: false });
-      } else if (e.key === "q") {
-        doQueue();
       }
     },
     [
@@ -2233,7 +2377,9 @@ export default function Console() {
       bucket,
       view,
       focusedAction,
+      flattenedAgenda,
       moveAgendaSelection,
+      scrollActionRowIntoView,
       doActionStatus,
       bulkIds,
       batchTargets,
@@ -2252,10 +2398,14 @@ export default function Console() {
       refreshList,
       refreshOverview,
       refreshCounts,
-      doIngest,
-      doBackfill,
-      doQueue,
+      refreshActions,
       clearNew,
+      selectAllVisible,
+      scrollThreadIntoView,
+      narrowPane,
+      panels,
+      selectedId,
+      showPanel,
     ],
   );
 
@@ -2421,7 +2571,9 @@ export default function Console() {
         {!isNarrow && bulkIds.size > 0 ? (
           <>
             <span className="text-muted-foreground tabular-nums shrink-0">
-              {bulkIds.size} selected
+              {!searchMode && allCounts[bucket] > visibleItems.length
+                ? `${bulkIds.size} of ${allCounts[bucket]} selected`
+                : `${bulkIds.size} selected`}
             </span>
             <button
               onClick={() => doDoneBatch(batchTargets())}
@@ -2435,12 +2587,14 @@ export default function Console() {
             >
               delete
             </button>
-            <button
-              onClick={() => setBulkIds(new Set())}
-              className="shrink-0 px-2 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
-            >
-              clear
-            </button>
+            {bulkIds.size < visibleItems.length && (
+              <button
+                onClick={selectAllVisible}
+                className="shrink-0 px-2 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+              >
+                select all
+              </button>
+            )}
           </>
         ) : (
           <span className="text-muted-foreground tabular-nums shrink-0">
@@ -2668,17 +2822,22 @@ export default function Console() {
     </section>
   );
 
+  // The agenda never populates focusedItem (that's derived from the bucket
+  // list) — fall back to whatever thread is actually loaded so the
+  // prediction bar and the done/delete buttons still work for a thread
+  // opened from there.
+  const detailThreadId = focusedItem?.thread_id ?? thread?.thread.id;
   const detailPane = (
     <ThreadDetailPane
       data={thread}
-      classification={focusedItem?.classification ?? null}
+      classification={focusedItem?.classification ?? thread?.classification ?? null}
       loading={threadLoading}
       error={threadError}
       onReclassify={doReclassify}
       onBack={isNarrow ? () => setNarrowPane("list") : undefined}
       onCollapse={isNarrow ? undefined : () => togglePanel("detail")}
-      onDone={focusedItem ? () => doDone(focusedItem.thread_id) : undefined}
-      onDelete={focusedItem ? () => doDelete(focusedItem.thread_id) : undefined}
+      onDone={detailThreadId ? () => doDone(detailThreadId) : undefined}
+      onDelete={detailThreadId ? () => doDelete(detailThreadId) : undefined}
       showAccountBadge={multiAccount}
       side={arrangement.reading}
       predictionOpen={panels.prediction}
@@ -2789,7 +2948,13 @@ export default function Console() {
           }}
           onIngest={() => setIngestOpen(true)}
           onBackfill={() => setBackfillOpen(true)}
-          onQueue={doQueue}
+          onSelectAll={selectAllVisible}
+          canSelectAll={
+            !isNarrow &&
+            view === "buckets" &&
+            visibleItems.length > 0 &&
+            bulkIds.size < visibleItems.length
+          }
           onReclassify={doReclassify}
           hasFocusedThread={!!focusedItem}
           onToggleSidebar={() => togglePanel("sidebar")}

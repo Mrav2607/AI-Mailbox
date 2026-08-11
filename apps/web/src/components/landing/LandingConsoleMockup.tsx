@@ -1,7 +1,13 @@
 import { BrainCircuit, Mail, MessagesSquare } from "lucide-react";
 import { useState } from "react";
 
-import { LABEL_META, confidenceColor, confidenceText } from "@/lib/labels";
+import {
+  LABEL_META,
+  confidenceColor,
+  confidenceText,
+  CONF_BAR_TRACK,
+  CONF_BAR_FILL,
+} from "@/lib/labels";
 import type { Label } from "@/lib/types";
 
 const STATS: { icon: typeof Mail; label: string; value: number }[] = [
@@ -198,10 +204,13 @@ export function LandingConsoleMockup() {
                     <span className={`truncate text-[11px] ${meta.text}`}>{meta.name}</span>
                   </span>
                   <span className="flex w-16 shrink-0 items-center gap-1.5">
-                    <span className="h-[2px] w-9 overflow-hidden bg-border">
+                    <span className={`${CONF_BAR_TRACK} w-9`}>
                       <span
-                        className={`landing-bar-fill block h-full ${confidenceColor(row.confidence)}`}
-                        style={{ width: `${pct}%`, animationDelay: `${barDelay}ms` }}
+                        className={`landing-bar-fill block ${CONF_BAR_FILL} ${confidenceColor(row.confidence)}`}
+                        style={{
+                          width: pct ? `max(2px, ${pct}%)` : "0%",
+                          animationDelay: `${barDelay}ms`,
+                        }}
                       />
                     </span>
                     <span

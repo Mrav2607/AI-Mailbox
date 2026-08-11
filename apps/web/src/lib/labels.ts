@@ -88,17 +88,40 @@ export function bucketLabel(b: BucketKey): string {
   return LABEL_META[b].name;
 }
 
-// Confidence keeps a universal green/amber/red read, muted to sit inside the
-// terminal palette rather than glow like a status LED.
+// Confidence reads as a three-step red -> amber -> green traffic light. Three
+// steps, not five: the bar is 3px tall, and squeezing more tiers into the
+// lightness range that contrast allows made neighbouring steps as close to
+// each other as they were to the label colors -- a distinction nobody could
+// see. The exact number is printed beside the bar anyway, so the bar's job is
+// just "can I trust this at a glance". See index.css for why the tokens sit
+// at low chroma and ramp in lightness.
+//
+// Thresholds are on the DISPLAYED percentage (Math.round(c * 100)), not the
+// raw float -- every call site renders the rounded percentage, so branching on
+// the float let a row's color and its printed number land in different tiers
+// right at a boundary (0.2549 and 0.2551 both print "25%").
 export function confidenceColor(c: number | null): string {
   if (c == null) return "bg-muted";
-  if (c >= 0.8) return "bg-[var(--conf-hi)]";
-  if (c >= 0.5) return "bg-[var(--conf-mid)]";
-  return "bg-[var(--conf-low)]";
+  const pct = Math.round(c * 100);
+  if (pct <= 25) return "bg-[var(--conf-red)]";
+  if (pct <= 80) return "bg-[var(--conf-amber)]";
+  return "bg-[var(--conf-green)]";
 }
 export function confidenceText(c: number | null): string {
   if (c == null) return "text-muted-foreground";
-  if (c >= 0.8) return "text-[var(--conf-hi-text)]";
-  if (c >= 0.5) return "text-[var(--conf-mid-text)]";
-  return "text-[var(--conf-low-text)]";
+  const pct = Math.round(c * 100);
+  if (pct <= 25) return "text-[var(--conf-red-text)]";
+  if (pct <= 80) return "text-[var(--conf-amber-text)]";
+  return "text-[var(--conf-green-text)]";
 }
+
+// One thickness, one shape, for the confidence bar everywhere it renders --
+// the three call sites used to drift (2px/3px/2px) and looked inconsistent
+// once the console's zoom transform rounded each one to different device
+// pixels.
+export const CONF_BAR_TRACK = "h-[3px] shrink-0 rounded-full bg-border overflow-hidden";
+// No rounded-full here -- the track's own rounding + overflow-hidden already
+// clips the fill's visible left edge, and a corner radius on a 2-3px-tall
+// fill eats the whole bar at low confidences (a 5% fill is ~2px wide, all
+// corner, nothing painted).
+export const CONF_BAR_FILL = "h-full";

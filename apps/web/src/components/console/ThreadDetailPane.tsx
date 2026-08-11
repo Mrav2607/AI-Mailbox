@@ -13,7 +13,13 @@ import {
   Undo2,
 } from "lucide-react";
 import { emailDocument, sanitizeEmailHtml } from "@/lib/email-html";
-import { LABEL_META, confidenceColor, confidenceText } from "@/lib/labels";
+import {
+  LABEL_META,
+  confidenceColor,
+  confidenceText,
+  CONF_BAR_TRACK,
+  CONF_BAR_FILL,
+} from "@/lib/labels";
 import { emailLocalPart } from "@/lib/sender";
 import { absTime } from "@/lib/time";
 import type { Classification, Label, ThreadDetail, ThreadMessage } from "@/lib/types";
@@ -326,10 +332,10 @@ export function ThreadDetailPane({
                 {classification?.label ?? "unclassified"}
               </span>
               <div className="flex items-center gap-1.5">
-                <div className="h-[3px] w-24 rounded-full bg-muted overflow-hidden">
+                <div className={`${CONF_BAR_TRACK} w-24`}>
                   <div
-                    className={`h-full ${confidenceColor(conf)}`}
-                    style={{ width: `${confPct ?? 0}%` }}
+                    className={`${CONF_BAR_FILL} ${confidenceColor(conf)}`}
+                    style={{ width: confPct ? `max(2px, ${confPct}%)` : "0%" }}
                   />
                 </div>
                 <span className={`text-xs font-mono tabular-nums ${confidenceText(conf)}`}>

@@ -521,6 +521,7 @@ export function mockThread(id: string): ThreadDetail {
       account_email: item.account_email,
     },
     messages,
+    classification: item.classification,
   };
 }
 
