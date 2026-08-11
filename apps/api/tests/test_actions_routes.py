@@ -204,6 +204,7 @@ def test_list_assembles_items_with_account_email_fallback(client, monkeypatch):
             display_email="owner@gmail.example",
             external_user_id="owner-external-id",
             label="action_required",
+            last_message_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
         ),
         _Row(
             item_with_fallback_only,
@@ -213,6 +214,7 @@ def test_list_assembles_items_with_account_email_fallback(client, monkeypatch):
             display_email=None,
             external_user_id="tid:oid",
             label="needs_reply",
+            last_message_at=None,
         ),
     ]
     db = _ListThenCountsDB(rows, (2, 1))
@@ -232,6 +234,50 @@ def test_list_assembles_items_with_account_email_fallback(client, monkeypatch):
     ]
     assert body["items"][0]["title"] == "Pay invoice #429"
     assert body["items"][0]["label"] == "action_required"
+
+
+def test_list_items_carry_thread_last_message_at(client):
+    # The console's unread ("seen") store compares a thread's stored
+    # timestamp against this field to decide whether it's still bold --
+    # an agenda row needs its source thread's latest-message time, and a
+    # thread that's never received a message stays None.
+    c, _, user = client
+    dated_item = _make_action_item()
+    undated_item = _make_action_item(status="open")
+    rows = [
+        _Row(
+            dated_item,
+            thread_subject="Invoice due",
+            provider="gmail",
+            sender="billing@example.com",
+            display_email="owner@gmail.example",
+            external_user_id="owner-external-id",
+            label="action_required",
+            last_message_at=datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc),
+        ),
+        _Row(
+            undated_item,
+            thread_subject="RSVP",
+            provider="outlook",
+            sender="events@example.com",
+            display_email=None,
+            external_user_id="tid:oid",
+            label="needs_reply",
+            last_message_at=None,
+        ),
+    ]
+    db = _ListThenCountsDB(rows, (2, 0))
+    app.dependency_overrides[get_current_user] = lambda: user
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        resp = TestClient(app).get("/api/v1/mail/actions")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["items"][0]["last_message_at"] == "2026-07-30T12:00:00Z"
+    assert body["items"][1]["last_message_at"] is None
 
 
 # ---------------------------------------------------------------------------
