@@ -119,9 +119,12 @@ export function confidenceText(c: number | null): string {
 // the three call sites used to drift (2px/3px/2px) and looked inconsistent
 // once the console's zoom transform rounded each one to different device
 // pixels.
-export const CONF_BAR_TRACK = "h-[3px] shrink-0 rounded-full bg-border overflow-hidden";
+// `block` so these work on a <span> as well as a <div>: inside a row <button>
+// the markup has to be phrasing content, and an inline box would drop the
+// height and the fill's width entirely.
+export const CONF_BAR_TRACK = "block h-[3px] shrink-0 rounded-full bg-border overflow-hidden";
 // No rounded-full here -- the track's own rounding + overflow-hidden already
 // clips the fill's visible left edge, and a corner radius on a 2-3px-tall
 // fill eats the whole bar at low confidences (a 5% fill is ~2px wide, all
 // corner, nothing painted).
-export const CONF_BAR_FILL = "h-full";
+export const CONF_BAR_FILL = "block h-full";

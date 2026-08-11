@@ -206,7 +206,7 @@ export function LandingConsoleMockup() {
                   <span className="flex w-16 shrink-0 items-center gap-1.5">
                     <span className={`${CONF_BAR_TRACK} w-9`}>
                       <span
-                        className={`landing-bar-fill block ${CONF_BAR_FILL} ${confidenceColor(row.confidence)}`}
+                        className={`landing-bar-fill ${CONF_BAR_FILL} ${confidenceColor(row.confidence)}`}
                         style={{
                           // Raw confidence, not the rounded percent — under
                           // 0.005 it rounds to 0 and loses the 2px floor.

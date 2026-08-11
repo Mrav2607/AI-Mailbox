@@ -390,9 +390,16 @@ function BackfillForm({
 type AccountStatus = "ok" | "amber" | "red";
 
 const ACCOUNT_STATUS_DOT: Record<AccountStatus, string> = {
-  ok: "bg-emerald-500",
-  amber: "bg-amber-500",
-  red: "bg-destructive",
+  // Filled circle -- syncing fine.
+  ok: "rounded-full bg-[var(--success)]",
+  // Same circle, hollow instead of filled -- "stale/syncing" reads as a
+  // fill-vs-outline difference from "ok", not just a hue difference, so it
+  // still tells apart under red/green colorblindness or on a grayscale
+  // screen.
+  amber: "rounded-full border border-[var(--primary)] bg-transparent",
+  // Diamond, not a circle -- the most severe state (reauth) gets its own
+  // silhouette on top of the color change.
+  red: "rotate-45 bg-destructive",
 };
 
 const ACCOUNT_STATUS_LABEL: Record<AccountStatus, string> = {
@@ -459,9 +466,14 @@ function AccountsMenu({
                 className="rounded border border-border px-2 py-1.5 space-y-1"
               >
                 <div className="flex items-center gap-2">
+                  {/* role="img" + aria-label puts the status text in the
+                      accessibility tree on its own -- a title alone only
+                      reaches a sighted mouse user hovering long enough. */}
                   <span
-                    className={cn("h-1.5 w-1.5 rounded-full shrink-0", ACCOUNT_STATUS_DOT[status])}
+                    role="img"
+                    aria-label={ACCOUNT_STATUS_LABEL[status]}
                     title={ACCOUNT_STATUS_LABEL[status]}
+                    className={cn("h-1.5 w-1.5 shrink-0", ACCOUNT_STATUS_DOT[status])}
                   />
                   <span className="shrink-0 flex items-center" title={c.provider}>
                     {c.provider === "outlook" ? <MicrosoftMark /> : <GoogleMark />}
@@ -664,7 +676,7 @@ export function TopBar({
               disabled={backfilling}
               aria-expanded={backfillOpen}
               aria-label="Classify / backfill"
-              className="h-7 max-md:h-10 px-2.5 max-md:w-10 max-md:px-0 max-md:justify-center rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+              className="h-7 max-md:h-10 px-2.5 max-md:w-10 max-md:px-0 max-md:justify-center rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground flex items-center gap-1.5 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
               {backfilling ? (
                 <Loader2 className="h-3 w-3 animate-spin" />

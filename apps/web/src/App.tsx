@@ -2598,7 +2598,7 @@ export default function Console() {
   );
 
   const agendaListPane = (
-    <section className="flex-1 min-w-0 min-h-0 flex flex-col">
+    <section aria-label="agenda" className="flex-1 min-w-0 min-h-0 flex flex-col">
       <div className="h-10 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center px-3 gap-2.5 font-mono text-[11.5px]">
         <span className="text-primary font-semibold tracking-tight shrink-0">agenda</span>
         <span className="text-muted-foreground tabular-nums shrink-0">
@@ -2653,18 +2653,36 @@ export default function Console() {
   );
 
   const listPane = view === "agenda" ? agendaListPane : (
-    <section className="flex-1 min-w-0 min-h-0 flex flex-col">
+    <section
+      aria-label={searchMode ? "search results" : `${bucket.replace("_", " ")} threads`}
+      className="flex-1 min-w-0 min-h-0 flex flex-col"
+    >
       <div className="h-10 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center px-3 gap-2.5 font-mono text-[11.5px]">
         <span className="text-primary font-semibold tracking-tight shrink-0">
           {searchMode ? "search" : bucket.replace("_", " ")}
         </span>
-        {!isNarrow && bulkIds.size > 0 ? (
+        {/* One stable element for both states (rather than two spans that
+            mount/unmount across branches) so the live region only ever
+            announces an actual text change — not its own appearance. */}
+        <span
+          role="status"
+          aria-live="polite"
+          className="text-muted-foreground tabular-nums shrink-0"
+        >
+          {!isNarrow && bulkIds.size > 0
+            ? !searchMode && allCounts[bucket] > visibleItems.length
+              ? `${bulkIds.size} of ${allCounts[bucket]} selected`
+              : `${bulkIds.size} selected`
+            : searchMode
+              ? `${visibleItems.length} ${
+                  visibleItems.length === 1 ? "match" : "matches"
+                } · all buckets`
+              : `${visibleItems.length} ${
+                  visibleItems.length === 1 ? "thread" : "threads"
+                }`}
+        </span>
+        {!isNarrow && bulkIds.size > 0 && (
           <>
-            <span className="text-muted-foreground tabular-nums shrink-0">
-              {!searchMode && allCounts[bucket] > visibleItems.length
-                ? `${bulkIds.size} of ${allCounts[bucket]} selected`
-                : `${bulkIds.size} selected`}
-            </span>
             <button
               onClick={() => doDoneBatch(batchTargets())}
               className="shrink-0 px-2 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
@@ -2686,13 +2704,6 @@ export default function Console() {
               </button>
             )}
           </>
-        ) : (
-          <span className="text-muted-foreground tabular-nums shrink-0">
-            {visibleItems.length}
-            {searchMode ? " match" : " thread"}
-            {visibleItems.length === 1 ? "" : "s"}
-            {searchMode ? " · all buckets" : ""}
-          </span>
         )}
 
         {pendingNew > 0 && (
@@ -3014,28 +3025,41 @@ export default function Console() {
           }}
         />
 
-        {isNarrow ? (
-          <NarrowShell
-            pane={narrowPane}
-            onPaneChange={setNarrowPane}
-            buckets={sidebarPane}
-            list={listPane}
-            reading={detailPane}
-          />
-        ) : (
-          <ConsoleLayout
-            arrangement={arrangement}
-            onArrangementChange={setArrangement}
-            sidebarVisible={panels.sidebar}
-            detailVisible={panels.detail}
-            onExpandSidebar={() => togglePanel("sidebar")}
-            paneSizes={paneSizes}
-            onPaneSizesChange={handlePaneSizes}
-            sidebar={sidebarPane}
-            list={listPane}
-            detail={detailPane}
-          />
-        )}
+        {/* Everything below the top bar is the actual console body — wrapping
+            it in main gives it a landmark of its own, which also scopes the
+            detail pane's <header> out of the top-level document so it stops
+            competing with the top bar for the banner landmark. flex-1
+            min-h-0 flex flex-col mirrors what the child below used to own
+            directly, so the box model is unchanged. */}
+        <main className="flex-1 min-h-0 flex flex-col">
+          {/* Visually nothing — heading navigation had no level-one heading to
+              land on before, just the thread subject's h2. It lives inside
+              main so it's covered by a landmark itself; loose at the top of
+              the tree it was the one node left outside one. */}
+          <h1 className="sr-only">CortexMail console</h1>
+          {isNarrow ? (
+            <NarrowShell
+              pane={narrowPane}
+              onPaneChange={setNarrowPane}
+              buckets={sidebarPane}
+              list={listPane}
+              reading={detailPane}
+            />
+          ) : (
+            <ConsoleLayout
+              arrangement={arrangement}
+              onArrangementChange={setArrangement}
+              sidebarVisible={panels.sidebar}
+              detailVisible={panels.detail}
+              onExpandSidebar={() => togglePanel("sidebar")}
+              paneSizes={paneSizes}
+              onPaneSizesChange={handlePaneSizes}
+              sidebar={sidebarPane}
+              list={listPane}
+              detail={detailPane}
+            />
+          )}
+        </main>
 
         <CommandPalette
           open={paletteOpen}
