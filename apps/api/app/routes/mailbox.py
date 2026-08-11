@@ -343,6 +343,23 @@ def get_thread(
         .scalars()
         .all()
     )
+    # The agenda view opens threads that never went through a bucket fetch, so
+    # unlike triage/search this can't rely on a row the console already has --
+    # the latest message's newest classification has to travel with the
+    # detail response itself. Same "newest row wins" lookup as
+    # _assemble_triage_items, just scoped to a single message.
+    latest_classification = (
+        db.execute(
+            select(Classification)
+            .where(Classification.message_id == messages[0].id)
+            .order_by(desc(Classification.created_at))
+            .limit(1)
+        )
+        .scalars()
+        .first()
+        if messages
+        else None
+    )
     return {
         "thread": {
             "id": str(thread.id),
@@ -366,6 +383,15 @@ def get_thread(
             }
             for m in messages
         ],
+        "classification": {
+            "label": latest_classification.label,
+            "confidence": float(latest_classification.confidence)
+            if latest_classification.confidence is not None
+            else None,
+            "model_version": latest_classification.model_version,
+        }
+        if latest_classification
+        else None,
     }
 
 

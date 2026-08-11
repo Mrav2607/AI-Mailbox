@@ -474,3 +474,131 @@ def test_counts_includes_actions_and_ignores_the_account_filter(monkeypatch):
     # Always cross-account: compute_action_counts gets the user id only, no
     # account scoping, even though the request set provider_account_id.
     assert captured["user_id"] == user.id
+
+
+# ---------------------------------------------------------------------------
+# GET /mail/thread/{id} -- classification carried on the detail response
+# ---------------------------------------------------------------------------
+
+
+class _ThreadDetailDB:
+    """Fake session backing GET /mail/thread/{id}: db.get resolves the owned
+    thread, and db.execute dispatches on statement shape between the account
+    lookup, the ordered message list, and the latest message's newest
+    classification lookup. Every statement is recorded so a test can also
+    assert the classification query's own ordering/limit, not just trust
+    whatever this stub was told to hand back."""
+
+    def __init__(self, thread, account_row, messages, classification):
+        self.thread = thread
+        self.account_row = account_row
+        self.messages = messages
+        self.classification = classification
+        self.statements = []
+
+    def get(self, model, pk):
+        return self.thread if pk == self.thread.id else None
+
+    def execute(self, statement):
+        self.statements.append(statement)
+        result = MagicMock()
+        compiled = str(statement)
+        if "provider_account" in compiled:
+            result.one.return_value = self.account_row
+        elif "FROM classification" in compiled:
+            result.scalars.return_value.first.return_value = self.classification
+        else:
+            result.scalars.return_value.all.return_value = self.messages
+        return result
+
+
+def _thread_detail_client(db, user_id):
+    app.dependency_overrides[get_current_user] = lambda: MagicMock(id=user_id)
+    app.dependency_overrides[get_db] = lambda: db
+    return TestClient(app)
+
+
+def _thread_detail_setup(*, classification):
+    user_id = uuid4()
+    thread_id = uuid4()
+    message_id = uuid4()
+    account_id = uuid4()
+    thread = SimpleNamespace(
+        id=thread_id,
+        user_id=user_id,
+        subject="Renewal notice",
+        provider="google",
+        provider_thread_id="thread-abc",
+        last_message_at=None,
+        done_at=None,
+        provider_account_id=account_id,
+    )
+    account_row = SimpleNamespace(display_email="owner@gmail.example", external_user_id="owner-ext")
+    message = SimpleNamespace(
+        id=message_id,
+        sent_at=None,
+        sender="billing@vendor.example",
+        snippet="Your plan renews soon",
+        body_text="body",
+        body_html="<p>body</p>",
+    )
+    db = _ThreadDetailDB(thread, account_row, [message], classification)
+    return _thread_detail_client(db, user_id), db, thread_id, message_id
+
+
+def test_thread_detail_returns_latest_message_classification():
+    classification = SimpleNamespace(label="needs_reply", confidence=0.87, model_version="local-v3")
+    client, _db, thread_id, _message_id = _thread_detail_setup(classification=classification)
+    try:
+        resp = client.get(f"/api/v1/mail/thread/{thread_id}")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert resp.json()["classification"] == {
+        "label": "needs_reply",
+        "confidence": 0.87,
+        "model_version": "local-v3",
+    }
+
+
+def test_thread_detail_classification_is_null_when_unclassified():
+    client, _db, thread_id, _message_id = _thread_detail_setup(classification=None)
+    try:
+        resp = client.get(f"/api/v1/mail/thread/{thread_id}")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert resp.json()["classification"] is None
+
+
+def test_thread_detail_reclassified_thread_returns_newest_classification_row():
+    # A thread whose latest message was reclassified must surface the newest
+    # classification row, not whichever one was written first -- this is the
+    # ordering guarantee the whole feature rests on.
+    newest = SimpleNamespace(label="fyi", confidence=1.0, model_version="user-override")
+    client, db, thread_id, message_id = _thread_detail_setup(classification=newest)
+    try:
+        resp = client.get(f"/api/v1/mail/thread/{thread_id}")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert resp.json()["classification"] == {
+        "label": "fyi",
+        "confidence": 1.0,
+        "model_version": "user-override",
+    }
+
+    classification_statements = [
+        statement for statement in db.statements if "FROM classification" in str(statement)
+    ]
+    assert len(classification_statements) == 1
+    compiled = _compiled(classification_statements[0])
+    # Scoped to the latest message (messages[0]) with no second message
+    # query, ordered newest-first, and capped to one row -- the mechanism
+    # that guarantees a reclassification wins over the original label.
+    assert f"classification.message_id = '{message_id.hex}'" in compiled
+    assert "ORDER BY classification.created_at DESC" in compiled
+    assert "LIMIT 1" in compiled

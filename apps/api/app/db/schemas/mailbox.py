@@ -71,6 +71,11 @@ class ThreadMessage(Response):
 class ThreadDetail(Response):
     thread: ThreadSummary
     messages: list[ThreadMessage]
+    # The agenda opens threads that aren't in any loaded bucket list, so the
+    # console can't fall back on a triage row's label the way the bucket view
+    # does -- the detail response has to carry it directly. None when the
+    # thread has no messages or its latest one hasn't been classified yet.
+    classification: ClassificationOut | None = None
 
 
 class Reclassified(Response):
