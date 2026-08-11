@@ -287,10 +287,11 @@ export function ThreadList({
                   </span>
                 )}
 
-                {/* confidence: hairline track + mono percent */}
-                <div className="shrink-0 flex items-center gap-1.5 w-[70px]">
-                  <div className={`${CONF_BAR_TRACK} w-11`}>
-                    <div
+                {/* confidence: hairline track + mono percent. Spans, not divs:
+                    a <button>'s content model is phrasing content only. */}
+                <span className="shrink-0 flex items-center gap-1.5 w-[70px]">
+                  <span className={`${CONF_BAR_TRACK} w-11`}>
+                    <span
                       className={`${CONF_BAR_FILL} ${confidenceColor(conf)}`}
                       // Floor keys off the raw confidence, not the rounded
                       // percent: anything under 0.005 rounds to 0 and would
@@ -298,16 +299,16 @@ export function ThreadList({
                       // thing the floor exists to prevent.
                       style={{ width: conf ? `max(2px, ${confPct}%)` : "0%" }}
                     />
-                  </div>
+                  </span>
                   <span
                     className={`text-[10.5px] font-mono tabular-nums w-8 text-right ${confidenceText(conf)}`}
                   >
                     {confPct == null ? "—" : `${confPct}%`}
                   </span>
-                </div>
+                </span>
 
                 {/* subject + snippet */}
-                <div className="min-w-0 flex-1 flex items-baseline gap-2 overflow-hidden">
+                <span className="min-w-0 flex-1 flex items-baseline gap-2 overflow-hidden">
                   <span
                     className={[
                       "truncate",
@@ -321,7 +322,7 @@ export function ThreadList({
                   <span className="truncate text-muted-foreground text-[12px]">
                     {it.latest_message_snippet ?? ""}
                   </span>
-                </div>
+                </span>
 
                 {showAccount && <AccountBadge email={it.account_email} />}
 

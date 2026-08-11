@@ -122,13 +122,15 @@ function AgendaRow({
           {groupKey === "overdue" && <span className="sr-only"> (overdue)</span>}
         </span>
 
-        <div className="min-w-0 flex-1 flex items-baseline gap-2 overflow-hidden">
+        {/* A span, not a div — a <button>'s content model is phrasing content
+            only, and this sits inside the row button. */}
+        <span className="min-w-0 flex-1 flex items-baseline gap-2 overflow-hidden">
           <span className="truncate text-foreground/90 font-medium">{rowTitle}</span>
           <span className="truncate text-muted-foreground text-[12px]">
             {item.thread_subject ?? ""}
             {sender ? ` · ${sender}` : ""}
           </span>
-        </div>
+        </span>
 
         {unverified && (
           <span className="shrink-0 text-[10px] text-muted-foreground border border-border/50 rounded px-1">

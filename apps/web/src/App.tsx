@@ -2673,9 +2673,13 @@ export default function Console() {
             ? !searchMode && allCounts[bucket] > visibleItems.length
               ? `${bulkIds.size} of ${allCounts[bucket]} selected`
               : `${bulkIds.size} selected`
-            : `${visibleItems.length}${searchMode ? " match" : " thread"}${
-                visibleItems.length === 1 ? "" : "s"
-              }${searchMode ? " · all buckets" : ""}`}
+            : searchMode
+              ? `${visibleItems.length} ${
+                  visibleItems.length === 1 ? "match" : "matches"
+                } · all buckets`
+              : `${visibleItems.length} ${
+                  visibleItems.length === 1 ? "thread" : "threads"
+                }`}
         </span>
         {!isNarrow && bulkIds.size > 0 && (
           <>
