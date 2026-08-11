@@ -63,11 +63,14 @@
   --popover-foreground: oklch(0.22 0 0);
   --primary: oklch(0.55 0.13 80);
   --primary-foreground: oklch(0.98 0.02 80);
-  /* Darker amber for text sitting on a primary/15 tint (e.g. the backfill
-     button) -- plain --primary only clears ~3.9:1 there, short of 4.5:1.
+  /* Darker amber for text sitting on a primary/15 tint -- covers the top
+     bar's backfill button as well as the ingest/backfill popover submits and
+     the AI settings modal submit, all of which land on a slightly different
+     amber-tinted backdrop. Solved against the worst of those backdrops
+     (#dad3c4) at 4.64:1; the lightest backdrop (#fcfcfc) clears 6.74:1.
      .dark below just points this back at --primary since the dark tint
      already passes on its own. */
-  --primary-tint-foreground: oklch(0.5 0.13 80);
+  --primary-tint-foreground: oklch(0.47 0.1 80);
   --secondary: oklch(0.92 0 0);
   --secondary-foreground: oklch(0.25 0 0);
   --muted: oklch(0.92 0 0);

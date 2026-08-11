@@ -235,7 +235,7 @@ function IngestForm({
       <button
         type="submit"
         disabled={busy || noneSelected}
-        className="w-full h-7 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+        className="w-full h-7 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
       >
         run ingest
       </button>
@@ -343,7 +343,7 @@ function BackfillForm({
             <button
               type="button"
               onClick={onOpenLlmSettings}
-              className="text-primary underline underline-offset-2 cursor-pointer"
+              className="text-primary-tint-foreground underline underline-offset-2 cursor-pointer"
             >
               AI settings
             </button>
@@ -379,7 +379,7 @@ function BackfillForm({
       <button
         type="submit"
         disabled={busy}
-        className="w-full h-7 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+        className="w-full h-7 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
       >
         run backfill
       </button>

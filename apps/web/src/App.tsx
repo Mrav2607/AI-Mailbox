@@ -151,6 +151,13 @@ const OnboardingTour = lazy(
 // actually sent to the server.
 const UNDO_MS = 5000;
 
+// Shared look for the "something needs your attention" sync pills (reconnect,
+// connect-provider, generic actionable). All three render the exact same
+// classes, so we keep one copy instead of drifting three copies apart.
+const SYNC_ACTION_PILL_CLASS =
+  "shrink-0 h-6 px-2 rounded-full border border-primary/40 bg-primary/10 text-[11px] text-primary-tint-foreground hover:bg-primary/20 cursor-pointer transition-colors flex items-center gap-1";
+const SYNC_ACTION_DOT_CLASS = "h-1.5 w-1.5 rounded-full bg-primary/70";
+
 // Guards the one-time OAuth code exchange. The authorization code is single-use,
 // but React StrictMode invokes effects twice in dev — without this module-level
 // latch the second run would re-POST the spent code and get `invalid_grant`.
@@ -2731,9 +2738,9 @@ export default function Console() {
                 data-testid="sync-failed-dot"
                 onClick={reconnectFor(c.provider)}
                 title={`${c.provider === "outlook" ? "Outlook" : "Gmail"} access was revoked for ${c.email_address} — reconnect to resume syncing`}
-                className="shrink-0 h-6 px-2 rounded-full border border-amber-500/40 bg-amber-500/10 text-[11px] text-amber-700 dark:text-amber-300 hover:bg-amber-500/20 cursor-pointer transition-colors flex items-center gap-1"
+                className={SYNC_ACTION_PILL_CLASS}
               >
-                <span className="h-1.5 w-1.5 rounded-full bg-amber-500/70" />
+                <span className={SYNC_ACTION_DOT_CLASS} />
                 reconnect {emailLocalPart(c.email_address)}
               </button>
             ))
@@ -2747,9 +2754,9 @@ export default function Console() {
                 data-testid="sync-failed-dot"
                 onClick={p === "outlook" ? handleConnectOutlook : handleConnectGmail}
                 title={syncStatus.detail}
-                className="shrink-0 h-6 px-2 rounded-full border border-amber-500/40 bg-amber-500/10 text-[11px] text-amber-700 dark:text-amber-300 hover:bg-amber-500/20 cursor-pointer transition-colors flex items-center gap-1"
+                className={SYNC_ACTION_PILL_CLASS}
               >
-                <span className="h-1.5 w-1.5 rounded-full bg-amber-500/70" />
+                <span className={SYNC_ACTION_DOT_CLASS} />
                 connect {p}
               </button>
             ))
@@ -2758,9 +2765,9 @@ export default function Console() {
               data-testid="sync-failed-dot"
               onClick={handleConnectGmail}
               title={syncStatus.detail}
-              className="shrink-0 h-6 px-2 rounded-full border border-amber-500/40 bg-amber-500/10 text-[11px] text-amber-700 dark:text-amber-300 hover:bg-amber-500/20 cursor-pointer transition-colors flex items-center gap-1"
+              className={SYNC_ACTION_PILL_CLASS}
             >
-              <span className="h-1.5 w-1.5 rounded-full bg-amber-500/70" />
+              <span className={SYNC_ACTION_DOT_CLASS} />
               {syncStatus.label}
             </button>
           ) : (
