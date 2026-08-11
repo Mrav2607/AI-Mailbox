@@ -9,6 +9,8 @@ from app.db.models import MailMessage
 from app.deps import get_current_user, get_db
 from app.main import app
 from app.routes import mailbox
+from app.services.nlp.classifier import build_classification_text
+from app.services.nlp.persistence import FEEDBACK_TEXT_MAX
 
 
 def test_triage_items_include_latest_message_sender_and_account_email(monkeypatch):
@@ -110,17 +112,23 @@ def test_triage_account_email_prefers_display_email_over_external_user_id(monkey
 
 
 class _ReclassifyDB:
-    """Fake session backing reclassify_thread: db.get resolves the owned
-    thread, db.execute resolves the latest-message lookup (and swallows
-    upsert_classification's own insert plus the extracted->ineligible
-    invalidation UPDATE, both recorded in `statements`), and commit() is
-    timestamped into `events` so tests can assert the enqueue happens
-    strictly after it."""
+    """Fake session backing reclassify_thread. Dispatches db.execute() by
+    statement shape instead of returning one canned result for every call --
+    the route issues up to four statements per request now (locked
+    latest-message select, prior-classification select, feedback insert,
+    classification upsert), plus an optional fifth (extracted->ineligible
+    invalidation UPDATE), and a single fake result would silently make every
+    read return whatever this stub was last told to hand back. Every
+    statement is recorded in `statements` (in call order) regardless, and
+    commit() is timestamped into `events` so tests can assert the extraction
+    enqueue happens strictly after it.
+    """
 
-    def __init__(self, thread, message, events):
+    def __init__(self, thread, message, events, *, prior_classification=None):
         self.thread = thread
         self.message = message
         self.events = events
+        self.prior_classification = prior_classification
         self.statements = []
 
     def get(self, model, pk):
@@ -128,12 +136,29 @@ class _ReclassifyDB:
 
     def execute(self, statement):
         self.statements.append(statement)
+        compiled = str(statement)
         result = MagicMock()
-        result.scalars.return_value.first.return_value = self.message
+        if "FROM mail_message" in compiled:
+            result.scalars.return_value.first.return_value = self.message
+        elif "FROM classification" in compiled:
+            result.scalars.return_value.first.return_value = self.prior_classification
+        elif "INSERT INTO classification " in compiled:
+            # The upsert -- rowcount 1 reads as "written", not "protected".
+            result.rowcount = 1
         return result
 
     def commit(self):
         self.events.append("commit")
+
+
+def _statement_matching(db, substring):
+    """The one statement in db.statements whose SQL contains `substring` --
+    fails loudly on zero or multiple matches rather than silently grabbing
+    the wrong index, since the exact statement count/order here is precisely
+    what several of these tests exist to pin down."""
+    matches = [s for s in db.statements if substring in str(s)]
+    assert len(matches) == 1, f"expected exactly one match for {substring!r}, got {len(matches)}"
+    return matches[0]
 
 
 class _FakeExtractionTask:
@@ -152,14 +177,23 @@ class _FakeExtractionTask:
             raise RuntimeError("broker down")
 
 
-def _reclassify_setup(monkeypatch, *, extraction_available, should_raise=False):
+def _reclassify_setup(
+    monkeypatch,
+    *,
+    extraction_available,
+    should_raise=False,
+    prior_classification=None,
+    subject="Renewal notice",
+    snippet="Your plan renews soon",
+    body_text="Full message body.",
+):
     user = MagicMock(id=uuid4())
     thread_id = uuid4()
     message_id = uuid4()
-    thread = SimpleNamespace(id=thread_id, user_id=user.id)
-    message = SimpleNamespace(id=message_id)
+    thread = SimpleNamespace(id=thread_id, user_id=user.id, subject=subject)
+    message = SimpleNamespace(id=message_id, snippet=snippet, body_text=body_text)
     events: list[str] = []
-    db = _ReclassifyDB(thread, message, events)
+    db = _ReclassifyDB(thread, message, events, prior_classification=prior_classification)
     fake_task = _FakeExtractionTask(events, should_raise=should_raise)
 
     monkeypatch.setattr(
@@ -256,11 +290,12 @@ def test_reclassify_away_invalidates_a_settled_extracted_row(monkeypatch):
         app.dependency_overrides.clear()
 
     assert resp.status_code == 200
-    # statements: [0] latest-message select, [1] classification upsert,
-    # [2] the extracted->ineligible invalidation UPDATE.
-    assert len(db.statements) == 3
+    # statements: [0] locked latest-message select, [1] prior-classification
+    # select, [2] feedback insert, [3] classification upsert, [4] the
+    # extracted->ineligible invalidation UPDATE.
+    assert len(db.statements) == 5
     compiled = str(
-        db.statements[2].compile(compile_kwargs={"literal_binds": True})
+        db.statements[4].compile(compile_kwargs={"literal_binds": True})
     )
     assert "UPDATE action_item" in compiled
     assert f"action_item.message_id = '{message_id.hex}'" in compiled
@@ -285,10 +320,218 @@ def test_reclassify_to_action_label_issues_no_invalidation_update(monkeypatch):
         app.dependency_overrides.clear()
 
     assert resp.status_code == 200
-    # Only the latest-message select and the classification upsert -- no
-    # third (invalidation) statement.
-    assert len(db.statements) == 2
+    # Locked latest-message select, prior-classification select, feedback
+    # insert, classification upsert -- no fifth (invalidation) statement.
+    assert len(db.statements) == 4
     assert fake_task.calls == [str(message_id)]
+
+
+def test_reclassify_locks_the_latest_message_row_for_update(monkeypatch):
+    # The row lock is what makes the prior-read -> insert -> upsert sequence
+    # race-safe against a second concurrent reclassify on the same thread.
+    client, _fake_task, _events, thread_id, _message_id, db = _reclassify_setup(
+        monkeypatch, extraction_available=False
+    )
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread_id}/classification",
+            json={"label": "fyi"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    lock_statement = db.statements[0]
+    compiled = str(lock_statement)
+    assert "FROM mail_message" in compiled
+    assert "FOR UPDATE" in compiled
+
+
+def test_reclassify_feedback_row_carries_prior_snapshot(monkeypatch):
+    prior = SimpleNamespace(label="fyi", confidence=0.62, model_version="local-v3")
+    client, _fake_task, _events, thread_id, message_id, db = _reclassify_setup(
+        monkeypatch,
+        extraction_available=False,
+        prior_classification=prior,
+        subject="Renewal notice",
+        snippet="Your plan renews soon",
+        body_text="Full message body.",
+    )
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread_id}/classification",
+            json={"label": "action_required"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    params = _statement_matching(
+        db, "INSERT INTO classification_feedback"
+    ).compile().params
+    assert params["message_id"] == message_id
+    assert params["user_id"] == db.thread.user_id
+    assert params["prior_label"] == "fyi"
+    assert params["prior_confidence"] == 0.62
+    assert params["prior_model_version"] == "local-v3"
+    assert params["new_label"] == "action_required"
+    assert params["input_text"] == build_classification_text(
+        "Renewal notice", "Your plan renews soon", "Full message body."
+    )
+
+
+def test_reclassify_feedback_prior_is_none_for_unclassified_message(monkeypatch):
+    client, _fake_task, _events, thread_id, message_id, db = _reclassify_setup(
+        monkeypatch, extraction_available=False, prior_classification=None
+    )
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread_id}/classification",
+            json={"label": "fyi"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    params = _statement_matching(
+        db, "INSERT INTO classification_feedback"
+    ).compile().params
+    assert params["message_id"] == message_id
+    assert params["prior_label"] is None
+    assert params["prior_confidence"] is None
+    assert params["prior_model_version"] is None
+    assert params["new_label"] == "fyi"
+
+
+def test_reclassify_override_of_override_appends_with_previous_override_as_prior(
+    monkeypatch,
+):
+    # The operator corrects their own earlier override to a different label --
+    # this must be recorded (not suppressed), with prior_* reflecting that
+    # earlier override, not a model prediction.
+    prior_override = SimpleNamespace(label="fyi", confidence=1.0, model_version="user-override")
+    client, _fake_task, _events, thread_id, _message_id, db = _reclassify_setup(
+        monkeypatch, extraction_available=False, prior_classification=prior_override
+    )
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread_id}/classification",
+            json={"label": "spam"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    params = _statement_matching(
+        db, "INSERT INTO classification_feedback"
+    ).compile().params
+    assert params["prior_label"] == "fyi"
+    assert params["prior_confidence"] == 1.0
+    assert params["prior_model_version"] == "user-override"
+    assert params["new_label"] == "spam"
+
+
+def test_reclassify_exact_repeat_of_operator_override_is_suppressed(monkeypatch):
+    # Same label as the operator's own last override -- a double-click/stuck-
+    # key repeat, not a new correction. No feedback row, but the upsert still
+    # runs (harmless no-op write against the classification table).
+    prior_override = SimpleNamespace(label="fyi", confidence=1.0, model_version="user-override")
+    client, _fake_task, _events, thread_id, _message_id, db = _reclassify_setup(
+        monkeypatch, extraction_available=False, prior_classification=prior_override
+    )
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread_id}/classification",
+            json={"label": "fyi"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert not any(
+        "INSERT INTO classification_feedback" in str(s) for s in db.statements
+    )
+    # The classification upsert still ran.
+    assert any(
+        "INSERT INTO classification " in str(s) for s in db.statements
+    )
+
+
+def test_reclassify_input_text_truncated_at_feedback_text_max(monkeypatch):
+    long_body = "x" * (FEEDBACK_TEXT_MAX + 500)
+    client, _fake_task, _events, thread_id, _message_id, db = _reclassify_setup(
+        monkeypatch,
+        extraction_available=False,
+        subject="Subject",
+        snippet="Snippet",
+        body_text=long_body,
+    )
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread_id}/classification",
+            json={"label": "fyi"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    params = _statement_matching(
+        db, "INSERT INTO classification_feedback"
+    ).compile().params
+    assert len(params["input_text"]) == FEEDBACK_TEXT_MAX
+    full_text = build_classification_text("Subject", "Snippet", long_body)
+    assert params["input_text"] == full_text[:FEEDBACK_TEXT_MAX]
+
+
+def test_reclassify_invalid_label_writes_nothing(monkeypatch):
+    client, _fake_task, _events, thread_id, _message_id, db = _reclassify_setup(
+        monkeypatch, extraction_available=False
+    )
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread_id}/classification",
+            json={"label": "not_a_real_label"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 422
+    assert db.statements == []
+
+
+def test_reclassify_unknown_thread_writes_nothing(monkeypatch):
+    client, _fake_task, _events, _thread_id, _message_id, db = _reclassify_setup(
+        monkeypatch, extraction_available=False
+    )
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{uuid4()}/classification",
+            json={"label": "fyi"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 404
+    assert db.statements == []
+
+
+def test_reclassify_thread_with_no_messages_writes_nothing(monkeypatch):
+    client, _fake_task, _events, thread_id, _message_id, db = _reclassify_setup(
+        monkeypatch, extraction_available=False
+    )
+    db.message = None
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread_id}/classification",
+            json={"label": "fyi"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 409
+    # The latest-message select itself still ran (that's how we learned
+    # there's nothing to lock) -- nothing past it.
+    assert len(db.statements) == 1
 
 
 # ---------------------------------------------------------------------------

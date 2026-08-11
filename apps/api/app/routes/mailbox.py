@@ -4,7 +4,7 @@ from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
-from sqlalchemy import select, desc, or_, func, update
+from sqlalchemy import select, desc, insert, or_, func, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -29,6 +29,7 @@ from app.db.models import (
     ActionItem,
     AppUser,
     Classification,
+    ClassificationFeedback,
     MailMessage,
     MailSyncRun,
     MailThread,
@@ -48,10 +49,14 @@ from app.services.nlp.backfill import (
     latest_messages_by_thread,
     run_backfill,
 )
-from app.services.nlp.classifier import LABELS
+from app.services.nlp.classifier import LABELS, build_classification_text
 from app.services.nlp.extractor import ACTION_LABELS
 from app.services.nlp.providers import extraction_available
-from app.services.nlp.persistence import upsert_classification
+from app.services.nlp.persistence import (
+    FEEDBACK_TEXT_MAX,
+    OPERATOR_MODEL_VERSION as _OPERATOR_MODEL_VERSION,
+    upsert_classification,
+)
 from app.services.sync_runs import (
     ACTIVE_SYNC_STATUSES,
     active_syncs,
@@ -87,10 +92,12 @@ _CLASSIFIER_BACKENDS = frozenset({"local", "llm", "gemini", "heuristic", "auto"}
 # What we tell callers about on a bad value -- the alias is accepted but not
 # advertised, so nobody learns the deprecated spelling from an error message.
 _DOCUMENTED_BACKENDS = _CLASSIFIER_BACKENDS - {"gemini"}
-# Marks a label set by a human in the console rather than a model, so it's
-# distinguishable from a real prediction and never overwritten by a backfill
-# (which only touches unclassified messages unless forced).
-_OPERATOR_MODEL_VERSION = "user-override"
+# _OPERATOR_MODEL_VERSION is persistence.OPERATOR_MODEL_VERSION under its old
+# local name (see the import above) -- marks a label set by a human in the
+# console rather than a model, so it's distinguishable from a real prediction
+# and never overwritten by a model write path (persistence's write-time
+# guard) or a backfill (which only touches unclassified messages unless
+# forced).
 
 
 class ReclassifyRequest(BaseModel):
@@ -408,6 +415,14 @@ def reclassify_thread(
     label is stored against the thread's latest message (the same message whose
     classification drives the triage view), with full confidence and an
     ``user-override`` model_version.
+
+    Also records the correction as ground truth in ``classification_feedback``
+    (see docs/plans/2026-08-11-feedback-capture-plan.md §3.2): the latest
+    message is locked FOR UPDATE first, so two concurrent overrides on the
+    same thread serialize instead of racing on which one's "prior" snapshot
+    is true. An exact repeat of the operator's own last override (same label,
+    already ``user-override``) is a double-click/stuck-key no-op and is not
+    recorded.
     """
     if payload.label not in LABELS:
         raise HTTPException(
@@ -428,12 +443,57 @@ def reclassify_thread(
             # the exact message whose classification drives the triage bucket.
             .order_by(*latest_message_ordering())
             .limit(1)
+            # Locks the row so a second concurrent reclassify on this thread
+            # blocks here instead of racing the prior-read/insert/upsert
+            # sequence below -- the loser re-reads under the lock and records
+            # the winner's override as its own "prior", which is the true
+            # history.
+            .with_for_update()
         )
         .scalars()
         .first()
     )
     if latest_message is None:
         raise HTTPException(status_code=409, detail="Thread has no messages to label")
+
+    # Read under the lock just acquired, so this reflects whatever the
+    # winner of a concurrent reclassify just committed -- never a stale prior.
+    prior_classification = (
+        db.execute(
+            select(Classification).where(Classification.message_id == latest_message.id)
+        )
+        .scalars()
+        .first()
+    )
+    # subject lives on the thread, snippet/body_text on the message -- same
+    # assembly build_classification_text expects everywhere else. Bounded to
+    # FEEDBACK_TEXT_MAX: a correction snapshot, not an unbounded copy of the
+    # message body.
+    input_text = build_classification_text(
+        thread.subject, latest_message.snippet, latest_message.body_text
+    )[:FEEDBACK_TEXT_MAX]
+
+    is_noop_repeat = (
+        prior_classification is not None
+        and prior_classification.model_version == _OPERATOR_MODEL_VERSION
+        and prior_classification.label == payload.label
+    )
+    if not is_noop_repeat:
+        db.execute(
+            insert(ClassificationFeedback).values(
+                user_id=current_user.id,
+                message_id=latest_message.id,
+                input_text=input_text,
+                prior_label=prior_classification.label if prior_classification else None,
+                prior_confidence=(
+                    prior_classification.confidence if prior_classification else None
+                ),
+                prior_model_version=(
+                    prior_classification.model_version if prior_classification else None
+                ),
+                new_label=payload.label,
+            )
+        )
 
     upsert_classification(
         db,
@@ -442,6 +502,9 @@ def reclassify_thread(
         confidence=1.0,
         rationale="Operator override from the console.",
         model_version=_OPERATOR_MODEL_VERSION,
+        # The whole point of this route -- an operator's own reclassify must
+        # always win, even over their own prior override.
+        overwrite_user_override=True,
     )
     if payload.label not in ACTION_LABELS:
         # A prior extraction may have already settled this message's row as

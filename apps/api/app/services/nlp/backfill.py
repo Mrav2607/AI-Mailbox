@@ -25,10 +25,16 @@ def latest_message_ordering():
     """The one true "newest message wins" ordering. Coalesce rather than plain
     NULLS LAST: a message with no sent_at falls back to created_at, and every
     consumer has to agree on that or they'll disagree about which message is a
-    thread's latest."""
+    thread's latest. The trailing id tie-breaker matters too: two messages
+    with an identical coalesced timestamp AND created_at (bulk ingest,
+    clock resolution) would otherwise resolve to different rows on different
+    calls, and the classification-feedback lock (§3.2) needs every caller to
+    agree on the SAME latest message or two concurrent corrections can lock
+    different rows."""
     return (
         func.coalesce(MailMessage.sent_at, MailMessage.created_at).desc().nullslast(),
         MailMessage.created_at.desc(),
+        MailMessage.id.desc(),
     )
 
 
