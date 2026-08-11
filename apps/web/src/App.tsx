@@ -635,10 +635,14 @@ export default function Console() {
       try {
         // 500 is the API's `le` cap for this param -- request it explicitly.
         const res = await getActions("open", 500);
-        setActions(res.items);
+        // A thread mid-undo-window is already gone from the UI but not yet
+        // from the server — same masking the triage/search paths already do,
+        // otherwise a deleted thread's agenda rows come right back.
+        const rows = res.items.filter((a) => !pendingDeletes.current.has(a.thread_id));
+        setActions(rows);
         if (!quiet) {
           setSelectedActionId((prev) =>
-            prev && res.items.some((a) => a.id === prev) ? prev : (res.items[0]?.id ?? null),
+            prev && rows.some((a) => a.id === prev) ? prev : (rows[0]?.id ?? null),
           );
         }
       } catch (e) {
@@ -1206,13 +1210,18 @@ export default function Console() {
 
   // Marks a thread seen on explicit navigation only (row click, j/k, gg/G,
   // narrow Enter) — never on the automatic first-row selection after a load.
+  // The lookup below only covers the bucket list; an agenda-opened thread
+  // usually isn't in it, so callers that already have the row in hand (the
+  // agenda) pass its timestamp explicitly instead of relying on the lookup.
   const markThreadSeen = useCallback(
-    (id: string) => {
+    (id: string, explicitLastMessageAt?: string | null) => {
       if (!user) return;
-      const item =
-        itemsRef.current.find((i) => i.thread_id === id) ??
-        visibleItems.find((i) => i.thread_id === id);
-      markSeen(seenRef.current, user.id, id, item?.last_message_at ?? null);
+      const lastMessageAt =
+        explicitLastMessageAt !== undefined
+          ? explicitLastMessageAt
+          : (itemsRef.current.find((i) => i.thread_id === id) ??
+              visibleItems.find((i) => i.thread_id === id))?.last_message_at ?? null;
+      markSeen(seenRef.current, user.id, id, lastMessageAt);
       setSeenVersion((v) => v + 1);
     },
     [user, visibleItems],
@@ -1615,6 +1624,11 @@ export default function Console() {
               : prev,
           );
           refreshCounts();
+          // The server bulk-closes every open ActionItem on this thread and
+          // deliberately doesn't reopen them on undo — refetch the agenda so
+          // the row (or its absence) matches that server truth instead of
+          // sitting there stale.
+          refreshActions({ quiet: true });
           toast(marking ? "thread done" : "thread restored", {
             action: {
               label: "undo",
@@ -1628,6 +1642,7 @@ export default function Console() {
                     );
                     restore();
                     refreshCounts();
+                    refreshActions({ quiet: true });
                   })
                   .catch((e) =>
                     toast.error((e as Error).message ?? "undo failed"),
@@ -1643,7 +1658,7 @@ export default function Console() {
         }
       })();
     },
-    [selectedId, bucket, items, searchMode, visibleItems, refreshCounts, thread, view],
+    [selectedId, bucket, items, searchMode, visibleItems, refreshCounts, thread, view, refreshActions],
   );
 
   // Batch done/restore: mirrors doDone, fanned out with per-item failure
@@ -1709,6 +1724,10 @@ export default function Console() {
         }
         applyDoneState(succeededIds, marking);
         refreshCounts();
+        // Same reasoning as doDone: the server bulk-closed these threads'
+        // agenda rows and won't reopen them on undo, so the agenda has to
+        // refetch to stay honest about what's actually still open.
+        refreshActions({ quiet: true });
 
         if (succeededIds.length > 0) {
           toast(`${succeededIds.length} threads ${marking ? "done" : "restored"}`, {
@@ -1728,6 +1747,7 @@ export default function Console() {
                     );
                   }
                   refreshCounts();
+                  refreshActions({ quiet: true });
                 });
               },
             },
@@ -1735,7 +1755,7 @@ export default function Console() {
         }
       })();
     },
-    [bucket, items, searchMode, selectedId, visibleItems, refreshCounts],
+    [bucket, items, searchMode, selectedId, visibleItems, refreshCounts, refreshActions],
   );
 
   // Jump to the thread in the Gmail web UI (default signed-in account).
@@ -2096,7 +2116,14 @@ export default function Console() {
   useHotkeys(
     (e) => {
       // overlays open: only handle escape
-      if (shouldSuppressConsoleHotkeys(paletteOpen, shortcutsOpen, tourActive)) {
+      if (
+        shouldSuppressConsoleHotkeys(
+          paletteOpen,
+          shortcutsOpen,
+          tourActive,
+          ingestOpen || backfillOpen || layoutOpen || accountsOpen || llmSettingsOpen || llmUsageOpen,
+        )
+      ) {
         if (e.key === "Escape") {
           if (tourActive) {
             skipTour();
@@ -2106,6 +2133,17 @@ export default function Console() {
           }
         }
         return;
+      }
+
+      // `l` then a 1-6 digit (checked further down, near the relabel
+      // binding) relabels the focused thread. The digit has to be the very
+      // next keystroke — any other key here disarms the prefix, so changing
+      // your mind mid-sequence can't relabel the wrong thread. `l` itself
+      // re-arms instead of disarming, so a doubled `l` still works.
+      if (e.key === "l") {
+        lPressedAt.current = Date.now();
+      } else if (!(Date.now() - lPressedAt.current < 800 && /^[1-6]$/.test(e.key))) {
+        lPressedAt.current = 0;
       }
 
       // Escape priority: overlay/tour handling above already returned; a live
@@ -2149,6 +2187,14 @@ export default function Console() {
         selectAllVisible();
         return;
       }
+      // Everything below assumes a bare, unmodified key. A modified chord
+      // means the browser (or the OS) has its own shortcut in mind — step
+      // out of the way without preventDefault so ⌘/Ctrl+0, ⌘/Ctrl+1-9,
+      // ⌘/Ctrl+O, ⌘[, ⌘], ⌘/Ctrl+X, and ⌘/Ctrl+C all keep working instead of
+      // the console swallowing or corrupting them. Shift stays out of this
+      // list on purpose — `#`, `?`, and `G` are all Shift-modified on a US
+      // layout and still need to fire normally.
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === "?") {
         e.preventDefault();
         setShortcutsOpen(true);
@@ -2212,7 +2258,7 @@ export default function Console() {
             if (isNarrow) {
               if (narrowPane !== "reading") {
                 setSelectedId(focusedAction.thread_id);
-                markThreadSeen(focusedAction.thread_id);
+                markThreadSeen(focusedAction.thread_id, focusedAction.last_message_at);
                 setNarrowPane("reading");
               } else {
                 setNarrowPane("list");
@@ -2222,7 +2268,7 @@ export default function Console() {
               // the detail pane at this action's thread without closing it
               // if it happened to already be open.
               setSelectedId(focusedAction.thread_id);
-              markThreadSeen(focusedAction.thread_id);
+              markThreadSeen(focusedAction.thread_id, focusedAction.last_message_at);
               showPanel("detail");
             } else {
               togglePanel("detail");
@@ -2293,10 +2339,7 @@ export default function Console() {
         if (focusedItem) toggleBulk(focusedItem.thread_id);
         return;
       }
-      if (e.key === "l") {
-        lPressedAt.current = Date.now();
-        return;
-      }
+      if (e.key === "l") return; // arming already happened above, before Escape
       // l then 1-6: relabel the focused thread (checked before bucket
       // switching so the digit doesn't change buckets instead).
       if (Date.now() - lPressedAt.current < 800 && /^[1-6]$/.test(e.key)) {
@@ -2368,6 +2411,12 @@ export default function Console() {
       paletteOpen,
       shortcutsOpen,
       tourActive,
+      ingestOpen,
+      backfillOpen,
+      layoutOpen,
+      accountsOpen,
+      llmSettingsOpen,
+      llmUsageOpen,
       skipTour,
       searchMode,
       query,
@@ -2542,7 +2591,7 @@ export default function Console() {
           onSelect={(item) => {
             setSelectedActionId(item.id);
             setSelectedId(item.thread_id);
-            markThreadSeen(item.thread_id);
+            markThreadSeen(item.thread_id, item.last_message_at);
             if (isNarrow) setNarrowPane("reading");
           }}
           onStatusChange={doActionStatus}
@@ -2956,7 +3005,9 @@ export default function Console() {
             bulkIds.size < visibleItems.length
           }
           onReclassify={doReclassify}
-          hasFocusedThread={!!focusedItem}
+          // `focusedItem` only comes from the bucket list — a thread opened
+          // from the agenda still has one on screen, it's just `thread`.
+          hasFocusedThread={!!focusedItem || !!thread}
           onToggleSidebar={() => togglePanel("sidebar")}
           onToggleDetail={() => togglePanel("detail")}
           onTogglePrediction={() => togglePanel("prediction")}
@@ -2967,7 +3018,13 @@ export default function Console() {
             setTimeout(() => searchInputRef.current?.focus(), 60)
           }
           onDone={() => doDone()}
-          inDoneBucket={bucket === "done"}
+          // Mirrors doDone's own `marking` logic: when the loaded thread IS
+          // the one `doDone()` would act on (it defaults to `selectedId`),
+          // trust its own `done` flag instead of guessing from `bucket` —
+          // an agenda thread usually isn't sitting in the loaded bucket page.
+          inDoneBucket={
+            thread?.thread.id === selectedId ? thread.thread.done : bucket === "done"
+          }
           onOpenGmail={openInGmail}
           onDelete={() => doDelete()}
           onRestartTour={restartTour}

@@ -171,6 +171,7 @@ const ACTIONS: ActionItem[] = [
     provider: "gmail",
     account_email: CONNECTIONS[0].email_address,
     label: "action_required",
+    last_message_at: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
   },
   {
     id: "mock-action-2",
@@ -191,6 +192,7 @@ const ACTIONS: ActionItem[] = [
     provider: "gmail",
     account_email: CONNECTIONS[0].email_address,
     label: "action_required",
+    last_message_at: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
   },
   {
     id: "mock-action-3",
@@ -212,6 +214,7 @@ const ACTIONS: ActionItem[] = [
     provider: "gmail",
     account_email: CONNECTIONS[1].email_address,
     label: "needs_reply",
+    last_message_at: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
   },
   {
     id: "mock-action-4",
@@ -232,6 +235,7 @@ const ACTIONS: ActionItem[] = [
     provider: "gmail",
     account_email: CONNECTIONS[0].email_address,
     label: "action_required",
+    last_message_at: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
   },
   {
     id: "mock-action-5",
@@ -252,6 +256,7 @@ const ACTIONS: ActionItem[] = [
     provider: "gmail",
     account_email: CONNECTIONS[0].email_address,
     label: "needs_reply",
+    last_message_at: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
   },
   {
     id: "mock-action-6a",
@@ -272,6 +277,7 @@ const ACTIONS: ActionItem[] = [
     provider: "gmail",
     account_email: CONNECTIONS[0].email_address,
     label: "needs_reply",
+    last_message_at: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
   },
   {
     id: "mock-action-6b",
@@ -292,6 +298,7 @@ const ACTIONS: ActionItem[] = [
     provider: "gmail",
     account_email: CONNECTIONS[0].email_address,
     label: "action_required",
+    last_message_at: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
   },
   // Already resolved — exercises the status filter/board beyond "open".
   {
@@ -313,6 +320,7 @@ const ACTIONS: ActionItem[] = [
     provider: "gmail",
     account_email: CONNECTIONS[0].email_address,
     label: "needs_reply",
+    last_message_at: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
   },
 ];
 

@@ -31,6 +31,7 @@ function makeItem(overrides: Partial<ActionItem> = {}): ActionItem {
     provider: "gmail",
     account_email: "operator@gmail.com",
     label: "needs_reply",
+    last_message_at: "2026-01-01T00:00:00.000Z",
     ...overrides,
   };
 }

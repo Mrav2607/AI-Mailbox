@@ -1,4 +1,4 @@
-import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 
 // Third field flags rows that only work in the bucket view — the agenda's
 // key handler early-returns for these, since it has no search box, sort
@@ -34,9 +34,14 @@ export function Shortcuts({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md bg-[var(--color-panel)] border-border">
-        <div className="font-mono text-[11px] tracking-wide text-muted-foreground mb-2">
+        {/* This heading also serves as the dialog's accessible name (Radix
+            points aria-labelledby at it) -- promoting it to DialogTitle
+            instead of adding a second sr-only one keeps a single heading
+            doing both jobs. font-normal/leading-normal override
+            DialogTitle's defaults so the visible styling doesn't change. */}
+        <DialogTitle className="font-mono font-normal text-[11px] leading-normal tracking-wide text-muted-foreground mb-2">
           keyboard shortcuts
-        </div>
+        </DialogTitle>
         <ul className="divide-y divide-border">
           {ROWS.map(([k, label, bucketOnly]) => (
             <li

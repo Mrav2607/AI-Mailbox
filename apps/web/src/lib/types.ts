@@ -102,6 +102,10 @@ export interface ActionItem {
   provider: string;
   account_email: string;
   label: string | null;
+  // The source thread's latest-message timestamp. Opening a thread from the
+  // agenda has to mark it seen, and the seen store compares against this --
+  // without it every agenda-opened thread stays unread forever.
+  last_message_at: string | null;
 }
 
 export interface ActionCounts {
