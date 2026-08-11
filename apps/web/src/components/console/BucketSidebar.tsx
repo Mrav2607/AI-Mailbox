@@ -111,10 +111,18 @@ export function BucketSidebar({
           );
         })}
       </nav>
+      {/* One hint per line: the sidebar only clears ~184px here, and even the
+          old single-character chip needed 185px, so the inline version always
+          wrapped mid-phrase. Stacking makes that deliberate and leaves room
+          for the full "Shift ?" chip. */}
       {!narrow && (
-        <div className="border-t border-border px-3 py-2 text-[11px] text-muted-foreground font-mono">
-          <span className="kbd">?</span> shortcuts ·{" "}
-          <span className="kbd">⌘K</span> palette
+        <div className="border-t border-border px-3 py-2 text-[11px] text-muted-foreground font-mono flex flex-col gap-1">
+          <span>
+            <span className="kbd">Shift ?</span> shortcuts
+          </span>
+          <span>
+            <span className="kbd">⌘K / Ctrl K</span> palette
+          </span>
         </div>
       )}
     </aside>

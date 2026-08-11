@@ -121,6 +121,7 @@ def list_actions(
             ActionItem,
             MailThread.subject.label("thread_subject"),
             MailThread.provider.label("provider"),
+            MailThread.last_message_at.label("last_message_at"),
             MailMessage.sender.label("sender"),
             ProviderAccount.display_email.label("display_email"),
             ProviderAccount.external_user_id.label("external_user_id"),
@@ -157,6 +158,7 @@ def list_actions(
             "thread_subject": row.thread_subject,
             "sender": row.sender,
             "provider": row.provider,
+            "last_message_at": row.last_message_at,
             # display_email fallback identity rule, same as the mailbox list
             # routes: external_user_id (Outlook's tid:oid) is only a fallback.
             "account_email": row.display_email or row.external_user_id,

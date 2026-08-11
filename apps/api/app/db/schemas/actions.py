@@ -35,6 +35,10 @@ class ActionOut(Response):
     sender: str | None
     provider: str
     account_email: str
+    # The source thread's latest-message timestamp -- the console's unread
+    # tracking compares a thread's stored "seen" timestamp against this to
+    # decide whether it's still bold, so an agenda row needs it too.
+    last_message_at: datetime | None
     # The source message's current classification label -- what the
     # visibility join is keyed on, surfaced so the console can explain why an
     # item is showing.

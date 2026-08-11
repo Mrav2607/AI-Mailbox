@@ -21,7 +21,6 @@ interface Props {
   onBucket: (b: BucketKey) => void;
   onIngest: () => void;
   onBackfill: () => void;
-  onQueue: () => void;
   onReclassify: (l: Label) => void;
   hasFocusedThread: boolean;
   onToggleSidebar: () => void;
@@ -40,6 +39,10 @@ interface Props {
   onBackfillActions: () => void;
   onOpenLlmSettings: () => void;
   onOpenLlmUsage: () => void;
+  onSelectAll: () => void;
+  // False in the narrow layout and in the agenda view, where there's no bulk
+  // selection to fill — the command hides rather than sitting there dead.
+  canSelectAll: boolean;
 }
 
 export function CommandPalette({
@@ -48,7 +51,6 @@ export function CommandPalette({
   onBucket,
   onIngest,
   onBackfill,
-  onQueue,
   onReclassify,
   hasFocusedThread,
   onToggleSidebar,
@@ -67,6 +69,8 @@ export function CommandPalette({
   onBackfillActions,
   onOpenLlmSettings,
   onOpenLlmUsage,
+  onSelectAll,
+  canSelectAll,
 }: Props) {
   const run = (fn: () => void) => {
     onOpenChange(false);
@@ -107,6 +111,14 @@ export function CommandPalette({
               >
                 search threads
               </CommandItem>
+              {canSelectAll && (
+                <CommandItem
+                  onSelect={() => run(onSelectAll)}
+                  value="select all threads bulk selection"
+                >
+                  select all threads
+                </CommandItem>
+              )}
               <CommandItem
                 onSelect={() => run(onToggleSidebar)}
                 value="toggle buckets sidebar"
@@ -170,16 +182,10 @@ export function CommandPalette({
                 backfill classification…
               </CommandItem>
               <CommandItem
-                onSelect={() => run(onQueue)}
-                value="queue classification"
-              >
-                queue classification (async)
-              </CommandItem>
-              <CommandItem
                 onSelect={() => run(onBackfillActions)}
                 value="extract actions backfill agenda"
               >
-                extract actions (backfill)
+                extract actions
               </CommandItem>
               <CommandItem
                 onSelect={() => run(onOpenLlmSettings)}

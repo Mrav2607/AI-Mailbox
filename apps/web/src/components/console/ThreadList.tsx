@@ -1,7 +1,13 @@
 import { Fragment } from "react";
 import type { ReactNode } from "react";
 import { Check, Inbox } from "lucide-react";
-import { LABEL_META, confidenceColor, confidenceText } from "@/lib/labels";
+import {
+  LABEL_META,
+  confidenceColor,
+  confidenceText,
+  CONF_BAR_TRACK,
+  CONF_BAR_FILL,
+} from "@/lib/labels";
 import { emailLocalPart, senderName } from "@/lib/sender";
 import type { TriageItem } from "@/lib/types";
 import { dateGroup, relTime } from "@/lib/time";
@@ -280,10 +286,14 @@ export function ThreadList({
 
                 {/* confidence: hairline track + mono percent */}
                 <div className="shrink-0 flex items-center gap-1.5 w-[70px]">
-                  <div className="h-[2px] w-11 bg-border overflow-hidden">
+                  <div className={`${CONF_BAR_TRACK} w-11`}>
                     <div
-                      className={`h-full ${confidenceColor(conf)}`}
-                      style={{ width: `${confPct ?? 0}%` }}
+                      className={`${CONF_BAR_FILL} ${confidenceColor(conf)}`}
+                      // Floor keys off the raw confidence, not the rounded
+                      // percent: anything under 0.005 rounds to 0 and would
+                      // fall back to a zero-width bar, which is the very
+                      // thing the floor exists to prevent.
+                      style={{ width: conf ? `max(2px, ${confPct}%)` : "0%" }}
                     />
                   </div>
                   <span

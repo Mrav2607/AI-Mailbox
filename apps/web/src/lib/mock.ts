@@ -102,9 +102,10 @@ function makeItems(count: number): TriageItem[] {
     minutesAgo += 3 + ((i * 13) % 200);
     const hasLabel = i % 11 !== 0;
     const label = hasLabel ? ALL_LABELS[i % ALL_LABELS.length] : null;
-    const conf = hasLabel
-      ? Math.max(0.15, Math.min(0.99, 0.4 + ((i * 37) % 65) / 100))
-      : null;
+    // Spread across the whole 0-1 range, not just the confident end: the
+    // confidence bar's low tier only paints under 25%, and the old 0.40 floor
+    // meant preview never rendered it at all.
+    const conf = hasLabel ? +(0.08 + ((i * 37) % 92) / 100).toFixed(2) : null;
     out.push({
       thread_id: `mock-${i}-${(i * 9301 + 49297) % 233280}`,
       subject: rand(SUBJECTS, i + (i % 3)),
@@ -146,16 +147,58 @@ function daysFromNow(d: number): string {
   return new Date(Date.now() + d * 24 * 60 * 60 * 1000).toISOString();
 }
 
+// Agenda rows must point at threads that genuinely exist in ALL. The detail
+// pane fetches the thread by id, and mockThread throws a 404 for anything it
+// can't find -- so invented ids made the agenda's reading pane impossible to
+// open in preview at all, which is exactly the surface most worth demoing.
+//
+// The API only lists actions whose source message is still needs_reply or
+// action_required, so the preview pool matches that visibility rule too.
+const AGENDA_THREADS = ALL.filter(
+  (t) =>
+    t.classification.label === "needs_reply" ||
+    t.classification.label === "action_required",
+);
+
+// Fills in every field an agenda row shares with its source thread, so the row
+// and the reading pane can never disagree about subject, sender, or account.
+function actionFor(
+  src: TriageItem,
+  fields: Omit<
+    ActionItem,
+    | "thread_id"
+    | "message_id"
+    | "provider"
+    | "thread_subject"
+    | "sender"
+    | "account_email"
+    | "label"
+    | "last_message_at"
+  >,
+): ActionItem {
+  return {
+    ...fields,
+    thread_id: src.thread_id,
+    // mockThread builds three messages per thread with these ids; the last one
+    // is the newest, which is what an extractor would have read.
+    message_id: `${src.thread_id}-m2`,
+    provider: "gmail",
+    thread_subject: src.subject,
+    sender: src.latest_message_sender,
+    account_email: src.account_email,
+    label: src.classification.label,
+    last_message_at: src.last_message_at,
+  };
+}
+
 // Demo data for the Agenda view — spans overdue / today / this week / later /
 // no-deadline, one low-confidence item (renders the "unverified" treatment),
 // and two items sourced from different messages in the SAME thread (the
 // agenda selects rows by action id, not thread id, since a thread can carry
 // more than one open obligation).
 const ACTIONS: ActionItem[] = [
-  {
+  actionFor(AGENDA_THREADS[0], {
     id: "mock-action-1",
-    thread_id: "mock-action-thread-1",
-    message_id: "mock-action-msg-1",
     kind: "payment",
     title: "Pay invoice #4821",
     due_at: daysFromNow(-2),
@@ -166,16 +209,9 @@ const ACTIONS: ActionItem[] = [
     source_confidence: 0.82,
     status: "open",
     created_at: daysFromNow(-5),
-    thread_subject: "Re: invoice for Q3 services",
-    sender: "alice@stripe.com",
-    provider: "gmail",
-    account_email: CONNECTIONS[0].email_address,
-    label: "action_required",
-  },
-  {
+  }),
+  actionFor(AGENDA_THREADS[1], {
     id: "mock-action-2",
-    thread_id: "mock-action-thread-2",
-    message_id: "mock-action-msg-2",
     kind: "signature",
     title: "Sign the updated contractor agreement",
     due_at: hoursFromNow(4),
@@ -186,16 +222,9 @@ const ACTIONS: ActionItem[] = [
     source_confidence: 0.91,
     status: "open",
     created_at: daysFromNow(-1),
-    thread_subject: "Contractor agreement — please sign",
-    sender: "carol@acme.io",
-    provider: "gmail",
-    account_email: CONNECTIONS[0].email_address,
-    label: "action_required",
-  },
-  {
+  }),
+  actionFor(AGENDA_THREADS[2], {
     id: "mock-action-3",
-    thread_id: "mock-action-thread-3",
-    message_id: "mock-action-msg-3",
     kind: "rsvp",
     title: "RSVP to the design review sync",
     due_at: daysFromNow(3),
@@ -207,16 +236,9 @@ const ACTIONS: ActionItem[] = [
     source_confidence: 0.55,
     status: "open",
     created_at: daysFromNow(-1),
-    thread_subject: "Calendar invite: design review",
-    sender: "bob@figma.com",
-    provider: "gmail",
-    account_email: CONNECTIONS[1].email_address,
-    label: "needs_reply",
-  },
-  {
+  }),
+  actionFor(AGENDA_THREADS[3], {
     id: "mock-action-4",
-    thread_id: "mock-action-thread-4",
-    message_id: "mock-action-msg-4",
     kind: "form",
     title: "Complete the vendor security questionnaire",
     due_at: daysFromNow(20),
@@ -227,16 +249,9 @@ const ACTIONS: ActionItem[] = [
     source_confidence: 0.88,
     status: "open",
     created_at: daysFromNow(-2),
-    thread_subject: "Vendor security review",
-    sender: "support@aws.amazon.com",
-    provider: "gmail",
-    account_email: CONNECTIONS[0].email_address,
-    label: "action_required",
-  },
-  {
+  }),
+  actionFor(AGENDA_THREADS[4], {
     id: "mock-action-5",
-    thread_id: "mock-action-thread-5",
-    message_id: "mock-action-msg-5",
     kind: "other",
     title: "Review Q3 budget notes",
     due_at: null,
@@ -247,16 +262,10 @@ const ACTIONS: ActionItem[] = [
     source_confidence: 0.7,
     status: "open",
     created_at: daysFromNow(-3),
-    thread_subject: "Standup notes — engineering",
-    sender: "team@linear.app",
-    provider: "gmail",
-    account_email: CONNECTIONS[0].email_address,
-    label: "needs_reply",
-  },
-  {
+  }),
+  // Two obligations on one thread — same source, different action ids.
+  actionFor(AGENDA_THREADS[5], {
     id: "mock-action-6a",
-    thread_id: "mock-action-thread-6",
-    message_id: "mock-action-msg-6a",
     kind: "reply",
     title: "Reply with the shipping address",
     due_at: daysFromNow(1),
@@ -267,16 +276,9 @@ const ACTIONS: ActionItem[] = [
     source_confidence: 0.93,
     status: "open",
     created_at: daysFromNow(-1),
-    thread_subject: "Order #29104 — a couple of questions",
-    sender: "deals@uber.com",
-    provider: "gmail",
-    account_email: CONNECTIONS[0].email_address,
-    label: "needs_reply",
-  },
-  {
+  }),
+  actionFor(AGENDA_THREADS[5], {
     id: "mock-action-6b",
-    thread_id: "mock-action-thread-6",
-    message_id: "mock-action-msg-6b",
     kind: "payment",
     title: "Confirm the payment method on file",
     due_at: daysFromNow(2),
@@ -287,17 +289,10 @@ const ACTIONS: ActionItem[] = [
     source_confidence: 0.77,
     status: "open",
     created_at: daysFromNow(-1),
-    thread_subject: "Order #29104 — a couple of questions",
-    sender: "deals@uber.com",
-    provider: "gmail",
-    account_email: CONNECTIONS[0].email_address,
-    label: "action_required",
-  },
+  }),
   // Already resolved — exercises the status filter/board beyond "open".
-  {
+  actionFor(AGENDA_THREADS[6], {
     id: "mock-action-7",
-    thread_id: "mock-action-thread-7",
-    message_id: "mock-action-msg-7",
     kind: "reply",
     title: "Confirm dinner Friday",
     due_at: daysFromNow(-1),
@@ -308,12 +303,7 @@ const ACTIONS: ActionItem[] = [
     source_confidence: 0.85,
     status: "done",
     created_at: daysFromNow(-4),
-    thread_subject: "Re: dinner Friday?",
-    sender: "bob@figma.com",
-    provider: "gmail",
-    account_email: CONNECTIONS[0].email_address,
-    label: "needs_reply",
-  },
+  }),
 ];
 
 function mockActionCounts(): ActionCounts {
@@ -486,6 +476,16 @@ export function mockIngest(accountIds?: string[]): number {
 export function mockSetDone(threadId: string, done: boolean) {
   if (done) DONE.add(threadId);
   else DONE.delete(threadId);
+  // Mirrors the API: marking a thread done resolves every open action on it
+  // (see routes/mailbox.py's set_thread_done), and un-done deliberately does
+  // NOT reopen them -- items come back individually via the status route.
+  // Preview has to model that, or the agenda looks consistent here and
+  // desyncs against the real server.
+  if (done) {
+    for (const a of ACTIONS) {
+      if (a.thread_id === threadId && a.status === "open") a.status = "done";
+    }
+  }
 }
 
 export function mockThread(id: string): ThreadDetail {
@@ -521,6 +521,7 @@ export function mockThread(id: string): ThreadDetail {
       account_email: item.account_email,
     },
     messages,
+    classification: item.classification,
   };
 }
 
