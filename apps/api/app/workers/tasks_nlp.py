@@ -52,7 +52,7 @@ def classify_message(message_id: str) -> dict:
         routing = resolve_classification_routing(db, thread.user_id) if thread else None
         attempt = classify_with_usage(text_for_classification, routing=routing)
         label, confidence, rationale, model_version = attempt.verdict
-        upsert_classification(
+        outcome = upsert_classification(
             db,
             message_id=message.id,
             label=label,
@@ -102,6 +102,12 @@ def classify_message(message_id: str) -> dict:
         db.commit()
         if usage_recorded:
             acc.committed()
+        # A "protected" outcome means a user override landed on this message
+        # before this write reached it -- the label above never persisted, so
+        # returning it here would misreport a classification that didn't
+        # happen.
+        if outcome == "protected":
+            return {"message_id": message_id, "status": "skipped_user_override"}
         return {"message_id": message_id, "label": label, "confidence": confidence}
 
 
@@ -160,6 +166,7 @@ def classify_latest_threads(
         "user_id": user_id,
         "created": result["task_created"],
         "processed": result["task_processed"],
+        "skipped_user_overrides": result["skipped_user_overrides"],
     }
 
 

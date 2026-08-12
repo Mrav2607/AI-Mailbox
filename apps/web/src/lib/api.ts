@@ -566,6 +566,9 @@ export interface TaskResult {
   created?: number;
   scanned?: number;
   processed?: number;
+  // User-override rows a backfill/classify run left untouched (write-time
+  // guard protecting operator corrections from being reclassified).
+  skipped_user_overrides?: number;
 }
 
 export interface SyncRunStatus {

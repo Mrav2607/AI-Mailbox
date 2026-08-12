@@ -26,6 +26,7 @@ from app.services.nlp import backfill
 from app.services.nlp import classifier as classifier_module
 from app.services.nlp.classifier import ClassificationAttempt
 from app.services.nlp.llm_client import LlmUsage
+from app.services.nlp.persistence import OPERATOR_MODEL_VERSION
 from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
 
@@ -55,12 +56,24 @@ class _BackfillFakeDB:
     """Answers just enough of a Session for run_backfill -- dispatched by
     which table each select's first column belongs to, mirroring
     test_providers.py's `_FakeClassificationDB` idiom for the same resolver.
+
+    ``classification_rows`` stands in for the message_id/label/model_version
+    read: pass SimpleNamespace(message_id=..., label=..., model_version=...)
+    rows (defaults to none, i.e. nothing classified yet).
     """
 
-    def __init__(self, *, threads, latest_rows, classified_ids=(), routing_row=None, events=None):
+    def __init__(
+        self,
+        *,
+        threads,
+        latest_rows,
+        classification_rows=(),
+        routing_row=None,
+        events=None,
+    ):
         self._threads = threads
         self._latest_rows = latest_rows
-        self._classified_ids = classified_ids
+        self._classification_rows = classification_rows
         # (provider, classification_byok) for the routing projection read, or
         # None for "no stored credential" -- there's never a second read to
         # answer here because every test below either opts out, is a
@@ -85,7 +98,7 @@ class _BackfillFakeDB:
         if table == "mail_message":
             return _Result(self._latest_rows)
         if table == "classification":
-            return _Result(self._classified_ids)
+            return _Result(self._classification_rows)
         raise AssertionError(f"unexpected table in test query: {table}")
 
     def flush(self):
@@ -237,7 +250,7 @@ def test_run_backfill_builds_one_router_per_run_and_calls_routing_for_per_messag
         )
 
     monkeypatch.setattr(backfill, "classify_with_usage", fake_classify_with_usage)
-    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: None)
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
 
     result = backfill.run_backfill(db, user_id, limit=10)
 
@@ -271,7 +284,7 @@ def test_run_backfill_custom_opt_in_credential_routes_off_with_no_server_call(mo
 
     monkeypatch.setattr(classifier_module, "_genai_client", _explode)
     monkeypatch.setattr(classifier_module, "call_chat_completion", _explode)
-    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: None)
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
 
     # backend="llm" skips the local-model branch so routing (not whatever
     # the local encoder happens to be doing in this test env) decides the
@@ -324,7 +337,7 @@ def test_run_backfill_records_usage_only_for_user_mode_routing(monkeypatch):
             usage=usage,
         ),
     )
-    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: None)
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
     fake_acc = _FakeAcc(user_id)
     monkeypatch.setattr(backfill, "UsageAccumulator", lambda uid: fake_acc)
 
@@ -348,7 +361,7 @@ def test_run_backfill_server_mode_routing_records_nothing(monkeypatch):
             usage=LlmUsage(prompt_tokens=1, completion_tokens=2, total_tokens=3),
         ),
     )
-    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: None)
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
     fake_acc = _FakeAcc(user_id)
     monkeypatch.setattr(backfill, "UsageAccumulator", lambda uid: fake_acc)
 
@@ -373,7 +386,7 @@ def test_run_backfill_flush_happens_before_commit_and_committed_after(monkeypatc
             usage=None,
         ),
     )
-    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: None)
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
     fake_acc = _FakeAcc(user_id, events=events)
     monkeypatch.setattr(backfill, "UsageAccumulator", lambda uid: fake_acc)
 
@@ -399,7 +412,7 @@ def test_run_backfill_failing_usage_flush_does_not_block_business_commit(monkeyp
             usage=None,
         ),
     )
-    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: None)
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
     fake_acc = _FakeAcc(user_id, flush_raises=SQLAlchemyError("boom"))
     monkeypatch.setattr(backfill, "UsageAccumulator", lambda uid: fake_acc)
 
@@ -407,3 +420,81 @@ def test_run_backfill_failing_usage_flush_does_not_block_business_commit(monkeyp
 
     assert result["created"] == 1  # the business write still landed
     assert fake_acc.calls.index("discard") < fake_acc.calls.index("committed")
+
+
+# ---------------------------------------------------------------------------
+# run_backfill: protecting user overrides (plan §3.3) -- a force run must
+# neither re-classify an override at read time nor claim credit for one that
+# survives the write-time guard.
+# ---------------------------------------------------------------------------
+
+
+def test_run_backfill_force_skips_user_override_rows_at_candidate_selection(monkeypatch):
+    user_id = uuid4()
+    thread_override, thread_model = uuid4(), uuid4()
+    msg_override, msg_model = uuid4(), uuid4()
+
+    threads = [
+        SimpleNamespace(id=thread_override, subject="a"),
+        SimpleNamespace(id=thread_model, subject="b"),
+    ]
+    latest_rows = [
+        SimpleNamespace(id=msg_override, thread_id=thread_override, snippet="s-a", body_text="b-a"),
+        SimpleNamespace(id=msg_model, thread_id=thread_model, snippet="s-b", body_text="b-b"),
+    ]
+    classification_rows = [
+        SimpleNamespace(message_id=msg_override, label="fyi", model_version=OPERATOR_MODEL_VERSION),
+        SimpleNamespace(message_id=msg_model, label="fyi", model_version="heuristic-v1"),
+    ]
+    db = _BackfillFakeDB(
+        threads=threads, latest_rows=latest_rows, classification_rows=classification_rows
+    )
+    routing = ClassificationRouting(mode="server", credential=None)
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+    monkeypatch.setattr(
+        backfill, "classify_with_usage",
+        lambda text, backend=None, routing=None: ClassificationAttempt(
+            verdict=("fyi", 0.5, "no cues", "heuristic-v1"),
+            provider_call_succeeded=False,
+            usage=None,
+        ),
+    )
+    upserted_ids = []
+
+    def fake_upsert(db_arg, *, message_id, **kwargs):
+        upserted_ids.append(message_id)
+        return "written"
+
+    monkeypatch.setattr(backfill, "upsert_classification", fake_upsert)
+
+    result = backfill.run_backfill(db, user_id, limit=10, force=True)
+
+    # Only the model-labeled message gets re-classified; the override never
+    # even reaches classify_with_usage/upsert_classification.
+    assert upserted_ids == [msg_model]
+    assert result["created"] == 1
+    assert result["skipped_user_overrides"] == 1
+
+
+def test_run_backfill_protected_upsert_outcome_counts_as_skipped_not_created(monkeypatch):
+    # Simulates a user override landing mid-run: the message clears the
+    # read-time candidate check (it wasn't an override yet when the run
+    # started), but the write-time guard in upsert_classification catches it.
+    user_id = uuid4()
+    db = _single_message_db()
+    routing = ClassificationRouting(mode="server", credential=None)
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+    monkeypatch.setattr(
+        backfill, "classify_with_usage",
+        lambda text, backend=None, routing=None: ClassificationAttempt(
+            verdict=("fyi", 0.5, "r", "heuristic-v1"),
+            provider_call_succeeded=False,
+            usage=None,
+        ),
+    )
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "protected")
+
+    result = backfill.run_backfill(db, user_id, limit=10)
+
+    assert result["created"] == 0
+    assert result["skipped_user_overrides"] == 1

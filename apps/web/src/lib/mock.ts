@@ -606,7 +606,7 @@ export function mockBackfill(opts: BackfillOptions): BackfillResult {
     };
     created += 1;
   }
-  return { status: "ok", created, scanned: scanned.length };
+  return { status: "ok", created, scanned: scanned.length, skipped_user_overrides: 0 };
 }
 
 // --- BYOK LLM settings -------------------------------------------------------

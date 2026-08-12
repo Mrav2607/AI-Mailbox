@@ -148,7 +148,7 @@ export interface BackfillOptions {
 // Small backfills run inline and report counts; over the API's inline cap the
 // server queues a worker task and answers 202 with its id.
 export type BackfillResult =
-  | { status: "ok"; created: number; scanned: number }
+  | { status: "ok"; created: number; scanned: number; skipped_user_overrides: number }
   | { status: "queued"; task_id: string };
 
 export interface ThreadMessage {

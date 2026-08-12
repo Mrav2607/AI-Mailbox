@@ -381,7 +381,12 @@ def test_small_backfill_runs_inline(client, fake_backfill_delay):
     # the request and reports counts (zero against the empty-result DB stub).
     resp = client.post("/api/v1/mail/classify/backfill?limit=50")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "created": 0, "scanned": 0}
+    assert resp.json() == {
+        "status": "ok",
+        "created": 0,
+        "scanned": 0,
+        "skipped_user_overrides": 0,
+    }
     fake_backfill_delay.assert_not_called()
 
 

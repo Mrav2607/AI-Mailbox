@@ -160,6 +160,10 @@ class BackfillDone(Response):
     status: str
     created: int
     scanned: int
+    # How many candidate rows a force run left alone because a human already
+    # overrode them -- see run_backfill's docstring. Defaults to 0 so an old
+    # Celery result recorded before this field existed still parses.
+    skipped_user_overrides: int = 0
 
 
 class Queued(Response):

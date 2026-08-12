@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.core.logging import logger
 from app.db.models import MailThread, MailMessage, Classification
 from app.services.nlp.classifier import classify_with_usage, build_classification_text
-from app.services.nlp.persistence import upsert_classification
+from app.services.nlp.persistence import OPERATOR_MODEL_VERSION, upsert_classification
 from app.services.nlp.providers import ClassificationRouter
 from app.services.nlp.usage import UsageAccumulator
 
@@ -103,6 +103,12 @@ def run_backfill(
     """Classify (or, with ``force``, re-classify) the latest message of up to
     ``limit`` of the user's threads currently in ``bucket``.
 
+    ``force`` means "re-classifies model-labeled rows; operator overrides are
+    never overwritten": a ``user-override`` row is skipped at candidate
+    selection (counted into the returned ``skipped_user_overrides``), and the
+    write itself stays guarded by ``upsert_classification``'s conditional
+    ``ON CONFLICT`` in case a fresh override lands mid-run.
+
     Assumes bucket/backend were already validated -- the route checks both
     before running inline or enqueuing the worker task.
     """
@@ -136,39 +142,59 @@ def run_backfill(
 
     subject_by_thread = {t.id: t.subject for t in threads}
     message_ids = [m.id for m in latest_message_by_thread.values()]
+    # One read for both label and provenance -- already_classified decides the
+    # non-force skip, user_override_message_ids decides the force-time skip,
+    # and neither needs a second round trip to the same rows.
+    classification_rows = (
+        db.execute(
+            select(
+                Classification.message_id,
+                Classification.label,
+                Classification.model_version,
+            ).where(Classification.message_id.in_(message_ids))
+        ).all()
+        if message_ids
+        else []
+    )
     # Only a row with an actual label counts as classified. upsert_classification
     # can persist label=None, and the bucket filter treats that as unclassified
     # (the subquery yields NULL) -- so if we skipped on mere row existence, a
     # null-label message would sit in "unclassified" forever, unreachable
     # without force.
-    already_classified = (
-        set(
-            db.execute(
-                select(Classification.message_id).where(
-                    Classification.message_id.in_(message_ids),
-                    Classification.label.is_not(None),
-                )
-            ).scalars()
-        )
-        if message_ids
-        else set()
-    )
+    already_classified = {
+        row.message_id for row in classification_rows if row.label is not None
+    }
+    user_override_message_ids = {
+        row.message_id
+        for row in classification_rows
+        if row.model_version == OPERATOR_MODEL_VERSION
+    }
 
     # Skip the (expensive) classify call when a label already exists and we're
-    # not forcing a refresh. We snapshot plain values here so the loop below
-    # never touches ORM state that gets expired by the batch commits.
-    to_classify = [
-        (
-            message.id,
-            build_classification_text(
-                subject_by_thread.get(message.thread_id),
-                message.snippet,
-                message.body_text,
-            ),
+    # not forcing a refresh; with force, skip user-override rows instead (the
+    # write-time guard in upsert_classification is the real protection -- this
+    # is the read-time optimization plus honest accounting). We snapshot plain
+    # values here so the loop below never touches ORM state that gets expired
+    # by the batch commits.
+    skipped_user_overrides = 0
+    to_classify: list[tuple[UUID, str]] = []
+    for message in latest_message_by_thread.values():
+        if force:
+            if message.id in user_override_message_ids:
+                skipped_user_overrides += 1
+                continue
+        elif message.id in already_classified:
+            continue
+        to_classify.append(
+            (
+                message.id,
+                build_classification_text(
+                    subject_by_thread.get(message.thread_id),
+                    message.snippet,
+                    message.body_text,
+                ),
+            )
         )
-        for message in latest_message_by_thread.values()
-        if force or message.id not in already_classified
-    ]
     task_created = sum(
         message_id not in already_classified for message_id, _text in to_classify
     )
@@ -191,9 +217,9 @@ def run_backfill(
     usage_pending = False
 
     def flush_pending() -> None:
-        nonlocal created, usage_pending
+        nonlocal created, skipped_user_overrides, usage_pending
         for message_id, label, confidence, rationale, model_version in pending:
-            upsert_classification(
+            outcome = upsert_classification(
                 db,
                 message_id=message_id,
                 label=label,
@@ -201,6 +227,14 @@ def run_backfill(
                 rationale=rationale,
                 model_version=model_version,
             )
+            # A "protected" outcome means a user override landed on this
+            # message mid-run and the write-time guard held -- that's a skip,
+            # not a classification, even though this message cleared the
+            # read-time candidate check above.
+            if outcome == "written":
+                created += 1
+            else:
+                skipped_user_overrides += 1
 
         # db.flush() sits OUTSIDE the try: begin_nested() flushes pending ORM
         # state before opening its SAVEPOINT, so a genuine business-write
@@ -222,7 +256,6 @@ def run_backfill(
             usage_pending = False
         db.commit()
         acc.committed()
-        created += len(pending)
         pending.clear()
 
     # Classify outside any transaction, then commit results in small batches so
@@ -256,6 +289,7 @@ def run_backfill(
         "status": "ok",
         "created": created,
         "scanned": scanned,
+        "skipped_user_overrides": skipped_user_overrides,
     }
     if include_task_counts:
         result["task_created"] = task_created
