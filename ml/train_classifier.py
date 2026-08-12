@@ -271,9 +271,10 @@ def _split(texts, labels, test_size, seed):
 
 
 class EmailDataset(torch.utils.data.Dataset):
-    def __init__(self, texts, labels, tokenizer, max_length):
+    def __init__(self, texts, labels, tokenizer, max_length, include_index: bool = False):
         self.enc = tokenizer(texts, truncation=True, max_length=max_length)
         self.labels = labels
+        self.include_index = include_index
 
     def __len__(self):
         return len(self.labels)
@@ -281,30 +282,154 @@ class EmailDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         item = {k: v[idx] for k, v in self.enc.items()}
         item["labels"] = self.labels[idx]
+        if self.include_index:
+            # Only the CRL train dataset sets include_index=True; this is
+            # what compute_loss uses to index the correctness-history
+            # buffers (plan §3.4). compute_loss pops it defensively either
+            # way -- an un-popped extra key would TypeError in the model
+            # forward.
+            item["sample_idx"] = torch.tensor(idx)
         return item
 
 
-class WeightedTrainer(Trainer):
-    """Trainer with class-weighted cross-entropy for imbalanced labels."""
+def crl_pair_loss(kappa: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """Circular-adjacent-pair CRL ranking loss (the paper's pairing, the
+    CRL-cb correctness-history variant frozen in plan §3.1).
 
-    def __init__(self, *args, class_weights=None, **kwargs):
+    Sample k is paired with sample ``(k+1) % B`` for every k, including the
+    wrap-around pair (B-1, 0). Each pair is oriented so ``i`` is the member
+    with the larger correctness-history ratio ``c``; a pair with equal ``c``
+    contributes exactly 0 regardless of the confidence values (plan §3.2 --
+    the raw margin formula does NOT zero itself out on a tie, so ties are
+    masked explicitly).
+
+    Parameters
+    ----------
+    kappa : torch.Tensor
+        Max-softmax confidence per sample, shape ``(B,)``, computed in fp32
+        (plan §3.2 -- half-precision margin arithmetic under autocast isn't
+        trustworthy). Must carry a grad_fn; it's the only differentiable
+        input here.
+    c : torch.Tensor
+        Correctness-history ratio per sample, shape ``(B,)``, same device as
+        ``kappa``. Comes from a no_grad history buffer, so it never
+        contributes gradient.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar loss: sum of all B circular pair losses divided by B (plan
+        §3.2, Codex P2-1 -- NEVER divide by the count of unequal pairs, or
+        a batch with one unequal pair gets B times the intended pressure
+        and lambda stops being comparable across batches). ``max(B, 1)``
+        guards the empty-batch edge case.
+    """
+    batch_size = kappa.size(0)
+    if batch_size == 0:
+        return kappa.new_zeros(())
+
+    kappa_next = torch.roll(kappa, shifts=-1, dims=0)
+    c_next = torch.roll(c, shifts=-1, dims=0)
+
+    i_has_larger_c = c >= c_next
+    kappa_i = torch.where(i_has_larger_c, kappa, kappa_next)
+    kappa_j = torch.where(i_has_larger_c, kappa_next, kappa)
+    c_i = torch.where(i_has_larger_c, c, c_next)
+    c_j = torch.where(i_has_larger_c, c_next, c)
+
+    pair_loss = torch.clamp(-(kappa_i - kappa_j) + (c_i - c_j), min=0.0)
+    equal_c = c == c_next
+    pair_loss = torch.where(equal_c, torch.zeros_like(pair_loss), pair_loss)
+
+    return pair_loss.sum() / max(batch_size, 1)
+
+
+class WeightedTrainer(Trainer):
+    """Trainer with class-weighted cross-entropy for imbalanced labels, plus
+    an optional CRL-cb auxiliary loss (plan §3) that ranks confidence by
+    per-sample correctness history to widen the correct-vs-wrong confidence
+    gap. CRL is fully inert at crl_lambda=0.0 (the default) -- every branch
+    below is skipped and this Trainer is bit-identical to the pre-CRL one.
+    """
+
+    def __init__(self, *args, class_weights=None, crl_lambda: float = 0.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.class_weights = class_weights
+        self.crl_lambda = crl_lambda
+        # Buffers live on the Trainer, not the dataset -- a dataloader
+        # worker would otherwise copy-on-fork its own private history
+        # (workers are 0 today, but this placement doesn't depend on that
+        # staying true). Sized off self.train_dataset because the row
+        # count is only known post-dedup/cap/drop (plan §3.1).
+        self.hist_correct: torch.Tensor | None = None
+        self.hist_seen: torch.Tensor | None = None
+        if self.crl_lambda > 0:
+            n_train = len(self.train_dataset)
+            self.hist_correct = torch.zeros(n_train, dtype=torch.float32)
+            self.hist_seen = torch.zeros(n_train, dtype=torch.float32)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         labels = inputs.pop("labels")
+        sample_idx = inputs.pop("sample_idx", None)
         outputs = model(**inputs)
-        weight = self.class_weights.to(outputs.logits.device) if self.class_weights is not None else None
-        loss = torch.nn.functional.cross_entropy(outputs.logits, labels, weight=weight)
+        logits = outputs.logits
+        weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
+        loss = torch.nn.functional.cross_entropy(logits, labels, weight=weight)
+
+        if self.crl_lambda > 0 and self.model.training and sample_idx is not None:
+            # CRL-cb (plan §3.1): correctness history is updated with the
+            # CURRENT batch before the loss uses it, so epoch 1 already has
+            # signal (c_i in {0, 1}) instead of the paper's all-equal-c
+            # first epoch. Everything in this block except kappa is under
+            # no_grad -- no gradient may flow through the history path.
+            with torch.no_grad():
+                batch_correct = (logits.detach().argmax(dim=-1) == labels).float()
+                idx_cpu = sample_idx.detach().cpu()
+                self.hist_seen[idx_cpu] += 1
+                self.hist_correct[idx_cpu] += batch_correct.cpu()
+                c_batch = (self.hist_correct[idx_cpu] / self.hist_seen[idx_cpu]).to(logits.device)
+
+            # fp32 under autocast (plan §3.2) -- kappa keeps its grad_fn so
+            # the ranking term can backprop into the model.
+            kappa = torch.softmax(logits.float(), dim=-1).max(dim=-1).values
+            crl_loss = crl_pair_loss(kappa, c_batch)
+            loss = loss + self.crl_lambda * crl_loss
+            # Gate on the step counter ourselves: a direct self.log() fires
+            # the console callback immediately, every call -- logging_steps
+            # only paces the Trainer's own periodic logging, not this one.
+            if self.state.global_step % max(self.args.logging_steps, 1) == 0:
+                self.log({"crl_loss": float(crl_loss.detach())})
+
+        # Gradient accumulation is 1 today, so one micro-batch == one
+        # optimizer step; if that ever changes, CRL pairs are formed
+        # per-micro-batch, not across the accumulated macro-batch.
         return (loss, outputs) if return_outputs else loss
+
+
+def _mean_or_zero(values) -> float:
+    """Mean of ``values``, or 0.0 if empty -- used for conf_gap so a side
+    with no correct (or no wrong) predictions in an eval batch doesn't
+    blow up the metric with a NaN."""
+    return float(np.mean(values)) if len(values) else 0.0
 
 
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
+
+    # conf_gap makes the per-epoch gap trajectory visible without touching
+    # checkpoint selection (plan §3.4 -- metric_for_best_model stays
+    # macro_f1, D2).
+    probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    probs = probs / probs.sum(axis=-1, keepdims=True)
+    kappa = probs.max(axis=-1)
+    correct = preds == labels
+    conf_gap = _mean_or_zero(kappa[correct]) - _mean_or_zero(kappa[~correct])
+
     return {
         "accuracy": accuracy_score(labels, preds),
         "macro_f1": f1_score(labels, preds, average="macro"),
+        "conf_gap": conf_gap,
     }
 
 
@@ -336,6 +461,9 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--crl-lambda", type=float, default=0.0,
+                        help="weight on the CRL confidence-ranking auxiliary loss (plan §3); "
+                             "0.0 (default) fully disables CRL and reproduces the pre-CRL trainer")
     args = parser.parse_args()
 
     guard_paths = list(args.guard_files) + ([args.eval_file] if args.eval_file else [])
@@ -370,7 +498,10 @@ def main() -> None:
         args.model_name, num_labels=len(LABELS), id2label=ID2LABEL, label2id=LABEL2ID
     )
 
-    train_ds = EmailDataset(x_train, y_train, tokenizer, args.max_length)
+    # include_index is train-only and CRL-only: it's what lets compute_loss
+    # index the history buffers, and skipping it when crl_lambda == 0 keeps
+    # non-CRL runs bit-identical to the pre-CRL dataset.
+    train_ds = EmailDataset(x_train, y_train, tokenizer, args.max_length, include_index=args.crl_lambda > 0)
     val_ds = EmailDataset(x_val, y_val, tokenizer, args.max_length)
     test_ds = EmailDataset(x_test, y_test, tokenizer, args.max_length)
 
@@ -411,6 +542,14 @@ def main() -> None:
         fp16=use_cuda and not bf16,
         report_to="none",
         seed=args.seed,
+        # For a plain torch Dataset, Trainer wraps the collator with
+        # _get_collator_with_removed_columns and silently strips any key
+        # the model's forward signature doesn't accept -- that would drop
+        # sample_idx and make CRL a no-op that quietly reproduces the
+        # baseline (plan §3.4). Harmless for the non-CRL path too, so this
+        # is unconditional rather than gated on crl_lambda -- a conditional
+        # here would just invite the same drift back in later.
+        remove_unused_columns=False,
     )
 
     trainer = WeightedTrainer(
@@ -421,6 +560,7 @@ def main() -> None:
         data_collator=DataCollatorWithPadding(tokenizer),
         compute_metrics=compute_metrics,
         class_weights=class_weights,
+        crl_lambda=args.crl_lambda,
     )
 
     trainer.train()

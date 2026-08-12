@@ -118,6 +118,11 @@ def load_eval_set(paths: list[str], labels: list[str]) -> tuple[list[str], list[
 
 CALIBRATION_LABEL_COUNT = 6  # the v2.1 taxonomy is frozen at 6 labels -- not "however many the model has"
 
+# The plan's G2/gap ship gates bind on these four classes only -- security
+# and spam are report-only (too little support on test_v21b to gate on;
+# plan §2, §5).
+GATED_LABELS = ("needs_reply", "action_required", "fyi", "promotional")
+
 
 def _is_finite_number(value) -> bool:
     """True for a plain int/float that's finite -- excludes bool (an int
@@ -282,6 +287,11 @@ def print_confidence_stats(gold: list[str], preds: list[str], confidences: list[
         return f"{sum(values) / len(values):.3f}" if values else "-"
 
     print(f"\nOverall mean confidence -- correct: {_mean(correct_conf)}  incorrect: {_mean(wrong_conf)}")
+    if correct_conf and wrong_conf:
+        gap = sum(correct_conf) / len(correct_conf) - sum(wrong_conf) / len(wrong_conf)
+        print(f"confidence gap (correct - wrong): {gap:.4f}")
+    else:
+        print("confidence gap (correct - wrong): - (need both a correct and a wrong prediction)")
 
     print("\nPer-class confidence:")
     header = f"{'label':<20}{'n':>6}{'accuracy':>10}{'conf(correct)':>15}{'conf(wrong)':>13}"
@@ -455,6 +465,10 @@ def main() -> None:
     print(f"\n===== {model_dir} vs {', '.join(args.data)} =====")
     print(classification_report(gold, preds, labels=labels, digits=3, zero_division=0))
     print(f"accuracy: {accuracy_score(gold, preds):.3f} | macro-F1: {f1_score(gold, preds, labels=labels, average='macro'):.3f}")
+
+    gated_labels = [label for label in GATED_LABELS if label in labels]
+    gated_f1 = f1_score(gold, preds, labels=gated_labels, average="macro", zero_division=0)
+    print(f"gated macro-F1 (nr, ar, fyi, promo): {gated_f1:.4f}")
 
     ece, bin_rows = compute_calibration(gold, preds, confidences)
     brier = compute_brier_score(gold, class_probs, labels)
