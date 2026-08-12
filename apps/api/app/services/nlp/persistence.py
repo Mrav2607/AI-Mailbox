@@ -33,6 +33,20 @@ from app.services.nlp.extractor import ExtractedAction, NoAction
 PENDING_LEASE = timedelta(minutes=30)
 MAX_ATTEMPTS = 3
 
+# Marks a label set by a human in the console rather than a model -- lets
+# every write path (this module, the route, backfill) agree on the string
+# without importing it from a route. `upsert_classification`'s write-time
+# guard checks against this to decide whether a model path is allowed to
+# clobber it.
+OPERATOR_MODEL_VERSION = "user-override"
+
+# Bounded snapshot cap for classification_feedback.input_text: the first
+# FEEDBACK_TEXT_MAX chars of build_classification_text(...)'s output. Matches
+# the LLM paths' own 6,000-char cap and sits ~4x the local model's 256-token
+# window, so it's generous enough to cover what either classifier actually
+# saw without storing unbounded email bodies forever.
+FEEDBACK_TEXT_MAX = 6000
+
 
 def upsert_classification(
     db: Session,
@@ -42,11 +56,24 @@ def upsert_classification(
     confidence: float | None,
     rationale: str | None,
     model_version: str | None,
-) -> None:
+    overwrite_user_override: bool = False,
+) -> str:
     """Insert a classification for ``message_id``, or overwrite the existing one.
 
     Does not commit -- the caller controls the transaction boundary so it can
     batch writes.
+
+    ``overwrite_user_override`` gates whether this write is allowed to clobber
+    an operator's manual label. Every model-driven path (backfill, both
+    ingests, the Celery classify task) leaves it ``False``, which adds a
+    ``WHERE classification.model_version IS DISTINCT FROM 'user-override'`` to
+    the conflict update -- so a user override that lands mid-run survives even
+    when the model path finishes after it. Only the reclassify route itself
+    passes ``True``.
+
+    Returns ``"written"`` if the row was inserted or updated, or
+    ``"protected"`` if the conflict hit the override guard and nothing
+    changed (distinguished via the statement's rowcount: 1 vs 0).
     """
     values = {
         "message_id": message_id,
@@ -63,8 +90,19 @@ def upsert_classification(
             "rationale": rationale,
             "model_version": model_version,
         },
+        where=(
+            None
+            if overwrite_user_override
+            else Classification.model_version.is_distinct_from(OPERATOR_MODEL_VERSION)
+        ),
     )
-    db.execute(stmt)
+    # preserve_rowcount matters: without it, psycopg3 reports -1 (truthy!) for
+    # INSERT..ON CONFLICT statements, and every guarded write would read as
+    # "written" even when the override guard blocked it. Set on the statement
+    # (not as an execute() kwarg) so callers and test fakes keep the plain
+    # single-argument execute signature.
+    result = db.execute(stmt.execution_options(preserve_rowcount=True))
+    return "written" if result.rowcount else "protected"
 
 
 def claimable_predicate(*, force: bool = False):

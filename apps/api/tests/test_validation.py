@@ -119,7 +119,12 @@ def test_backfill_valid_params_pass_validation(client):
         "/api/v1/mail/classify/backfill?bucket=unclassified&backend=heuristic&limit=10"
     )
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "created": 0, "scanned": 0}
+    assert resp.json() == {
+        "status": "ok",
+        "created": 0,
+        "scanned": 0,
+        "skipped_user_overrides": 0,
+    }
 
 
 def test_invalid_reclassify_label_is_rejected(client):

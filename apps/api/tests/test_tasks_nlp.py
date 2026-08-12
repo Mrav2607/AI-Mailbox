@@ -30,6 +30,7 @@ def test_classify_latest_threads_delegates_to_the_shared_backfill(monkeypatch):
             "status": "ok",
             "created": 3,
             "scanned": 9,
+            "skipped_user_overrides": 1,
             "task_created": 2,
             "task_processed": 3,
         }
@@ -49,6 +50,7 @@ def test_classify_latest_threads_delegates_to_the_shared_backfill(monkeypatch):
         "user_id": str(user_id),
         "created": 2,
         "processed": 3,
+        "skipped_user_overrides": 1,
     }
 
 
@@ -96,7 +98,7 @@ def test_classify_message_resolves_routing_once_after_loading_thread(monkeypatch
         return _classification_attempt(("fyi", 0.5, "no cues", "heuristic-v1"))
 
     monkeypatch.setattr(tasks_nlp, "classify_with_usage", fake_classify_with_usage)
-    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: None)
+    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: "written")
 
     tasks_nlp.classify_message.run(str(message_id))
 
@@ -128,11 +130,38 @@ def test_classify_message_missing_thread_routes_to_none_without_resolving(monkey
         return _classification_attempt(("fyi", 0.4, "no cues", "heuristic-v1"))
 
     monkeypatch.setattr(tasks_nlp, "classify_with_usage", fake_classify_with_usage)
-    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: None)
+    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: "written")
 
     tasks_nlp.classify_message.run(str(message_id))
 
     assert classify_calls == [None]
+
+
+def test_classify_message_reports_skipped_marker_when_upsert_protects_a_user_override(
+    monkeypatch,
+):
+    # upsert_classification returns "protected" when a user override landed
+    # on this message before this write reached it -- classify_message must
+    # not claim the label it computed but never actually persisted.
+    message_id = uuid4()
+    message = SimpleNamespace(
+        id=message_id, thread_id=uuid4(), snippet="hi", body_text="there"
+    )
+
+    db = MagicMock()
+    db.get.side_effect = [message, None]
+    monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(db))
+    monkeypatch.setattr(
+        tasks_nlp, "classify_with_usage",
+        lambda text, backend=None, routing=None: _classification_attempt(
+            ("fyi", 0.4, "no cues", "heuristic-v1")
+        ),
+    )
+    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: "protected")
+
+    result = tasks_nlp.classify_message.run(str(message_id))
+
+    assert result == {"message_id": str(message_id), "status": "skipped_user_override"}
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +229,7 @@ def test_classify_message_records_usage_only_for_user_mode_routing(monkeypatch):
             ("fyi", 0.5, "r", "openai:gpt-4o-mini"), provider_call_succeeded=True, usage=usage
         ),
     )
-    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: None)
+    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: "written")
     fake_acc = _FakeAcc(thread.user_id)
     monkeypatch.setattr(tasks_nlp, "UsageAccumulator", lambda uid: fake_acc)
 
@@ -228,7 +257,7 @@ def test_classify_message_server_mode_routing_records_nothing(monkeypatch):
             usage=LlmUsage(prompt_tokens=1, completion_tokens=2, total_tokens=3),
         ),
     )
-    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: None)
+    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: "written")
 
     def _fail_if_constructed(uid):
         raise AssertionError("UsageAccumulator must not be constructed when nothing is recorded")
@@ -257,7 +286,7 @@ def test_classify_message_flush_happens_before_commit_and_committed_after(monkey
             ("fyi", 0.5, "r", "openai:gpt-4o-mini"), provider_call_succeeded=True
         ),
     )
-    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: None)
+    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: "written")
     fake_acc = _FakeAcc(thread.user_id, events=events)
     monkeypatch.setattr(tasks_nlp, "UsageAccumulator", lambda uid: fake_acc)
 
@@ -282,7 +311,7 @@ def test_classify_message_failing_usage_flush_does_not_block_business_commit(mon
             ("fyi", 0.5, "r", "openai:gpt-4o-mini"), provider_call_succeeded=True
         ),
     )
-    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: None)
+    monkeypatch.setattr(tasks_nlp, "upsert_classification", lambda *a, **k: "written")
     fake_acc = _FakeAcc(thread.user_id, flush_raises=SQLAlchemyError("boom"))
     monkeypatch.setattr(tasks_nlp, "UsageAccumulator", lambda uid: fake_acc)
 
