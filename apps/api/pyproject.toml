@@ -12,7 +12,7 @@ dependencies = [
   "uvicorn[standard]",
   "pydantic>=2.6",
   "pydantic-settings>=2.2",
-  "sqlalchemy>=2.0",
+  "sqlalchemy>=2.0.28",
   "psycopg[binary]",
   "alembic>=1.13",
   "python-dotenv",

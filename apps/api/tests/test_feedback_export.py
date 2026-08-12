@@ -188,8 +188,11 @@ def test_user_filter_narrows_the_statement_to_that_user():
 
     export_feedback_jsonl(_CapturingDB(), user_id=user_id, out=io.StringIO(), err=io.StringIO())
 
-    compiled = str(captured_stmt["stmt"].compile(dialect=postgresql.dialect()))
-    assert "user_id" in compiled.lower()
+    # The SELECT lists user_id as a column either way -- only a WHERE
+    # predicate with the bound uuid proves the filter actually narrows.
+    compiled = captured_stmt["stmt"].compile(dialect=postgresql.dialect())
+    assert "where classification_feedback.user_id =" in str(compiled).lower()
+    assert user_id in compiled.params.values()
 
 
 # ---------------------------------------------------------------------------
