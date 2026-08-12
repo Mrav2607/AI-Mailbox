@@ -28,7 +28,11 @@ class ClassificationFeedback(Base):
     Every row is a training example: the model's prior label/confidence (if
     any), the label the human chose, and a bounded snapshot of the text shown
     at correction time (`input_text`, truncated to `FEEDBACK_TEXT_MAX` chars
-    -- see `services/nlp/persistence.py` for the policy). Rows are never
+    -- see `services/nlp/persistence.py` for the policy). `prior_*` means
+    "the committed classification state at correction time, read under the
+    message lock" -- a model write racing that same instant may not be
+    represented (the operator never saw it), so consumers must treat a NULL
+    prior as "no prediction was visible", not "no prediction ever existed". Rows are never
     updated or deleted by application code; a second correction on the same
     message appends a new row instead, and `capture_seq` -- not `created_at`,
     which is transaction-start time and can mis-sort under concurrency --

@@ -456,8 +456,14 @@ def reclassify_thread(
     if latest_message is None:
         raise HTTPException(status_code=409, detail="Thread has no messages to label")
 
-    # Read under the lock just acquired, so this reflects whatever the
-    # winner of a concurrent reclassify just committed -- never a stale prior.
+    # Read under the lock just acquired, so this reflects whatever the winner
+    # of a concurrent reclassify just committed. Model paths (backfill,
+    # classify tasks) don't take this lock, so one of their writes can still
+    # commit inside the milliseconds between this read and our commit -- the
+    # operator's label always wins the classification row regardless, but the
+    # feedback row would record the pre-race prior. Accepted for v1: prior_*
+    # means "the state at correction time", and that racing prediction was
+    # never on the operator's screen.
     prior_classification = (
         db.execute(
             select(Classification).where(Classification.message_id == latest_message.id)
