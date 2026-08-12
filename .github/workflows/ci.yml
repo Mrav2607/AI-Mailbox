@@ -83,10 +83,14 @@ jobs:
         run: alembic upgrade head
       - name: Schema drift gate (alembic check)
         run: alembic check
-      # Real-DB auth integration tests -- the offline suite above stubs Postgres,
+      # Exercises the newest migration's downgrade, which upgrade-from-scratch
+      # alone never touches -- a broken downgrade otherwise ships silently.
+      - name: Migration round-trip (downgrade newest, re-upgrade)
+        run: alembic downgrade -1 && alembic upgrade head
+      # Real-DB integration tests -- the offline suite above stubs Postgres,
       # so this is the only job that exercises the actual schema end to end.
-      - name: Test (auth integration)
-        run: pytest -q tests/test_auth_integration.py
+      - name: Test (real-Postgres integration)
+        run: pytest -q tests/test_auth_integration.py tests/test_feedback_integration.py
 
   web:
     name: Web (lint · type · test · build)

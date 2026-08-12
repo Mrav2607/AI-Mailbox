@@ -195,9 +195,6 @@ def run_backfill(
                 ),
             )
         )
-    task_created = sum(
-        message_id not in already_classified for message_id, _text in to_classify
-    )
     scanned = len(latest_message_by_thread)
     # Close the read transaction before classifying -- classify() can block on
     # a Gemini call or local inference, and we don't want to sit
@@ -213,11 +210,15 @@ def run_backfill(
 
     batch_size = 25
     created = 0
+    # Counted at flush time from actual upsert outcomes, not precomputed from
+    # the candidate list -- a mid-run override produces a "protected" outcome,
+    # and a precomputed count would report that message as classified anyway.
+    task_created = 0
     pending: list[tuple[UUID, str | None, float | None, str | None, str | None]] = []
     usage_pending = False
 
     def flush_pending() -> None:
-        nonlocal created, skipped_user_overrides, usage_pending
+        nonlocal created, task_created, skipped_user_overrides, usage_pending
         for message_id, label, confidence, rationale, model_version in pending:
             outcome = upsert_classification(
                 db,
@@ -233,6 +234,8 @@ def run_backfill(
             # read-time candidate check above.
             if outcome == "written":
                 created += 1
+                if message_id not in already_classified:
+                    task_created += 1
             else:
                 skipped_user_overrides += 1
 

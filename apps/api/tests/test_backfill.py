@@ -494,7 +494,13 @@ def test_run_backfill_protected_upsert_outcome_counts_as_skipped_not_created(mon
     )
     monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "protected")
 
-    result = backfill.run_backfill(db, user_id, limit=10)
+    result = backfill.run_backfill(db, user_id, limit=10, include_task_counts=True)
 
     assert result["created"] == 0
     assert result["skipped_user_overrides"] == 1
+    # task_created must come from actual upsert outcomes, not the candidate
+    # list -- this message was unclassified at selection, but nothing was
+    # persisted, so reporting it as created would be a lie the task result
+    # (classify_latest_threads) passes straight to the client.
+    assert result["task_created"] == 0
+    assert result["task_processed"] == 1
