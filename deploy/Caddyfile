@@ -19,6 +19,11 @@
 	# HTTPS.
 	header Strict-Transport-Security "max-age=31536000"
 
+	# Don't advertise the server software. nginx already drops its version via
+	# server_tokens off; this removes the header entirely at the edge, covering
+	# both proxied responses and any Caddy-generated error pages.
+	header -Server
+
 	reverse_proxy web:8080 {
 		# Overwrite rather than append. Caddy ignores an inbound X-Forwarded-For
 		# by default, but say so out loud: the API trusts the leftmost entry of
