@@ -467,8 +467,17 @@ def main() -> None:
     print(f"accuracy: {accuracy_score(gold, preds):.3f} | macro-F1: {f1_score(gold, preds, labels=labels, average='macro'):.3f}")
 
     gated_labels = [label for label in GATED_LABELS if label in labels]
-    gated_f1 = f1_score(gold, preds, labels=gated_labels, average="macro", zero_division=0)
-    print(f"gated macro-F1 (nr, ar, fyi, promo): {gated_f1:.4f}")
+    # A foreign model dir can have none of the gated labels -- f1_score on an
+    # empty label list returns NaN, so say n/a instead of printing that.
+    if not gated_labels:
+        print("gated macro-F1 (nr, ar, fyi, promo): n/a (none of the gated labels present)")
+    else:
+        gated_f1 = f1_score(gold, preds, labels=gated_labels, average="macro", zero_division=0)
+        subset_note = (
+            "" if len(gated_labels) == len(GATED_LABELS)
+            else f" (only {', '.join(gated_labels)} present)"
+        )
+        print(f"gated macro-F1 (nr, ar, fyi, promo): {gated_f1:.4f}{subset_note}")
 
     ece, bin_rows = compute_calibration(gold, preds, confidences)
     brier = compute_brier_score(gold, class_probs, labels)

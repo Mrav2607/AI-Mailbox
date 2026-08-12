@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -364,6 +365,16 @@ class WeightedTrainer(Trainer):
         self.hist_correct: torch.Tensor | None = None
         self.hist_seen: torch.Tensor | None = None
         if self.crl_lambda > 0:
+            # Each rank would keep its own private history and distributed
+            # shuffling moves samples across ranks between epochs -- the
+            # correctness ratios would silently go rank-dependent. This
+            # script is single-GPU by construction; make that explicit.
+            if self.args.world_size > 1:
+                raise ValueError(
+                    "--crl-lambda requires single-process training "
+                    f"(world_size == 1, got {self.args.world_size}): the CRL "
+                    "correctness history is not synchronized across ranks"
+                )
             n_train = len(self.train_dataset)
             self.hist_correct = torch.zeros(n_train, dtype=torch.float32)
             self.hist_seen = torch.zeros(n_train, dtype=torch.float32)
@@ -465,6 +476,10 @@ def main() -> None:
                         help="weight on the CRL confidence-ranking auxiliary loss (plan §3); "
                              "0.0 (default) fully disables CRL and reproduces the pre-CRL trainer")
     args = parser.parse_args()
+    # argparse happily accepts nan (silently disables CRL) and inf (blows up
+    # the loss); a negative value silently disables it too. Fail loudly.
+    if not math.isfinite(args.crl_lambda) or args.crl_lambda < 0:
+        parser.error("--crl-lambda must be a finite, non-negative float")
 
     guard_paths = list(args.guard_files) + ([args.eval_file] if args.eval_file else [])
     run_input_guards(args.data, guard_paths)
