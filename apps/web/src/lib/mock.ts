@@ -103,7 +103,7 @@ function makeItems(count: number): TriageItem[] {
     const hasLabel = i % 11 !== 0;
     const label = hasLabel ? ALL_LABELS[i % ALL_LABELS.length] : null;
     // Spread across the whole 0-1 range, not just the confident end: the
-    // confidence bar's low tier only paints under 25%, and the old 0.40 floor
+    // confidence bar's low tier only paints under 35%, and the old 0.40 floor
     // meant preview never rendered it at all.
     const conf = hasLabel ? +(0.08 + ((i * 37) % 92) / 100).toFixed(2) : null;
     out.push({
