@@ -1072,13 +1072,30 @@ export default function Console() {
   }, [hasMore, searchMode, loadMore]);
 
   // Login/logout keeps the Console mounted (see the in-place reload note
-  // above), so the open detail pane's selection survives a sign-out and would
-  // otherwise show the previous account's thread/action to whoever logs in
-  // next. Clear it whenever the signed-in identity changes. (selectedId -> null
-  // also clears the loaded `thread` via the detail effect below.)
+  // above), so account-scoped state survives a sign-out and would otherwise
+  // bleed into whoever logs in next. Reset it all whenever the signed-in
+  // identity changes, so the incoming account starts from a clean loading state
+  // instead of momentarily seeing the previous account's data before the
+  // post-login refetch lands. The refetch (effects above) repopulates from the
+  // new account. `allCounts` is left alone -- it's non-null integers that
+  // refetch immediately, so there's nothing sensitive to flash.
   useEffect(() => {
+    // Detail-pane selection: the one piece that never refetches on its own, so
+    // clearing it here is what actually closes the leaked pane. (selectedId ->
+    // null also clears the loaded `thread` via the detail effect below.)
     setSelectedId(null);
     setSelectedActionId(null);
+    // Account-scoped lists: cleared so the previous account's mail content and
+    // connected-account emails can't flash during the refetch window.
+    setItems([]);
+    setActions([]);
+    setConnections([]);
+    setOverview(null);
+    setActionCounts(undefined);
+    // Any in-flight search from the previous account.
+    setSearchMode(false);
+    setSearchResults([]);
+    setQuery("");
   }, [user?.id]);
 
   // thread detail
