@@ -292,7 +292,7 @@ class Settings(BaseSettings):
     # Back-compat aliases for earlier scaffold usages
     @property
     def APP_NAME(self) -> str:  # pragma: no cover
-        return "AI Mailbox API"
+        return "CortexMail API"
 
     @property
     def ENV(self) -> str:  # pragma: no cover

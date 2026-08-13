@@ -1,4 +1,4 @@
-# Frontend design prompts — AI Mailbox "Command Center"
+# Frontend design prompts — CortexMail "Command Center"
 
 Two copy-pasteable system prompts for AI design tools, derived from the live
 FastAPI backend (routers in `apps/api/app/routes`, ORM models in
@@ -12,7 +12,7 @@ for a locally fine-tuned email classifier. Paste the relevant block verbatim.
 ## Prompt A — v0.dev (Next.js + shadcn/ui + Tailwind)
 
 ```
-You are designing the frontend for "AI Mailbox", a power-user email triage
+You are designing the frontend for "CortexMail", a power-user email triage
 console backed by a self-hosted FastAPI service and a locally fine-tuned encoder
 model. The user is an ML operator, not a casual mail reader. Build a Next.js (App
 Router) UI with TypeScript, Tailwind, and shadcn/ui.
@@ -121,7 +121,7 @@ keyboard-navigable thread list wired to GET /api/v1/mail/triage.
 ## Prompt B — Lovable.dev (React + Vite + Tailwind)
 
 ```
-Build "AI Mailbox", a keyboard-driven Command Center for triaging email that has
+Build "CortexMail", a keyboard-driven Command Center for triaging email that has
 been auto-classified by a locally fine-tuned ML model. Use React + Vite +
 TypeScript + Tailwind. This connects to an existing self-hosted FastAPI backend
 (do NOT add Supabase or a new backend) — call it over fetch with a bearer token

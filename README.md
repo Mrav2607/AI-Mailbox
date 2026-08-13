@@ -1,4 +1,4 @@
-# AI Mailbox
+# CortexMail
 
 AI-assisted email triage: ingests Gmail, classifies each message into a 6-label
 taxonomy (`needs_reply`, `action_required`, `fyi`, `promotional`,

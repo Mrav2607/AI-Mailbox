@@ -1,4 +1,4 @@
-# Local stack for AI-Mailbox. From the repo root:
+# Local stack for CortexMail. From the repo root:
 #
 #   cp deploy/local.env.example deploy/.env
 #   docker compose up --build

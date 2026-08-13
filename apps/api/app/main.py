@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="AI Mailbox API", lifespan=lifespan)
+app = FastAPI(title="CortexMail API", lifespan=lifespan)
 
 # Safety-net handlers for DB and uncaught errors (consistent JSON, no leaks).
 register_exception_handlers(app)
