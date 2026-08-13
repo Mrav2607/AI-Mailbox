@@ -214,7 +214,7 @@ def test_extract_action_model_version_attribution(monkeypatch):
 def test_extract_action_never_logs_the_api_key(monkeypatch, caplog, make_stub, expect_result_is_none):
     monkeypatch.setattr(extractor, "call_chat_completion", make_stub())
     credential = _make_credential(api_key=SECRET_KEY)
-    with caplog.at_level(logging.WARNING, logger="ai-mailbox"):
+    with caplog.at_level(logging.WARNING, logger="cortexmail"):
         result = extract_action(**_default_kwargs(credential=credential))
     if expect_result_is_none:
         assert result is None
@@ -305,6 +305,6 @@ def test_test_credential_maps_parse_failure_to_invalid_response(monkeypatch):
 def test_test_credential_never_logs_the_api_key(monkeypatch, caplog):
     monkeypatch.setattr(extractor, "call_chat_completion", _stub_raises("http_500", 500))
     credential = _make_credential(api_key=SECRET_KEY)
-    with caplog.at_level(logging.WARNING, logger="ai-mailbox"):
+    with caplog.at_level(logging.WARNING, logger="cortexmail"):
         _test_credential(credential)
     assert SECRET_KEY not in caplog.text

@@ -12,7 +12,7 @@ def test_dev_mail_logs_link_and_skips_http(monkeypatch, caplog):
     monkeypatch.setattr(mailer.settings, "resend_api_key", None)
     monkeypatch.setattr(mailer.httpx, "Client", client)
 
-    with caplog.at_level(logging.INFO, logger="ai-mailbox"):
+    with caplog.at_level(logging.INFO, logger="cortexmail"):
         mailer.send_verification_email("user@example.com", "https://app/#token=secret")
 
     assert "[dev-mail] verify_email for user@example.com: https://app/#token=secret" in caplog.text

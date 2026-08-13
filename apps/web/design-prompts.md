@@ -59,7 +59,7 @@ GET /api/v1/analytics/overview
 GET /api/v1/auth/me
   -> { "id": "uuid", "email": "string", "display_name": "string | null" }
 
-## API SURFACE (wire interactive state to these; bearer token in localStorage key "ai_mailbox_token", sent as Authorization: Bearer)
+## API SURFACE (wire interactive state to these; bearer token in localStorage key "cortexmail_token", sent as Authorization: Bearer)
   - POST /api/v1/auth/demo-login   body {"email": string}  -> { "access_token": string, "token_type": "bearer", "user": {id,email,display_name} }
   - GET  /api/v1/auth/me           -> validate stored token / restore session
   - GET  /api/v1/mail/triage       -> primary list, refetch on bucket change
@@ -125,7 +125,7 @@ Build "CortexMail", a keyboard-driven Command Center for triaging email that has
 been auto-classified by a locally fine-tuned ML model. Use React + Vite +
 TypeScript + Tailwind. This connects to an existing self-hosted FastAPI backend
 (do NOT add Supabase or a new backend) — call it over fetch with a bearer token
-read from localStorage key "ai_mailbox_token". Base URL comes from an env var
+read from localStorage key "cortexmail_token". Base URL comes from an env var
 VITE_API_BASE_URL (e.g. http://localhost:8000/api/v1). For preview, you may mock
 these exact response shapes, but keep the property names and types identical so
 swapping in the real API is a no-op.

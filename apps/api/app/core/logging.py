@@ -25,7 +25,7 @@ from app.core.config import settings
 if TYPE_CHECKING:
     from sqlalchemy.exc import IntegrityError
 
-logger = logging.getLogger("ai-mailbox")
+logger = logging.getLogger("cortexmail")
 
 
 def integrity_error_detail(exc: IntegrityError) -> str:
@@ -143,7 +143,7 @@ def configure_logging() -> None:
             # root) see our records -- so named loggers must NOT set propagate False.
             "root": {"level": level, "handlers": ["default"]},
             "loggers": {
-                "ai-mailbox": {"level": level, "handlers": [], "propagate": True},
+                "cortexmail": {"level": level, "handlers": [], "propagate": True},
                 "uvicorn": {"level": level, "handlers": [], "propagate": True},
                 "uvicorn.error": {"level": level, "handlers": [], "propagate": True},
                 # Own handler + no propagate: it needs the query-strip filter, and

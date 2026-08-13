@@ -15,7 +15,7 @@ def _configure_worker_logging(**kwargs):
 
 
 celery_app = Celery(
-    "ai_mailbox",
+    "cortexmail",
     broker=settings.redis_url,
     backend=settings.redis_url,
     include=[

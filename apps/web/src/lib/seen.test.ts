@@ -12,8 +12,8 @@ describe("seen store", () => {
     markSeen(map, USER, "t1", "2026-07-01T00:00:00Z");
 
     expect(window.localStorage.getItem(`${THREAD_SEEN_KEY_PREFIX}${USER}`)).not.toBeNull();
-    expect(THREAD_SEEN_KEY_PREFIX).toBe("ai_mailbox_thread_seen:");
-    expect(THREAD_SEEN_KEY_PREFIX).not.toBe("ai_mailbox_seen:");
+    expect(THREAD_SEEN_KEY_PREFIX).toBe("cortexmail_thread_seen:");
+    expect(THREAD_SEEN_KEY_PREFIX).not.toBe("cortexmail_seen:");
   });
 
   it("round-trips entries through persist and reload", () => {

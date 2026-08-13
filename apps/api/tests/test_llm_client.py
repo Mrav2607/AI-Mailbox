@@ -583,7 +583,7 @@ def test_read_body_within_deadline_reraises_a_real_failure_untouched():
 def test_call_chat_completion_never_logs_the_api_key(monkeypatch, caplog):
     _install_mock_transport(monkeypatch, _json_handler(500, {"error": "boom"}))
     credential = _make_credential(api_key=SECRET_KEY)
-    with caplog.at_level(logging.WARNING, logger="ai-mailbox"):
+    with caplog.at_level(logging.WARNING, logger="cortexmail"):
         with pytest.raises(LlmCallError):
             call_chat_completion(credential, prompt="prompt", user_content="text", max_tokens=512)
     assert SECRET_KEY not in caplog.text
