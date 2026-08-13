@@ -34,8 +34,8 @@ coverage.xml
 *.swo
 
 # Project specific
-cortexmail/apps/api/dev.db
-cortexmail/apps/api/receipts_export.csv
+/apps/api/dev.db
+/apps/api/receipts_export.csv
 
 # ML artifacts & datasets & data scripts (repo-root only -- leading slash so
 # these don't shadow nested dirs like apps/api/app/db/models)
