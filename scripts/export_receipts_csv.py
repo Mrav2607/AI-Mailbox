@@ -1,7 +1,7 @@
 import os, csv
 from sqlalchemy import create_engine, text
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://user:pass@localhost:5432/ai_mailbox")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://user:pass@localhost:5432/cortexmail")
 engine = create_engine(DATABASE_URL)
 
 with engine.connect() as conn, open("receipts_export.csv", "w", newline="") as f:
