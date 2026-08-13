@@ -99,7 +99,8 @@ export function bucketLabel(b: BucketKey): string {
 // Thresholds are on the DISPLAYED percentage (Math.round(c * 100)), not the
 // raw float -- every call site renders the rounded percentage, so branching on
 // the float let a row's color and its printed number land in different tiers
-// right at a boundary (0.3549 and 0.3551 both print "35%").
+// right at a boundary: 0.3451 and 0.3549 both print "35%", but a raw `c <= 0.35`
+// cut puts them in different tiers.
 export function confidenceColor(c: number | null): string {
   if (c == null) return "bg-muted";
   const pct = Math.round(c * 100);
