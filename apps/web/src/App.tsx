@@ -1071,6 +1071,16 @@ export default function Console() {
     return () => observer.disconnect();
   }, [hasMore, searchMode, loadMore]);
 
+  // Login/logout keeps the Console mounted (see the in-place reload note
+  // above), so the open detail pane's selection survives a sign-out and would
+  // otherwise show the previous account's thread/action to whoever logs in
+  // next. Clear it whenever the signed-in identity changes. (selectedId -> null
+  // also clears the loaded `thread` via the detail effect below.)
+  useEffect(() => {
+    setSelectedId(null);
+    setSelectedActionId(null);
+  }, [user?.id]);
+
   // thread detail
   useEffect(() => {
     if (!selectedId) {
