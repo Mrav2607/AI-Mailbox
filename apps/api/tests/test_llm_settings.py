@@ -265,7 +265,7 @@ def test_get_configured_row_masks_key_and_shows_suffix(monkeypatch, caplog, user
         lambda db_, uid: _resolved(stored=True, source="user"),
     )
 
-    with caplog.at_level(logging.WARNING, logger="ai-mailbox"):
+    with caplog.at_level(logging.WARNING, logger="cortexmail"):
         resp = TestClient(app).get("/api/v1/settings/llm")
 
     body = resp.json()
@@ -766,7 +766,7 @@ def test_read_bounded_body_rejects_an_oversized_streamed_body_with_no_content_le
 def test_put_malformed_json_is_422_and_never_echoes_the_body(caplog, user):
     db = _CredentialDB()
     _override(user, db)
-    with caplog.at_level(logging.WARNING, logger="ai-mailbox"):
+    with caplog.at_level(logging.WARNING, logger="cortexmail"):
         resp = TestClient(app).put(
             "/api/v1/settings/llm",
             content=b'{"api_key": "sk-secret-1234", not valid json',
@@ -783,7 +783,7 @@ def test_put_non_utf8_body_is_422_and_never_echoes_the_body(caplog, user):
     db = _CredentialDB()
     _override(user, db)
     body = b"\xff\xfe" + b'{"api_key": "sk-secret-1234"}'
-    with caplog.at_level(logging.WARNING, logger="ai-mailbox"):
+    with caplog.at_level(logging.WARNING, logger="cortexmail"):
         resp = TestClient(app).put(
             "/api/v1/settings/llm",
             content=body,
@@ -1562,7 +1562,7 @@ def test_put_unexpected_exception_never_leaks_the_key(monkeypatch, caplog, user)
 
     monkeypatch.setattr(llm_settings, "resolve_preset_base_url", _boom)
     client = TestClient(app, raise_server_exceptions=False)
-    with caplog.at_level(logging.ERROR, logger="ai-mailbox"):
+    with caplog.at_level(logging.ERROR, logger="cortexmail"):
         resp = client.put(
             "/api/v1/settings/llm",
             json={"provider": "openai", "api_key": "sk-secret-1234", "model": "gpt-4o-mini"},
@@ -1647,7 +1647,7 @@ def test_test_success_stamps_last_verified_at_via_id_and_revision(monkeypatch, c
     monkeypatch.setattr(llm_settings, "test_credential", lambda cred: (True, None, 123))
 
     assert row.last_verified_at is None
-    with caplog.at_level(logging.WARNING, logger="ai-mailbox"):
+    with caplog.at_level(logging.WARNING, logger="cortexmail"):
         resp = TestClient(app).post("/api/v1/settings/llm/test")
     assert resp.status_code == 200
     assert resp.json() == {"ok": True, "latency_ms": 123, "error": None}
@@ -1792,7 +1792,7 @@ def test_test_unexpected_exception_never_leaks_the_key(monkeypatch, caplog, user
 
     monkeypatch.setattr(llm_settings, "test_credential", _boom)
     client = TestClient(app, raise_server_exceptions=False)
-    with caplog.at_level(logging.ERROR, logger="ai-mailbox"):
+    with caplog.at_level(logging.ERROR, logger="cortexmail"):
         resp = client.post("/api/v1/settings/llm/test")
     assert resp.status_code == 500
     assert secret not in resp.text

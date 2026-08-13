@@ -100,7 +100,7 @@ export type UiState = {
   fontScale: number; // CSS zoom applied to the console root; 1 = today's size
 };
 
-export const UI_KEY = "ai_mailbox_ui";
+export const UI_KEY = "cortexmail_ui";
 export const TOUR_VERSION = 3;
 
 export const DEFAULT_UI: UiState = {

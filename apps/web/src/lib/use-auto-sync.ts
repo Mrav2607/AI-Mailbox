@@ -31,8 +31,8 @@ export const NEW_MAIL_SCAN_LIMIT = 50;
 // Per-user "newest mail I've acknowledged" watermark. Persisted so the pill
 // survives reloads: it's derived by comparing server data against this mark,
 // never by catching a one-shot task result that a reload could orphan.
-const seenKey = (userId: string) => `ai_mailbox_seen:${userId}`;
-const channelName = (userId: string) => `ai-mailbox-sync:${userId}`;
+const seenKey = (userId: string) => `cortexmail_seen:${userId}`;
+const channelName = (userId: string) => `cortexmail-sync:${userId}`;
 
 export function broadcastSyncComplete(userId: string) {
   if (!("BroadcastChannel" in window)) return;
@@ -74,7 +74,7 @@ function useSyncLeader(enabled: boolean, userId: string | null): boolean {
       lockController = controller;
       void navigator.locks
         .request(
-          `ai-mailbox-auto-sync:${userId}`,
+          `cortexmail-auto-sync:${userId}`,
           { signal: controller.signal },
           async () => {
             acquiring = false;

@@ -1,11 +1,11 @@
 // Per-user "threads I've opened" store for unread/seen dimming (feature 9).
 // Purely local — no backend, no unread counts. Keyed separately from the
-// auto-sync new-mail watermark (`ai_mailbox_seen:<userId>` in
+// auto-sync new-mail watermark (`cortexmail_seen:<userId>` in
 // use-auto-sync.ts): that key tracks the newest mail acknowledged for the
 // sync pill, this one tracks per-thread open state for row styling.
 
 export const SEEN_CAP = 2000;
-export const THREAD_SEEN_KEY_PREFIX = "ai_mailbox_thread_seen:";
+export const THREAD_SEEN_KEY_PREFIX = "cortexmail_thread_seen:";
 
 const storageKey = (userId: string) => `${THREAD_SEEN_KEY_PREFIX}${userId}`;
 

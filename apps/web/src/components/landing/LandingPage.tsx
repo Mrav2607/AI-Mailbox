@@ -9,7 +9,7 @@ import type { Label } from "@/lib/types";
 import { LandingAgendaMockup } from "./LandingAgendaMockup";
 import { LandingConsoleMockup } from "./LandingConsoleMockup";
 
-const GITHUB_URL = "https://github.com/Mrav2607/AI-Mailbox";
+const GITHUB_URL = "https://github.com/Mrav2607/CortexMail";
 
 const THEME_ICONS: Record<ThemePref, typeof Sun> = {
   system: Monitor,

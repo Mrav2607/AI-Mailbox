@@ -51,7 +51,7 @@ jobs:
           # and data/ are gitignored, so secrets and the model are left untouched.
           ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts \
             "$VM_USER@$VM_HOST" \
-            'set -euo pipefail; cd ~/AI-Mailbox && git fetch --prune origin && git checkout -f main && git reset --hard origin/main && bash deploy/vm-deploy.sh'
+            'set -euo pipefail; cd ~/CortexMail && git fetch --prune origin && git checkout -f main && git reset --hard origin/main && bash deploy/vm-deploy.sh'
 
       - name: Smoke check
         run: |

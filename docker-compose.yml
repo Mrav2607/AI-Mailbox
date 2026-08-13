@@ -1,4 +1,4 @@
-# Local stack for AI-Mailbox. From the repo root:
+# Local stack for CortexMail. From the repo root:
 #
 #   cp deploy/local.env.example deploy/.env
 #   docker compose up --build
@@ -18,7 +18,7 @@
 # fine-tuned model instead: drop it in ./models/email-classifier, set
 # CLASSIFIER_BACKEND=local in deploy/.env, and build with
 # INSTALL_LOCAL_CLASSIFIER=true docker compose up --build
-name: ai-mailbox
+name: cortexmail
 
 services:
   db:
@@ -59,7 +59,7 @@ services:
       dockerfile: deploy/Dockerfile.api
       args:
         INSTALL_LOCAL_CLASSIFIER: ${INSTALL_LOCAL_CLASSIFIER:-false}
-    image: ai-mailbox-api:local
+    image: cortexmail-api:local
     command: alembic upgrade head
     env_file: ./deploy/.env
     depends_on:
@@ -69,7 +69,7 @@ services:
 
   api:
     build: *api-build
-    image: ai-mailbox-api:local
+    image: cortexmail-api:local
     env_file: ./deploy/.env
     # Mount a fine-tuned classifier (if you have one) so CLASSIFIER_BACKEND=local
     # can serve it without rebuilding. Harmless when the dir is absent/empty.
@@ -99,7 +99,7 @@ services:
 
   worker:
     build: *api-build
-    image: ai-mailbox-api:local
+    image: cortexmail-api:local
     command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
     env_file: ./deploy/.env
     volumes:
@@ -125,7 +125,7 @@ services:
   # The scheduler that makes email sync independent of the browser.
   beat:
     build: *api-build
-    image: ai-mailbox-api:local
+    image: cortexmail-api:local
     command: celery -A app.workers.celery_app beat --loglevel=info --schedule /tmp/celerybeat-schedule
     env_file: ./deploy/.env
     depends_on:
@@ -151,7 +151,7 @@ services:
       args:
         # Relative base → same-origin calls that nginx proxies to the API.
         VITE_API_BASE_URL: /api/v1
-    image: ai-mailbox-web:local
+    image: cortexmail-web:local
     ports:
       - "8080:8080"
     depends_on:

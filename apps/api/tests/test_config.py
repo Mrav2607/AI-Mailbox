@@ -21,7 +21,7 @@ PROD_OK = dict(
     TOKEN_ENCRYPTION_KEY=Fernet.generate_key().decode(),
     RESEND_API_KEY="re_test_key",
     FRONTEND_BASE_URL="https://app.example.com",
-    EMAIL_FROM="AI Mailbox <hello@example.com>",
+    EMAIL_FROM="CortexMail <hello@example.com>",
 )
 
 
@@ -82,7 +82,7 @@ def test_production_requires_email_from_to_be_explicitly_set():
 
 def test_production_accepts_explicit_email_from():
     s = Settings(**PROD_OK)
-    assert s.email_from == "AI Mailbox <hello@example.com>"
+    assert s.email_from == "CortexMail <hello@example.com>"
 
 
 def test_malformed_token_encryption_key_rejected_in_any_env():

@@ -22,8 +22,8 @@ from app.core.config import settings
 
 # Who mints the token and who it's for. Both are checked on decode, so tokens
 # from another deployment (or another app sharing the secret) get rejected.
-JWT_ISSUER = "ai-mailbox-api"
-JWT_AUDIENCE = "ai-mailbox"
+JWT_ISSUER = "cortexmail-api"
+JWT_AUDIENCE = "cortexmail"
 
 # These are argon2-cffi 23.1's PasswordHasher defaults, pinned so changing the
 # library cannot quietly weaken newly-issued password hashes.

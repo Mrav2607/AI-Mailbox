@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     # the startup validator); dev falls back to a key derived from api_secret so
     # it can run with zero extra config.
     token_encryption_key: str | None = Field(default=None, alias="TOKEN_ENCRYPTION_KEY")
-    database_url: str = Field(default="postgresql+psycopg://user:pass@localhost:5432/ai_mailbox", alias="DATABASE_URL")
+    database_url: str = Field(default="postgresql+psycopg://user:pass@localhost:5432/cortexmail", alias="DATABASE_URL")
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
@@ -292,7 +292,7 @@ class Settings(BaseSettings):
     # Back-compat aliases for earlier scaffold usages
     @property
     def APP_NAME(self) -> str:  # pragma: no cover
-        return "AI Mailbox API"
+        return "CortexMail API"
 
     @property
     def ENV(self) -> str:  # pragma: no cover

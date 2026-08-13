@@ -13,7 +13,7 @@ from app.core.logging import JsonFormatter, StripQueryString
 
 def _record(**overrides):
     base = dict(
-        name="ai-mailbox",
+        name="cortexmail",
         level=logging.INFO,
         pathname=__file__,
         lineno=1,
@@ -32,7 +32,7 @@ def test_emits_valid_json_with_canonical_keys():
     out = JsonFormatter().format(_record())
     obj = json.loads(out)  # raises if not valid JSON
     assert obj["level"] == "INFO"
-    assert obj["logger"] == "ai-mailbox"
+    assert obj["logger"] == "cortexmail"
     assert obj["msg"] == "hello world"  # args interpolated
     assert obj["ts"].endswith("Z")
 
@@ -65,7 +65,7 @@ def test_extra_cannot_clobber_canonical_keys():
     rec.logger = "spoofed"
     obj = json.loads(JsonFormatter().format(rec))
     assert obj["level"] == "INFO"
-    assert obj["logger"] == "ai-mailbox"
+    assert obj["logger"] == "cortexmail"
 
 
 def test_strip_query_string_removes_secrets_from_access_path():

@@ -24,7 +24,7 @@
       // in storage should produce anything else.
       (function () {
         try {
-          var ui = JSON.parse(localStorage.getItem("ai_mailbox_ui") || "{}") || {};
+          var ui = JSON.parse(localStorage.getItem("cortexmail_ui") || "{}") || {};
           var dark =
             ui.theme === "light"
               ? false

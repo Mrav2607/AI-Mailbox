@@ -13,7 +13,7 @@ The production stack is Docker Compose + Caddy on the Azure VM (`cortexmail.dev`
 see `docs/RUNBOOK.md`. A deploy is just the runbook's manual flow, automated:
 
 1. CI passes on the pushed commit.
-2. The workflow SSHes in as `$VM_USER` and runs, in `~/AI-Mailbox`:
+2. The workflow SSHes in as `$VM_USER` and runs, in `~/CortexMail`:
    ```
    git fetch --prune origin && git checkout main && git reset --hard origin/main
    bash deploy/vm-deploy.sh
@@ -55,7 +55,7 @@ from GitHub. Nothing else to configure.
 Deploys are just git checkouts, so rolling back is one too. On the VM:
 
 ```bash
-cd ~/AI-Mailbox
+cd ~/CortexMail
 git reset --hard <previous-good-sha>
 bash deploy/vm-deploy.sh
 ```

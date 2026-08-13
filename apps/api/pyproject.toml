@@ -3,9 +3,9 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ai-mailbox-api"
+name = "cortexmail-api"
 version = "0.1.0"
-description = "AI Mailbox API"
+description = "CortexMail API"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.111.0",

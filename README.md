@@ -1,4 +1,4 @@
-# AI Mailbox
+# CortexMail
 
 AI-assisted email triage: ingests Gmail, classifies each message into a 6-label
 taxonomy (`needs_reply`, `action_required`, `fyi`, `promotional`,
@@ -99,7 +99,7 @@ cd apps/api; pip install -e ".[local-classifier]"; cd ../..
 3. Apply database migrations (needs Postgres running — see step 1 of the daily startup):
 
 ```bash
-export DATABASE_URL="postgresql+psycopg://user:pass@localhost:5432/ai_mailbox"
+export DATABASE_URL="postgresql+psycopg://user:pass@localhost:5432/cortexmail"
 cd apps/api; alembic upgrade head; cd ../..
 ```
 

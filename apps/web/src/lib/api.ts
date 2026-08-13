@@ -45,7 +45,7 @@ import {
   mockUser,
 } from "./mock";
 
-const TOKEN_KEY = "ai_mailbox_token";
+const TOKEN_KEY = "cortexmail_token";
 const BASE = (import.meta.env.VITE_API_BASE_URL as string) ?? "";
 const USE_MOCK = !BASE;
 

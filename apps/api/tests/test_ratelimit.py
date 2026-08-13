@@ -94,7 +94,7 @@ def test_first_hit_starts_the_window(fake_redis):
 def test_redis_failure_fails_open_and_logs(monkeypatch, caplog):
     monkeypatch.setattr(ratelimit, "_client", lambda: BrokenRedis())
     client = TestClient(_limited_app(limit=1))
-    with caplog.at_level(logging.WARNING, logger="ai-mailbox"):
+    with caplog.at_level(logging.WARNING, logger="cortexmail"):
         # Way past the limit, but every request must still get through.
         for _ in range(5):
             assert client.get("/ping").status_code == 200
