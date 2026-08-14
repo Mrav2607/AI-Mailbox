@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import threading
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -121,7 +122,9 @@ def _seed_thread(db, user, account, *, subject="s"):
     return thread
 
 
-def _seed_message(db, thread, *, sent_at=None, snippet="hi", body_text="there"):
+def _seed_message(
+    db, thread, *, sent_at=None, snippet="hi", body_text="there", created_at=None
+):
     message = MailMessage(
         thread_id=thread.id,
         provider_message_id=str(uuid4()),
@@ -129,6 +132,12 @@ def _seed_message(db, thread, *, sent_at=None, snippet="hi", body_text="there"):
         snippet=snippet,
         body_text=body_text,
     )
+    # An explicit created_at overrides the server default -- the tie-break
+    # test below needs two rows with a genuinely identical timestamp, which
+    # the default can no longer produce (clock_timestamp() since migration
+    # 0023 stamps each insert individually).
+    if created_at is not None:
+        message.created_at = created_at
     db.add(message)
     db.flush()
     return message
@@ -388,18 +397,21 @@ def test_conditional_upsert_reports_written_then_protected_against_an_override(d
 
 # ---------------------------------------------------------------------------
 # Equal-timestamp latest-message tie-break (Codex P2-6): two messages with an
-# identical sent_at (both NULL, falling back to created_at) inserted in the
-# SAME transaction get the SAME now()-derived created_at -- Postgres's now()
-# is transaction-start time, so this is a genuine, reproducible tie, not a
-# best-effort one.
+# identical sent_at (both NULL, falling back to created_at) and an EXPLICIT
+# identical created_at. This used to lean on Postgres's now() being
+# transaction-start time (same txn == same stamp), but created_at defaults to
+# clock_timestamp() since migration 0023 -- per-insert stamps, so the tie has
+# to be seeded explicitly now. The behavior under test is unchanged: on a
+# true timestamp tie, the id decides, deterministically.
 # ---------------------------------------------------------------------------
 
 
 def test_equal_timestamp_latest_message_tie_breaks_on_message_id(db_session):
     user, account = _seed_user_and_account(db_session)
     thread = _seed_thread(db_session, user, account)
-    message_a = _seed_message(db_session, thread, sent_at=None)
-    message_b = _seed_message(db_session, thread, sent_at=None)
+    tie_instant = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+    message_a = _seed_message(db_session, thread, sent_at=None, created_at=tie_instant)
+    message_b = _seed_message(db_session, thread, sent_at=None, created_at=tie_instant)
     db_session.commit()
 
     expected_winner = max(message_a.id, message_b.id)
