@@ -22,6 +22,7 @@ celery_app = Celery(
         "app.workers.tasks_nlp",
         "app.workers.tasks_ingest",
         "app.workers.tasks_email",
+        "app.workers.tasks_label_sync",
     ],
 )
 
@@ -51,6 +52,14 @@ celery_app.conf.beat_schedule = {
         "task": "app.workers.tasks_nlp.prune_llm_usage_daily",
         "schedule": 86400.0,
         "options": {"expires": 86400},
+    },
+    # Fixed cadence, independent of any per-account state (label-sync-plan
+    # §3.1 P1-7): a backed-up queue can't stack stale sweeps thanks to
+    # `expires` matching the schedule.
+    "label-sync-tick": {
+        "task": "app.workers.tasks_label_sync.label_sync_tick",
+        "schedule": 300.0,
+        "options": {"expires": 300},
     },
 }
 

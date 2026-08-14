@@ -48,6 +48,7 @@ import {
   mockTestLlmSettings,
   mockThread,
   mockTriage,
+  mockUpdateConnection,
   mockUser,
 } from "./mock";
 
@@ -386,6 +387,26 @@ export async function deleteConnection(id: string): Promise<void> {
   }
   await request<void>(`/auth/connections/${encodeURIComponent(id)}`, {
     method: "DELETE",
+  });
+}
+
+// Flips an account's label-sync opt-in (plan §3.3). The response mirrors the
+// connections list row. ENABLE can fail with a structured 409 -- code
+// missing_scope / reauth_required / account_paused / label_sync_busy --
+// same {code, message} envelope the reply-send route uses, which
+// errorFromResponse already parses onto ApiError.code with no extra work
+// needed here. The flag is never changed server-side on that failure.
+export async function updateConnection(
+  id: string,
+  input: { label_sync_enabled: boolean },
+): Promise<Connection> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 120));
+    return mockUpdateConnection(id, input.label_sync_enabled);
+  }
+  return request<Connection>(`/auth/connections/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
   });
 }
 

@@ -44,10 +44,19 @@ class ConnectionOut(Response):
     created_at: datetime
     email_address: str
     reauth_required: bool
+    label_sync_enabled: bool
+    # Drift-count "syncing... N remaining" line (plan §3.4/§3.6). None when
+    # sync is off -- there's nothing converging to report, and it lets a
+    # client tell "off" apart from "fully converged" (0).
+    label_sync_drift: int | None = None
 
 
 class Connections(Response):
     connections: list[ConnectionOut]
+
+
+class UpdateConnectionRequest(Response):
+    label_sync_enabled: bool
 
 
 class SignupRequest(Response):

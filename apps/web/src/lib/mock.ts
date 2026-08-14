@@ -44,6 +44,8 @@ let CONNECTIONS: Connection[] = [
     email_address: "operator@gmail.com",
     created_at: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
     reauth_required: false,
+    label_sync_enabled: false,
+    label_sync_drift: null,
   },
   {
     id: "mock-acct-2",
@@ -51,6 +53,8 @@ let CONNECTIONS: Connection[] = [
     email_address: "ops-archive@gmail.com",
     created_at: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
     reauth_required: false,
+    label_sync_enabled: false,
+    label_sync_drift: null,
   },
 ];
 
@@ -391,6 +395,73 @@ export function mockUser(): User {
 
 export function mockListConnections(): Connection[] {
   return CONNECTIONS.map((c) => ({ ...c }));
+}
+
+// Copy for the label-sync ENABLE-time failure codes (plan §3.3), mirrored
+// from the API's own routes/auth.py:_ENABLE_FAILURE_MESSAGES so preview mode
+// and the real backend read the same words. label_sync_busy's wording is
+// frozen verbatim by the plan.
+export const LABEL_SYNC_ENABLE_ERROR_COPY: Record<string, string> = {
+  missing_scope: "This account needs to be reconnected to grant label-sync permission.",
+  reauth_required: "This account needs to be reconnected before label sync can turn on.",
+  account_paused:
+    "This account is paused and needs to be reconnected before label sync can turn on.",
+  label_sync_busy: "a sync is finishing — try again in a few minutes",
+};
+
+// Test/demo-only rigging: forces the NEXT enable attempt on `id` to fail
+// with `code` instead of taking the happy path. This mirrors real hidden
+// per-account state (scope, refresh token, an in-flight claim) that
+// GET /auth/connections never exposes -- only an actual enable attempt
+// reveals it (plan §3.3). One-shot, cleared the instant it's read, so a
+// retry after "fixing" the simulated problem succeeds, same as the real
+// missing_scope/reauth_required/account_paused -> reconnect -> retry flow
+// and the real label_sync_busy -> wait -> retry flow.
+let forcedEnableFailure: { id: string; code: string } | null = null;
+export function mockForceLabelSyncEnableFailure(id: string, code: string | null) {
+  forcedEnableFailure = code ? { id, code } : null;
+}
+
+// Preview's stand-in for PATCH /auth/connections/{id} (plan §3.3). A repeat
+// of the account's current state, in either direction, is a pure echo, same
+// as the real route. Disabling always succeeds. Enabling fails without
+// changing the flag when the account already needs reauth (the existing
+// `reauth_required` field, same signal the real API's account_paused check
+// reads) or when a forced failure is armed for this id; otherwise it turns
+// on and seeds a drift count from this account's classified mail, mirroring
+// "enable = backfill" (plan §3.4).
+export function mockUpdateConnection(id: string, labelSyncEnabled: boolean): Connection {
+  const conn = CONNECTIONS.find((c) => c.id === id);
+  if (!conn) throw new ApiError(404, "Not Found");
+
+  if (labelSyncEnabled === conn.label_sync_enabled) return { ...conn };
+
+  if (!labelSyncEnabled) {
+    conn.label_sync_enabled = false;
+    conn.label_sync_drift = null;
+    return { ...conn };
+  }
+
+  if (conn.reauth_required) {
+    throw new ApiError(
+      409,
+      LABEL_SYNC_ENABLE_ERROR_COPY.reauth_required,
+      undefined,
+      "reauth_required",
+    );
+  }
+  if (forcedEnableFailure?.id === id) {
+    const code = forcedEnableFailure.code;
+    forcedEnableFailure = null;
+    const message = LABEL_SYNC_ENABLE_ERROR_COPY[code] ?? "Couldn't turn on label sync.";
+    throw new ApiError(409, message, undefined, code);
+  }
+
+  conn.label_sync_enabled = true;
+  conn.label_sync_drift = ALL.filter(
+    (i) => i.account_email === conn.email_address && i.classification.label !== null,
+  ).length;
+  return { ...conn };
 }
 
 // Mirrors the server: dropping a connection takes its synced mail with it.

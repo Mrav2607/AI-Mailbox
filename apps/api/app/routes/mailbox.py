@@ -45,6 +45,7 @@ from app.workers.tasks_nlp import (
     classify_latest_threads,
     extract_action_for_message,
 )
+from app.workers.tasks_label_sync import sync_thread_labels
 from app.services.nlp.backfill import (
     latest_label_subquery,
     latest_message_ordering,
@@ -539,6 +540,12 @@ def reclassify_thread(
     # 404 (not 403) for another user's thread so we don't leak that it exists.
     if not thread or thread.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Thread not found")
+    # Captured now, not read off `thread` after the commit below: the
+    # session's expire_on_commit clears this attribute at commit time, and
+    # re-reading it post-commit means a lazy-load SELECT that can raise
+    # (e.g. a concurrent delete_connection's cascade already dropped the
+    # row) -- a plain scalar we already have needs no such round trip.
+    provider_account_id = thread.provider_account_id
 
     latest_message = (
         db.execute(
@@ -664,6 +671,27 @@ def reclassify_thread(
             logger.exception(
                 "action extraction enqueue failed for message %s", latest_message.id
             )
+
+    # Post-commit, in its OWN try/except (plan docs/plans/2026-08-13-label-
+    # sync-plan.md §3.1) -- a manual correction should reach the provider in
+    # seconds, but this enqueue's failure must never suppress the extraction
+    # enqueue above, and vice versa. Only fires when the account opted in;
+    # the tick is the guarantee, this is the latency optimization. The
+    # eligibility lookup lives INSIDE this try too -- it's a fresh SELECT
+    # against `provider_account_id` (never the expired `thread` row), but a
+    # racing account deletion between the commit above and this SELECT can
+    # still raise, and that must land here, not 500 an otherwise-successful
+    # reclassify.
+    try:
+        label_sync_enabled = db.execute(
+            select(ProviderAccount.label_sync_enabled).where(
+                ProviderAccount.id == provider_account_id
+            )
+        ).scalar_one_or_none()
+        if label_sync_enabled:
+            cast(Any, sync_thread_labels).delay(str(thread_id))
+    except Exception:
+        logger.exception("label sync enqueue failed for thread %s", thread_id)
 
     return {
         "thread_id": str(thread_id),

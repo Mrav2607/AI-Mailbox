@@ -134,6 +134,10 @@ def _connection(**overrides):
         display_email=None,
         sync_paused_at=None,
         refresh_token="a-refresh-token",
+        label_sync_enabled=False,
+        label_sync_generation=0,
+        gmail_label_map=None,
+        scope="https://www.googleapis.com/auth/gmail.modify",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

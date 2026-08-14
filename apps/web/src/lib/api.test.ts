@@ -425,6 +425,87 @@ describe("snoozeThread", () => {
   });
 });
 
+describe("updateConnection", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("PATCHes { label_sync_enabled } to /auth/connections/{id}", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({
+      id: "c1",
+      provider: "gmail",
+      created_at: "2026-08-01T00:00:00Z",
+      email_address: "operator@gmail.com",
+      reauth_required: false,
+      label_sync_enabled: true,
+      label_sync_drift: 12,
+    });
+    const res = await api.updateConnection("c1", { label_sync_enabled: true });
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(new URL(url as string).pathname).toBe("/api/v1/auth/connections/c1");
+    expect((opts as RequestInit).method).toBe("PATCH");
+    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({
+      label_sync_enabled: true,
+    });
+    expect(res.label_sync_enabled).toBe(true);
+    expect(res.label_sync_drift).toBe(12);
+  });
+
+  it("URL-encodes the connection id", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({
+      id: "c/1",
+      provider: "gmail",
+      created_at: "2026-08-01T00:00:00Z",
+      email_address: "operator@gmail.com",
+      reauth_required: false,
+      label_sync_enabled: false,
+      label_sync_drift: null,
+    });
+    await api.updateConnection("c/1", { label_sync_enabled: false });
+    expect(new URL(fetchMock.mock.calls[0][0] as string).pathname).toBe(
+      "/api/v1/auth/connections/c%2F1",
+    );
+  });
+
+  // Every ENABLE-time failure code (plan §3.3) rides the same structured
+  // {code, message} envelope the reply-send route pioneered -- one
+  // representative case here proves errorFromResponse parses it onto
+  // ApiError.code the same way for this route too.
+  it("surfaces the server's structured label_sync_busy code", async () => {
+    const api = await importLiveApi();
+    stubFetch(
+      {
+        detail: {
+          code: "label_sync_busy",
+          message: "a sync is finishing — try again in a few minutes",
+        },
+      },
+      409,
+    );
+    await expect(
+      api.updateConnection("c1", { label_sync_enabled: true }),
+    ).rejects.toMatchObject({ status: 409, code: "label_sync_busy" });
+  });
+
+  it("in mock mode, round-trips enabling and disabling label sync for a connection", async () => {
+    const api = await importMockApi();
+    const [conn] = await api.listConnections();
+    expect(conn.label_sync_enabled).toBe(false);
+    expect(conn.label_sync_drift).toBeNull();
+
+    const enabled = await api.updateConnection(conn.id, { label_sync_enabled: true });
+    expect(enabled.label_sync_enabled).toBe(true);
+    expect(enabled.label_sync_drift).toEqual(expect.any(Number));
+
+    const disabled = await api.updateConnection(conn.id, { label_sync_enabled: false });
+    expect(disabled.label_sync_enabled).toBe(false);
+    expect(disabled.label_sync_drift).toBeNull();
+  });
+});
+
 describe("backfillActions", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
