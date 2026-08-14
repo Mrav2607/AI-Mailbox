@@ -362,9 +362,21 @@ export async function microsoftConnectCallback(
 // set, which is what gates the "Sign in with Microsoft" / "Connect Outlook"
 // UI on top of this.
 export async function listAuthProviders(): Promise<string[]> {
-  if (USE_MOCK) return ["gmail"];
-  const res = await request<{ providers: string[] }>("/auth/providers");
-  return res.providers;
+  return (await listAuthOptions()).providers;
+}
+
+// The same endpoint, plus whether this deployment can serve the passwordless
+// demo login. Production 404s that route, so the sign-in screen hides the
+// control there rather than offering one that always fails.
+export async function listAuthOptions(): Promise<{
+  providers: string[];
+  demoLogin: boolean;
+}> {
+  if (USE_MOCK) return { providers: ["gmail"], demoLogin: true };
+  const res = await request<{ providers: string[]; demo_login?: boolean }>(
+    "/auth/providers",
+  );
+  return { providers: res.providers, demoLogin: res.demo_login ?? false };
 }
 
 // Every Gmail account the operator has connected, for the accounts menu.

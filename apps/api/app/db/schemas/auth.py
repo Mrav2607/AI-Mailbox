@@ -17,6 +17,10 @@ class UserOut(Response):
 
 class Providers(Response):
     providers: list[str]
+    # Whether the passwordless demo login is actually callable here. It 404s in
+    # production, so the sign-in screen uses this to avoid advertising a button
+    # that can only fail.
+    demo_login: bool = False
 
 
 class AuthUrl(Response):

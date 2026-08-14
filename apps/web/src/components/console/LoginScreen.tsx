@@ -8,7 +8,7 @@ import {
   demoLogin,
   forgotPassword,
   googleAuthStart,
-  listAuthProviders,
+  listAuthOptions,
   login,
   microsoftAuthStart,
   resendVerification,
@@ -37,15 +37,20 @@ export function LoginScreen({ onAuthed, onBack }: Props) {
   const [googleBusy, setGoogleBusy] = useState(false);
   const [msBusy, setMsBusy] = useState(false);
   const [providers, setProviders] = useState<string[]>([]);
+  // Off until the server says otherwise, so production never flashes a demo
+  // control that its own API refuses to serve.
+  const [demoEnabled, setDemoEnabled] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [resendUntil, setResendUntil] = useState<number | null>(null);
   const [resendSeconds, setResendSeconds] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
-    listAuthProviders()
-      .then((p) => {
-        if (!cancelled) setProviders(p);
+    listAuthOptions()
+      .then((opts) => {
+        if (cancelled) return;
+        setProviders(opts.providers);
+        setDemoEnabled(opts.demoLogin);
       })
       .catch(() => {
         // The Microsoft button is additive UI -- a failed providers fetch just
@@ -329,14 +334,19 @@ export function LoginScreen({ onAuthed, onBack }: Props) {
                 create account
               </button>
             </div>
+            {demoEnabled && (
+            <>
             <div className="my-4 flex items-center gap-2 text-[10.5px] tracking-wide text-muted-foreground font-mono">
               <div className="h-px flex-1 bg-border" />
-              dev login
+              try it
               <div className="h-px flex-1 bg-border" />
             </div>
-            <details className="text-[11px] font-mono text-muted-foreground">
+            {/* Open by default: this is the path the README's quick start
+                tells a first-time visitor to take, and it only renders where
+                the route actually works. */}
+            <details open className="text-[11px] font-mono text-muted-foreground">
               <summary className="cursor-pointer hover:text-foreground">
-                use a development session
+                demo login — no account needed
               </summary>
               <form onSubmit={submitDemo} className="mt-3">
                 <label htmlFor="demo-email" className={labelClass}>
@@ -360,6 +370,8 @@ export function LoginScreen({ onAuthed, onBack }: Props) {
                 </button>
               </form>
             </details>
+            </>
+            )}
             {USE_MOCK && (
               <div className="mt-4 text-[11px] text-muted-foreground font-mono leading-relaxed">
                 no VITE_API_BASE_URL configured; running with in-memory mock data
