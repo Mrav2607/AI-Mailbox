@@ -480,13 +480,19 @@ def send_reply(
 
     provider = account.provider
     provider_account_id = account.id
+    # Capture thread attributes BEFORE the refresh below: a Gmail refresh
+    # commits, which expires every loaded object (expire_on_commit), and a
+    # post-commit lazy reload of `thread` would 500 with ObjectDeletedError
+    # if the row vanished meanwhile (concurrent disconnect cascade) -- the
+    # same class of bug the reclassify enqueue had.
+    provider_thread_id = thread.provider_thread_id
+    subject = thread.subject
+    gmail_message_id_header = generate_message_id() if provider == "gmail" else None
+
     # Proactive refresh (plan §4.2), before any lock and before the provider
     # sequence -- an access token aging past its ~1h TTL must not become a
     # routine send_rejected.
     access_token = _ensure_fresh_access_token(db, account)
-    provider_thread_id = thread.provider_thread_id
-    subject = thread.subject
-    gmail_message_id_header = generate_message_id() if provider == "gmail" else None
 
     # Txn A (plan §3.6 step 1): validate + claim, under a short lock_timeout
     # so an ingest run legitimately holding this thread's lock for minutes
