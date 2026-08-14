@@ -6,6 +6,7 @@ import {
   mockCounts,
   mockDeleteConnection,
   mockDeleteLlmSettings,
+  mockForceLabelSyncEnableFailure,
   mockGetClassifierMix,
   mockGetLlmSettings,
   mockGetLlmUsage,
@@ -19,6 +20,7 @@ import {
   mockTestLlmSettings,
   mockThread,
   mockTriage,
+  mockUpdateConnection,
 } from "./mock";
 import { ApiError } from "./api";
 
@@ -408,6 +410,74 @@ describe("mock snooze", () => {
     const found = mockSearch("", 10_000).items.find((i) => i.thread_id === id);
     expect(found?.snoozed_until).toBe(until);
   });
+});
+
+describe("mock update connection (label sync)", () => {
+  it("404s for an unknown connection id", () => {
+    expect(() => mockUpdateConnection("not-a-real-id", true)).toThrow(ApiError);
+    let caught: ApiError | undefined;
+    try {
+      mockUpdateConnection("not-a-real-id", true);
+    } catch (e) {
+      caught = e as ApiError;
+    }
+    expect(caught!.status).toBe(404);
+  });
+
+  it("enables sync, seeding a drift count from this account's classified mail, then echoes a repeat", () => {
+    const [conn] = mockListConnections();
+    expect(conn.label_sync_enabled).toBe(false);
+
+    const enabled = mockUpdateConnection(conn.id, true);
+    expect(enabled.label_sync_enabled).toBe(true);
+    expect(enabled.label_sync_drift).toEqual(expect.any(Number));
+    expect(enabled.label_sync_drift).toBeGreaterThan(0);
+
+    // A repeat of the current state is a pure echo -- same drift, no
+    // recomputation -- mirroring the real route's early return.
+    const echoed = mockUpdateConnection(conn.id, true);
+    expect(echoed).toEqual(enabled);
+
+    // Reset for tests below.
+    mockUpdateConnection(conn.id, false);
+  });
+
+  it("disables sync, clearing both the flag and the drift count", () => {
+    const [conn] = mockListConnections();
+    mockUpdateConnection(conn.id, true);
+    const disabled = mockUpdateConnection(conn.id, false);
+    expect(disabled.label_sync_enabled).toBe(false);
+    expect(disabled.label_sync_drift).toBeNull();
+  });
+
+  // Every ENABLE-time failure code (plan §3.3) is representable via the
+  // forced-failure rig, one-shot -- the retry after "fixing" it succeeds,
+  // same as the real reconnect-then-retry / wait-then-retry flows.
+  it.each(["missing_scope", "reauth_required", "account_paused", "label_sync_busy"])(
+    "surfaces a forced %s failure once, without changing the flag, then succeeds on retry",
+    (code) => {
+      const [conn] = mockListConnections();
+      expect(conn.label_sync_enabled).toBe(false);
+
+      mockForceLabelSyncEnableFailure(conn.id, code);
+      let caught: ApiError | undefined;
+      try {
+        mockUpdateConnection(conn.id, true);
+      } catch (e) {
+        caught = e as ApiError;
+      }
+      expect(caught).toBeInstanceOf(ApiError);
+      expect(caught!.status).toBe(409);
+      expect(caught!.code).toBe(code);
+      // The flag never changed on failure.
+      expect(mockListConnections()[0].label_sync_enabled).toBe(false);
+
+      // One-shot: the same call now succeeds.
+      const retried = mockUpdateConnection(conn.id, true);
+      expect(retried.label_sync_enabled).toBe(true);
+      mockUpdateConnection(conn.id, false); // reset for the next case
+    },
+  );
 });
 
 describe("mock delete connection", () => {

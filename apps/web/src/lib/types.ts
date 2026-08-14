@@ -249,6 +249,11 @@ export interface Connection {
   email_address: string;
   created_at: string;
   reauth_required: boolean;
+  // Label-sync opt-in (docs/plans/2026-08-13-label-sync-plan.md §3.3/§3.7).
+  label_sync_enabled: boolean;
+  // "Syncing — N remaining" drift count, only meaningful while enabled.
+  // null when sync is off -- tells "off" apart from "fully converged" (0).
+  label_sync_drift: number | null;
 }
 
 export interface Overview {

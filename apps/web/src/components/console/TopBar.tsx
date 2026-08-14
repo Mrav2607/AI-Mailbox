@@ -19,6 +19,7 @@ import { Popover } from "./Popover";
 import { LayoutPicker } from "./LayoutPicker";
 import { bucketLabel } from "@/lib/labels";
 import { cn } from "@/lib/utils";
+import { ApiError, updateConnection } from "@/lib/api";
 import { BUCKETS } from "@/lib/types";
 import type { Arrangement, Density } from "@/lib/layout";
 import { THEME_PREFS } from "@/lib/theme";
@@ -423,6 +424,139 @@ function accountStatus(
   return "ok";
 }
 
+// ENABLE-time failure copy (docs/plans/2026-08-13-label-sync-plan.md §3.3),
+// mirrored from the API's own routes/auth.py:_ENABLE_FAILURE_MESSAGES so
+// this row and the backend read the same words. label_sync_busy's wording
+// is frozen verbatim by the plan.
+const LABEL_SYNC_ERROR_COPY: Record<string, string> = {
+  missing_scope: "This account needs to be reconnected to grant label-sync permission.",
+  reauth_required: "This account needs to be reconnected before label sync can turn on.",
+  account_paused:
+    "This account is paused and needs to be reconnected before label sync can turn on.",
+  label_sync_busy: "a sync is finishing — try again in a few minutes",
+};
+
+// Same shape as ReplyComposer's RECONNECT_CODES -- these three are only
+// fixable by reconnecting. label_sync_busy is transient (a task's lease
+// expires on its own) and gets no reconnect action, just the wait-and-retry
+// copy above; the toggle itself stays off either way (plan §3.3 -- ENABLE
+// never changes the flag on failure).
+const LABEL_SYNC_RECONNECT_CODES = new Set([
+  "missing_scope",
+  "reauth_required",
+  "account_paused",
+]);
+
+function LabelSyncRow({
+  connection,
+  onConnectGmail,
+  onConnectOutlook,
+  disabled,
+}: {
+  connection: Connection;
+  onConnectGmail: () => void;
+  onConnectOutlook?: () => void;
+  disabled?: boolean;
+}) {
+  // Local overlay on top of the connection prop -- this row owns its own
+  // PATCH call (the plan scopes W3 to lib/types+api+mock plus this
+  // component, not App's connections state), so a successful toggle updates
+  // here rather than waiting on the next full GET /auth/connections. A
+  // fresh prop (the parent's own refresh landing) always wins -- see the
+  // effect below -- so this never goes stale forever.
+  const [override, setOverride] = useState<{
+    label_sync_enabled: boolean;
+    label_sync_drift: number | null;
+  } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    setOverride(null);
+    setErrorCode(null);
+    setErrorMessage(null);
+  }, [connection.label_sync_enabled, connection.label_sync_drift]);
+
+  const enabled = override?.label_sync_enabled ?? connection.label_sync_enabled;
+  const drift = override ? override.label_sync_drift : connection.label_sync_drift;
+
+  async function handleToggle() {
+    if (busy || disabled) return;
+    setBusy(true);
+    setErrorCode(null);
+    setErrorMessage(null);
+    try {
+      const updated = await updateConnection(connection.id, {
+        label_sync_enabled: !enabled,
+      });
+      setOverride({
+        label_sync_enabled: updated.label_sync_enabled,
+        label_sync_drift: updated.label_sync_drift,
+      });
+    } catch (e) {
+      if (e instanceof ApiError && e.code && LABEL_SYNC_ERROR_COPY[e.code]) {
+        setErrorCode(e.code);
+        setErrorMessage(LABEL_SYNC_ERROR_COPY[e.code]);
+      } else {
+        setErrorMessage((e as Error).message || "Couldn't update label sync for this account.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const reconnect = connection.provider === "outlook" ? onConnectOutlook : onConnectGmail;
+  const showReconnect = !!errorCode && LABEL_SYNC_RECONNECT_CODES.has(errorCode) && !!reconnect;
+
+  return (
+    <div className="pl-3.5 space-y-1">
+      <label
+        className={cn(
+          "flex items-center gap-2 text-[11px] font-mono text-foreground/80",
+          busy || disabled ? "cursor-not-allowed opacity-70" : "cursor-pointer",
+        )}
+      >
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={busy || disabled}
+          onChange={() => void handleToggle()}
+          className="accent-primary"
+        />
+        Sync labels to {connection.provider === "outlook" ? "Outlook" : "Gmail"}
+      </label>
+      <p className="text-[10px] font-mono text-muted-foreground leading-snug">
+        creates CortexMail labels in your mailbox
+      </p>
+      {enabled && !!drift && (
+        <p className="text-[10px] font-mono text-muted-foreground leading-snug">
+          syncing — {drift} remaining
+        </p>
+      )}
+      {errorMessage && (
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <span className="text-[10px] font-mono text-destructive leading-snug">
+            {errorMessage}
+          </span>
+          {showReconnect && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                reconnect?.();
+              }}
+              className="shrink-0 h-5 px-1.5 rounded border border-destructive/50 font-mono text-[10px] text-foreground hover:bg-destructive/10 cursor-pointer transition-colors"
+            >
+              reconnect
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AccountsMenu({
   connections,
   health,
@@ -528,6 +662,12 @@ function AccountsMenu({
                     deletes this account&apos;s synced mail — reconnecting resyncs from scratch
                   </p>
                 )}
+                <LabelSyncRow
+                  connection={c}
+                  onConnectGmail={onConnectGmail}
+                  onConnectOutlook={onConnectOutlook}
+                  disabled={actionsLocked}
+                />
               </li>
             );
           })}
