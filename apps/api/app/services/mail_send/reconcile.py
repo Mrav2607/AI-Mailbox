@@ -25,8 +25,13 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.logging import logger
-from app.db.models import MailMessage, MailThread, ReplyAttempt
-from app.services.mail_send.common import advance_fence_and_resolve, mark_sent, stamp_verified
+from app.db.models import Classification, MailMessage, MailThread, ReplyAttempt
+from app.services.mail_send.common import (
+    advance_fence_and_resolve,
+    header_value,
+    mark_sent_reconciled,
+    stamp_verified,
+)
 from app.services.nlp.classifier import build_classification_text, classify_with_usage
 from app.services.nlp.persistence import upsert_classification
 from app.services.nlp.providers import ClassificationRouter
@@ -115,13 +120,39 @@ def _match_message(
 
 def _settle_match(
     db: Session, *, attempt: ReplyAttempt, thread_id: UUID, message: MailMessage
-) -> dict:
+) -> dict | None:
     """Phase 1, its own transaction: settle `sent` + fence + action
     resolution. Runs first and unconditionally on a match, regardless of
-    whether classification later succeeds."""
+    whether classification later succeeds.
+
+    R-1 (final review): the eligible set includes `unknown` attempts --
+    settling those from the provider's own sent copy is this module's whole
+    purpose -- so this uses `mark_sent_reconciled` (CAS from
+    inflight/abandoned/unknown), not the send route's narrower `mark_sent`.
+    A failed CAS is followed by a re-read, under the same thread lock, of
+    the attempt's actual status: anything other than an already-`sent` row
+    is a genuine anomaly (not a race this function knows how to resolve),
+    so the fence/resolution below must NOT run -- returns `None` instead of
+    silently advancing state for an attempt that isn't actually settled.
+    """
     db.execute(select(MailThread).where(MailThread.id == thread_id).with_for_update())
     if attempt.status != "sent":
-        mark_sent(db, attempt_id=attempt.id, provider_message_id=message.provider_message_id)
+        settled = mark_sent_reconciled(
+            db, attempt_id=attempt.id, provider_message_id=message.provider_message_id
+        )
+        if not settled:
+            current_status = db.execute(
+                select(ReplyAttempt.status).where(ReplyAttempt.id == attempt.id)
+            ).scalar_one()
+            if current_status != "sent":
+                db.rollback()
+                logger.warning(
+                    "reply reconciliation: attempt %s matched a message but is in "
+                    "unexpected status %r -- not settling",
+                    attempt.id,
+                    current_status,
+                )
+                return None
     resolved = advance_fence_and_resolve(
         db, thread_id=thread_id, attempt_created_at=attempt.created_at
     )
@@ -151,9 +182,31 @@ def _classify_and_stamp(
         db.rollback()
         return False
 
+    # R-3 (final review): a classification-enabled sync classifies the
+    # persisted Sent Items message in its OWN page loop; the claim above
+    # only guards against a second reconciliation worker via verified_at, so
+    # without this check the END pass classifies the SAME message again --
+    # a double BYOK charge, and a real risk of overwriting an already-good
+    # verdict (or a user override). If a Classification row already exists
+    # (model-driven or user-override, either way), this claim just stamps
+    # verified_at and never calls the classifier or writes over it.
+    existing_classification = db.execute(
+        select(Classification.id).where(Classification.message_id == message.id)
+    ).scalar_one_or_none()
+    if existing_classification is not None:
+        stamp_verified(db, attempt_id=attempt_id)
+        db.commit()
+        return True
+
     try:
+        # R-7 (final review): the Subject header, read case-insensitively
+        # from the stored `headers` JSONB the same way ingest does -- a
+        # `None` subject here would classify this message differently than
+        # the identical message classified through the normal ingest path,
+        # violating the same-pipeline rule.
+        subject = header_value(message.headers, "Subject")
         text_for_classification = build_classification_text(
-            None, message.snippet, message.body_text
+            subject, message.snippet, message.body_text
         )
         router = ClassificationRouter(user_id)
         routing = router.routing_for(db)
@@ -207,6 +260,10 @@ def _reconcile_one_attempt(
         return None
 
     outcome = _settle_match(db, attempt=attempt, thread_id=thread.id, message=message)
+    if outcome is None:
+        # R-1: a genuine settlement anomaly (see _settle_match) -- nothing
+        # was fenced/resolved, so there's nothing to classify either.
+        return None
 
     classified = False
     if (

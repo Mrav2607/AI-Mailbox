@@ -17,6 +17,7 @@ from app.db.base import SessionLocal
 from app.db.models import MailSyncRun, MailThread, ProviderAccount
 from app.services.ingest.gmail_ingest import ingest_gmail_messages
 from app.services.ingest.outlook_ingest import ingest_outlook_messages
+from app.services.mail_send.reconcile import run_reconciliation_pass
 from app.services.nlp.providers import extraction_available, extraction_feature_enabled
 from app.services.sync_runs import renew_sync, start_sync_run
 
@@ -501,6 +502,19 @@ def reconcile_reply_attempt(self, account_id: str, *, retry_count: int = 0) -> d
     copy even existed on the provider (P4-7) -- this re-enqueues itself once
     more with a longer countdown, then stops; the durable attempt row
     guarantees correctness either way.
+
+    R-4 (final review): the level pass below runs directly, in its OWN
+    isolated session, regardless of whether the claim was won or
+    deduplicated. Previously a deduplicated claim did nothing but the
+    re-enqueue -- if the in-flight run had already persisted the correlated
+    message before dying (or simply hadn't reached its own END pass yet),
+    an `unknown` attempt stayed blocking until the stale sync lease expired,
+    even though the message needed to unblock it was already sitting in the
+    DB. Running the pass here closes that gap directly instead of trusting
+    either the in-flight run's own END pass or the one-shot re-enqueue to
+    eventually cover it -- every step is idempotent, so this is
+    redundant-but-harmless on a won claim whose new ingest run does its own
+    START/END passes too.
     """
     with SessionLocal() as db:
         try:
@@ -509,6 +523,9 @@ def reconcile_reply_attempt(self, account_id: str, *, retry_count: int = 0) -> d
             return {"status": "skipped", "account_id": account_id, "reason": "bad account id"}
         if account is None or not account.refresh_token or account.sync_paused_at is not None:
             return {"status": "skipped", "account_id": account_id}
+
+        provider_account_id = account.id
+        provider = account.provider
 
         _run, deduplicated = start_sync_run(
             db,
@@ -521,7 +538,15 @@ def reconcile_reply_attempt(self, account_id: str, *, retry_count: int = 0) -> d
                 "classify_messages": True,
                 "new_only": True,
             },
-            provider=account.provider,
+            provider=provider,
+        )
+
+    with SessionLocal() as recon_db:
+        run_reconciliation_pass(
+            recon_db,
+            provider_account_id=provider_account_id,
+            provider=provider,
+            classify_messages=True,
         )
 
     if not deduplicated:

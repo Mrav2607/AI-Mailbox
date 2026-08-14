@@ -444,7 +444,14 @@ def mark_sent(
     provably left, `sent` is terminal truth, and reconciliation may win this
     race before the completion transaction gets here -- losing to an
     already-`sent` row is handled by the caller treating rowcount 0 as
-    "already done", not a failure)."""
+    "already done", not a failure).
+
+    This is the SEND ROUTE's completion-transaction CAS specifically -- it
+    never needs to settle an `unknown` attempt (an `unknown` row only exists
+    once the route has already returned an ambiguous 502; the completion
+    transaction that calls this ran and returned before that). Reconciliation
+    settling an `unknown` attempt from the provider's own sent copy uses
+    `mark_sent_reconciled` below instead (R-1, final review)."""
     values: dict[str, Any] = {"status": "sent", "updated_at": text("now()")}
     if provider_message_id is not None:
         values["provider_message_id"] = provider_message_id
@@ -453,6 +460,44 @@ def mark_sent(
     result = db.execute(
         update(ReplyAttempt)
         .where(ReplyAttempt.id == attempt_id, ReplyAttempt.status.in_(("inflight", "abandoned")))
+        .values(**values)
+    )
+    return bool(result.rowcount)
+
+
+def mark_sent_reconciled(
+    db: Session,
+    *,
+    attempt_id: UUID,
+    provider_message_id: str | None = None,
+    verified_at: datetime | None = None,
+) -> bool:
+    """`inflight`/`abandoned`/`unknown` -> `sent` -- RECONCILIATION ONLY
+    (R-1, final review). `mark_sent`'s CAS was `WHERE status IN
+    ('inflight','abandoned')`, but reconciliation's whole purpose is
+    settling `unknown` attempts from the provider's authoritative sent
+    copy -- an `unknown` row could never win that CAS, so it stayed
+    reconciliation-eligible (and kept the in-flight guard closed) forever
+    even after a matching message was found. The completion-transaction
+    route path keeps `mark_sent`'s narrower semantics unchanged -- it never
+    observes an `unknown` attempt itself.
+
+    Zero rowcount here is NOT automatically "someone else already did it"
+    the way it is for `mark_sent` -- the caller must re-read the row under
+    the same lock to confirm it's actually `sent` before treating settlement
+    as complete; any other status is a genuine anomaly.
+    """
+    values: dict[str, Any] = {"status": "sent", "updated_at": text("now()")}
+    if provider_message_id is not None:
+        values["provider_message_id"] = provider_message_id
+    if verified_at is not None:
+        values["verified_at"] = verified_at
+    result = db.execute(
+        update(ReplyAttempt)
+        .where(
+            ReplyAttempt.id == attempt_id,
+            ReplyAttempt.status.in_(("inflight", "abandoned", "unknown")),
+        )
         .values(**values)
     )
     return bool(result.rowcount)

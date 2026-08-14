@@ -3303,6 +3303,14 @@ export default function Console() {
   const detailThreadId =
     focusedItem?.thread_id ??
     (thread && thread.thread.id === selectedId ? thread.thread.id : undefined);
+  // Same stale-thread guard as the Shift+R hotkey above and detailThreadId's
+  // done/delete fallback: while a newer selectedId's fetch is in flight,
+  // `thread` (and therefore the composer's `data`) is still the PREVIOUS
+  // thread. Withholding the composer callbacks here — not just closing
+  // `composerOpen` — is what actually removes the Reply button and unmounts
+  // an already-open composer for that window; ThreadDetailPane's
+  // composerEnabled requires all three.
+  const threadMatchesSelection = !!thread && thread.thread.id === selectedId;
   const detailPane = (
     <ThreadDetailPane
       data={thread}
@@ -3323,11 +3331,11 @@ export default function Console() {
       predictionOpen={panels.prediction}
       onTogglePrediction={() => togglePanel("prediction")}
       composerOpen={composerOpen}
-      onComposerOpenChange={setComposerOpen}
+      onComposerOpenChange={threadMatchesSelection ? setComposerOpen : undefined}
       composerFocusToken={composerFocusToken}
-      onReplySent={handleReplySent}
+      onReplySent={threadMatchesSelection ? handleReplySent : undefined}
       onReconnect={thread ? () => reconnectFor(thread.thread.provider)() : undefined}
-      onRefetchReplyState={refetchReplyState}
+      onRefetchReplyState={threadMatchesSelection ? refetchReplyState : undefined}
     />
   );
 
