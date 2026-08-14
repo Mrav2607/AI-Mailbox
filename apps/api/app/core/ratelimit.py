@@ -92,7 +92,7 @@ def _enforce(
     retry_after = ttl if ttl and ttl > 0 else window_seconds
     raise HTTPException(
         status_code=429,
-        detail="Too many requests; try again shortly.",
+        detail={"code": "rate_limited", "message": "Too many requests; try again shortly."},
         headers={"Retry-After": str(retry_after)},
     )
 

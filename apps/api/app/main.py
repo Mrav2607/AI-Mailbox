@@ -17,6 +17,7 @@ from .routes import (
     health,
     llm_settings,
     mailbox,
+    reply,
 )
 import uvicorn
 
@@ -63,6 +64,7 @@ app.include_router(auth_password.router, prefix="/api/v1/auth")
 app.include_router(auth_google.router, prefix="/api/v1/auth/google")
 app.include_router(auth_microsoft.router, prefix="/api/v1/auth/microsoft")
 app.include_router(mailbox.router, prefix="/api/v1")
+app.include_router(reply.router, prefix="/api/v1")
 app.include_router(actions.router, prefix="/api/v1")
 app.include_router(analytics.router, prefix="/api/v1")
 app.include_router(llm_settings.router, prefix="/api/v1")

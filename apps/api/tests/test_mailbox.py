@@ -22,6 +22,7 @@ def test_triage_items_include_latest_message_sender_and_account_email(monkeypatc
         subject="Status update",
         last_message_at=None,
         provider_account_id=account_id,
+        replied_at=None,
     )
     message = SimpleNamespace(
         id=message_id,
@@ -80,6 +81,7 @@ def test_triage_account_email_prefers_display_email_over_external_user_id(monkey
         subject="Status update",
         last_message_at=None,
         provider_account_id=account_id,
+        replied_at=None,
     )
     monkeypatch.setattr(
         mailbox, "latest_messages_by_thread", lambda db, thread_ids, columns: {}
@@ -775,6 +777,7 @@ def _thread_detail_setup(*, classification):
         last_message_at=None,
         done_at=None,
         provider_account_id=account_id,
+        replied_at=None,
     )
     account_row = SimpleNamespace(display_email="owner@gmail.example", external_user_id="owner-ext")
     message = SimpleNamespace(

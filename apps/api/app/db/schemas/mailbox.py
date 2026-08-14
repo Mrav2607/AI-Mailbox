@@ -22,6 +22,10 @@ class TriageItem(Response):
     # Which connected Gmail account this thread belongs to, so a multi-account
     # console can label rows instead of blending every mailbox into one list.
     account_email: str
+    # The reply fence (docs/plans/2026-08-13-reply-plan.md §3.5/§3.9): null =
+    # never replied from CortexMail, timestamp = when a reply attempt last
+    # completed. Powers the "replied" indicator without a second call.
+    replied_at: datetime | None
 
 
 class Triage(Response):
@@ -57,6 +61,9 @@ class ThreadSummary(Response):
     done: bool
     # Which connected Gmail account this thread belongs to.
     account_email: str
+    # See TriageItem.replied_at -- same fence, same composer-seeding use
+    # (docs/plans/2026-08-13-reply-plan.md §3.9).
+    replied_at: datetime | None
 
 
 class ThreadMessage(Response):
