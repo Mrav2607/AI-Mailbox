@@ -20,6 +20,7 @@ understand that SQL.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -143,6 +144,8 @@ class _ReplyDB:
         already_sent_message=None,
         fail_thread_lock=False,
         locked_replied_at=_NO_OVERRIDE,
+        fail_commit_at=None,
+        commit_exception=None,
     ):
         self.thread = thread
         self.account = account
@@ -156,8 +159,15 @@ class _ReplyDB:
         # to simulate a fence that committed between the route's earlier
         # `db.get(MailThread, ...)` and this locked re-read.
         self.locked_replied_at = locked_replied_at
+        # R-5 (final review): the Nth call to `commit()` (1-indexed) raises
+        # `commit_exception` instead of succeeding -- lets a test inject a
+        # post-provider-call DB failure at a specific boundary without the
+        # fake needing to understand *why* that particular commit matters.
+        self.fail_commit_at = fail_commit_at
+        self.commit_exception = commit_exception
         self.statements = []
         self.commits = 0
+        self.commit_attempts = 0
         self.rollbacks = 0
         self._message_rows: dict[UUID, SimpleNamespace] = {}
         self.subject_update = None
@@ -231,6 +241,9 @@ class _ReplyDB:
         raise AssertionError(f"_ReplyDB: unhandled statement: {compiled}")
 
     def commit(self):
+        self.commit_attempts += 1
+        if self.fail_commit_at is not None and self.commit_attempts == self.fail_commit_at:
+            raise self.commit_exception or OperationalError("COMMIT", {}, Exception("db down"))
         self.commits += 1
 
     def rollback(self):
@@ -442,6 +455,70 @@ def test_reply_too_many_recipients_from_compute_recipients():
     assert resp.json()["detail"]["code"] == "too_many_recipients"
 
 
+def test_reply_computes_target_and_recipients_under_the_thread_lock(monkeypatch):
+    """R-2 (final review): target/recipient computation must happen AFTER
+    the thread FOR UPDATE lock, not before it -- otherwise a concurrently
+    ingested newer inbound message (a different sender) wouldn't be seen,
+    the guard would still pass (it doesn't change `replied_at`), and the
+    reply would go to the STALE correspondent while the fence resolved the
+    NEWER message's obligation as answered too.
+
+    Asserted two ways: (1) the message-set read is issued strictly AFTER
+    the thread lock in statement order, and (2) the resulting MIME actually
+    targets the newest message's sender -- the one a concurrent ingest
+    landing right before the lock would have contributed.
+    """
+    user_id = uuid4()
+    account = _account()
+    thread = _thread(user_id=user_id, account_id=account.id)
+    older = _message(sender="stale@example.com", minutes_ago=30)
+    newer = _message(sender="fresh@example.com", minutes_ago=1)
+    # Both already present in `db.messages` -- this fake can't model a true
+    # two-phase mid-request insert, but the ORDERING assertion below proves
+    # the route reads this set AFTER the lock, which is what actually makes
+    # a real concurrent ingest (committed before the lock is granted)
+    # visible here.
+    db = _ReplyDB(thread=thread, account=account, messages=[older, newer])
+    _basic_send_stubs(monkeypatch, db)
+
+    captured = {}
+
+    def fake_send(client, *, raw, provider_thread_id, remaining_seconds=None):
+        captured["raw"] = raw
+        return {"id": "sent-1"}
+
+    monkeypatch.setattr(reply_routes, "gmail_send_reply", fake_send)
+
+    client = _client_for(db, user_id)
+    try:
+        resp = _send_request(client, thread.id)
+    finally:
+        _teardown()
+
+    assert resp.status_code == 200
+
+    import base64
+    from email import message_from_bytes
+
+    decoded = message_from_bytes(base64.urlsafe_b64decode(captured["raw"] + "=="))
+    assert decoded["To"] == "fresh@example.com"
+
+    compiled_statements = [
+        str(stmt.compile(dialect=postgresql.dialect())) for stmt in db.statements
+    ]
+    lock_index = next(
+        i
+        for i, s in enumerate(compiled_statements)
+        if s.startswith("SELECT mail_thread.replied_at") and "FOR UPDATE" in s
+    )
+    messages_index = next(
+        i for i, s in enumerate(compiled_statements) if "FROM mail_message" in s
+    )
+    assert lock_index < messages_index, (
+        "message set must be read AFTER the thread lock, not before it"
+    )
+
+
 def test_reply_body_text_validation_rejects_blank():
     user_id = uuid4()
     account = _account()
@@ -484,7 +561,7 @@ def test_reply_gmail_refreshes_expired_token_before_sending(monkeypatch):
 
     used_tokens = []
 
-    def fake_send(client, *, raw, provider_thread_id):
+    def fake_send(client, *, raw, provider_thread_id, remaining_seconds=None):
         used_tokens.append(client.token)
         return {"id": "gmail-sent-1"}
 
@@ -575,7 +652,7 @@ def test_reply_outlook_refreshes_expired_token_before_sending(monkeypatch):
 
     used_tokens = []
 
-    def fake_create_draft(client, *, message_id, reply_all, comment):
+    def fake_create_draft(client, *, message_id, reply_all, comment, remaining_seconds=None):
         used_tokens.append(client.token)
         return {
             "id": "draft-1",
@@ -584,7 +661,7 @@ def test_reply_outlook_refreshes_expired_token_before_sending(monkeypatch):
         }
 
     monkeypatch.setattr(reply_routes, "create_reply_draft", fake_create_draft)
-    monkeypatch.setattr(reply_routes, "send_reply_draft", lambda client, *, draft_id: None)
+    monkeypatch.setattr(reply_routes, "send_reply_draft", lambda client, *, draft_id, remaining_seconds=None: None)
     monkeypatch.setattr(reply_routes.reconcile_reply_attempt, "apply_async", MagicMock())
 
     client = _client_for(db, user_id)
@@ -621,7 +698,7 @@ def test_reply_gmail_refreshes_token_within_expiry_skew_buffer(monkeypatch):
     monkeypatch.setattr(
         reply_routes,
         "gmail_send_reply",
-        lambda client, *, raw, provider_thread_id: {"id": "gmail-sent-1"},
+        lambda client, *, raw, provider_thread_id, remaining_seconds=None: {"id": "gmail-sent-1"},
     )
 
     client = _client_for(db, user_id)
@@ -652,7 +729,7 @@ def test_reply_gmail_does_not_refresh_token_comfortably_outside_skew_buffer(monk
     monkeypatch.setattr(
         reply_routes,
         "gmail_send_reply",
-        lambda client, *, raw, provider_thread_id: {"id": "gmail-sent-1"},
+        lambda client, *, raw, provider_thread_id, remaining_seconds=None: {"id": "gmail-sent-1"},
     )
 
     client = _client_for(db, user_id)
@@ -800,7 +877,7 @@ def test_reply_override_abandons_current_blocker_and_proceeds(monkeypatch):
     monkeypatch.setattr(
         reply_routes,
         "gmail_send_reply",
-        lambda client, *, raw, provider_thread_id: {"id": "sent-1"},
+        lambda client, *, raw, provider_thread_id, remaining_seconds=None: {"id": "sent-1"},
     )
 
     client = _client_for(db, user_id)
@@ -893,7 +970,7 @@ def test_reply_send_rejected_on_definite_4xx(monkeypatch):
     db = _ReplyDB(thread=thread, account=account, messages=messages)
     _basic_send_stubs(monkeypatch, db)
 
-    def raise_400(client, *, raw, provider_thread_id):
+    def raise_400(client, *, raw, provider_thread_id, remaining_seconds=None):
         request = httpx.Request("POST", "https://gmail.googleapis.com/x")
         response = httpx.Response(400, request=request, json={"error": "bad"})
         raise httpx.HTTPStatusError("bad request", request=request, response=response)
@@ -917,7 +994,7 @@ def test_reply_send_outcome_unknown_on_timeout(monkeypatch):
     db = _ReplyDB(thread=thread, account=account, messages=messages)
     _basic_send_stubs(monkeypatch, db)
 
-    def raise_timeout(client, *, raw, provider_thread_id):
+    def raise_timeout(client, *, raw, provider_thread_id, remaining_seconds=None):
         raise httpx.ConnectTimeout("timed out")
 
     monkeypatch.setattr(reply_routes, "gmail_send_reply", raise_timeout)
@@ -939,7 +1016,7 @@ def test_reply_send_outcome_unknown_on_5xx(monkeypatch):
     db = _ReplyDB(thread=thread, account=account, messages=messages)
     _basic_send_stubs(monkeypatch, db)
 
-    def raise_502(client, *, raw, provider_thread_id):
+    def raise_502(client, *, raw, provider_thread_id, remaining_seconds=None):
         request = httpx.Request("POST", "https://gmail.googleapis.com/x")
         response = httpx.Response(502, request=request)
         raise httpx.HTTPStatusError("bad gateway", request=request, response=response)
@@ -967,7 +1044,7 @@ def test_reply_unknown_outcome_enqueue_failure_does_not_mask_502(monkeypatch):
     db = _ReplyDB(thread=thread, account=account, messages=messages)
     _basic_send_stubs(monkeypatch, db)
 
-    def raise_timeout(client, *, raw, provider_thread_id):
+    def raise_timeout(client, *, raw, provider_thread_id, remaining_seconds=None):
         raise httpx.ConnectTimeout("timed out")
 
     monkeypatch.setattr(reply_routes, "gmail_send_reply", raise_timeout)
@@ -1003,7 +1080,7 @@ def test_reply_outlook_403_on_create_reply_maps_to_missing_scope(monkeypatch):
         reply_routes, "mark_failed", lambda db, *, attempt_id: mark_failed_calls.append(attempt_id)
     )
 
-    def raise_403(client, *, message_id, reply_all, comment):
+    def raise_403(client, *, message_id, reply_all, comment, remaining_seconds=None):
         raise SendError(
             "missing_scope",
             "This account needs to be reconnected to grant reply-send permission.",
@@ -1034,7 +1111,7 @@ def test_reply_outlook_403_on_send_draft_maps_to_missing_scope(monkeypatch):
     monkeypatch.setattr(
         reply_routes,
         "create_reply_draft",
-        lambda client, *, message_id, reply_all, comment: {
+        lambda client, *, message_id, reply_all, comment, remaining_seconds=None: {
             "id": "draft-1",
             "body": {"contentType": "text", "content": comment},
             "bodyPreview": comment[:50],
@@ -1045,7 +1122,7 @@ def test_reply_outlook_403_on_send_draft_maps_to_missing_scope(monkeypatch):
         reply_routes, "mark_failed", lambda db, *, attempt_id: mark_failed_calls.append(attempt_id)
     )
 
-    def raise_403(client, *, draft_id):
+    def raise_403(client, *, draft_id, remaining_seconds=None):
         raise SendError(
             "missing_scope",
             "This account needs to be reconnected to grant reply-send permission.",
@@ -1076,7 +1153,7 @@ def test_reply_outlook_cap_violation_marks_failed_and_returns_422(monkeypatch):
         reply_routes, "mark_failed", lambda db, *, attempt_id: mark_failed_calls.append(attempt_id)
     )
 
-    def raise_cap(client, *, message_id, reply_all, comment):
+    def raise_cap(client, *, message_id, reply_all, comment, remaining_seconds=None):
         raise SendError("too_many_recipients", "61 addresses exceeds the 50 cap")
 
     monkeypatch.setattr(reply_routes, "create_reply_draft", raise_cap)
@@ -1089,6 +1166,112 @@ def test_reply_outlook_cap_violation_marks_failed_and_returns_422(monkeypatch):
     assert resp.status_code == 422
     assert resp.json()["detail"]["code"] == "too_many_recipients"
     assert len(mark_failed_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# R-5 (final review): post-provider DB failure boundaries.
+# ---------------------------------------------------------------------------
+
+
+def test_reply_outlook_draft_record_db_failure_settles_failed_and_deletes_draft(monkeypatch):
+    """R-5(a): createReply already succeeded on the provider, but recording
+    the draft id (or committing that write) fails -- left alone, the
+    `inflight` attempt would survive with NO correlation id for an unsent
+    draft, unreconcilable forever. Must roll back, best-effort delete the
+    orphan draft, settle the attempt `failed` in a fresh session, and
+    return the safe-to-retry `send_rejected` -- never a 500."""
+    user_id = uuid4()
+    account = _account(provider="outlook", scope="Mail.ReadWrite Mail.Send", display_email=_SELF)
+    thread = _thread(user_id=user_id, account_id=account.id, provider="outlook")
+    messages = [_message()]
+    db = _ReplyDB(
+        thread=thread,
+        account=account,
+        messages=messages,
+        # commit #1: Txn A. #2: preparing->inflight. #3: the draft-id-record
+        # commit this test targets.
+        fail_commit_at=3,
+    )
+    _basic_send_stubs(monkeypatch, db)
+
+    monkeypatch.setattr(
+        reply_routes,
+        "create_reply_draft",
+        lambda client, *, message_id, reply_all, comment, remaining_seconds=None: {
+            "id": "draft-1",
+            "body": {"contentType": "text", "content": comment},
+            "bodyPreview": comment[:50],
+        },
+    )
+    delete_calls = []
+    monkeypatch.setattr(
+        reply_routes.OutlookClient,
+        "delete_draft",
+        lambda self, draft_id: delete_calls.append(draft_id),
+    )
+    mark_failed_calls = []
+    monkeypatch.setattr(
+        reply_routes,
+        "mark_failed",
+        lambda db, *, attempt_id: mark_failed_calls.append(attempt_id) or True,
+    )
+    monkeypatch.setattr(reply_routes, "SessionLocal", lambda: nullcontext(MagicMock()))
+
+    client = _client_for(db, user_id)
+    try:
+        resp = _send_request(client, thread.id)
+    finally:
+        _teardown()
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"]["code"] == "send_rejected"
+    assert delete_calls == ["draft-1"]
+    assert len(mark_failed_calls) == 1
+    assert db.rollbacks >= 1
+
+
+def test_reply_gmail_completion_db_failure_after_send_marks_unknown(monkeypatch):
+    """R-5(b): the Gmail send already succeeded when the completion
+    transaction's own commit fails -- this must never surface as a 500.
+    Rolls back, CASes the attempt to `unknown` in a fresh session,
+    best-effort re-enqueues reconciliation, and returns the honest
+    `send_outcome_unknown` -- the mail DID leave."""
+    user_id = uuid4()
+    account = _account()
+    thread = _thread(user_id=user_id, account_id=account.id)
+    messages = [_message(headers={"Message-ID": "<orig@example.com>"})]
+    db = _ReplyDB(
+        thread=thread,
+        account=account,
+        messages=messages,
+        # commit #1: Txn A. #2: preparing->inflight. #3: the completion
+        # transaction's own commit this test targets.
+        fail_commit_at=3,
+    )
+    _basic_send_stubs(monkeypatch, db)
+    monkeypatch.setattr(
+        reply_routes,
+        "gmail_send_reply",
+        lambda client, *, raw, provider_thread_id, remaining_seconds=None: {"id": "gmail-sent-1"},
+    )
+    mark_unknown_calls = []
+    monkeypatch.setattr(
+        reply_routes,
+        "mark_unknown",
+        lambda db, *, attempt_id: mark_unknown_calls.append(attempt_id) or True,
+    )
+    monkeypatch.setattr(reply_routes, "SessionLocal", lambda: nullcontext(MagicMock()))
+
+    client = _client_for(db, user_id)
+    try:
+        resp = _send_request(client, thread.id)
+    finally:
+        _teardown()
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"]["code"] == "send_outcome_unknown"
+    assert len(mark_unknown_calls) == 1
+    assert db.rollbacks >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -1107,7 +1290,7 @@ def test_reply_gmail_success_persists_message_and_returns_replied_at(monkeypatch
     monkeypatch.setattr(
         reply_routes,
         "gmail_send_reply",
-        lambda client, *, raw, provider_thread_id: {"id": "gmail-sent-1"},
+        lambda client, *, raw, provider_thread_id, remaining_seconds=None: {"id": "gmail-sent-1"},
     )
 
     client = _client_for(db, user_id)
@@ -1157,7 +1340,7 @@ def test_reply_gmail_completion_returns_early_when_reconciliation_already_won(mo
     monkeypatch.setattr(
         reply_routes,
         "gmail_send_reply",
-        lambda client, *, raw, provider_thread_id: {"id": "gmail-sent-1"},
+        lambda client, *, raw, provider_thread_id, remaining_seconds=None: {"id": "gmail-sent-1"},
     )
 
     client = _client_for(db, user_id)
@@ -1183,7 +1366,7 @@ def test_reply_outlook_success_builds_ephemeral_message_and_enqueues_reconcile(m
     monkeypatch.setattr(
         reply_routes,
         "create_reply_draft",
-        lambda client, *, message_id, reply_all, comment: {
+        lambda client, *, message_id, reply_all, comment, remaining_seconds=None: {
             "id": "draft-1",
             "body": {"contentType": "text", "content": comment},
             "bodyPreview": comment[:50],
@@ -1193,7 +1376,7 @@ def test_reply_outlook_success_builds_ephemeral_message_and_enqueues_reconcile(m
     monkeypatch.setattr(
         reply_routes,
         "send_reply_draft",
-        lambda client, *, draft_id: send_calls.append(draft_id),
+        lambda client, *, draft_id, remaining_seconds=None: send_calls.append(draft_id),
     )
     reconcile_mock = MagicMock()
     monkeypatch.setattr(reply_routes.reconcile_reply_attempt, "apply_async", reconcile_mock)
@@ -1226,13 +1409,13 @@ def test_reply_outlook_success_enqueue_failure_does_not_mask_200(monkeypatch):
     monkeypatch.setattr(
         reply_routes,
         "create_reply_draft",
-        lambda client, *, message_id, reply_all, comment: {
+        lambda client, *, message_id, reply_all, comment, remaining_seconds=None: {
             "id": "draft-1",
             "body": {"contentType": "text", "content": comment},
             "bodyPreview": comment[:50],
         },
     )
-    monkeypatch.setattr(reply_routes, "send_reply_draft", lambda client, *, draft_id: None)
+    monkeypatch.setattr(reply_routes, "send_reply_draft", lambda client, *, draft_id, remaining_seconds=None: None)
     monkeypatch.setattr(
         reply_routes.reconcile_reply_attempt,
         "apply_async",

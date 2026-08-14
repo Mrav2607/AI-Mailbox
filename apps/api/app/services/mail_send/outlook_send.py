@@ -32,16 +32,44 @@ def _raise_missing_scope_if_forbidden(exc: httpx.HTTPStatusError) -> None:
         raise SendError("missing_scope", _MISSING_SCOPE_MESSAGE) from exc
 
 
+def _raise_if_deadline_exhausted(remaining_seconds: float | None) -> None:
+    """R-8 (final review), Outlook half: a pre-flight guard against starting
+    a call with no budget left in the route's 45s end-to-end deadline,
+    raising the same ambiguous-outcome timeout shape a natural network
+    timeout already produces -- before even opening the connection.
+
+    `OutlookClient._post` has no retry loop (unlike Gmail's send path, a
+    blind retry here risks a double-send or duplicate draft), so there's no
+    backoff sleep to cap -- this pre-flight check plus the ACTUAL per-request
+    HTTP timeout `OutlookClient.create_reply`/`send_draft` now cap to
+    `remaining_seconds` (via `_capped_timeout`) together cover the same
+    ground Gmail's retry-loop capping does.
+    """
+    if remaining_seconds is not None and remaining_seconds <= 0:
+        raise httpx.ReadTimeout("reply send exceeded its remaining deadline")
+
+
 def create_reply_draft(
-    client: OutlookClient, *, message_id: str, reply_all: bool, comment: str
+    client: OutlookClient,
+    *,
+    message_id: str,
+    reply_all: bool,
+    comment: str,
+    remaining_seconds: float | None = None,
 ) -> dict[str, Any]:
     """POST createReply/createReplyAll and enforce the §3.3 recipient cap
     against Graph's own computed recipients. Deletes the draft and raises
     `SendError("too_many_recipients")` on violation -- draft inspection is
     the only way to see the count Graph actually chose to CC/BCC.
     """
+    _raise_if_deadline_exhausted(remaining_seconds)
     try:
-        draft = client.create_reply(message_id, reply_all=reply_all, comment=comment)
+        draft = client.create_reply(
+            message_id,
+            reply_all=reply_all,
+            comment=comment,
+            remaining_seconds=remaining_seconds,
+        )
     except httpx.HTTPStatusError as exc:
         _raise_missing_scope_if_forbidden(exc)
         raise
@@ -71,10 +99,13 @@ def create_reply_draft(
     return draft
 
 
-def send_reply_draft(client: OutlookClient, *, draft_id: str) -> None:
+def send_reply_draft(
+    client: OutlookClient, *, draft_id: str, remaining_seconds: float | None = None
+) -> None:
     """POST /send for an already-created, already-cap-checked draft."""
+    _raise_if_deadline_exhausted(remaining_seconds)
     try:
-        client.send_draft(draft_id)
+        client.send_draft(draft_id, remaining_seconds=remaining_seconds)
     except httpx.HTTPStatusError as exc:
         _raise_missing_scope_if_forbidden(exc)
         raise
