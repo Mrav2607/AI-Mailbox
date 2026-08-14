@@ -21,6 +21,16 @@ _BASE_URL = "https://graph.microsoft.com/v1.0"
 _TIMEOUT = 20.0
 _MAX_ATTEMPTS = 3
 _RETRY_5XX = frozenset({500, 502, 503, 504})
+# Label sync's task deadline is 8 minutes and its claim lease is 10 (see
+# app/workers/tasks_label_sync.py) -- `_get`'s ingest-path Retry-After
+# compliance is deliberately unbounded (a long delta walk can afford to
+# wait), but a label-sync call honoring a large Retry-After verbatim could
+# sleep past a STOLEN lease and keep writing after another task has taken
+# over. The label-path methods below cap any single sleep at this many
+# seconds; a server-requested wait beyond it fails the attempt immediately
+# (no partial sleep) instead of blocking, so a bad item fails cleanly and
+# the tick's per-item isolation retries it later.
+_LABEL_SYNC_MAX_RETRY_SLEEP = 30.0
 _PREFER_IMMUTABLE_ID = 'IdType="ImmutableId"'
 _MESSAGE_SELECT = (
     "id,conversationId,subject,from,toRecipients,ccRecipients,"
@@ -105,6 +115,55 @@ class OutlookClient:
         assert resp is not None  # pragma: no cover
         return resp
 
+    def _get_bounded(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """Label-sync-only GET retry loop -- same shape as `_get`, but every
+        single sleep (429 Retry-After OR 5xx backoff) is capped at
+        `_LABEL_SYNC_MAX_RETRY_SLEEP`. Kept as its OWN method rather than a
+        parameter on `_get` so ingest's unbounded Retry-After compliance
+        (a deliberate, different tradeoff for a long delta walk) can never
+        be changed by a label-sync edit.
+        """
+        request_headers = {"Authorization": f"Bearer {self.token}"}
+        if headers:
+            request_headers.update(headers)
+        resp: httpx.Response | None = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            resp = _client().get(url, headers=request_headers, params=params)
+            if resp.status_code == 429 and attempt < _MAX_ATTEMPTS:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after else float(2 ** (attempt - 1))
+                except ValueError:
+                    wait = float(2 ** (attempt - 1))
+                if wait > _LABEL_SYNC_MAX_RETRY_SLEEP:
+                    logger.warning(
+                        "Graph 429 for %s requested a %ss wait, over the label-sync "
+                        "cap (%ss) -- failing this attempt instead of sleeping",
+                        url,
+                        wait,
+                        _LABEL_SYNC_MAX_RETRY_SLEEP,
+                    )
+                    break
+                logger.warning("Graph 429 for %s; retrying in %ss", url, wait)
+                time.sleep(wait)
+                continue
+            if resp.status_code in _RETRY_5XX and attempt < _MAX_ATTEMPTS:
+                backoff = min(float(2 ** (attempt - 1)), _LABEL_SYNC_MAX_RETRY_SLEEP)
+                logger.warning(
+                    "Graph %s returned %s; retrying in %ss", url, resp.status_code, backoff
+                )
+                time.sleep(backoff)
+                continue
+            break
+        assert resp is not None  # pragma: no cover
+        return resp
+
     def _post(
         self,
         url: str,
@@ -175,6 +234,81 @@ class OutlookClient:
             return None
         resp.raise_for_status()
         return resp.json()
+
+    def get_message_categories(self, message_id: str) -> dict[str, Any] | None:
+        """GET /me/messages/{id}?$select=categories, reading BOTH the
+        categories and the @odata.etag -- label sync's If-Match PATCH below
+        needs the etag to avoid clobbering a category the user adds between
+        this read and that write (label-sync plan §3.2). Returns None on
+        404, same "message truly gone" contract as get_message.
+        """
+        resp = self._get_bounded(
+            f"{_BASE_URL}/me/messages/{message_id}",
+            params={"$select": "categories"},
+            headers={"Prefer": _PREFER_IMMUTABLE_ID},
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        body = resp.json()
+        return {"categories": body.get("categories") or [], "etag": body.get("@odata.etag")}
+
+    def set_message_categories(
+        self, message_id: str, categories: list[str], *, etag: str
+    ) -> httpx.Response:
+        """PATCH /me/messages/{id} with an If-Match etag -- Graph's
+        categories PATCH replaces the WHOLE collection, so the etag is what
+        makes a 412 (rather than a silent overwrite) the caller's signal to
+        re-GET and re-merge once (label-sync plan §3.2).
+
+        Retry-safe the same way `_get` is (429/5xx, idempotent replace of a
+        fixed list) -- but a 412 is returned to the caller, not retried
+        here, since recovering from it needs a fresh GET this method
+        doesn't have. The raw response is returned (not raise_for_status'd)
+        so the caller can branch on 404/412 without exception-based control
+        flow.
+
+        Every single sleep here is capped at `_LABEL_SYNC_MAX_RETRY_SLEEP`
+        (plan §3.1 P4-2) -- a Retry-After beyond that fails the attempt
+        immediately (no partial sleep) rather than risking a live write
+        outliving a stolen claim lease; the caller's per-item isolation
+        retries it on a later tick.
+        """
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Prefer": _PREFER_IMMUTABLE_ID,
+            "If-Match": etag,
+        }
+        url = f"{_BASE_URL}/me/messages/{message_id}"
+        resp: httpx.Response | None = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            resp = _client().patch(url, headers=headers, json={"categories": categories})
+            if resp.status_code == 429 and attempt < _MAX_ATTEMPTS:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after else float(2 ** (attempt - 1))
+                except ValueError:
+                    wait = float(2 ** (attempt - 1))
+                if wait > _LABEL_SYNC_MAX_RETRY_SLEEP:
+                    logger.warning(
+                        "Graph 429 for %s requested a %ss wait, over the label-sync "
+                        "cap (%ss) -- failing this attempt instead of sleeping",
+                        url,
+                        wait,
+                        _LABEL_SYNC_MAX_RETRY_SLEEP,
+                    )
+                    break
+                logger.warning("Graph 429 for %s; retrying in %ss", url, wait)
+                time.sleep(wait)
+                continue
+            if resp.status_code in _RETRY_5XX and attempt < _MAX_ATTEMPTS:
+                backoff = min(float(2 ** (attempt - 1)), _LABEL_SYNC_MAX_RETRY_SLEEP)
+                logger.warning("Graph %s returned %s; retrying in %ss", url, resp.status_code, backoff)
+                time.sleep(backoff)
+                continue
+            break
+        assert resp is not None  # pragma: no cover
+        return resp
 
     def delta_page(
         self,

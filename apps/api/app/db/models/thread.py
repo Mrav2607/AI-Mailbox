@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     Index,
@@ -97,6 +98,37 @@ class MailThread(Base):
     # predicate compares this against last_message_at to tell "time passed"
     # from "new mail woke it early".
     snoozed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The label-sync applied pair (docs/plans/2026-08-13-label-sync-plan.md
+    # §3.1): what was last successfully pushed to the provider, and the
+    # provider message id that was the thread's latest at push time. Both
+    # null until the first successful push; recorded together, only after a
+    # provider write actually succeeds (app/services/label_sync/service.py's
+    # record_sync_result, §3.8 step 6).
+    synced_label: Mapped[str | None] = mapped_column(Text)
+    synced_message_id: Mapped[str | None] = mapped_column(Text)
+    # Set on re-enable for threads with a classification or a populated
+    # applied pair, WITHOUT touching the pair itself (§3.3/P3-2) -- forces
+    # reconvergence without erasing the Outlook cleanup target. Cleared only
+    # after a successful reconciliation records a fresh applied pair.
+    label_resync_needed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # Per-thread claim/lease over the lockless provider-write window (§3.8
+    # step 1, sync-run lease precedent): a claim younger than the 10-minute
+    # lease blocks a second task from racing the same thread; an expired one
+    # is simply reclaimed by the next tick. Always set/cleared together.
+    label_sync_claim_token: Mapped[str | None] = mapped_column(Text)
+    label_sync_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    # The message id a claimed task is about to (or may already have)
+    # written a category/label for (§3.1 P4-2/P5-1, Outlook's per-message
+    # writes in particular). Populated in txn 1b, cleared only alongside a
+    # successful txn 2 record -- a crash between those two leaves this as
+    # the only trace of a possibly-applied-but-unrecorded provider write, so
+    # it keeps the thread selected by the drift predicate until a
+    # successor cleans it up.
+    label_sync_pending_target: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()")
     )

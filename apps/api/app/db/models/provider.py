@@ -8,6 +8,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Integer,
     Text,
     UniqueConstraint,
     text,
@@ -88,6 +89,27 @@ class ProviderAccount(Base):
     # stable tid:oid identity, not necessarily an email. Null for existing
     # gmail rows.
     display_email: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Per-account opt-in for pushing CortexMail's classification back to the
+    # provider as a Gmail label / Outlook category (docs/plans/2026-08-13-
+    # label-sync-plan.md §3.1/§3.3). Off by default -- this is a write path,
+    # so it never turns on without the user asking for it.
+    label_sync_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # Cached Gmail label name -> id map (JSON text, outlook_delta_cursors
+    # precedent above): full slash-delimited names ("CortexMail",
+    # "CortexMail/Needs reply", ...) to their Gmail label ids, so a sync task
+    # doesn't re-list/re-create labels on every run. Cleared on re-enable
+    # (label-sync-plan §3.3) since a label renamed while disabled would
+    # otherwise keep a stale-but-valid cached id.
+    gmail_label_map: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Bumped on every enable (false->true). Tasks capture this at claim time
+    # and fence their writes against it (label-sync-plan §3.1/§3.8 P4-1) so
+    # an older-generation task can never repopulate a cache -- or clear a
+    # resync flag -- a re-enable just reset.
+    label_sync_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()")
     )
