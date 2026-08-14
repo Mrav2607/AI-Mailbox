@@ -151,6 +151,91 @@ def test_assemble_triage_items_defaults_snoozed_until_to_none_without_a_map():
 
 
 # ---------------------------------------------------------------------------
+# GET /mail/search -- must carry the same snoozed_until projection as
+# get_triage (search is the documented way to reach a thread outside the
+# open buckets, so its results can't always report snoozed_until: null).
+# ---------------------------------------------------------------------------
+
+
+class _SearchDB:
+    """Fake session for search_threads' full call chain: the main search
+    select (mail_thread, projected snoozed_until), latest_messages_by_thread
+    (mail_message), the classification lookup, and the account-email lookup
+    -- dispatched by each statement's FROM table, same style as
+    _AccountLookupDB above."""
+
+    def __init__(self, rows):
+        self._rows = rows  # list of (thread, projected_snoozed_until) tuples
+
+    def execute(self, statement):
+        table = statement.get_final_froms()[0].name
+        result = MagicMock()
+        if table == "mail_thread":
+            result.all.return_value = self._rows
+        elif table == "provider_account":
+            result.all.return_value = [
+                (thread.provider_account_id, None, "owner@gmail.example")
+                for thread, _ in self._rows
+            ]
+        else:
+            # mail_message (no messages) / classification (no classifications).
+            result.all.return_value = []
+            result.scalars.return_value.all.return_value = []
+        return result
+
+
+def _search_client(db, user_id):
+    app.dependency_overrides[get_current_user] = lambda: MagicMock(id=user_id)
+    app.dependency_overrides[get_db] = lambda: db
+    return TestClient(app)
+
+
+def test_search_reports_snoozed_until_for_an_actively_snoozed_thread():
+    user_id, account_id = uuid4(), uuid4()
+    active_wake = datetime.now(timezone.utc) + timedelta(days=1)
+    thread = _owned_thread(uuid4(), user_id, subject="Renewal reminder")
+    thread.provider_account_id = account_id
+    thread.last_message_at = None
+    thread.replied_at = None
+    db = _SearchDB([(thread, active_wake)])
+    client = _search_client(db, user_id)
+    try:
+        resp = client.get("/api/v1/mail/search?q=renewal")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    [item] = resp.json()["items"]
+    assert datetime.fromisoformat(item["snoozed_until"]) == active_wake
+
+
+def test_search_reports_null_snoozed_until_for_a_stale_pair_thread():
+    # Raw snoozed_until/snoozed_at are still set (a wake that already passed)
+    # but the projection -- what the SQL predicate actually says -- is None.
+    user_id, account_id = uuid4(), uuid4()
+    thread = _owned_thread(
+        uuid4(),
+        user_id,
+        subject="Old reminder",
+        snoozed_until=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        snoozed_at=datetime(2019, 12, 1, tzinfo=timezone.utc),
+    )
+    thread.provider_account_id = account_id
+    thread.last_message_at = None
+    thread.replied_at = None
+    db = _SearchDB([(thread, None)])
+    client = _search_client(db, user_id)
+    try:
+        resp = client.get("/api/v1/mail/search?q=old")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    [item] = resp.json()["items"]
+    assert item["snoozed_until"] is None
+
+
+# ---------------------------------------------------------------------------
 # GET /mail/triage -- snoozed bucket, sort contract, and every other
 # bucket's NOT active_snoozed exclusion.
 # ---------------------------------------------------------------------------
