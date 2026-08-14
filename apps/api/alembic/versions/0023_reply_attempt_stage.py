@@ -57,17 +57,21 @@ def upgrade() -> None:
         sa.Column("gmail_message_id_header", sa.Text(), nullable=True),
         sa.Column("provider_message_id", sa.Text(), nullable=True),
         sa.Column("verified_at", sa.DateTime(timezone=True), nullable=True),
+        # clock_timestamp(), not now(): now() is transaction-START time, and
+        # the fence math (plan section 3.5) compares these stamps against
+        # mail_message.created_at for visibility ordering -- txn-start stamps
+        # from long transactions break that ordering.
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.text("now()"),
+            server_default=sa.text("clock_timestamp()"),
         ),
         sa.Column(
             "updated_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.text("now()"),
+            server_default=sa.text("clock_timestamp()"),
         ),
         sa.CheckConstraint(
             "status IN ('preparing','inflight','sent','unknown','failed','abandoned','expired')",
@@ -86,6 +90,20 @@ def upgrade() -> None:
 
     op.add_column(
         "mail_thread", sa.Column("replied_at", sa.DateTime(timezone=True), nullable=True)
+    )
+
+    # The reply fence resolves an extraction as already-answered when its
+    # source message's created_at <= mail_thread.replied_at. Postgres now()
+    # is fixed at TRANSACTION start, and ingest runs long multi-thread
+    # transactions (classification inside), so a message committed AFTER a
+    # reply could carry a created_at from BEFORE it -- silently resolving an
+    # obligation the replier never saw. clock_timestamp() stamps the actual
+    # insert moment; combined with ingest locking the thread row before its
+    # message inserts, visibility order and stamp order now agree.
+    op.alter_column(
+        "mail_message",
+        "created_at",
+        server_default=sa.text("clock_timestamp()"),
     )
 
     op.drop_constraint(
@@ -128,6 +146,12 @@ def downgrade() -> None:
         "TO '/tmp/reply_draft_usage_backup.csv' CSV HEADER;\n"
         "DELETE FROM llm_usage_daily WHERE stage = 'reply_draft';",
         "0023_reply_attempt_stage (reply_draft usage rows exist)",
+    )
+
+    op.alter_column(
+        "mail_message",
+        "created_at",
+        server_default=sa.text("now()"),
     )
 
     op.drop_constraint(

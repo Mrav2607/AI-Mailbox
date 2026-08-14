@@ -66,8 +66,8 @@ class ReplyAttempt(Base):
     provider_message_id: Mapped[str | None] = mapped_column(Text)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=text("now()")
+        DateTime(timezone=True), server_default=text("clock_timestamp()")
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=text("now()")
+        DateTime(timezone=True), server_default=text("clock_timestamp()")
     )
