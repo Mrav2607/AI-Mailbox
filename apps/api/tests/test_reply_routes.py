@@ -26,6 +26,7 @@ from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import httpx
+import pytest
 import redis
 from fastapi.testclient import TestClient
 from sqlalchemy.dialects import postgresql
@@ -127,6 +128,11 @@ class _ReplyDB:
     test_reply_reconcile.py's `_FakeDB` docstring).
     """
 
+    # Sentinel distinguishing "no override given" from "override to None" --
+    # the F1 regression test needs to set the locked read to a value
+    # different from `thread.replied_at` (including None).
+    _NO_OVERRIDE = object()
+
     def __init__(
         self,
         *,
@@ -136,6 +142,7 @@ class _ReplyDB:
         attempt_status="inflight",
         already_sent_message=None,
         fail_thread_lock=False,
+        locked_replied_at=_NO_OVERRIDE,
     ):
         self.thread = thread
         self.account = account
@@ -143,6 +150,12 @@ class _ReplyDB:
         self.attempt_status = attempt_status
         self.already_sent_message = already_sent_message
         self.fail_thread_lock = fail_thread_lock
+        # F1: the value Txn A's column-only, identity-map-bypassing fence
+        # read returns -- defaults to `thread.replied_at` (the common case
+        # where nothing raced it), but a test can point it somewhere else
+        # to simulate a fence that committed between the route's earlier
+        # `db.get(MailThread, ...)` and this locked re-read.
+        self.locked_replied_at = locked_replied_at
         self.statements = []
         self.commits = 0
         self.rollbacks = 0
@@ -195,6 +208,18 @@ class _ReplyDB:
         if "AND mail_message.provider_message_id" in compiled:
             rows = [self.already_sent_message] if self.already_sent_message else []
             return _FakeResult(value=self.already_sent_message, rows=rows)
+        # Txn A's fence read (F1): a column-only SELECT ... FOR UPDATE,
+        # distinct from the plain full-row lock below -- checked first
+        # since it also contains "FOR UPDATE"/"FROM mail_thread".
+        if compiled.startswith("SELECT mail_thread.replied_at") and "FOR UPDATE" in compiled:
+            if self.fail_thread_lock:
+                raise OperationalError("SELECT ... FOR UPDATE", {}, Exception("lock timeout"))
+            value = (
+                self.thread.replied_at
+                if self.locked_replied_at is self._NO_OVERRIDE
+                else self.locked_replied_at
+            )
+            return _FakeResult(value=value)
         if "FOR UPDATE" in compiled and "FROM mail_thread" in compiled:
             if self.fail_thread_lock:
                 raise OperationalError("SELECT ... FOR UPDATE", {}, Exception("lock timeout"))
@@ -573,6 +598,72 @@ def test_reply_outlook_refreshes_expired_token_before_sending(monkeypatch):
     assert used_tokens == ["fresh-outlook-token"]
 
 
+def test_reply_gmail_refreshes_token_within_expiry_skew_buffer(monkeypatch):
+    """F8: a token expiring a few seconds from now -- inside the 60s skew
+    buffer, so `token_expiry > now` is still technically true -- must still
+    trigger a refresh. The provider sequence must not start with a token
+    that can die mid-request."""
+    user_id = uuid4()
+    account = _account(token_expiry=datetime.now(timezone.utc) + timedelta(seconds=30))
+    thread = _thread(user_id=user_id, account_id=account.id)
+    messages = [_message()]
+    db = _ReplyDB(thread=thread, account=account, messages=messages)
+    _basic_send_stubs(monkeypatch, db)
+
+    refresh_calls = []
+    new_expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    def fake_refresh(provider):
+        refresh_calls.append(provider.id)
+        return "fresh-access-token", new_expiry
+
+    monkeypatch.setattr(reply_routes, "_refresh_gmail_access_token", fake_refresh)
+    monkeypatch.setattr(
+        reply_routes,
+        "gmail_send_reply",
+        lambda client, *, raw, provider_thread_id: {"id": "gmail-sent-1"},
+    )
+
+    client = _client_for(db, user_id)
+    try:
+        resp = _send_request(client, thread.id)
+    finally:
+        _teardown()
+
+    assert resp.status_code == 200
+    assert refresh_calls == [account.id]
+
+
+def test_reply_gmail_does_not_refresh_token_comfortably_outside_skew_buffer(monkeypatch):
+    """The complement: a token expiring well past the 60s buffer is left
+    alone -- refresh must not fire on every request."""
+    user_id = uuid4()
+    account = _account(token_expiry=datetime.now(timezone.utc) + timedelta(minutes=10))
+    thread = _thread(user_id=user_id, account_id=account.id)
+    messages = [_message()]
+    db = _ReplyDB(thread=thread, account=account, messages=messages)
+    _basic_send_stubs(monkeypatch, db)
+
+    monkeypatch.setattr(
+        reply_routes,
+        "_refresh_gmail_access_token",
+        lambda provider: pytest.fail("must not refresh a comfortably fresh token"),
+    )
+    monkeypatch.setattr(
+        reply_routes,
+        "gmail_send_reply",
+        lambda client, *, raw, provider_thread_id: {"id": "gmail-sent-1"},
+    )
+
+    client = _client_for(db, user_id)
+    try:
+        resp = _send_request(client, thread.id)
+    finally:
+        _teardown()
+
+    assert resp.status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # Lock / stale / in-flight / override / superseded (§3.6 step 1)
 # ---------------------------------------------------------------------------
@@ -604,6 +695,39 @@ def test_reply_state_stale_when_expected_replied_at_mismatches():
     )
     messages = [_message()]
     db = _ReplyDB(thread=thread, account=account, messages=messages)
+    client = _client_for(db, user_id)
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread.id}/reply",
+            json={"body_text": "hi", "expected_replied_at": None},
+        )
+    finally:
+        _teardown()
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "reply_state_stale"
+
+
+def test_reply_state_stale_detected_via_locked_column_read_bypassing_identity_map():
+    """F1: the fence check must read `replied_at` via a column-only, FOR
+    UPDATE select -- not the identity-mapped object from the route's
+    earlier `db.get(MailThread, ...)`. Simulated by a fake DB that answers
+    the two reads differently: the thread snapshot still shows
+    `replied_at=None` (what the client's `expected_replied_at` agrees
+    with), but the locked column read reflects a reply that committed in
+    between -- this must still surface as `reply_state_stale`, not a
+    silent pass-through that a stale identity-mapped object would produce.
+    """
+    user_id = uuid4()
+    account = _account()
+    thread = _thread(user_id=user_id, account_id=account.id, replied_at=None)
+    messages = [_message()]
+    concurrent_fence = datetime.now(timezone.utc)
+    db = _ReplyDB(
+        thread=thread,
+        account=account,
+        messages=messages,
+        locked_replied_at=concurrent_fence,
+    )
     client = _client_for(db, user_id)
     try:
         resp = client.post(
@@ -831,6 +955,114 @@ def test_reply_send_outcome_unknown_on_5xx(monkeypatch):
     assert resp.json()["detail"]["code"] == "send_outcome_unknown"
 
 
+def test_reply_unknown_outcome_enqueue_failure_does_not_mask_502(monkeypatch):
+    """F3: a dead broker on the ambiguous-outcome reconcile enqueue must not
+    turn the honest 502 send_outcome_unknown into an unrelated 500 -- the
+    durable attempt row (already marked `unknown`) is the real guarantee,
+    this enqueue is only timeliness."""
+    user_id = uuid4()
+    account = _account()
+    thread = _thread(user_id=user_id, account_id=account.id)
+    messages = [_message()]
+    db = _ReplyDB(thread=thread, account=account, messages=messages)
+    _basic_send_stubs(monkeypatch, db)
+
+    def raise_timeout(client, *, raw, provider_thread_id):
+        raise httpx.ConnectTimeout("timed out")
+
+    monkeypatch.setattr(reply_routes, "gmail_send_reply", raise_timeout)
+    monkeypatch.setattr(
+        reply_routes.reconcile_reply_attempt,
+        "apply_async",
+        MagicMock(side_effect=RuntimeError("broker is down")),
+    )
+
+    client = _client_for(db, user_id)
+    try:
+        resp = _send_request(client, thread.id)
+    finally:
+        _teardown()
+    assert resp.status_code == 502
+    assert resp.json()["detail"]["code"] == "send_outcome_unknown"
+
+
+def test_reply_outlook_403_on_create_reply_maps_to_missing_scope(monkeypatch):
+    """F6: a Graph 403 (permission revoked between the up-front scope check
+    and now) surfaces as the same missing_scope/409 the up-front gate
+    returns, not a generic send_rejected -- and the attempt is marked
+    failed, not left dangling inflight."""
+    user_id = uuid4()
+    account = _account(provider="outlook", scope="Mail.ReadWrite Mail.Send", display_email=_SELF)
+    thread = _thread(user_id=user_id, account_id=account.id, provider="outlook")
+    messages = [_message()]
+    db = _ReplyDB(thread=thread, account=account, messages=messages)
+    _basic_send_stubs(monkeypatch, db)
+
+    mark_failed_calls = []
+    monkeypatch.setattr(
+        reply_routes, "mark_failed", lambda db, *, attempt_id: mark_failed_calls.append(attempt_id)
+    )
+
+    def raise_403(client, *, message_id, reply_all, comment):
+        raise SendError(
+            "missing_scope",
+            "This account needs to be reconnected to grant reply-send permission.",
+        )
+
+    monkeypatch.setattr(reply_routes, "create_reply_draft", raise_403)
+
+    client = _client_for(db, user_id)
+    try:
+        resp = _send_request(client, thread.id)
+    finally:
+        _teardown()
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "missing_scope"
+    assert len(mark_failed_calls) == 1
+
+
+def test_reply_outlook_403_on_send_draft_maps_to_missing_scope(monkeypatch):
+    """F6: the same 403-during-the-send-step case -- the draft was created
+    but sending it was rejected, nothing went out."""
+    user_id = uuid4()
+    account = _account(provider="outlook", scope="Mail.ReadWrite Mail.Send", display_email=_SELF)
+    thread = _thread(user_id=user_id, account_id=account.id, provider="outlook")
+    messages = [_message()]
+    db = _ReplyDB(thread=thread, account=account, messages=messages)
+    _basic_send_stubs(monkeypatch, db)
+
+    monkeypatch.setattr(
+        reply_routes,
+        "create_reply_draft",
+        lambda client, *, message_id, reply_all, comment: {
+            "id": "draft-1",
+            "body": {"contentType": "text", "content": comment},
+            "bodyPreview": comment[:50],
+        },
+    )
+    mark_failed_calls = []
+    monkeypatch.setattr(
+        reply_routes, "mark_failed", lambda db, *, attempt_id: mark_failed_calls.append(attempt_id)
+    )
+
+    def raise_403(client, *, draft_id):
+        raise SendError(
+            "missing_scope",
+            "This account needs to be reconnected to grant reply-send permission.",
+        )
+
+    monkeypatch.setattr(reply_routes, "send_reply_draft", raise_403)
+
+    client = _client_for(db, user_id)
+    try:
+        resp = _send_request(client, thread.id)
+    finally:
+        _teardown()
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "missing_scope"
+    assert len(mark_failed_calls) == 1
+
+
 def test_reply_outlook_cap_violation_marks_failed_and_returns_422(monkeypatch):
     user_id = uuid4()
     account = _account(provider="outlook", scope="Mail.ReadWrite Mail.Send", display_email=_SELF)
@@ -978,6 +1210,43 @@ def test_reply_outlook_success_builds_ephemeral_message_and_enqueues_reconcile(m
     assert body["message"]["body_text"] == "hi"
     reconcile_mock.assert_called_once()
     assert reconcile_mock.call_args.kwargs["args"] == [str(account.id)]
+
+
+def test_reply_outlook_success_enqueue_failure_does_not_mask_200(monkeypatch):
+    """F3: the same guard on the success-path enqueue -- the reply already
+    went out and the completion txn already committed, so a dead broker
+    here must not turn that into a 500."""
+    user_id = uuid4()
+    account = _account(provider="outlook", scope="Mail.ReadWrite Mail.Send", display_email=_SELF)
+    thread = _thread(user_id=user_id, account_id=account.id, provider="outlook")
+    messages = [_message()]
+    db = _ReplyDB(thread=thread, account=account, messages=messages)
+    _basic_send_stubs(monkeypatch, db)
+
+    monkeypatch.setattr(
+        reply_routes,
+        "create_reply_draft",
+        lambda client, *, message_id, reply_all, comment: {
+            "id": "draft-1",
+            "body": {"contentType": "text", "content": comment},
+            "bodyPreview": comment[:50],
+        },
+    )
+    monkeypatch.setattr(reply_routes, "send_reply_draft", lambda client, *, draft_id: None)
+    monkeypatch.setattr(
+        reply_routes.reconcile_reply_attempt,
+        "apply_async",
+        MagicMock(side_effect=RuntimeError("broker is down")),
+    )
+
+    client = _client_for(db, user_id)
+    try:
+        resp = _send_request(client, thread.id)
+    finally:
+        _teardown()
+
+    assert resp.status_code == 200
+    assert resp.json()["message"]["body_text"] == "hi"
 
 
 # ---------------------------------------------------------------------------

@@ -32,7 +32,7 @@ import type { ReadingSide } from "@/lib/layout";
 import { gmailThreadUrl } from "@/lib/utils";
 import { PaneDragHandle } from "./ConsoleLayout";
 import { Popover } from "./Popover";
-import { ReplyComposer } from "./ReplyComposer";
+import { ReplyComposer, type ReplyStateRefetch } from "./ReplyComposer";
 
 const fieldLabel = "font-mono text-[11px] text-muted-foreground";
 const control =
@@ -198,7 +198,7 @@ interface Props {
   composerFocusToken?: number;
   onReplySent?: (threadId: string, result: ReplySent) => void;
   onReconnect?: () => void;
-  onRefetchReplyState?: (threadId: string) => Promise<string | null>;
+  onRefetchReplyState?: (threadId: string) => Promise<ReplyStateRefetch>;
 }
 
 export function ThreadDetailPane({
@@ -227,6 +227,11 @@ export function ThreadDetailPane({
   onRefetchReplyState,
 }: Props) {
   const CollapseIcon = COLLAPSE_ICONS[side];
+  // The composer needs all three callbacks to function (open/close, send
+  // completion, and the stale-reply refetch) -- a caller wiring up only
+  // onComposerOpenChange would otherwise get a Reply button that toggles a
+  // composer that never actually renders. One flag gates both.
+  const composerEnabled = !!(onComposerOpenChange && onReplySent && onRefetchReplyState);
   if (error) {
     if (onBack) {
       return (
@@ -329,6 +334,7 @@ export function ThreadDetailPane({
             {data.thread.replied_at && (
               <span
                 title={`Replied ${absTime(data.thread.replied_at)}`}
+                role="img"
                 aria-label={`Replied ${absTime(data.thread.replied_at)}`}
                 className="inline-flex shrink-0 items-center text-muted-foreground/80"
               >
@@ -357,9 +363,9 @@ export function ThreadDetailPane({
               <ExternalLink className="h-3.5 w-3.5" />
             </a>
           )}
-          {onComposerOpenChange && (
+          {composerEnabled && (
             <button
-              onClick={() => onComposerOpenChange(!composerOpen)}
+              onClick={() => onComposerOpenChange!(!composerOpen)}
               aria-label={composerOpen ? "Hide reply composer" : "Reply"}
               aria-pressed={!!composerOpen}
               title={composerOpen ? "Hide reply ( Shift R )" : "Reply ( Shift R )"}
@@ -556,7 +562,7 @@ export function ThreadDetailPane({
         ))}
       </div>
 
-      {onComposerOpenChange && onReplySent && onRefetchReplyState && (
+      {composerEnabled && (
         <ReplyComposer
           key={data.thread.id}
           threadId={data.thread.id}
@@ -565,10 +571,10 @@ export function ThreadDetailPane({
           messages={data.messages}
           selfAddress={data.thread.account_email}
           open={!!composerOpen}
-          onOpenChange={onComposerOpenChange}
-          onSent={onReplySent}
+          onOpenChange={onComposerOpenChange!}
+          onSent={onReplySent!}
           onReconnect={onReconnect}
-          onRefetchReplyState={onRefetchReplyState}
+          onRefetchReplyState={onRefetchReplyState!}
           focusToken={composerFocusToken}
         />
       )}

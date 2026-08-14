@@ -237,13 +237,16 @@ def generate_message_id() -> str:
 def threading_headers(target_message: Any) -> tuple[str | None, str | None]:
     """`In-Reply-To`/`References` derived from the reply target's OWN stored
     headers -- `In-Reply-To` is its Message-ID, `References` appends that
-    onto whatever References chain it already carried (RFC 5322 §5.1)."""
+    onto whatever References chain it already carried (RFC 5322 §5.1). Both
+    are stored provider data, so they go through the same CRLF guard as the
+    address headers (F4) -- a value with an embedded line break is dropped
+    outright rather than risking an interior CRLF in the assembled MIME."""
     headers = target_message.headers or {}
-    target_msg_id = header_value(headers, "Message-ID")
-    in_reply_to = target_msg_id.strip() if target_msg_id else None
-    existing_refs = header_value(headers, "References")
+    target_msg_id = _clean_header_value(header_value(headers, "Message-ID"))
+    in_reply_to = target_msg_id.strip() or None
+    existing_refs = _clean_header_value(header_value(headers, "References"))
     parts = []
-    if existing_refs:
+    if existing_refs.strip():
         parts.append(existing_refs.strip())
     if in_reply_to:
         parts.append(in_reply_to)
@@ -253,8 +256,11 @@ def threading_headers(target_message: Any) -> tuple[str | None, str | None]:
 
 def _reply_subject(subject: str | None) -> str:
     """`Re: <original>` -- idempotent: an already-`Re:`-prefixed subject is
-    left alone rather than getting a second prefix."""
-    cleaned = (subject or "").strip()
+    left alone rather than getting a second prefix. Subject is stored
+    provider data too (F4): a value with an embedded CR/LF is dropped by the
+    same guard as the address headers, which lands it on the same "Re:"
+    fallback a genuinely blank subject already gets."""
+    cleaned = _clean_header_value(subject).strip()
     if not cleaned:
         return "Re:"
     if cleaned.lower().startswith("re:"):
@@ -281,10 +287,16 @@ def build_reply_mime(
         msg["Cc"] = ", ".join(recipients.cc)
     msg["Subject"] = _reply_subject(subject)
     msg["Message-ID"] = message_id
-    if in_reply_to:
-        msg["In-Reply-To"] = in_reply_to
-    if references:
-        msg["References"] = references
+    # `in_reply_to`/`references` are already cleaned by `threading_headers`
+    # at the call site, but guarded again here too (F4) -- this is the
+    # actual assembly boundary, and compat32's `as_bytes()` will happily
+    # emit an interior CRLF from any caller that skips that step.
+    cleaned_in_reply_to = _clean_header_value(in_reply_to)
+    if cleaned_in_reply_to:
+        msg["In-Reply-To"] = cleaned_in_reply_to
+    cleaned_references = _clean_header_value(references)
+    if cleaned_references:
+        msg["References"] = cleaned_references
     msg.set_content(body_text)
     return base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
 
@@ -317,12 +329,19 @@ def start_attempt(
     return attempt
 
 
-def expire_stale_preparing(db: Session, *, thread_id: UUID) -> int:
+def expire_stale_preparing(db: Session, *, thread_id: UUID, now: datetime | None = None) -> int:
     """`preparing` -> `expired` for rows older than `PREPARING_TTL` on this
     thread -- an explicit fencing transition (never a silent age-out), run
     under the thread lock before a new request admits itself. Returns the
-    number of rows expired."""
-    cutoff = datetime.now(timezone.utc) - PREPARING_TTL
+    number of rows expired.
+
+    `now` lets the caller pin ONE instant for both this call and the
+    matching `find_blocking_attempt` call right after it -- the two
+    predicates are meant to be exact complements, and each deriving its own
+    `datetime.now()` would let a row fall in the gap between them (neither
+    expired nor blocking) if the clock ticked past the TTL boundary between
+    the two calls."""
+    cutoff = (now or datetime.now(timezone.utc)) - PREPARING_TTL
     result = db.execute(
         update(ReplyAttempt)
         .where(
@@ -335,15 +354,21 @@ def expire_stale_preparing(db: Session, *, thread_id: UUID) -> int:
     return result.rowcount or 0
 
 
-def find_blocking_attempt(db: Session, *, thread_id: UUID) -> ReplyAttempt | None:
+def find_blocking_attempt(
+    db: Session, *, thread_id: UUID, now: datetime | None = None
+) -> ReplyAttempt | None:
     """The current in-flight guard's blocker, if any: a `preparing` row
     younger than `PREPARING_TTL`, or ANY `inflight`/`unknown` row regardless
     of age (time never unblocks an attempt that may have reached the
     provider). Call `expire_stale_preparing` first under the same lock so a
     stale `preparing` row never blocks. Newest first -- there should only
     ever be at most one live blocker, but this is defensive.
+
+    `now` should be the SAME instant passed to the `expire_stale_preparing`
+    call immediately before this one -- see that function's docstring for
+    why the two must share a cutoff.
     """
-    cutoff = datetime.now(timezone.utc) - PREPARING_TTL
+    cutoff = (now or datetime.now(timezone.utc)) - PREPARING_TTL
     return (
         db.execute(
             select(ReplyAttempt)

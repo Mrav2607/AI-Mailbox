@@ -80,6 +80,7 @@ import { AgendaList } from "@/components/console/AgendaList";
 import { BucketSidebar } from "@/components/console/BucketSidebar";
 import { ThreadList } from "@/components/console/ThreadList";
 import { ThreadDetailPane } from "@/components/console/ThreadDetailPane";
+import type { ReplyStateRefetch } from "@/components/console/ReplyComposer";
 import { TopBar } from "@/components/console/TopBar";
 import { CommandPalette } from "@/components/console/CommandPalette";
 import { Shortcuts } from "@/components/console/Shortcuts";
@@ -1169,17 +1170,20 @@ export default function Console() {
   // rest of the pane, not just the fence) and hand the composer back the
   // freshest replied_at to resubmit with on explicit confirm.
   const refetchReplyState = useCallback(
-    async (threadId: string): Promise<string | null> => {
+    async (threadId: string): Promise<ReplyStateRefetch> => {
       try {
         const d = await getThread(threadId);
         // The operator may have navigated to a different thread while this
         // was in flight — don't let a stale response clobber what's on
         // screen now.
         if (selectedIdRef.current === threadId) setThread(d);
-        return d.thread.replied_at;
+        return { ok: true, repliedAt: d.thread.replied_at };
       } catch (e) {
         if (e instanceof ApiError && e.status === 401) handleSessionExpired();
-        return null;
+        // The composer must not treat a failed refetch as "confirmed
+        // unchanged" — that would enable Send-anyway to resubmit with a null
+        // fence and bypass reply_state_stale on a mere network blip.
+        return { ok: false };
       }
     },
     [handleSessionExpired],
@@ -2607,8 +2611,17 @@ export default function Console() {
       // has loaded (plan §3.10) — `r` above is refresh, this is the shifted
       // "R" character, so the two never collide. A no-op with nothing loaded,
       // or on narrow layouts where the reading pane isn't the visible one.
+      // Same stale-thread guard as detailThreadId below: `thread` can still
+      // be the PREVIOUS thread while a newer selectedId's fetch is in
+      // flight, and without this check j then Shift+R inside that window
+      // opens the composer over (and replies to) the wrong thread.
       if (e.key === "R") {
-        if (!thread || (isNarrow && narrowPane !== "reading")) return;
+        if (
+          !thread ||
+          thread.thread.id !== selectedId ||
+          (isNarrow && narrowPane !== "reading")
+        )
+          return;
         e.preventDefault();
         setComposerOpen(true);
         setComposerFocusToken((n) => n + 1);

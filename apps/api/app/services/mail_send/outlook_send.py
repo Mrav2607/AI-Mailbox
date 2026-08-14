@@ -20,6 +20,17 @@ from app.core.logging import logger
 from app.services.ingest.outlook_client import OutlookClient
 from app.services.mail_send.common import MAX_RECIPIENTS, SendError
 
+# A 403 from createReply/send means the stored-scope check up front passed
+# but the permission was revoked in between (e.g. an admin pulled consent)
+# -- surfaced the same way the up-front scope gate is (F6), not as a
+# generic send_rejected.
+_MISSING_SCOPE_MESSAGE = "This account needs to be reconnected to grant reply-send permission."
+
+
+def _raise_missing_scope_if_forbidden(exc: httpx.HTTPStatusError) -> None:
+    if exc.response is not None and exc.response.status_code == 403:
+        raise SendError("missing_scope", _MISSING_SCOPE_MESSAGE) from exc
+
 
 def create_reply_draft(
     client: OutlookClient, *, message_id: str, reply_all: bool, comment: str
@@ -29,7 +40,11 @@ def create_reply_draft(
     `SendError("too_many_recipients")` on violation -- draft inspection is
     the only way to see the count Graph actually chose to CC/BCC.
     """
-    draft = client.create_reply(message_id, reply_all=reply_all, comment=comment)
+    try:
+        draft = client.create_reply(message_id, reply_all=reply_all, comment=comment)
+    except httpx.HTTPStatusError as exc:
+        _raise_missing_scope_if_forbidden(exc)
+        raise
     draft_id = draft.get("id")
     if not draft_id:
         raise SendError("send_rejected", "Graph did not return a draft id")
@@ -40,7 +55,12 @@ def create_reply_draft(
     if total > MAX_RECIPIENTS:
         try:
             client.delete_draft(draft_id)
-        except httpx.HTTPStatusError:
+        except httpx.HTTPError:
+            # Widened from HTTPStatusError (F5): a Timeout/ConnectError here
+            # means cleanup failed, not that the cap violation didn't
+            # happen -- it must not escape and get misclassified upstream
+            # as send_outcome_unknown (nothing was ever sent). The intended
+            # too_many_recipients error below still raises either way.
             logger.warning(
                 "failed to delete over-cap Outlook reply draft %s", draft_id
             )
@@ -53,7 +73,11 @@ def create_reply_draft(
 
 def send_reply_draft(client: OutlookClient, *, draft_id: str) -> None:
     """POST /send for an already-created, already-cap-checked draft."""
-    client.send_draft(draft_id)
+    try:
+        client.send_draft(draft_id)
+    except httpx.HTTPStatusError as exc:
+        _raise_missing_scope_if_forbidden(exc)
+        raise
 
 
 def build_ephemeral_message(

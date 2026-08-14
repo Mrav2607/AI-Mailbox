@@ -70,6 +70,7 @@ function RepliedBadge() {
   return (
     <span
       title="Replied"
+      role="img"
       aria-label="Replied"
       className="shrink-0 inline-flex items-center text-muted-foreground/70"
     >

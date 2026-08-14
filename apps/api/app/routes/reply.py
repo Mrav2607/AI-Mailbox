@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import base64
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
 from typing import Any, NoReturn
 from uuid import UUID
@@ -106,6 +106,13 @@ _SEND_ERROR_STATUS: dict[str, int] = {
 # so we derive one the same rough way the console displays one elsewhere.
 _SNIPPET_MAX_LEN = 200
 
+# Proactive-refresh buffer (plan §4.2, F8): a token that's merely close to
+# expiry -- not yet past it -- must not be handed to the provider sequence,
+# since Outlook's two-call choreography plus Gmail's own retries can eat
+# more than a few seconds. Refresh a little early instead of racing a 401
+# mid-sequence.
+_TOKEN_EXPIRY_SKEW = timedelta(seconds=60)
+
 
 class ReplyRequest(BaseModel):
     body_text: str
@@ -168,7 +175,7 @@ def _ensure_fresh_access_token(db: Session, account: ProviderAccount) -> str:
     which is the same dead end as no refresh token at all.
     """
     now = datetime.now(timezone.utc)
-    if account.token_expiry and account.token_expiry > now:
+    if account.token_expiry and account.token_expiry > now + _TOKEN_EXPIRY_SKEW:
         return account.access_token
 
     if account.provider == "gmail":
@@ -274,9 +281,17 @@ def _unknown_send(db: Session, *, attempt_id: UUID, provider_account_id: UUID) -
     an explicit override) resolves it."""
     mark_unknown(db, attempt_id=attempt_id)
     db.commit()
-    reconcile_reply_attempt.apply_async(
-        args=[str(provider_account_id)], countdown=_RECONCILE_COUNTDOWN_SECONDS
-    )
+    # A dead broker here must not turn an honest "may have sent" 502 into a
+    # 500 -- the durable attempt row is the real guarantee (it keeps the
+    # in-flight guard closed), this enqueue is only timeliness.
+    try:
+        reconcile_reply_attempt.apply_async(
+            args=[str(provider_account_id)], countdown=_RECONCILE_COUNTDOWN_SECONDS
+        )
+    except Exception:
+        logger.warning(
+            "reconcile_reply_attempt enqueue failed for unknown attempt %s", attempt_id
+        )
     raise _http_error(
         "send_outcome_unknown",
         "Your reply may have been sent. The thread will update once your "
@@ -414,8 +429,19 @@ def send_reply(
     # request.
     db.execute(text("SET LOCAL lock_timeout = '2s'"))
     try:
-        locked_thread = db.execute(
-            select(MailThread).where(MailThread.id == thread_id).with_for_update()
+        # Column-only select, bypassing the identity map (mailbox.py's
+        # set_thread_done idiom) -- `thread` above came from a plain
+        # db.get() and is already sitting in the session identity map. A
+        # follow-up select(MailThread)...with_for_update() would return
+        # that SAME cached object without refreshing its attributes (the
+        # ORM only repopulates an already-loaded object with
+        # populate_existing()), so a concurrent reply that committed
+        # between the two reads would go undetected -- the fence check
+        # would compare the pre-lock snapshot against itself. Selecting
+        # just the column skips the identity map entirely and always
+        # reflects the row as it exists once the lock is actually held.
+        locked_replied_at = db.execute(
+            select(MailThread.replied_at).where(MailThread.id == thread_id).with_for_update()
         ).scalar_one()
     except OperationalError as exc:
         db.rollback()
@@ -425,7 +451,7 @@ def send_reply(
             409,
         ) from exc
 
-    if not _same_instant(payload.expected_replied_at, locked_thread.replied_at):
+    if not _same_instant(payload.expected_replied_at, locked_replied_at):
         db.rollback()
         raise _http_error(
             "reply_state_stale",
@@ -435,9 +461,12 @@ def send_reply(
 
     # Stale-preparing expiry runs under the lock, before this request admits
     # itself (P5-1), so the in-flight guard below never blocks on a row that
-    # should already be terminal.
-    expire_stale_preparing(db, thread_id=thread_id)
-    blocker = find_blocking_attempt(db, thread_id=thread_id)
+    # should already be terminal. One shared `now` for expiry and both
+    # blocker lookups (F7) -- the two predicates are exact complements, and
+    # each deriving its own clock read could let a row fall between them.
+    lock_time = datetime.now(timezone.utc)
+    expire_stale_preparing(db, thread_id=thread_id, now=lock_time)
+    blocker = find_blocking_attempt(db, thread_id=thread_id, now=lock_time)
 
     if (
         blocker is not None
@@ -448,7 +477,7 @@ def send_reply(
         # this same lock, so a stale id from a second tab can't bypass a
         # newer blocker.
         abandon_attempt(db, attempt_id=payload.override_attempt_id)
-        blocker = find_blocking_attempt(db, thread_id=thread_id)
+        blocker = find_blocking_attempt(db, thread_id=thread_id, now=lock_time)
 
     if blocker is not None:
         # Commit here, not rollback -- the expiry/abandon writes above are
@@ -572,6 +601,13 @@ def send_reply(
         _unknown_send(db, attempt_id=attempt_id, provider_account_id=provider_account_id)
     try:
         send_reply_draft(client, draft_id=draft["id"])
+    except SendError as exc:
+        # F6: a Graph 403 on the send step too (permission revoked between
+        # the up-front scope check and now) -- draft-stage failure, nothing
+        # was sent, settled the same way create_reply_draft's SendError is.
+        mark_failed(db, attempt_id=attempt_id)
+        db.commit()
+        raise _send_error_response(exc) from exc
     except httpx.HTTPError as exc:
         _handle_provider_exception(
             exc, db, attempt_id=attempt_id, provider_account_id=provider_account_id
@@ -790,10 +826,18 @@ def _complete_outlook_send(
     ).scalar_one()
     # Timeliness (plan §3.4): enqueued on SUCCESS too, not just `unknown` --
     # the authoritative Sent Items copy still needs correlating and
-    # classifying, and nothing else proactively chases that down.
-    reconcile_reply_attempt.apply_async(
-        args=[str(account_id)], countdown=_RECONCILE_COUNTDOWN_SECONDS
-    )
+    # classifying, and nothing else proactively chases that down. A dead
+    # broker here must not turn an already-sent reply into a 500 -- the
+    # reply went out and the completion txn above already committed; this
+    # enqueue only affects how quickly the real message shows up.
+    try:
+        reconcile_reply_attempt.apply_async(
+            args=[str(account_id)], countdown=_RECONCILE_COUNTDOWN_SECONDS
+        )
+    except Exception:
+        logger.warning(
+            "reconcile_reply_attempt enqueue failed for sent attempt %s", attempt_id
+        )
     ephemeral = build_ephemeral_message(
         draft,
         attempt_id=attempt_id,

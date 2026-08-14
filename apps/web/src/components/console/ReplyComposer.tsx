@@ -48,6 +48,21 @@ const RECONNECT_CODES = new Set([
   "account_identity_unavailable",
 ]);
 
+// Only the two credential-shaped draft codes mean "this stays broken until
+// you fix the credential" -- reply_draft_failed is a one-off failure the
+// operator can just retry, so it must not join this set (see handleDraft).
+const DRAFT_CREDENTIAL_CODES = new Set([
+  "reply_draft_credential_missing",
+  "reply_draft_credential_blocked",
+]);
+
+// Result of a reply_state_stale refetch (plan §3.9). Distinguishing "the
+// refetch itself failed" from "it succeeded and the thread is unchanged"
+// matters: collapsing both to a bare replied_at lets a network blip during
+// the refetch masquerade as a confirmed fresh state, enabling "Send anyway"
+// to resubmit expected_replied_at: null and bypass the fence entirely.
+export type ReplyStateRefetch = { ok: true; repliedAt: string | null } | { ok: false };
+
 // Pulls the bare address out of a "Display Name <addr@x.com>" sender string
 // (or returns a plain address as-is). Lowercased for self-address exclusion.
 function extractAddress(raw: string | null): string | null {
@@ -108,9 +123,11 @@ interface Props {
   // happen in practice -- every thread has an owning account -- but the
   // composer degrades to plain copy rather than a dead button).
   onReconnect?: () => void;
-  // Re-fetches the thread and returns its fresh replied_at, for the
-  // reply_state_stale recovery (plan §3.9): refetch -> user-confirmed resend.
-  onRefetchReplyState: (threadId: string) => Promise<string | null>;
+  // Re-fetches the thread for the reply_state_stale recovery (plan §3.9):
+  // refetch -> user-confirmed resend. Must report whether the refetch itself
+  // succeeded (see ReplyStateRefetch) -- a failed refetch is not the same as
+  // a successful one that confirms nothing changed.
+  onRefetchReplyState: (threadId: string) => Promise<ReplyStateRefetch>;
   // Bumped by the parent on every Shift+R press so the textarea re-focuses
   // even when the composer was already open (plan §3.10).
   focusToken?: number;
@@ -143,7 +160,14 @@ export function ReplyComposer({
   // the composer is waiting on an explicit "send anyway" confirmation.
   const [staleConfirm, setStaleConfirm] = useState(false);
   const [freshRepliedAt, setFreshRepliedAt] = useState<string | null>(null);
+  // Persistent: only set for the two credential codes, and only cleared by
+  // reconnecting/reconfiguring (there's no retry that would change the
+  // outcome). Separate from draftError below, which IS retryable.
   const [draftBlocked, setDraftBlocked] = useState<string | null>(null);
+  // reply_draft_failed's one-off message -- clears itself on the next draft
+  // attempt, unlike draftBlocked which sticks around until the credential is
+  // fixed.
+  const [draftError, setDraftError] = useState<string | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Mirrors `phase === "sending"`, but read/written synchronously (see
@@ -165,6 +189,7 @@ export function ReplyComposer({
       setErrorMessage(null);
       setBlockerAttemptId(null);
       setStaleConfirm(false);
+      setDraftError(null);
     }
   }, [open]);
 
@@ -175,9 +200,20 @@ export function ReplyComposer({
     if (code === "reply_state_stale") {
       setErrorCode(code);
       setErrorMessage(SEND_ERROR_COPY[code]);
-      const fresh = await onRefetchReplyState(threadId);
-      setFreshRepliedAt(fresh);
-      setStaleConfirm(true);
+      const refetch = await onRefetchReplyState(threadId);
+      // A failed refetch must not enable "Send anyway": that would resubmit
+      // expected_replied_at: null, which bypasses the fence entirely on what
+      // might be nothing more than a network blip. Only a *successful*
+      // refetch gets to offer the confirm-and-resend banner.
+      if (refetch.ok) {
+        setFreshRepliedAt(refetch.repliedAt);
+        setStaleConfirm(true);
+      } else {
+        setErrorCode(null);
+        setErrorMessage(
+          "This thread changed since you opened it, and CortexMail couldn't refresh it to confirm. Check your connection and try sending again.",
+        );
+      }
       return;
     }
     if (code === "reply_in_flight") {
@@ -205,6 +241,14 @@ export function ReplyComposer({
     setPhase("sending");
     setErrorCode(null);
     setErrorMessage(null);
+    // Recovery banners (stale-confirm, in-flight-blocker) are only cleared
+    // on success today -- so a "Send anyway"/"Abandon and send anyway" retry
+    // that fails with a *different* code (rate_limited, send_rejected, ...)
+    // left the old recovery prompt on screen with no visible new error. Every
+    // fresh attempt starts clean; handleSendError re-arms whichever banner
+    // still applies.
+    setStaleConfirm(false);
+    setBlockerAttemptId(null);
     try {
       const result = await sendReply(threadId, {
         bodyText: trimmed,
@@ -235,6 +279,7 @@ export function ReplyComposer({
   async function handleDraft() {
     if (phase !== "idle" || draftBlocked) return;
     setPhase("drafting");
+    setDraftError(null);
     try {
       const result = await draftReply(threadId);
       // A deliberate click on "Draft with AI" is a fresh-start action --
@@ -244,8 +289,16 @@ export function ReplyComposer({
       textareaRef.current?.focus();
     } catch (e) {
       setPhase("idle");
-      if (e instanceof ApiError && e.code && DRAFT_ERROR_COPY[e.code]) {
+      if (e instanceof ApiError && e.code && DRAFT_CREDENTIAL_CODES.has(e.code)) {
+        // Credential codes stay broken until the operator fixes the
+        // credential -- disabling the button (rather than just showing an
+        // error) is the right call here.
         setDraftBlocked(DRAFT_ERROR_COPY[e.code]);
+      } else if (e instanceof ApiError && e.code && DRAFT_ERROR_COPY[e.code]) {
+        // reply_draft_failed and friends: a one-off failure, not a broken
+        // credential -- the button stays enabled so the operator can just
+        // try again.
+        setDraftError(DRAFT_ERROR_COPY[e.code]);
       } else {
         setErrorCode(null);
         setErrorMessage(
@@ -420,6 +473,11 @@ export function ReplyComposer({
           </button>
         </div>
       </div>
+      {draftError && (
+        <p role="alert" className="text-[11px] font-mono text-destructive">
+          {draftError}
+        </p>
+      )}
       {provider === "outlook" && (
         <p className="text-[10.5px] font-mono text-muted-foreground">
           Sent replies appear in this thread once your mailbox syncs.

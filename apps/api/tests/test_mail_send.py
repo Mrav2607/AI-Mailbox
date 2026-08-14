@@ -320,6 +320,76 @@ def test_build_reply_mime_sets_every_expected_header():
     assert msg.get_content().strip() == "Sounds good."
 
 
+def test_build_reply_mime_crlf_in_subject_is_dropped_not_injected():
+    """F4: Subject is stored provider data too -- an embedded CR/LF must be
+    dropped by the same guard as the address headers, not survive into
+    compat32's as_bytes() as an interior CRLF."""
+    recipients = common.RecipientSet(to=["bob@example.com"], cc=[])
+    raw = common.build_reply_mime(
+        self_address="me@example.com",
+        recipients=recipients,
+        subject="Hi\r\nBcc: evil@example.com",
+        body_text="hi",
+        in_reply_to=None,
+        references=None,
+        message_id="<x@cortexmail.app>",
+    )
+    import base64
+
+    decoded = base64.urlsafe_b64decode(raw.encode("ascii"))
+    assert b"\r\nBcc: evil@example.com" not in decoded
+
+    from email import policy
+    from email.parser import BytesParser
+
+    msg = BytesParser(policy=policy.default).parsebytes(decoded)
+    # Dropped outright -- falls back to the same "Re:" a blank subject gets.
+    assert msg["Subject"] == "Re:"
+
+
+def test_build_reply_mime_crlf_in_references_is_dropped_not_injected():
+    """F4: References comes from the reply target's own stored headers --
+    same CRLF guard, same "never reaches the wire bytes" requirement."""
+    recipients = common.RecipientSet(to=["bob@example.com"], cc=[])
+    raw = common.build_reply_mime(
+        self_address="me@example.com",
+        recipients=recipients,
+        subject="Hello",
+        body_text="hi",
+        in_reply_to="<orig@example.com>",
+        references="<root@example.com>\r\nBcc: evil@example.com",
+        message_id="<x@cortexmail.app>",
+    )
+    import base64
+
+    decoded = base64.urlsafe_b64decode(raw.encode("ascii"))
+    assert b"\r\nBcc: evil@example.com" not in decoded
+
+    from email import policy
+    from email.parser import BytesParser
+
+    msg = BytesParser(policy=policy.default).parsebytes(decoded)
+    # Dropped outright rather than partially sanitized -- References is
+    # absent, not truncated.
+    assert "References" not in msg
+    assert msg["In-Reply-To"] == "<orig@example.com>"
+
+
+def test_threading_headers_crlf_in_stored_headers_is_dropped_at_the_source():
+    """F4: the same guard applied where these values are actually derived
+    from stored provider data, not just at final MIME assembly."""
+    target = _msg(
+        sender="bob@example.com",
+        headers={
+            "Message-ID": "<orig@example.com>\r\nBcc: evil@example.com",
+            "References": "<root@example.com>\r\nBcc: evil@example.com",
+        },
+    )
+    in_reply_to, references = common.threading_headers(target)
+    assert in_reply_to is None
+    assert references is None
+
+
 def test_build_reply_mime_subject_prefix_is_idempotent():
     recipients = common.RecipientSet(to=["bob@example.com"], cc=[])
     raw = common.build_reply_mime(
@@ -429,6 +499,25 @@ def test_mark_failed_widened_cas_shape():
 def test_abandon_attempt_cannot_touch_a_terminal_row():
     db = _FakeDB([_FakeResult(rowcount=0)])
     assert common.abandon_attempt(db, attempt_id=uuid4()) is False
+
+
+def test_expire_stale_preparing_and_find_blocking_attempt_share_cutoff_when_given_same_now():
+    """F7: the two predicates are meant to be exact complements -- passing
+    the same `now` to both must produce the identical cutoff literal, so a
+    row can never fall in the gap between "expired" and "blocking" that two
+    independent `datetime.now()` reads could otherwise open up."""
+    shared_now = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+    expected_cutoff = (shared_now - common.PREPARING_TTL).isoformat(sep=" ")
+
+    db1 = _FakeDB([_FakeResult(rowcount=0)])
+    common.expire_stale_preparing(db1, thread_id=uuid4(), now=shared_now)
+    db2 = _FakeDB([_FakeResult(scalar=None)])
+    common.find_blocking_attempt(db2, thread_id=uuid4(), now=shared_now)
+
+    expire_sql = _compiled_sql(db1.statements[0], literal_binds=True)
+    blocking_sql = _compiled_sql(db2.statements[0], literal_binds=True)
+    assert expected_cutoff in expire_sql
+    assert expected_cutoff in blocking_sql
 
 
 def test_find_blocking_attempt_query_shape_excludes_terminal_statuses():
@@ -656,6 +745,65 @@ def test_outlook_create_reply_draft_missing_id_raises_send_rejected():
     with pytest.raises(common.SendError) as exc:
         outlook_send.create_reply_draft(client, message_id="msg-1", reply_all=False, comment="hi")
     assert exc.value.code == "send_rejected"
+
+
+def test_outlook_create_reply_draft_over_cap_delete_connect_error_still_raises_cap():
+    """F5: a Timeout/ConnectError during cleanup must not escape and get
+    misclassified upstream as send_outcome_unknown -- nothing was ever
+    sent, the cap violation is what actually happened, and the intended
+    too_many_recipients error still fires."""
+    client = MagicMock()
+    client.create_reply.return_value = {
+        "id": "draft-1",
+        "toRecipients": [{"emailAddress": {"address": f"u{i}@example.com"}} for i in range(60)],
+        "ccRecipients": [],
+    }
+    client.delete_draft.side_effect = httpx.ConnectError("connection refused")
+    with pytest.raises(common.SendError) as exc:
+        outlook_send.create_reply_draft(client, message_id="msg-1", reply_all=True, comment="hi")
+    assert exc.value.code == "too_many_recipients"
+    client.delete_draft.assert_called_once_with("draft-1")
+
+
+def test_outlook_create_reply_403_raises_missing_scope():
+    """F6: a Graph 403 from createReply (permission revoked after the
+    stored-scope check passed) surfaces as missing_scope, not a generic
+    provider-error passthrough."""
+    client = MagicMock()
+    request = httpx.Request("POST", "https://graph.microsoft.com/x")
+    response = httpx.Response(403, request=request)
+    client.create_reply.side_effect = httpx.HTTPStatusError(
+        "forbidden", request=request, response=response
+    )
+    with pytest.raises(common.SendError) as exc:
+        outlook_send.create_reply_draft(client, message_id="msg-1", reply_all=False, comment="hi")
+    assert exc.value.code == "missing_scope"
+
+
+def test_outlook_create_reply_non_403_status_error_propagates_unchanged():
+    """Only a 403 gets remapped -- any other status error falls through for
+    the route's normal 4xx/5xx classification."""
+    client = MagicMock()
+    request = httpx.Request("POST", "https://graph.microsoft.com/x")
+    response = httpx.Response(500, request=request)
+    client.create_reply.side_effect = httpx.HTTPStatusError(
+        "boom", request=request, response=response
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        outlook_send.create_reply_draft(client, message_id="msg-1", reply_all=False, comment="hi")
+
+
+def test_outlook_send_draft_403_raises_missing_scope():
+    """F6: the same 403-during-the-send-step case."""
+    client = MagicMock()
+    request = httpx.Request("POST", "https://graph.microsoft.com/x")
+    response = httpx.Response(403, request=request)
+    client.send_draft.side_effect = httpx.HTTPStatusError(
+        "forbidden", request=request, response=response
+    )
+    with pytest.raises(common.SendError) as exc:
+        outlook_send.send_reply_draft(client, draft_id="draft-1")
+    assert exc.value.code == "missing_scope"
 
 
 def test_outlook_build_ephemeral_message_uses_attempt_id_as_synthetic_id():
