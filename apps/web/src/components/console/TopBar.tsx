@@ -464,17 +464,26 @@ function LabelSyncRow({
   // here rather than waiting on the next full GET /auth/connections. A
   // fresh prop (the parent's own refresh landing) always wins -- see the
   // effect below -- so this never goes stale forever.
+  //
+  // `label_sync_enabled` is the ONLY optimistic part. Drift keeps moving
+  // long after a toggle (120 -> 75 -> 0 as sync catches up), so it never
+  // "agrees" with a fixed snapshot the way enabled does -- waiting on that
+  // agreement to clear the overlay left the row stuck on "syncing" forever
+  // (L-3). `drift` here only seeds the row's count from the PATCH response
+  // itself, for the brief window before the enabled flag's first agreeing
+  // refresh; once that happens the overlay drops entirely and drift always
+  // renders straight off the server prop.
   const [override, setOverride] = useState<{
     label_sync_enabled: boolean;
-    label_sync_drift: number | null;
+    drift: number | null;
   } | null>(null);
   const [busy, setBusy] = useState(false);
   const [errorCode, setErrorCode] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    // Only clear the overlay once the parent's props actually AGREE with
-    // it. A functional update (reading `current` from React, not the
+    // Only clear the overlay once the parent's enabled prop actually AGREES
+    // with it. A functional update (reading `current` from React, not the
     // `override` closure) means this effect doesn't need `override` in its
     // deps -- if it did, every toggle would re-run this same effect right
     // after setting the override, clearing it immediately. Without this
@@ -482,11 +491,7 @@ function LabelSyncRow({
     // NEWER toggle would wipe the newer optimistic state and flash the
     // stale server value until the next refresh catches up.
     setOverride((current) => {
-      if (
-        current &&
-        (current.label_sync_enabled !== connection.label_sync_enabled ||
-          current.label_sync_drift !== connection.label_sync_drift)
-      ) {
+      if (current && current.label_sync_enabled !== connection.label_sync_enabled) {
         return current;
       }
       return null;
@@ -496,7 +501,7 @@ function LabelSyncRow({
   }, [connection.label_sync_enabled, connection.label_sync_drift]);
 
   const enabled = override?.label_sync_enabled ?? connection.label_sync_enabled;
-  const drift = override ? override.label_sync_drift : connection.label_sync_drift;
+  const drift = override ? override.drift : connection.label_sync_drift;
 
   async function handleToggle() {
     if (busy || disabled) return;
@@ -509,7 +514,7 @@ function LabelSyncRow({
       });
       setOverride({
         label_sync_enabled: updated.label_sync_enabled,
-        label_sync_drift: updated.label_sync_drift,
+        drift: updated.label_sync_drift,
       });
     } catch (e) {
       if (e instanceof ApiError && e.code && LABEL_SYNC_ERROR_COPY[e.code]) {

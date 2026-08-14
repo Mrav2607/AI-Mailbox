@@ -717,6 +717,39 @@ def test_apply_gmail_labels_rebuilds_once_on_invalid_cached_id_at_modify_time():
     client.modify_thread.assert_called_once_with("t1", add_ids=[fresh_id], remove_ids=[])
 
 
+def test_apply_gmail_labels_recreates_a_deleted_label_after_a_stale_id_fails_modify():
+    # L-1: the cached id for "fyi" points at a label that's since been
+    # DELETED -- the re-list omits it entirely, so adopt-by-name alone can't
+    # repair the mapping. The stale id must be dropped (not just left
+    # unmatched) and the label recreated, not left broken forever.
+    names = _needed_gmail_names()
+    stale_map = {name: f"STALE-{name}" for name in names}
+    fyi_name = service.gmail_label_full_name("fyi")
+    client = MagicMock()
+    client.get_thread_minimal.side_effect = [_http_error(400), {"messages": [{"labelIds": []}]}]
+    client.list_labels.return_value = {
+        "labels": [
+            {"name": name, "id": f"FRESH-{name}"} for name in names if name != fyi_name
+        ]
+    }
+    client.create_label.return_value = {"id": "NEW-fyi"}
+
+    result = service.apply_gmail_labels(
+        client, provider_thread_id="t1", cached_map=stale_map, desired_label="fyi"
+    )
+
+    assert client.list_labels.call_count == 1
+    # Only the deleted label was recreated -- everything else came back off
+    # the fresh listing.
+    client.create_label.assert_called_once()
+    assert client.create_label.call_args.args[0]["name"] == fyi_name
+    assert result.working_map[fyi_name] == "NEW-fyi"
+    for name in names:
+        if name != fyi_name:
+            assert result.working_map[name] == f"FRESH-{name}"
+    client.modify_thread.assert_called_once_with("t1", add_ids=["NEW-fyi"], remove_ids=[])
+
+
 # ---------------------------------------------------------------------------
 # Outlook provider mechanics
 # ---------------------------------------------------------------------------

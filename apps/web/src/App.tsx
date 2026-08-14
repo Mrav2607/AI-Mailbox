@@ -154,6 +154,11 @@ const OnboardingTour = lazy(
 // actually sent to the server.
 const UNDO_MS = 5000;
 
+// Cadence for the label-sync drift poll (App.tsx's own refreshConnections
+// loop, distinct from use-auto-sync's HEALTH_POLL_MS) -- modest since it's
+// just a count ticking down, not new-mail freshness.
+const LABEL_SYNC_DRIFT_POLL_MS = 15_000;
+
 // Shared look for the "something needs your attention" sync pills (reconnect,
 // connect-provider, generic actionable). All three render the exact same
 // classes, so we keep one copy instead of drifting three copies apart.
@@ -363,6 +368,10 @@ export default function Console() {
   // refetches: resolving an action removes it optimistically, and a fetch that
   // was already in flight would otherwise land afterwards and put it back.
   const actionsGenRef = useRef(0);
+  // Same idea again for connections -- the label-sync drift poll (below) can
+  // overlap with a manual refreshConnections() from account connect/disconnect,
+  // and an older response landing after a newer one would clobber it.
+  const connectionsGenRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const liveSearchRef = useRef<LiveSearchController | null>(null);
 
@@ -716,8 +725,12 @@ export default function Console() {
   );
 
   const refreshConnections = useCallback(async () => {
+    const generation = ++connectionsGenRef.current;
     try {
-      setConnections(await listConnections());
+      const res = await listConnections();
+      // Superseded by a newer refreshConnections() call that resolved first.
+      if (generation !== connectionsGenRef.current) return;
+      setConnections(res);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) handleSessionExpired();
     }
@@ -1038,6 +1051,22 @@ export default function Console() {
         // it stays hidden, not that the console itself is broken.
       });
   }, [user, refreshOverview, refreshCounts, refreshConnections, refreshLlmSettings]);
+
+  // Label-sync drift poll: while any connection is still converging (enabled
+  // with a nonzero drift count), keep refreshing connections on a modest
+  // cadence so TopBar's "syncing — N remaining" line actually counts down
+  // instead of freezing at whatever it read on the last unrelated refresh
+  // (L-3). Stops on its own once no connection qualifies anymore.
+  useEffect(() => {
+    const hasDrift = connections.some(
+      (c) => c.label_sync_enabled && (c.label_sync_drift ?? 0) > 0,
+    );
+    if (!user || !hasDrift) return;
+    const timer = setInterval(() => {
+      if (!document.hidden) void refreshConnections();
+    }, LABEL_SYNC_DRIFT_POLL_MS);
+    return () => clearInterval(timer);
+  }, [user, connections, refreshConnections]);
 
   // Account filter change: re-issue whatever's on screen under the new scope
   // — a live search stays a search (just re-run against the new account),

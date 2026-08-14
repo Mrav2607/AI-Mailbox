@@ -243,6 +243,25 @@ def update_connection(
     # busy check while we hold it.
     acquire_account_lock(db, account.id)
 
+    # `account` entered the identity map on the plain db.get() above, i.e.
+    # BEFORE the lock -- if ingest commits a pause (or anything else) while
+    # this request was blocked on it, that plain object would keep echoing
+    # the pre-lock snapshot forever. Re-read FOR UPDATE with
+    # populate_existing so every check below runs against whatever's
+    # actually committed now, then redo them all -- including the
+    # current-state echo, since the fresh read may have changed it too (L-2).
+    account = db.execute(
+        select(ProviderAccount)
+        .where(ProviderAccount.id == connection_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    if payload.label_sync_enabled == account.label_sync_enabled:
+        return _connection_row(account, db)
+
     failure_code = _enable_failure_code(account)
     if failure_code:
         raise _label_sync_error(failure_code)

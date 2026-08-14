@@ -169,7 +169,8 @@ def test_patch_connection_enable_fails_on_missing_scope(auth_client):
     api_client, db = auth_client
     account = _account(scope="https://www.googleapis.com/auth/gmail.readonly")
     db.get.return_value = account
-    db.execute.return_value = MagicMock()  # the advisory-lock call
+    db.execute.return_value = MagicMock()  # the advisory-lock call and reread share this
+    db.execute.return_value.scalar_one_or_none.return_value = account
 
     resp = _patch(api_client, account.id, True)
 
@@ -184,6 +185,7 @@ def test_patch_connection_enable_fails_when_no_refresh_token(auth_client):
     account = _account(refresh_token=None)
     db.get.return_value = account
     db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = account
 
     resp = _patch(api_client, account.id, True)
 
@@ -198,6 +200,7 @@ def test_patch_connection_enable_fails_when_paused(auth_client):
     account = _account(sync_paused_at=datetime.now(timezone.utc))
     db.get.return_value = account
     db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = account
 
     resp = _patch(api_client, account.id, True)
 
@@ -212,9 +215,11 @@ def test_patch_connection_enable_fails_when_busy_with_an_unexpired_claim(auth_cl
     account = _account()
     db.get.return_value = account
     lock_result = MagicMock()
+    reread_result = MagicMock()
+    reread_result.scalar_one_or_none.return_value = account
     busy_result = MagicMock()
     busy_result.first.return_value = (uuid4(),)  # a live claim on some thread
-    db.execute.side_effect = [lock_result, busy_result]
+    db.execute.side_effect = [lock_result, reread_result, busy_result]
 
     resp = _patch(api_client, account.id, True)
 
@@ -226,8 +231,9 @@ def test_patch_connection_enable_fails_when_busy_with_an_unexpired_claim(auth_cl
     assert account.label_sync_generation == 0
     db.commit.assert_not_called()
 
-    # The busy check's window matches Wave 1's CLAIM_LEASE exactly.
-    busy_stmt = db.execute.call_args_list[1].args[0]
+    # The busy check's window matches Wave 1's CLAIM_LEASE exactly. It's
+    # the 3rd execute() call now: lock, the post-lock reread, then busy.
+    busy_stmt = db.execute.call_args_list[2].args[0]
     compiled = _compiled(busy_stmt)
     assert "label_sync_claim_token IS NOT NULL" in compiled
     assert "label_sync_claimed_at >" in compiled
@@ -240,10 +246,44 @@ def test_patch_connection_enable_never_persists_true_when_a_check_fails(auth_cli
     account = _account(sync_paused_at=datetime.now(timezone.utc))
     db.get.return_value = account
     db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = account
 
     _patch(api_client, account.id, True)
 
     assert account.label_sync_enabled is False
+
+
+# ---------------------------------------------------------------------------
+# L-2: the account row read via db.get() (before the advisory lock) must
+# never be what the eligibility checks run against -- a state change that
+# commits WHILE this request is blocked on the lock (e.g. ingest pausing the
+# account on an invalid_grant) has to be caught by a fresh, locked reread.
+# ---------------------------------------------------------------------------
+
+
+def test_patch_connection_enable_catches_a_pause_committed_while_waiting_on_the_lock(auth_client):
+    api_client, db = auth_client
+    # Two DISTINCT objects: what the pre-lock db.get() saw (unpaused), and
+    # what the post-lock reread sees (paused) -- a fake-db double standing
+    # in for "the row changed underneath us between those two reads".
+    pre_lock_account = _account(sync_paused_at=None)
+    paused_reread_account = _account(
+        id=pre_lock_account.id, sync_paused_at=datetime.now(timezone.utc)
+    )
+    db.get.return_value = pre_lock_account
+    lock_result = MagicMock()
+    reread_result = MagicMock()
+    reread_result.scalar_one_or_none.return_value = paused_reread_account
+    db.execute.side_effect = [lock_result, reread_result]
+
+    resp = _patch(api_client, pre_lock_account.id, True)
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "account_paused"
+    # Neither snapshot's flag was ever flipped true.
+    assert pre_lock_account.label_sync_enabled is False
+    assert paused_reread_account.label_sync_enabled is False
+    db.commit.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -257,12 +297,14 @@ def test_patch_connection_enable_success_bumps_generation_and_clears_map(auth_cl
     account = _account(label_sync_generation=4, gmail_label_map='{"CortexMail": "Label_1"}')
     db.get.return_value = account
     lock_result = MagicMock()
+    reread_result = MagicMock()
+    reread_result.scalar_one_or_none.return_value = account
     busy_result = MagicMock()
     busy_result.first.return_value = None  # nothing busy
     update_result = MagicMock()
     drift_result = MagicMock()
     drift_result.scalar_one.return_value = 7
-    db.execute.side_effect = [lock_result, busy_result, update_result, drift_result]
+    db.execute.side_effect = [lock_result, reread_result, busy_result, update_result, drift_result]
 
     resp = _patch(api_client, account.id, True)
 
@@ -275,9 +317,9 @@ def test_patch_connection_enable_success_bumps_generation_and_clears_map(auth_cl
     assert account.gmail_label_map is None
     db.commit.assert_called_once()
 
-    # 4 execute calls: advisory lock, busy check, resync-marking bulk
-    # update, drift count -- in that order.
-    assert db.execute.call_count == 4
+    # 5 execute calls: advisory lock, the post-lock reread, busy check,
+    # resync-marking bulk update, drift count -- in that order.
+    assert db.execute.call_count == 5
     lock_call = db.execute.call_args_list[0]
     assert "pg_advisory_xact_lock" in str(lock_call.args[0])
 
@@ -290,16 +332,18 @@ def test_patch_connection_enable_marks_resync_and_retains_the_applied_pair(auth_
     account = _account()
     db.get.return_value = account
     lock_result = MagicMock()
+    reread_result = MagicMock()
+    reread_result.scalar_one_or_none.return_value = account
     busy_result = MagicMock()
     busy_result.first.return_value = None
     update_result = MagicMock()
     drift_result = MagicMock()
     drift_result.scalar_one.return_value = 0
-    db.execute.side_effect = [lock_result, busy_result, update_result, drift_result]
+    db.execute.side_effect = [lock_result, reread_result, busy_result, update_result, drift_result]
 
     _patch(api_client, account.id, True)
 
-    update_stmt = db.execute.call_args_list[2].args[0]
+    update_stmt = db.execute.call_args_list[3].args[0]
     compiled = _compiled(update_stmt)
     assert "mail_thread SET label_resync_needed=true" in compiled
     assert "synced_label" not in compiled.split("SET")[1].split("WHERE")[0]
@@ -321,12 +365,14 @@ def test_patch_connection_enable_success_for_outlook_uses_outlook_scope_token(au
     )
     db.get.return_value = account
     lock_result = MagicMock()
+    reread_result = MagicMock()
+    reread_result.scalar_one_or_none.return_value = account
     busy_result = MagicMock()
     busy_result.first.return_value = None
     update_result = MagicMock()
     drift_result = MagicMock()
     drift_result.scalar_one.return_value = 0
-    db.execute.side_effect = [lock_result, busy_result, update_result, drift_result]
+    db.execute.side_effect = [lock_result, reread_result, busy_result, update_result, drift_result]
 
     resp = _patch(api_client, account.id, True)
 
@@ -339,6 +385,7 @@ def test_patch_connection_enable_fails_for_outlook_missing_mail_readwrite(auth_c
     account = _account(provider="outlook", scope="offline_access Mail.Send")
     db.get.return_value = account
     db.execute.return_value = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = account
 
     resp = _patch(api_client, account.id, True)
 

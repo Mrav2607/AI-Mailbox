@@ -58,6 +58,10 @@ def _label_for_gmail_full_name(name: str) -> str:
     raise ValueError(f"not a CortexMail-owned label name: {name!r}")
 
 
+GMAIL_OWNED_LABEL_NAMES: frozenset[str] = frozenset(
+    {GMAIL_PARENT_LABEL, *(gmail_label_full_name(lbl) for lbl in LABELS)}
+)
+
 OUTLOOK_OWNED_CATEGORY_NAMES: frozenset[str] = frozenset(
     outlook_category_name(label) for label in LABELS
 )
@@ -460,8 +464,7 @@ def _rebuild_gmail_map_from_listing(client: GmailClient, working: dict[str, str]
         for label in listing.get("labels", [])
         if label.get("name") and label.get("id")
     }
-    needed = {GMAIL_PARENT_LABEL, *(gmail_label_full_name(lbl) for lbl in LABELS)}
-    for name in needed:
+    for name in GMAIL_OWNED_LABEL_NAMES:
         if name in by_name:
             working[name] = by_name[name]
 
@@ -554,7 +557,18 @@ def apply_gmail_labels(
         if _is_auth_error(exc) or rebuilt["done"]:
             raise
         rebuilt["done"] = True
+        # A cached id can point at a label that's since been DELETED --
+        # `_rebuild_gmail_map_from_listing`'s adopt-by-name only overwrites
+        # names it actually finds, so a dead id for a name that's now
+        # missing from the listing would otherwise survive the rebuild
+        # untouched and fail every retry forever (L-1). Drop every
+        # CortexMail-owned entry first so the listing can only repopulate
+        # what's genuinely still there, then re-ensure so anything that's
+        # gone gets recreated before we retry the modify.
+        for name in GMAIL_OWNED_LABEL_NAMES:
+            working.pop(name, None)
         _rebuild_gmail_map_from_listing(client, working)
+        _ensure_gmail_label_ids(client, working, rebuilt)
         return compute_and_modify()
 
 
