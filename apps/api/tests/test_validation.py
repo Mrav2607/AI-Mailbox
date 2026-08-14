@@ -22,6 +22,9 @@ def client():
     # MagicMock.
     db = MagicMock()
     db.execute.return_value.scalars.return_value.all.return_value = []
+    # Triage/search now select (MailThread, projected snoozed_until) tuples
+    # and call .all() directly rather than .scalars().all().
+    db.execute.return_value.all.return_value = []
     app.dependency_overrides[get_current_user] = lambda: user
     app.dependency_overrides[get_db] = lambda: db
     yield TestClient(app)
