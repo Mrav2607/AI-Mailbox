@@ -105,6 +105,57 @@ class OutlookClient:
         assert resp is not None  # pragma: no cover
         return resp
 
+    def _post(
+        self,
+        url: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """POST for reply-send calls. No retry loop at all -- unlike `_get`'s
+        429/5xx retries (safe for idempotent reads), a blind retry of a send
+        or a draft-mutating call risks a double-send or a duplicate draft.
+        The caller (mail_send/outlook_send.py) treats any failure here as an
+        ambiguous outcome, never something to replay itself.
+        """
+        request_headers = {"Authorization": f"Bearer {self.token}"}
+        if headers:
+            request_headers.update(headers)
+        return _client().post(url, headers=request_headers, json=json_body)
+
+    def create_reply(self, message_id: str, *, reply_all: bool, comment: str) -> dict[str, Any]:
+        """POST /me/messages/{id}/createReply (or createReplyAll), with the
+        immutable-id Prefer header so the returned draft id survives the
+        draft -> Sent Items move (plan §3.1). Graph computes recipients from
+        the original message's Reply-To/To/Cc; the comment path preserves
+        the quoted original.
+        """
+        segment = "createReplyAll" if reply_all else "createReply"
+        resp = self._post(
+            f"{_BASE_URL}/me/messages/{message_id}/{segment}",
+            json_body={"comment": comment},
+            headers={"Prefer": _PREFER_IMMUTABLE_ID},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def send_draft(self, draft_id: str) -> None:
+        """POST /me/messages/{draft_id}/send -- no request body, no response
+        body on success."""
+        resp = self._post(
+            f"{_BASE_URL}/me/messages/{draft_id}/send",
+            headers={"Prefer": _PREFER_IMMUTABLE_ID},
+        )
+        resp.raise_for_status()
+
+    def delete_draft(self, draft_id: str) -> None:
+        """DELETE /me/messages/{draft_id} -- used to clean up a reply draft
+        that fails the recipient cap after createReply computed it (plan
+        §3.3)."""
+        headers = {"Authorization": f"Bearer {self.token}", "Prefer": _PREFER_IMMUTABLE_ID}
+        resp = _client().request("DELETE", f"{_BASE_URL}/me/messages/{draft_id}", headers=headers)
+        resp.raise_for_status()
+
     def get_me(self) -> dict[str, Any]:
         resp = self._get(f"{_BASE_URL}/me")
         resp.raise_for_status()

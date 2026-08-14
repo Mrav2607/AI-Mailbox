@@ -236,6 +236,7 @@ def record_extraction(
     result: ExtractedAction | NoAction | None,
     thread_done: bool,
     label_still_actionable: bool,
+    already_replied: bool = False,
 ) -> bool:
     """Fenced write of an extraction attempt's outcome.
 
@@ -253,11 +254,17 @@ def record_extraction(
     finds nothing must not leave stale fields from a prior attempt), ``None``
     -> ``failed`` (fields untouched, transient failure).
 
-    Independent of which branch above fires: if ``thread_done`` and the
-    row's existing ``status`` is ``"open"``, this record also resolves it to
-    ``"done"`` -- an open ineligible/no_action/failed row created on a done
-    thread must not resurface after an auto-reopen. Status is never reset
-    otherwise; re-extraction must not resurrect an item an operator resolved.
+    Independent of which branch above fires: this record also resolves the
+    row's existing ``"open"`` status to ``"done"`` when either ``thread_done``
+    -- an open row created on a done thread must not resurface after an
+    auto-reopen -- OR ``already_replied`` AND the result is a
+    ``kind="reply"`` extraction (docs/plans/2026-08-13-reply-plan.md §3.5:
+    the caller has already checked this message's ``created_at`` against
+    ``mail_thread.replied_at``, so an extraction that only now discovers
+    "needs a reply" on a message the user already answered from CortexMail
+    records itself pre-resolved, never a second obligation for an answered
+    message). Status is never reset otherwise; re-extraction must not
+    resurrect an item an operator resolved.
     """
     now = datetime.now(timezone.utc)
     values: dict = {"claim_token": None}
@@ -293,7 +300,10 @@ def record_extraction(
     else:
         values["outcome"] = "failed"
 
-    values.update(_done_stamp_columns(thread_done, now))
+    resolves_already_answered = (
+        already_replied and isinstance(result, ExtractedAction) and result.kind == "reply"
+    )
+    values.update(_done_stamp_columns(thread_done or resolves_already_answered, now))
 
     stmt = (
         update(ActionItem)

@@ -484,6 +484,58 @@ def _log_stale_mailboxes(db, candidates: list[tuple[UUID, UUID, str]]) -> None:
             )
 
 
+@celery_app.task(bind=True, ignore_result=True, time_limit=120)
+def reconcile_reply_attempt(self, account_id: str, *, retry_count: int = 0) -> dict:
+    """Timeliness-only recovery for an `unknown` (or Outlook `sent`-but-
+    unverified) reply attempt (plan §3.6 step 4). The durable `reply_attempt`
+    row and the send route's in-flight guard are the actual correctness
+    guarantee -- losing this task changes nothing about whether a duplicate
+    send is possible, only how fast the console shows the confirmed result.
+
+    Fires the account's normal single-flight sync claim
+    (`app.services.sync_runs.start_sync_run`, the same one
+    `dispatch_scheduled_syncs` uses): a won claim enqueues a real ingest run,
+    whose own START/END level passes (`run_reconciliation_pass`) do the
+    actual reconciliation work. If the claim is DEDUPLICATED -- an ingest for
+    this account is already in flight and may have fetched before the sent
+    copy even existed on the provider (P4-7) -- this re-enqueues itself once
+    more with a longer countdown, then stops; the durable attempt row
+    guarantees correctness either way.
+    """
+    with SessionLocal() as db:
+        try:
+            account = db.get(ProviderAccount, UUID(account_id))
+        except ValueError:
+            return {"status": "skipped", "account_id": account_id, "reason": "bad account id"}
+        if account is None or not account.refresh_token or account.sync_paused_at is not None:
+            return {"status": "skipped", "account_id": account_id}
+
+        _run, deduplicated = start_sync_run(
+            db,
+            account.user_id,
+            account.id,
+            mode="reply_reconcile",
+            options={
+                "max_results": settings.scheduled_sync_max_results,
+                "skip_existing": True,
+                "classify_messages": True,
+                "new_only": True,
+            },
+            provider=account.provider,
+        )
+
+    if not deduplicated:
+        return {"status": "enqueued", "account_id": account_id}
+
+    if retry_count < 1:
+        self.apply_async(
+            args=[account_id], kwargs={"retry_count": retry_count + 1}, countdown=120
+        )
+        return {"status": "deferred", "account_id": account_id}
+
+    return {"status": "gave_up", "account_id": account_id}
+
+
 @celery_app.task(ignore_result=True, time_limit=300)
 def prune_sync_runs() -> dict:
     """Drop old finished runs. Hourly, not per dispatch.

@@ -22,6 +22,10 @@ _TIMEOUT = 20.0
 # backoff rather than losing a long pull to one blip.
 _MAX_ATTEMPTS = 3
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+# A send is not idempotent the way a GET pull is -- a blind 5xx/timeout retry
+# risks a double-send, so send_message only ever retries a 429 (a definite
+# "not yet accepted" signal), bounded the same way as the GET path.
+_SEND_MAX_ATTEMPTS = 3
 
 _http: httpx.Client | None = None
 
@@ -74,6 +78,29 @@ class GmailClient:
 
     def get_profile(self) -> dict[str, Any]:
         return self._get("/profile")
+
+    def _post(self, path: str, json_body: dict[str, Any]) -> httpx.Response:
+        headers = {"Authorization": f"Bearer {self.token}"}
+        return _client().post(path, headers=headers, json=json_body)
+
+    def send_message(self, *, raw: str, thread_id: str) -> dict[str, Any]:
+        """POST /messages/send with a base64url-encoded raw MIME message and
+        the thread to append it to. Bounded 429 backoff only -- everything
+        else (including 5xx) surfaces to the caller as an ambiguous outcome
+        (plan §3.6 step 4): blindly retrying a send we can't confirm failed
+        is exactly the double-send risk this feature exists to avoid.
+        """
+        body: dict[str, Any] = {"raw": raw, "threadId": thread_id}
+        resp = self._post("/messages/send", body)
+        for attempt in range(1, _SEND_MAX_ATTEMPTS):
+            if resp.status_code != 429:
+                break
+            backoff = 2 ** (attempt - 1)
+            logger.warning("Gmail send 429; retrying in %ss", backoff)
+            time.sleep(backoff)
+            resp = self._post("/messages/send", body)
+        resp.raise_for_status()
+        return resp.json()
 
     def list_history(
         self,

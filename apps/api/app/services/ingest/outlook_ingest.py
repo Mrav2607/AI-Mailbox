@@ -51,6 +51,7 @@ from app.services.nlp.classifier import build_classification_text, classify_with
 from app.services.nlp.persistence import upsert_classification
 from app.services.nlp.providers import ClassificationRouter
 from app.services.nlp.usage import UsageAccumulator
+from app.services.mail_send.reconcile import run_reconciliation_pass
 
 # Inbox first: it's the folder users actually triage, so it gets first claim
 # on a bounded run's message/page budget.
@@ -470,6 +471,17 @@ def ingest_outlook_messages(
     if not provider or not provider.access_token:
         raise ValueError("Outlook provider account not connected.")
 
+    # Reply reconciliation START pass (plan §3.5): a level pass over this
+    # account's reconciliation-eligible reply attempts, run BEFORE any
+    # provider traversal begins -- own transactions, commits included. Never
+    # runs inside the per-page transactions below.
+    run_reconciliation_pass(
+        db,
+        provider_account_id=provider.id,
+        provider="outlook",
+        classify_messages=classify_messages,
+    )
+
     access_token = provider.access_token
     current_refresh_token = provider.refresh_token
     client = OutlookClient(access_token)
@@ -706,5 +718,16 @@ def ingest_outlook_messages(
                 # leave the rest of this generation's walk for a later run.
                 break
             cursor_url = next_url
+
+    # Reply reconciliation END pass (plan §3.5): re-fetches AFTER this run's
+    # final commit, catching both attempts created while the run was
+    # ingesting AND messages the run itself just persisted (whose cursors
+    # have advanced past them).
+    run_reconciliation_pass(
+        db,
+        provider_account_id=provider.id,
+        provider="outlook",
+        classify_messages=classify_messages,
+    )
 
     return stats

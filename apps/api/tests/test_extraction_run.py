@@ -146,12 +146,25 @@ class _FakeSession:
     """
 
     def __init__(
-        self, *, message=None, thread=None, classification=None, done_at_reads=None, events=None
+        self,
+        *,
+        message=None,
+        thread=None,
+        classification=None,
+        done_at_reads=None,
+        replied_at_reads=None,
+        events=None,
     ):
         self.message = message
         self.thread = thread
         self.classification = classification
         self._done_at_reads = list(done_at_reads or [])
+        # None (the default) means "every replied_at re-read comes back
+        # None" -- most tests never touch the reply fence, so this avoids
+        # requiring every existing call site to pass one more list just to
+        # keep popping in sync. Tests exercising the fence pass an explicit
+        # list, same shape as done_at_reads.
+        self._replied_at_reads = list(replied_at_reads) if replied_at_reads is not None else None
         self.commits = 0
         self.rollbacks = 0
         self.executed = []
@@ -169,6 +182,10 @@ class _FakeSession:
         name = stmt.column_descriptions[0]["name"]
         if name == "done_at":
             return _FakeResult(scalar=self._done_at_reads.pop(0))
+        if name == "replied_at":
+            if self._replied_at_reads is not None:
+                return _FakeResult(scalar=self._replied_at_reads.pop(0))
+            return _FakeResult(scalar=None)
         if name == "MailThread":
             return _FakeResult(scalar=self.thread)
         if name == "Classification":
