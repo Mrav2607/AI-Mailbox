@@ -21,6 +21,7 @@ from app.services.nlp.classifier import classify_with_usage, build_classificatio
 from app.services.nlp.persistence import upsert_classification
 from app.services.nlp.providers import ClassificationRouter
 from app.services.nlp.usage import UsageAccumulator
+from app.services.mail_send.reconcile import run_reconciliation_pass
 
 
 def _collect_history_thread_ids(
@@ -178,6 +179,17 @@ def ingest_gmail_messages(
         )
     if not provider or not provider.access_token:
         raise ValueError("Gmail provider account not connected.")
+
+    # Reply reconciliation START pass (plan §3.5): a level pass over this
+    # account's reconciliation-eligible reply attempts, run BEFORE any
+    # provider traversal begins -- own transactions, commits included. Never
+    # runs inside the per-thread page/batch transactions below.
+    run_reconciliation_pass(
+        db,
+        provider_account_id=provider.id,
+        provider="gmail",
+        classify_messages=classify_messages,
+    )
 
     access_token = provider.access_token
     if provider.token_expiry and provider.token_expiry <= datetime.now(timezone.utc):
@@ -595,6 +607,18 @@ def ingest_gmail_messages(
     # only becomes durable here, so relying on the periodic flush alone would
     # lose it on a later crash.
     flush_usage_then_commit()
+
+    # Reply reconciliation END pass (plan §3.5): re-fetches AFTER this run's
+    # final commit, catching both attempts created while the run was
+    # ingesting AND messages the run itself just persisted (whose cursors
+    # have advanced past them).
+    run_reconciliation_pass(
+        db,
+        provider_account_id=provider.id,
+        provider="gmail",
+        classify_messages=classify_messages,
+    )
+
     return {
         "threads_upserted": threads_upserted,
         "messages_upserted": messages_upserted,

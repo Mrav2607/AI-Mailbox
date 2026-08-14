@@ -14,6 +14,8 @@ import type {
   LlmTestResult,
   LlmUsage,
   Overview,
+  ReplyDraft,
+  ReplySent,
   SearchResponse,
   ThreadDetail,
   TriageResponse,
@@ -29,6 +31,7 @@ import {
   mockDeleteConnection,
   mockDeleteLlmSettings,
   mockDeleteThread,
+  mockDraftReply,
   mockGetClassifierMix,
   mockGetLlmSettings,
   mockGetLlmUsage,
@@ -37,6 +40,7 @@ import {
   mockOverview,
   mockPutLlmSettings,
   mockSearch,
+  mockSendReply,
   mockSetActionStatus,
   mockSetDone,
   mockTestLlmSettings,
@@ -64,28 +68,55 @@ export class ApiError extends Error {
   // The API's 500s carry an error_id that matches a server log line. Keep it so
   // a user reporting "it broke" can hand us something we can actually grep for.
   errorId?: string;
-  constructor(status: number, msg: string, errorId?: string) {
+  // Present when the API sent a structured {code, message, ...} object for
+  // `detail` (the reply-send error envelope, docs/plans/2026-08-13-reply-plan.md
+  // §3.8) -- lets a caller branch on the machine-readable code instead of
+  // parsing prose out of `message`. Undefined for every legacy string-detail
+  // response, which is most of the API today.
+  code?: string;
+  // The raw object-valued `detail`, when there was one -- e.g. reply_in_flight
+  // carries `attempt_id` here, which nothing else on this class exposes.
+  detail?: Record<string, unknown>;
+  constructor(
+    status: number,
+    msg: string,
+    errorId?: string,
+    code?: string,
+    detail?: Record<string, unknown>,
+  ) {
     super(msg);
     this.status = status;
     this.errorId = errorId;
+    this.code = code;
+    this.detail = detail;
   }
 }
 
-// The API answers errors with {detail, error_id?}. Read it if it's there, and
-// don't let a malformed body turn into a second, more confusing failure.
+// The API answers errors with {detail, error_id?}; `detail` is either a plain
+// string (most routes) or a {code, message} object (the reply-send envelope,
+// plan §3.8). Read whichever shape showed up, and don't let a malformed body
+// turn into a second, more confusing failure.
 async function errorFromResponse(res: Response): Promise<ApiError> {
-  let detail: string | undefined;
+  let msg: string | undefined;
   let errorId: string | undefined;
+  let code: string | undefined;
+  let detail: Record<string, unknown> | undefined;
   try {
     const body = await res.json();
     if (body && typeof body === "object") {
-      if (typeof body.detail === "string") detail = body.detail;
+      if (typeof body.detail === "string") {
+        msg = body.detail;
+      } else if (body.detail && typeof body.detail === "object") {
+        detail = body.detail as Record<string, unknown>;
+        if (typeof detail.code === "string") code = detail.code;
+        if (typeof detail.message === "string") msg = detail.message;
+      }
       if (typeof body.error_id === "string") errorId = body.error_id;
     }
   } catch {
     // No body, or not JSON -- fall back to the status line.
   }
-  return new ApiError(res.status, detail ?? `${res.status} ${res.statusText}`, errorId);
+  return new ApiError(res.status, msg ?? `${res.status} ${res.statusText}`, errorId, code, detail);
 }
 
 async function request<T>(
@@ -418,6 +449,46 @@ export async function getCounts(accountId?: string | null): Promise<CountsRespon
 export async function getThread(id: string): Promise<ThreadDetail> {
   if (USE_MOCK) return mockThread(id);
   return request<ThreadDetail>(`/mail/thread/${id}`);
+}
+
+export interface SendReplyInput {
+  bodyText: string;
+  replyAll?: boolean;
+  // Seeded from the fetched thread detail's replied_at (plan §3.9) -- the
+  // server 409s reply_state_stale on a mismatch against its own locked row.
+  expectedRepliedAt?: string | null;
+  // Set only on the explicit "abandon and send anyway" override flow
+  // (plan §3.6 step 1) -- re-submits over a blocking reply_in_flight attempt.
+  overrideAttemptId?: string | null;
+}
+
+// Sends a reply through the account that owns the thread. Recipients are
+// computed server-side ONLY (plan §3.3) -- nothing here ever names a To/Cc.
+export async function sendReply(threadId: string, input: SendReplyInput): Promise<ReplySent> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 250));
+    return mockSendReply(threadId, input);
+  }
+  return request<ReplySent>(`/mail/thread/${encodeURIComponent(threadId)}/reply`, {
+    method: "POST",
+    body: JSON.stringify({
+      body_text: input.bodyText,
+      reply_all: input.replyAll ?? false,
+      expected_replied_at: input.expectedRepliedAt ?? null,
+      override_attempt_id: input.overrideAttemptId ?? null,
+    }),
+  });
+}
+
+// Stateless AI-drafted reply text (plan §3.7) -- BYOK only, empty request body.
+export async function draftReply(threadId: string): Promise<ReplyDraft> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 400));
+    return mockDraftReply(threadId);
+  }
+  return request<ReplyDraft>(`/mail/thread/${encodeURIComponent(threadId)}/reply-draft`, {
+    method: "POST",
+  });
 }
 
 // Cross-bucket search over the whole mailbox (subject / sender / snippet).

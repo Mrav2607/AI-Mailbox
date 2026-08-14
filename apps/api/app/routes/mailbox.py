@@ -194,6 +194,7 @@ def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]
                     "model_version": classification.model_version if classification else None,
                 },
                 "account_email": account_emails.get(thread.provider_account_id),
+                "replied_at": thread.replied_at,
             }
         )
     return items
@@ -378,6 +379,7 @@ def get_thread(
             "last_message_at": thread.last_message_at,
             "done": thread.done_at is not None,
             "account_email": account_email,
+            "replied_at": thread.replied_at,
         },
         "messages": [
             {

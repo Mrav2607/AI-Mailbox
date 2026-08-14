@@ -27,7 +27,7 @@ router = APIRouter()
 
 MS_AUTH_BASE = f"https://login.microsoftonline.com/{settings.microsoft_tenant}/oauth2/v2.0"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-MS_SCOPES = "openid profile email offline_access User.Read Mail.ReadWrite"
+MS_SCOPES = "openid profile email offline_access User.Read Mail.ReadWrite Mail.Send"
 
 # Own Redis key prefix (not shared with auth_google's) so a state token minted
 # by one provider flow can never be mistaken for the other's, however

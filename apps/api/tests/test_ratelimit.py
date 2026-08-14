@@ -77,7 +77,10 @@ def test_requests_over_the_limit_get_429_with_retry_after(fake_redis):
         client.get("/ping")
     resp = client.get("/ping")
     assert resp.status_code == 429
-    assert resp.json()["detail"] == "Too many requests; try again shortly."
+    assert resp.json()["detail"] == {
+        "code": "rate_limited",
+        "message": "Too many requests; try again shortly.",
+    }
     # Retry-After should reflect the key's TTL, which the fake pins to the window.
     assert resp.headers["Retry-After"] == "60"
 

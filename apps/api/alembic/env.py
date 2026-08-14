@@ -43,6 +43,7 @@ MIGRATION_ONLY_INDEXES = {
     "uq_mail_sync_run_active_account",
     "ix_mail_thread_account_recency",
     "ix_mail_thread_open_user_recency",
+    "ix_reply_attempt_reconcile",
 }
 
 

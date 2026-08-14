@@ -37,7 +37,7 @@ class LlmUsageDaily(Base):
             "user_id", "usage_date", "stage", "provider", name="uq_llm_usage_daily_key"
         ),
         CheckConstraint(
-            "stage IN ('classification', 'extraction')",
+            "stage IN ('classification', 'extraction', 'reply_draft')",
             name="ck_llm_usage_daily_stage",
         ),
         CheckConstraint(

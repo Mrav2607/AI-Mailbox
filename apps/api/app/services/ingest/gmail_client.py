@@ -22,6 +22,10 @@ _TIMEOUT = 20.0
 # backoff rather than losing a long pull to one blip.
 _MAX_ATTEMPTS = 3
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+# A send is not idempotent the way a GET pull is -- a blind 5xx/timeout retry
+# risks a double-send, so send_message only ever retries a 429 (a definite
+# "not yet accepted" signal), bounded the same way as the GET path.
+_SEND_MAX_ATTEMPTS = 3
 
 _http: httpx.Client | None = None
 
@@ -74,6 +78,66 @@ class GmailClient:
 
     def get_profile(self) -> dict[str, Any]:
         return self._get("/profile")
+
+    def _post(
+        self, path: str, json_body: dict[str, Any], *, timeout: float | None = None
+    ) -> httpx.Response:
+        headers = {"Authorization": f"Bearer {self.token}"}
+        kwargs: dict[str, Any] = {}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return _client().post(path, headers=headers, json=json_body, **kwargs)
+
+    def send_message(
+        self, *, raw: str, thread_id: str, remaining_seconds: float | None = None
+    ) -> dict[str, Any]:
+        """POST /messages/send with a base64url-encoded raw MIME message and
+        the thread to append it to. Bounded 429 backoff only -- everything
+        else (including 5xx) surfaces to the caller as an ambiguous outcome
+        (plan §3.6 step 4): blindly retrying a send we can't confirm failed
+        is exactly the double-send risk this feature exists to avoid.
+
+        `remaining_seconds` (R-8, final review), when given, is the caller's
+        remaining slice of its own end-to-end provider-sequence deadline
+        (the route's 45s budget, plan §3.1) -- WITHOUT this, the fixed 20s
+        per-request timeout plus up to two 429 backoff sleeps can burn well
+        past that budget on their own, since the route previously only
+        checked its deadline BETWEEN calls, never during one. Both the
+        per-request timeout and each backoff sleep are capped to whatever's
+        left; exhausting it raises `httpx.ReadTimeout` before making another
+        request -- the same ambiguous-outcome shape a natural network
+        timeout already produces, so the route's existing
+        `httpx.HTTPError` handling needs no new case for it. `None` (the
+        default) preserves the old fixed-timeout, uncapped-backoff
+        behavior -- this method is also used nowhere else, but the default
+        keeps the shape self-contained.
+        """
+        deadline = (
+            time.monotonic() + remaining_seconds if remaining_seconds is not None else None
+        )
+
+        def _remaining() -> float | None:
+            if deadline is None:
+                return None
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise httpx.ReadTimeout("reply send exceeded its remaining deadline")
+            return left
+
+        body: dict[str, Any] = {"raw": raw, "threadId": thread_id}
+        resp = self._post("/messages/send", body, timeout=_remaining())
+        for attempt in range(1, _SEND_MAX_ATTEMPTS):
+            if resp.status_code != 429:
+                break
+            backoff = 2 ** (attempt - 1)
+            remaining = _remaining()
+            if remaining is not None:
+                backoff = min(backoff, remaining)
+            logger.warning("Gmail send 429; retrying in %ss", backoff)
+            time.sleep(backoff)
+            resp = self._post("/messages/send", body, timeout=_remaining())
+        resp.raise_for_status()
+        return resp.json()
 
     def list_history(
         self,

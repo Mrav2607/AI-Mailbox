@@ -209,11 +209,23 @@ def _claim_extract_record(
             classification is not None and classification.label in ACTION_LABELS
         )
 
-        # Re-read done_at -- a concurrent set_thread_done could have
-        # committed while the LLM call was in flight.
+        # Re-read done_at/replied_at -- a concurrent set_thread_done or reply
+        # send could have committed while the LLM call was in flight.
         current_done_at = db.execute(
             select(MailThread.done_at).where(MailThread.id == thread.id)
         ).scalar_one_or_none()
+        current_replied_at = db.execute(
+            select(MailThread.replied_at).where(MailThread.id == thread.id)
+        ).scalar_one_or_none()
+        # The fence (plan §3.5): this message's own DB created_at, never
+        # sent_at/received_at -- Postgres clock facts mean created_at is
+        # ingest time, not mail chronology, but only CORRELATED console
+        # attempts ever advance replied_at, so an inbound message that
+        # merely arrived before a batch-ingest replied_at can't mis-resolve
+        # here (P3-1's inbound-C case keeps created_at > replied_at).
+        already_replied = (
+            current_replied_at is not None and message.created_at <= current_replied_at
+        )
 
         recorded = record_extraction(
             db,
@@ -222,6 +234,7 @@ def _claim_extract_record(
             result=result,
             thread_done=current_done_at is not None,
             label_still_actionable=label_still_actionable,
+            already_replied=already_replied,
         )
 
         # Only a "user" payer gets recorded -- the operator's fallback key

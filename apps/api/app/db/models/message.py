@@ -42,6 +42,10 @@ class MailMessage(Base):
     body_text: Mapped[str | None] = mapped_column(Text)
     body_html: Mapped[str | None] = mapped_column(Text)
     headers: Mapped[dict | None] = mapped_column(JSONB)
+    # clock_timestamp(), not now() (migration 0023): now() is txn-START time,
+    # and the reply fence compares this stamp against mail_thread.replied_at
+    # for visibility ordering -- long ingest transactions would otherwise
+    # commit messages whose stamp predates a fence set mid-flight.
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=text("now()")
+        DateTime(timezone=True), server_default=text("clock_timestamp()")
     )

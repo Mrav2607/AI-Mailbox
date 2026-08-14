@@ -6,6 +6,7 @@ import {
   buildTriageQuery,
   sumIngestResults,
   waitForSyncRuns,
+  type ApiError,
   type SyncRunStatus,
 } from "./api";
 
@@ -666,6 +667,215 @@ describe("getLlmUsage", () => {
     expect(res.window_days).toBe(7);
     expect(res.daily.length).toBeGreaterThan(0);
     expect(res.daily.length).toBeLessThanOrEqual(7);
+  });
+});
+
+describe("errorFromResponse (via sendReply)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("keeps legacy string-detail responses working -- message only, no code", async () => {
+    const api = await importLiveApi();
+    stubFetch({ detail: "Thread not found" }, 404);
+    await expect(
+      api.sendReply("t1", { bodyText: "hi" }),
+    ).rejects.toMatchObject({ status: 404, message: "Thread not found", code: undefined });
+  });
+
+  it("reads the structured {code, message} envelope the reply routes use", async () => {
+    const api = await importLiveApi();
+    stubFetch(
+      {
+        detail: {
+          code: "reply_thread_busy",
+          message: "The mailbox is busy syncing -- try again in a moment.",
+        },
+      },
+      409,
+    );
+    await expect(api.sendReply("t1", { bodyText: "hi" })).rejects.toMatchObject({
+      status: 409,
+      code: "reply_thread_busy",
+      message: "The mailbox is busy syncing -- try again in a moment.",
+    });
+  });
+
+  it("exposes extra detail fields (e.g. reply_in_flight's attempt_id) for callers that need them", async () => {
+    const api = await importLiveApi();
+    stubFetch(
+      {
+        detail: {
+          code: "reply_in_flight",
+          message: "A reply to this thread is already in progress.",
+          attempt_id: "attempt-1",
+        },
+      },
+      409,
+    );
+    try {
+      await api.sendReply("t1", { bodyText: "hi" });
+      throw new Error("expected sendReply to reject");
+    } catch (e) {
+      expect((e as ApiError).code).toBe("reply_in_flight");
+      expect((e as ApiError).detail).toEqual({
+        code: "reply_in_flight",
+        message: "A reply to this thread is already in progress.",
+        attempt_id: "attempt-1",
+      });
+    }
+  });
+
+  it("falls back to the status line on a malformed (non-JSON) body, without a code", async () => {
+    const api = await importLiveApi();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 502,
+      statusText: "Bad Gateway",
+      json: async () => {
+        throw new SyntaxError("Unexpected end of JSON input");
+      },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.sendReply("t1", { bodyText: "hi" })).rejects.toMatchObject({
+      status: 502,
+      message: "502 Bad Gateway",
+      code: undefined,
+    });
+  });
+
+  it("still reads error_id alongside a legacy string detail", async () => {
+    const api = await importLiveApi();
+    stubFetch({ detail: "internal error", error_id: "err-abc" }, 500);
+    await expect(api.sendReply("t1", { bodyText: "hi" })).rejects.toMatchObject({
+      status: 500,
+      message: "internal error",
+      errorId: "err-abc",
+    });
+  });
+});
+
+describe("sendReply", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("posts body_text/reply_all/expected_replied_at/override_attempt_id, defaulting the optional fields", async () => {
+    const api = await importLiveApi();
+    const body = {
+      thread_id: "t1",
+      message: {
+        id: "m1",
+        sent_at: "2026-08-10T12:00:00Z",
+        sender: "operator@gmail.com",
+        recipient: ["alice@stripe.com"],
+        cc: null,
+        snippet: "hi",
+        body_text: "hi",
+        body_html: null,
+      },
+      replied_at: "2026-08-10T12:00:00Z",
+      resolved_action_items: 0,
+    };
+    const fetchMock = stubFetch(body);
+    const res = await api.sendReply("t1", { bodyText: "hi" });
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(new URL(url as string).pathname).toBe("/api/v1/mail/thread/t1/reply");
+    expect((opts as RequestInit).method).toBe("POST");
+    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({
+      body_text: "hi",
+      reply_all: false,
+      expected_replied_at: null,
+      override_attempt_id: null,
+    });
+    expect(res).toEqual(body);
+  });
+
+  it("passes reply_all, expected_replied_at, and override_attempt_id through when given", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({
+      thread_id: "t1",
+      message: {
+        id: "m1",
+        sent_at: null,
+        sender: null,
+        recipient: null,
+        cc: null,
+        snippet: null,
+        body_text: null,
+        body_html: null,
+      },
+      replied_at: "2026-08-10T12:00:00Z",
+      resolved_action_items: 2,
+    });
+    await api.sendReply("t1", {
+      bodyText: "hi all",
+      replyAll: true,
+      expectedRepliedAt: "2026-08-09T00:00:00Z",
+      overrideAttemptId: "attempt-9",
+    });
+    const opts = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(opts.body as string)).toEqual({
+      body_text: "hi all",
+      reply_all: true,
+      expected_replied_at: "2026-08-09T00:00:00Z",
+      override_attempt_id: "attempt-9",
+    });
+  });
+
+  it("in mock mode, marks the thread replied and resolves matching agenda actions", async () => {
+    const api = await importMockApi();
+    const before = await api.getActions("open", 500);
+    const replyAction = before.items.find((a) => a.kind === "reply");
+    expect(replyAction).toBeDefined();
+
+    const res = await api.sendReply(replyAction!.thread_id, { bodyText: "on it, thanks" });
+    expect(res.replied_at).not.toBeNull();
+    expect(res.resolved_action_items).toBeGreaterThan(0);
+    expect(res.message.body_text).toBe("on it, thanks");
+
+    const thread = await api.getThread(replyAction!.thread_id);
+    expect(thread.thread.replied_at).toBe(res.replied_at);
+
+    const after = await api.getActions("open", 500);
+    expect(after.items.find((a) => a.id === replyAction!.id)).toBeUndefined();
+  });
+});
+
+describe("draftReply", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("posts an empty body to /mail/thread/{id}/reply-draft", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ draft_text: "Hi,", provider: "openai", model: "gpt-4o-mini" });
+    const res = await api.draftReply("t1");
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(new URL(url as string).pathname).toBe("/api/v1/mail/thread/t1/reply-draft");
+    expect((opts as RequestInit).method).toBe("POST");
+    expect((opts as RequestInit).body).toBeUndefined();
+    expect(res).toEqual({ draft_text: "Hi,", provider: "openai", model: "gpt-4o-mini" });
+  });
+
+  it("in mock mode, drafts against the demo LLM settings when configured", async () => {
+    const api = await importMockApi();
+    const { items } = await api.getTriage("all", 1);
+    const res = await api.draftReply(items[0].thread_id);
+    expect(res.draft_text.length).toBeGreaterThan(0);
+  });
+
+  it("in mock mode, 409s with the credential-missing code once no key is configured", async () => {
+    const api = await importMockApi();
+    await api.deleteLlmSettings();
+    const { items } = await api.getTriage("all", 1);
+    await expect(api.draftReply(items[0].thread_id)).rejects.toMatchObject({
+      status: 409,
+      code: "reply_draft_credential_missing",
+    });
   });
 });
 

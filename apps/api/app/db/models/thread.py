@@ -55,6 +55,12 @@ class MailThread(Base):
     # Triage "done" marker: null = open, timestamp = when the operator cleared
     # it. Done threads leave every open bucket but stay searchable.
     done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The reply fence: null = never replied from CortexMail, timestamp = the
+    # moment a reply attempt completed (console success or reconciliation),
+    # on OUR clock -- never inferred from provider/ingest chronology (see
+    # docs/plans/2026-08-13-reply-plan.md §3.5). Only advances (greatest()),
+    # only through app/services/mail_send/common.py's fence/resolve helper.
+    replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()")
     )

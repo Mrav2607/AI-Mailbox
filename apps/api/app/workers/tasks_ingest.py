@@ -17,6 +17,7 @@ from app.db.base import SessionLocal
 from app.db.models import MailSyncRun, MailThread, ProviderAccount
 from app.services.ingest.gmail_ingest import ingest_gmail_messages
 from app.services.ingest.outlook_ingest import ingest_outlook_messages
+from app.services.mail_send.reconcile import run_reconciliation_pass
 from app.services.nlp.providers import extraction_available, extraction_feature_enabled
 from app.services.sync_runs import renew_sync, start_sync_run
 
@@ -482,6 +483,82 @@ def _log_stale_mailboxes(db, candidates: list[tuple[UUID, UUID, str]]) -> None:
                 account_id,
                 last.isoformat(),
             )
+
+
+@celery_app.task(bind=True, ignore_result=True, time_limit=120)
+def reconcile_reply_attempt(self, account_id: str, *, retry_count: int = 0) -> dict:
+    """Timeliness-only recovery for an `unknown` (or Outlook `sent`-but-
+    unverified) reply attempt (plan §3.6 step 4). The durable `reply_attempt`
+    row and the send route's in-flight guard are the actual correctness
+    guarantee -- losing this task changes nothing about whether a duplicate
+    send is possible, only how fast the console shows the confirmed result.
+
+    Fires the account's normal single-flight sync claim
+    (`app.services.sync_runs.start_sync_run`, the same one
+    `dispatch_scheduled_syncs` uses): a won claim enqueues a real ingest run,
+    whose own START/END level passes (`run_reconciliation_pass`) do the
+    actual reconciliation work. If the claim is DEDUPLICATED -- an ingest for
+    this account is already in flight and may have fetched before the sent
+    copy even existed on the provider (P4-7) -- this re-enqueues itself once
+    more with a longer countdown, then stops; the durable attempt row
+    guarantees correctness either way.
+
+    R-4 (final review): the level pass below runs directly, in its OWN
+    isolated session, regardless of whether the claim was won or
+    deduplicated. Previously a deduplicated claim did nothing but the
+    re-enqueue -- if the in-flight run had already persisted the correlated
+    message before dying (or simply hadn't reached its own END pass yet),
+    an `unknown` attempt stayed blocking until the stale sync lease expired,
+    even though the message needed to unblock it was already sitting in the
+    DB. Running the pass here closes that gap directly instead of trusting
+    either the in-flight run's own END pass or the one-shot re-enqueue to
+    eventually cover it -- every step is idempotent, so this is
+    redundant-but-harmless on a won claim whose new ingest run does its own
+    START/END passes too.
+    """
+    with SessionLocal() as db:
+        try:
+            account = db.get(ProviderAccount, UUID(account_id))
+        except ValueError:
+            return {"status": "skipped", "account_id": account_id, "reason": "bad account id"}
+        if account is None or not account.refresh_token or account.sync_paused_at is not None:
+            return {"status": "skipped", "account_id": account_id}
+
+        provider_account_id = account.id
+        provider = account.provider
+
+        _run, deduplicated = start_sync_run(
+            db,
+            account.user_id,
+            account.id,
+            mode="reply_reconcile",
+            options={
+                "max_results": settings.scheduled_sync_max_results,
+                "skip_existing": True,
+                "classify_messages": True,
+                "new_only": True,
+            },
+            provider=provider,
+        )
+
+    with SessionLocal() as recon_db:
+        run_reconciliation_pass(
+            recon_db,
+            provider_account_id=provider_account_id,
+            provider=provider,
+            classify_messages=True,
+        )
+
+    if not deduplicated:
+        return {"status": "enqueued", "account_id": account_id}
+
+    if retry_count < 1:
+        self.apply_async(
+            args=[account_id], kwargs={"retry_count": retry_count + 1}, countdown=120
+        )
+        return {"status": "deferred", "account_id": account_id}
+
+    return {"status": "gave_up", "account_id": account_id}
 
 
 @celery_app.task(ignore_result=True, time_limit=300)

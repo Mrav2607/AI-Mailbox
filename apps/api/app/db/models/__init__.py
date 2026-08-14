@@ -13,3 +13,4 @@ from .sync_run import MailSyncRun  # noqa: F401
 from .llm_credential import UserLlmCredential  # noqa: F401
 from .llm_usage import LlmUsageDaily  # noqa: F401
 from .classification_feedback import ClassificationFeedback  # noqa: F401
+from .reply_attempt import ReplyAttempt  # noqa: F401

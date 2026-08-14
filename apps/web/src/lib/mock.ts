@@ -18,7 +18,10 @@ import type {
   LlmUsageByProvider,
   LlmUsageByStage,
   LlmUsageDailyPoint,
+  MessageOut,
   Overview,
+  ReplyDraft,
+  ReplySent,
   SearchResponse,
   ThreadDetail,
   TriageItem,
@@ -26,8 +29,9 @@ import type {
   TriageSort,
   User,
 } from "./types";
+import { senderName } from "./sender";
 import { ALL_LABELS } from "./types";
-import { ApiError } from "./api";
+import { ApiError, type SendReplyInput } from "./api";
 
 // Two connected Gmail accounts, so preview mode can demo the unified inbox
 // and the accounts menu without a live API. Mutable (deleteConnection needs
@@ -124,6 +128,10 @@ function makeItems(count: number): TriageItem[] {
           : null,
       },
       account_email: CONNECTIONS[i % CONNECTIONS.length].email_address,
+      // Every 7th item starts pre-replied, so the "replied" indicator and
+      // the composer's expected_replied_at seeding have something to demo
+      // without requiring an actual send in preview mode.
+      replied_at: i % 7 === 0 ? new Date(now - minutesAgo * 60 * 1000 + 60_000).toISOString() : null,
     });
   }
   return out;
@@ -468,6 +476,7 @@ export function mockIngest(accountIds?: string[]): number {
         model_version: "heuristic-v1",
       },
       account_email: targets[(ingestSeq - 1) % targets.length].email_address,
+      replied_at: null,
     });
   }
   return 2;
@@ -519,9 +528,79 @@ export function mockThread(id: string): ThreadDetail {
       last_message_at: item.last_message_at,
       done: DONE.has(id),
       account_email: item.account_email,
+      replied_at: item.replied_at,
     },
     messages,
     classification: item.classification,
+  };
+}
+
+// A rough, deterministic sent-reply id — good enough for the mock's own
+// bookkeeping (React keys, resend idempotency isn't a concern here since
+// nothing else references it back).
+let replySeq = 0;
+
+// Preview's stand-in for POST /mail/thread/{id}/reply. No stale/in-flight/
+// rate-limit choreography (plan §3.5/§3.6) -- this only needs to exercise the
+// composer's happy path and the credential-gated draft button, same scope as
+// every other mock write path in this file.
+export function mockSendReply(threadId: string, input: SendReplyInput): ReplySent {
+  const item = ALL.find((i) => i.thread_id === threadId);
+  if (!item) throw new ApiError(404, `Thread not found: ${threadId}`);
+
+  const repliedAt = new Date().toISOString();
+  item.replied_at = repliedAt;
+  replySeq += 1;
+
+  const trimmed = input.bodyText.trim();
+  const snippet = trimmed.length > 200 ? `${trimmed.slice(0, 200).trimEnd()}…` : trimmed;
+  const message: MessageOut = {
+    id: `mock-reply-${threadId}-${replySeq}`,
+    sent_at: repliedAt,
+    sender: item.account_email,
+    recipient: item.latest_message_sender ? [item.latest_message_sender] : null,
+    cc: input.replyAll ? [] : null,
+    snippet,
+    body_text: trimmed,
+    body_html: null,
+  };
+
+  // Mirrors the real completion transaction's action-resolution step
+  // (plan §3.5): every open reply/unkinded obligation on this thread
+  // resolves, same as mockSetDone's ACTIONS mutation for a done-thread.
+  let resolved = 0;
+  for (const a of ACTIONS) {
+    if (a.thread_id === threadId && a.status === "open" && (a.kind === "reply" || a.kind === null)) {
+      a.status = "done";
+      resolved += 1;
+    }
+  }
+
+  return { thread_id: threadId, message, replied_at: repliedAt, resolved_action_items: resolved };
+}
+
+// Preview's stand-in for POST /mail/thread/{id}/reply-draft. Follows the same
+// BYOK-gated 409 the real route returns (routes/reply.py's
+// resolve_reply_draft_credential) so the composer's disabled-button-with-
+// tooltip state is demoable without a live API.
+export function mockDraftReply(threadId: string): ReplyDraft {
+  const item = ALL.find((i) => i.thread_id === threadId);
+  if (!item) throw new ApiError(404, `Thread not found: ${threadId}`);
+  if (!LLM_SETTINGS.configured) {
+    throw new ApiError(
+      409,
+      "No LLM credential is configured for drafting replies.",
+      undefined,
+      "reply_draft_credential_missing",
+    );
+  }
+  // senderName can come back null (no sender on the message) -- fall back to
+  // "there" instead of drafting "Hi null,".
+  const sender = senderName(item.latest_message_sender) ?? "there";
+  return {
+    draft_text: `Hi ${sender},\n\nThanks for the note — I'll follow up shortly.\n\nBest,`,
+    provider: LLM_SETTINGS.provider ?? "openai",
+    model: LLM_SETTINGS.model ?? "gpt-4o-mini",
   };
 }
 

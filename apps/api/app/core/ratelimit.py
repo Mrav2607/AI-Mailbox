@@ -2,10 +2,16 @@
 
 Two dependency factories: ``rate_limit`` keys on the caller's IP (for
 anonymous routes like demo-login), ``user_rate_limit`` keys on the
-authenticated user's id. Both fail open -- if Redis is down or unreachable we
-log a warning and let the request through, because rate limiting is a
-guardrail here, not a load-bearing wall. That also keeps offline dev and the
-test suite working without a Redis.
+authenticated user's id. Both fail open by default -- if Redis is down or
+unreachable we log a warning and let the request through, because rate
+limiting is a guardrail here, not a load-bearing wall. That also keeps
+offline dev and the test suite working without a Redis.
+
+``user_rate_limit``'s ``fail_closed`` parameter flips that for a scope where
+letting a Redis outage through is unacceptable -- reply sends (plan
+docs/plans/2026-08-13-reply-plan.md §3.6): mail must never leave without
+even a rate-limit check because the limiter itself is down. Every other
+scope keeps the fail-open default.
 """
 
 from __future__ import annotations
@@ -38,10 +44,18 @@ def _client() -> redis.Redis:
     return _redis_client
 
 
-def _enforce(scope: str, key: str, limit: int, window_seconds: int) -> None:
+def _enforce(
+    scope: str, key: str, limit: int, window_seconds: int, *, fail_closed: bool = False
+) -> None:
     """Fixed-window check: INCR a per-scope/per-caller counter and 429 once it
     passes the limit. The first hit in a window sets the expiry, so the counter
-    resets on its own."""
+    resets on its own.
+
+    ``fail_closed`` flips the Redis-outage behavior for a scope where letting
+    the request through unchecked is unacceptable (reply sends -- plan
+    docs/plans/2026-08-13-reply-plan.md §3.6): rejects with 503 rather than
+    the default fail-open pass-through, before any provider contact.
+    """
     redis_key = f"rl:{scope}:{key}"
     try:
         client = _client()
@@ -52,6 +66,19 @@ def _enforce(scope: str, key: str, limit: int, window_seconds: int) -> None:
             return
         ttl = client.ttl(redis_key)
     except redis.RedisError as exc:
+        if fail_closed:
+            logger.warning(
+                "Rate limiter unavailable (%s); rejecting request for scope %r (fail-closed)",
+                type(exc).__name__,
+                scope,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "send_unavailable",
+                    "message": "Nothing was sent -- sending is temporarily unavailable",
+                },
+            ) from exc
         # Fail open: a down Redis shouldn't take the whole API with it.
         logger.warning(
             "Rate limiter unavailable (%s); allowing request for scope %r",
@@ -65,7 +92,7 @@ def _enforce(scope: str, key: str, limit: int, window_seconds: int) -> None:
     retry_after = ttl if ttl and ttl > 0 else window_seconds
     raise HTTPException(
         status_code=429,
-        detail="Too many requests; try again shortly.",
+        detail={"code": "rate_limited", "message": "Too many requests; try again shortly."},
         headers={"Retry-After": str(retry_after)},
     )
 
@@ -82,12 +109,19 @@ def rate_limit(scope: str, limit: int, window_seconds: int) -> Callable:
     return dependency
 
 
-def user_rate_limit(scope: str, limit: int, window_seconds: int) -> Callable:
+def user_rate_limit(
+    scope: str, limit: int, window_seconds: int, *, fail_closed: bool = False
+) -> Callable:
     """Per-user limiter for authenticated routes. FastAPI caches dependency
     results per request, so leaning on get_current_user here doesn't cost a
-    second token lookup."""
+    second token lookup.
+
+    ``fail_closed=True`` (only the reply-send scope uses it) rejects with
+    503 ``{"code": "send_unavailable"}`` instead of the default fail-open
+    pass-through when Redis is unreachable -- see ``_enforce``.
+    """
 
     def dependency(current_user: AppUser = Depends(get_current_user)) -> None:
-        _enforce(scope, str(current_user.id), limit, window_seconds)
+        _enforce(scope, str(current_user.id), limit, window_seconds, fail_closed=fail_closed)
 
     return dependency
