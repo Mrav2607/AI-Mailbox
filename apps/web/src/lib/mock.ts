@@ -574,6 +574,14 @@ export function mockSnoozeThread(threadId: string, until: string | null): Snooze
   }
 
   const now = Date.now();
+  // `new Date("2026-08-15T08:00:00")` (no Z/offset) parses fine as LOCAL
+  // time in JS -- the real API 422s that same string as naive_datetime, so
+  // without this check the mock silently diverges from prod. Require a
+  // trailing Z or a numeric UTC offset before ever handing the string to
+  // Date, same shape check as the server's tzinfo-is-None guard.
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/.test(until)) {
+    throw new ApiError(422, "until must be timezone-aware", undefined, "naive_datetime");
+  }
   const untilMs = new Date(until).getTime();
   if (Number.isNaN(untilMs)) {
     throw new ApiError(422, "until must be timezone-aware", undefined, "naive_datetime");

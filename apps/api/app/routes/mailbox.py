@@ -894,7 +894,12 @@ def search_threads(
         )
         .exists()
     )
-    query = select(MailThread).where(
+    # Same projection triage uses (§3.4/P2-1) -- search is the documented way
+    # to reach a thread outside the open buckets, so its results have to carry
+    # snooze state too instead of always reporting null. One `now` captured
+    # here, same as get_triage.
+    now = datetime.now(timezone.utc)
+    query = select(MailThread, _projected_active_snoozed_until(now)).where(
         MailThread.user_id == current_user.id,
         or_(MailThread.subject.ilike(pattern, escape="\\"), message_match),
     )
@@ -902,16 +907,17 @@ def search_threads(
         # Same self-scoping predicate as triage -- a non-owned or unknown id
         # just yields an empty page, never a 404.
         query = query.where(MailThread.provider_account_id == provider_account_id)
-    threads = list(
-        db.execute(
-            query.order_by(*_recency_order())
-            .offset(offset)
-            .limit(limit)
-        )
-        .scalars()
-        .all()
-    )
-    return {"query": q, "items": _assemble_triage_items(db, threads)}
+    rows = db.execute(
+        query.order_by(*_recency_order())
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    threads = [row[0] for row in rows]
+    snoozed_until_by_thread = {row[0].id: row[1] for row in rows}
+    return {
+        "query": q,
+        "items": _assemble_triage_items(db, threads, snoozed_until_by_thread),
+    }
 
 
 # response_model=None: a 204 carries no body, so there is nothing to validate

@@ -378,6 +378,30 @@ describe("mock snooze", () => {
     expect(caught!.code).toBe("snooze_too_far");
   });
 
+  it("rejects a naive datetime string (no Z/offset) with naive_datetime", () => {
+    // `new Date("...T08:00:00")` parses fine as LOCAL time in JS -- the real
+    // API 422s this exact shape as naive_datetime, so the mock has to match.
+    const id = pickThreadId();
+    let caught: ApiError | undefined;
+    try {
+      mockSnoozeThread(id, "2026-09-01T08:00:00");
+    } catch (e) {
+      caught = e as ApiError;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    expect(caught!.status).toBe(422);
+    expect(caught!.code).toBe("naive_datetime");
+  });
+
+  it("accepts an until carrying a numeric UTC offset, not just Z", () => {
+    const id = pickThreadId();
+    const until = new Date(Date.now() + 3 * 60 * 60 * 1000);
+    const offsetString = until.toISOString().replace("Z", "+00:00");
+
+    const res = mockSnoozeThread(id, offsetString);
+    expect(res.snoozed_until).toBe(until.toISOString());
+  });
+
   it("404s snoozing a thread id that doesn't exist", () => {
     expect(() =>
       mockSnoozeThread("not-a-real-id", new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString()),
