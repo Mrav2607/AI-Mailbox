@@ -184,9 +184,9 @@ Each ingested message is classified into one of six labels: `needs_reply`,
 `action_required`, `fyi`, `promotional`, `security_alert`, `spam`. The backend is
 chosen by `CLASSIFIER_BACKEND` in `.env`:
 
-- `local` (the code default, though both shipped `.env.example` files set
-  `heuristic` so a fresh clone runs without a model) — a fine-tuned encoder
-  loaded from `CLASSIFIER_MODEL_PATH`
+- `local` (the code default, though both deploy templates set `heuristic`, so
+  copying one to `deploy/.env` selects the no-model backend) — a fine-tuned
+  encoder loaded from `CLASSIFIER_MODEL_PATH`
   (default `models/email-classifier`). Needs the `local-classifier` extra. If
   torch or the model files are missing, it falls back to the heuristic, so the
   API still runs without a trained model. If the model directory contains a
