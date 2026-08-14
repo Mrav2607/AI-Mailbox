@@ -119,18 +119,22 @@ class _ReclassifyDB:
     the route issues up to four statements per request now (locked
     latest-message select, prior-classification select, feedback insert,
     classification upsert), plus an optional fifth (extracted->ineligible
-    invalidation UPDATE), and a single fake result would silently make every
+    invalidation UPDATE) and a sixth post-commit (the label-sync-enabled
+    lookup, plan §3.1), and a single fake result would silently make every
     read return whatever this stub was last told to hand back. Every
     statement is recorded in `statements` (in call order) regardless, and
     commit() is timestamped into `events` so tests can assert the extraction
     enqueue happens strictly after it.
     """
 
-    def __init__(self, thread, message, events, *, prior_classification=None):
+    def __init__(
+        self, thread, message, events, *, prior_classification=None, label_sync_enabled=False
+    ):
         self.thread = thread
         self.message = message
         self.events = events
         self.prior_classification = prior_classification
+        self.label_sync_enabled = label_sync_enabled
         self.statements = []
 
     def get(self, model, pk):
@@ -142,6 +146,8 @@ class _ReclassifyDB:
         result = MagicMock()
         if "FROM mail_message" in compiled:
             result.scalars.return_value.first.return_value = self.message
+        elif "FROM provider_account" in compiled:
+            result.scalar_one_or_none.return_value = self.label_sync_enabled
         elif "FROM classification" in compiled:
             result.scalars.return_value.first.return_value = self.prior_classification
         elif "INSERT INTO classification " in compiled:
@@ -192,7 +198,9 @@ def _reclassify_setup(
     user = MagicMock(id=uuid4())
     thread_id = uuid4()
     message_id = uuid4()
-    thread = SimpleNamespace(id=thread_id, user_id=user.id, subject=subject)
+    thread = SimpleNamespace(
+        id=thread_id, user_id=user.id, subject=subject, provider_account_id=uuid4()
+    )
     message = SimpleNamespace(id=message_id, snippet=snippet, body_text=body_text)
     events: list[str] = []
     db = _ReclassifyDB(thread, message, events, prior_classification=prior_classification)
@@ -294,8 +302,9 @@ def test_reclassify_away_invalidates_a_settled_extracted_row(monkeypatch):
     assert resp.status_code == 200
     # statements: [0] locked latest-message select, [1] prior-classification
     # select, [2] feedback insert, [3] classification upsert, [4] the
-    # extracted->ineligible invalidation UPDATE.
-    assert len(db.statements) == 5
+    # extracted->ineligible invalidation UPDATE, [5] the post-commit
+    # label-sync-enabled lookup (plan §3.1, always runs regardless of label).
+    assert len(db.statements) == 6
     compiled = str(
         db.statements[4].compile(compile_kwargs={"literal_binds": True})
     )
@@ -323,8 +332,9 @@ def test_reclassify_to_action_label_issues_no_invalidation_update(monkeypatch):
 
     assert resp.status_code == 200
     # Locked latest-message select, prior-classification select, feedback
-    # insert, classification upsert -- no fifth (invalidation) statement.
-    assert len(db.statements) == 4
+    # insert, classification upsert, then the post-commit label-sync-enabled
+    # lookup -- no invalidation statement (this label stays an action label).
+    assert len(db.statements) == 5
     assert fake_task.calls == [str(message_id)]
 
 

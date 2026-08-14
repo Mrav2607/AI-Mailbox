@@ -45,6 +45,7 @@ from app.workers.tasks_nlp import (
     classify_latest_threads,
     extract_action_for_message,
 )
+from app.workers.tasks_label_sync import sync_thread_labels
 from app.services.nlp.backfill import (
     latest_label_subquery,
     latest_message_ordering,
@@ -664,6 +665,22 @@ def reclassify_thread(
             logger.exception(
                 "action extraction enqueue failed for message %s", latest_message.id
             )
+
+    # Post-commit, in its OWN try/except (plan docs/plans/2026-08-13-label-
+    # sync-plan.md §3.1) -- a manual correction should reach the provider in
+    # seconds, but this enqueue's failure must never suppress the extraction
+    # enqueue above, and vice versa. Only fires when the account opted in;
+    # the tick is the guarantee, this is the latency optimization.
+    label_sync_enabled = db.execute(
+        select(ProviderAccount.label_sync_enabled).where(
+            ProviderAccount.id == thread.provider_account_id
+        )
+    ).scalar_one_or_none()
+    if label_sync_enabled:
+        try:
+            cast(Any, sync_thread_labels).delay(str(thread_id))
+        except Exception:
+            logger.exception("label sync enqueue failed for thread %s", thread_id)
 
     return {
         "thread_id": str(thread_id),
