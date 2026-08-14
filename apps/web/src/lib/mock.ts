@@ -773,7 +773,9 @@ export function mockDraftReply(threadId: string): ReplyDraft {
       "reply_draft_credential_missing",
     );
   }
-  const sender = senderName(item.latest_message_sender);
+  // senderName can come back null (no sender on the message) -- fall back to
+  // "there" instead of drafting "Hi null,".
+  const sender = senderName(item.latest_message_sender) ?? "there";
   return {
     draft_text: `Hi ${sender},\n\nThanks for the note — I'll follow up shortly.\n\nBest,`,
     provider: LLM_SETTINGS.provider ?? "openai",

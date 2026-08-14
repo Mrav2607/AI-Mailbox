@@ -728,7 +728,14 @@ def set_thread_done(
         raise HTTPException(status_code=404, detail="Thread not found")
 
     locked = db.execute(
-        select(MailThread).where(MailThread.id == thread_id).with_for_update()
+        # populate_existing: the pre-lock db.get put this row in the identity
+        # map, and without it this select hands back that same object with its
+        # STALE attributes -- the locked re-read would see nothing a concurrent
+        # commit changed (the exact bug the reply fence had, PR #45 review).
+        select(MailThread)
+        .where(MailThread.id == thread_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one()
     now = datetime.now(timezone.utc)
 
@@ -811,7 +818,14 @@ def snooze_thread(
         until = until.astimezone(timezone.utc)
 
     locked = db.execute(
-        select(MailThread).where(MailThread.id == thread_id).with_for_update()
+        # populate_existing: the pre-lock db.get put this row in the identity
+        # map, and without it this select hands back that same object with its
+        # STALE attributes -- the locked re-read would see nothing a concurrent
+        # commit changed (the exact bug the reply fence had, PR #45 review).
+        select(MailThread)
+        .where(MailThread.id == thread_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one()
     now = datetime.now(timezone.utc)
 

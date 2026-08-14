@@ -243,30 +243,46 @@ def run_reconciliation_pass(
     ingest START, ingest END, and from `reconcile_reply_attempt` -- every
     step is idempotent, so re-running against already-settled rows is a
     cheap no-op.
+
+    Timeliness-only (this module's own docstring): a failure OUTSIDE the
+    per-attempt loop below -- the eligible-attempts query itself, or
+    anything else unexpected -- must never propagate to the four ingest
+    call sites. Aborting a sync before it's fetched anything (the START
+    pass) or failing an already-committed run (the END pass) over a
+    reconciliation-only concern would be exactly the gating this function's
+    docstring promises never happens. Rolled back, logged, and reported as
+    nothing-done instead of raised.
     """
-    attempt_ids = _eligible_attempt_ids(
-        db, provider_account_id=provider_account_id, provider=provider
-    )
-    completed = 0
-    classified = 0
-    for attempt_id in attempt_ids:
-        try:
-            outcome = _reconcile_one_attempt(
-                db, attempt_id=attempt_id, classify_messages=classify_messages
-            )
-        except Exception:
-            db.rollback()
-            logger.exception(
-                "reply reconciliation pass failed for attempt %s", attempt_id
-            )
-            continue
-        if outcome is None:
-            continue
-        completed += 1
-        if outcome.get("classified"):
-            classified += 1
-    return {
-        "attempts_checked": len(attempt_ids),
-        "completed": completed,
-        "classified": classified,
-    }
+    try:
+        attempt_ids = _eligible_attempt_ids(
+            db, provider_account_id=provider_account_id, provider=provider
+        )
+        completed = 0
+        classified = 0
+        for attempt_id in attempt_ids:
+            try:
+                outcome = _reconcile_one_attempt(
+                    db, attempt_id=attempt_id, classify_messages=classify_messages
+                )
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "reply reconciliation pass failed for attempt %s", attempt_id
+                )
+                continue
+            if outcome is None:
+                continue
+            completed += 1
+            if outcome.get("classified"):
+                classified += 1
+        return {
+            "attempts_checked": len(attempt_ids),
+            "completed": completed,
+            "classified": classified,
+        }
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "reply reconciliation pass failed for account %s", provider_account_id
+        )
+        return {"attempts_checked": 0, "completed": 0, "classified": 0}

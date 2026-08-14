@@ -519,6 +519,31 @@ def test_run_reconciliation_pass_isolates_a_failing_attempt(monkeypatch):
     assert db.rolled_back is True
 
 
+def test_run_reconciliation_pass_eligible_query_failure_never_raises(monkeypatch):
+    """F2: reconciliation is timeliness-only and must never gate ingest -- a
+    failure OUTSIDE the per-attempt loop (the eligible-attempts query
+    itself) must roll back, log, and return cleanly instead of propagating
+    to the four ingest call sites (which would abort a sync before fetch,
+    or fail an already-committed run)."""
+
+    def raise_boom(db, **kwargs):
+        raise RuntimeError("eligible-attempts query blew up")
+
+    monkeypatch.setattr(reconcile, "_eligible_attempt_ids", raise_boom)
+
+    class _DB:
+        def rollback(self):
+            self.rolled_back = True
+
+    db = _DB()
+    result = reconcile.run_reconciliation_pass(
+        db, provider_account_id=uuid4(), provider="gmail", classify_messages=True
+    )
+
+    assert result == {"attempts_checked": 0, "completed": 0, "classified": 0}
+    assert db.rolled_back is True
+
+
 def test_run_reconciliation_pass_counts_matches_with_nothing_yet_as_incomplete(monkeypatch):
     ids = [uuid4(), uuid4()]
     monkeypatch.setattr(reconcile, "_eligible_attempt_ids", lambda db, **k: ids)

@@ -23,7 +23,7 @@ ordering from plan §5).
 from __future__ import annotations
 
 from contextlib import nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -637,6 +637,59 @@ def test_claim_extract_record_rereads_done_at_at_record_time(monkeypatch):
     extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     assert recorded["thread_done"] is True
+
+
+def test_claim_extract_record_already_replied_true_when_created_at_equals_fence(monkeypatch):
+    """F9 / plan §3.5: the fence CAS uses `created_at <= replied_at`, so the
+    exact boundary -- a message whose own created_at equals the fence --
+    counts as already answered."""
+    fence = datetime.now(timezone.utc)
+    message = _make_message(created_at=fence)
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(
+        message=message, thread=thread,
+        classification=_make_classification(), done_at_reads=[None],
+        replied_at_reads=[fence],
+    )
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage", lambda **k: _extraction_attempt(NoAction())
+    )
+    recorded = {}
+    monkeypatch.setattr(
+        extraction_run, "record_extraction",
+        lambda db, **kwargs: recorded.update(kwargs) or True,
+    )
+
+    extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+
+    assert recorded["already_replied"] is True
+
+
+def test_claim_extract_record_already_replied_false_when_created_at_after_fence(monkeypatch):
+    """The complementary boundary: a message that arrived strictly AFTER
+    the reply fence was not answered by it (P3-1's inbound-C case)."""
+    fence = datetime.now(timezone.utc)
+    message = _make_message(created_at=fence + timedelta(seconds=1))
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(
+        message=message, thread=thread,
+        classification=_make_classification(), done_at_reads=[None],
+        replied_at_reads=[fence],
+    )
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage", lambda **k: _extraction_attempt(NoAction())
+    )
+    recorded = {}
+    monkeypatch.setattr(
+        extraction_run, "record_extraction",
+        lambda db, **kwargs: recorded.update(kwargs) or True,
+    )
+
+    extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+
+    assert recorded["already_replied"] is False
 
 
 def test_claim_extract_record_stale_record_is_skipped(monkeypatch):
