@@ -1,4 +1,4 @@
-import { LABEL_META, bucketLabel } from "@/lib/labels";
+import { BUCKET_KEYS, LABEL_META, bucketLabel } from "@/lib/labels";
 import type { ActionCounts, BucketKey, Label } from "@/lib/types";
 import { ALL_LABELS, BUCKETS } from "@/lib/types";
 import type { SidebarSide } from "@/lib/layout";
@@ -72,11 +72,15 @@ export function BucketSidebar({
         </button>
       </div>
       <nav className="flex-1 overflow-y-auto scrollbar-thin py-1">
-        {BUCKETS.map((b, i) => {
+        {BUCKETS.map((b) => {
           const isActive = b === active;
           const meta = (ALL_LABELS as readonly string[]).includes(b)
             ? LABEL_META[b as Label]
             : null;
+          // "snoozed" has no digit (P2-3, docs/plans/2026-08-13-snooze-
+          // plan.md §3.6) -- reached by click or the command palette only,
+          // so no chip renders for it here.
+          const key = BUCKET_KEYS[b];
           return (
             <button
               key={b}
@@ -92,7 +96,7 @@ export function BucketSidebar({
                   : "border-transparent text-muted-foreground hover:bg-[var(--color-panel-hi)]/60 hover:text-foreground",
               ].join(" ")}
             >
-              <span className="kbd">{i + 1}</span>
+              {key && <span className="kbd">{key}</span>}
               <span
                 className={[
                   "h-2 w-2 rounded-full shrink-0",

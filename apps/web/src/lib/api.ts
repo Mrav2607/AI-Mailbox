@@ -17,6 +17,7 @@ import type {
   ReplyDraft,
   ReplySent,
   SearchResponse,
+  SnoozeResult,
   ThreadDetail,
   TriageResponse,
   TriageSort,
@@ -43,6 +44,7 @@ import {
   mockSendReply,
   mockSetActionStatus,
   mockSetDone,
+  mockSnoozeThread,
   mockTestLlmSettings,
   mockThread,
   mockTriage,
@@ -521,6 +523,25 @@ export async function setThreadDone(
     `/mail/thread/${encodeURIComponent(threadId)}/done`,
     { method: "POST", body: JSON.stringify({ done }) },
   );
+}
+
+// Snooze a thread until a future instant (client-computed local-time preset,
+// docs/plans/2026-08-13-snooze-plan.md §3.4/§3.6 -- the server only ever
+// sees the resolved absolute instant), or clear an existing snooze with
+// `until: null`. A too-soon/too-far/naive-datetime `until` comes back as a
+// 422 with a structured {code, message} detail -- see ApiError.code.
+export async function snoozeThread(
+  threadId: string,
+  until: string | null,
+): Promise<SnoozeResult> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 120));
+    return mockSnoozeThread(threadId, until);
+  }
+  return request<SnoozeResult>(`/mail/thread/${encodeURIComponent(threadId)}/snooze`, {
+    method: "POST",
+    body: JSON.stringify({ until }),
+  });
 }
 
 // Permanently delete a thread (and its messages/classifications via cascade).

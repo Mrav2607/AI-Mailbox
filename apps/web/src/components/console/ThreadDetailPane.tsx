@@ -1,5 +1,7 @@
 import { useMemo, useState } from "react";
 import {
+  AlarmClock,
+  AlarmClockOff,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
@@ -23,12 +25,65 @@ import {
 } from "@/lib/labels";
 import { emailLocalPart } from "@/lib/sender";
 import { absTime } from "@/lib/time";
+import { SNOOZE_PRESETS } from "@/lib/snooze";
 import type { Classification, Label, ReplySent, ThreadDetail, ThreadMessage } from "@/lib/types";
 import { ALL_LABELS } from "@/lib/types";
 import type { ReadingSide } from "@/lib/layout";
 import { gmailThreadUrl } from "@/lib/utils";
 import { PaneDragHandle } from "./ConsoleLayout";
+import { Popover } from "./Popover";
 import { ReplyComposer, type ReplyStateRefetch } from "./ReplyComposer";
+
+const fieldLabel = "font-mono text-[11px] text-muted-foreground";
+const control =
+  "w-full bg-[var(--color-panel)] border border-border rounded px-2 py-1 text-[12px] font-mono text-foreground";
+
+// The clock button's popover content: presets resolve client-side in local
+// time (docs/plans/2026-08-13-snooze-plan.md §3.4/§3.6 -- the server only
+// ever sees the resolved absolute instant), plus a native datetime-local
+// fallback for anything the presets don't cover.
+function SnoozeMenu({ onPick }: { onPick: (d: Date) => void }) {
+  const [custom, setCustom] = useState("");
+  return (
+    <div className="space-y-1.5">
+      <div className={fieldLabel}>snooze until</div>
+      {SNOOZE_PRESETS.map((p) => (
+        <button
+          key={p.id}
+          type="button"
+          onClick={() => onPick(p.resolve(new Date()))}
+          className="w-full text-left h-7 px-2 rounded border border-border bg-[var(--color-panel)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
+        >
+          {p.label}
+        </button>
+      ))}
+      <label className="block space-y-1 pt-1.5 border-t border-border">
+        <span className={fieldLabel}>pick date…</span>
+        <input
+          type="datetime-local"
+          value={custom}
+          onChange={(e) => setCustom(e.target.value)}
+          className={control}
+        />
+      </label>
+      <button
+        type="button"
+        disabled={!custom}
+        onClick={() => {
+          // datetime-local's value has no timezone offset -- the Date
+          // constructor treats that as local time, same as every preset
+          // above, so the instant sent to the server always matches what
+          // the picker showed.
+          const d = new Date(custom);
+          if (!Number.isNaN(d.getTime())) onPick(d);
+        }}
+        className="w-full h-7 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+      >
+        snooze
+      </button>
+    </div>
+  );
+}
 
 const COLLAPSE_ICONS = {
   right: PanelRightClose,
@@ -119,6 +174,16 @@ interface Props {
   onCollapse?: () => void;
   onDone?: () => void;
   onDelete?: () => void;
+  // Snooze wiring (docs/plans/2026-08-13-snooze-plan.md §3.6). Popover open
+  // state is lifted to App (P2-5): the custom Popover has no dialog role,
+  // so the console hotkey handler's suppression check needs its own signal
+  // rather than relying on the hook's role="dialog" backstop. Omitting
+  // these together just leaves the clock control off, same pattern as
+  // onDone/onDelete.
+  onSnooze?: (until: Date) => void;
+  onUnsnooze?: () => void;
+  snoozePopoverOpen?: boolean;
+  onSnoozePopoverOpenChange?: (open: boolean) => void;
   // Only worth showing once there's more than one connected account to
   // disambiguate — a single-account mailbox doesn't need it.
   showAccountBadge?: boolean;
@@ -146,6 +211,10 @@ export function ThreadDetailPane({
   onCollapse,
   onDone,
   onDelete,
+  onSnooze,
+  onUnsnooze,
+  snoozePopoverOpen,
+  onSnoozePopoverOpenChange,
   showAccountBadge,
   side = "right",
   predictionOpen = true,
@@ -304,6 +373,41 @@ export function ThreadDetailPane({
             >
               <ReplyIcon className="h-3.5 w-3.5" />
             </button>
+          )}
+          {onSnooze && onUnsnooze && onSnoozePopoverOpenChange && (
+            <Popover
+              align="end"
+              open={!!snoozePopoverOpen}
+              onOpenChange={onSnoozePopoverOpenChange}
+              trigger={
+                <button
+                  onClick={() => {
+                    // Binary control (P2-3): once snoozed_until is set, the
+                    // control unsnoozes directly -- there's nothing to pick,
+                    // so it never opens the preset popover.
+                    if (data.thread.snoozed_until) onUnsnooze();
+                    else onSnoozePopoverOpenChange(!snoozePopoverOpen);
+                  }}
+                  aria-label={data.thread.snoozed_until ? "Unsnooze thread" : "Snooze thread"}
+                  aria-expanded={data.thread.snoozed_until ? undefined : !!snoozePopoverOpen}
+                  title={data.thread.snoozed_until ? "Unsnooze ( z )" : "Snooze ( z )"}
+                  className="inline-flex items-center justify-center max-md:h-10 max-md:w-10 text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+                >
+                  {data.thread.snoozed_until ? (
+                    <AlarmClockOff className="h-3.5 w-3.5" />
+                  ) : (
+                    <AlarmClock className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              }
+            >
+              <SnoozeMenu
+                onPick={(d) => {
+                  onSnoozePopoverOpenChange(false);
+                  onSnooze(d);
+                }}
+              />
+            </Popover>
           )}
           {onDone && (
             <button

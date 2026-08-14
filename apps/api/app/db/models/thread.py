@@ -3,7 +3,15 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Index, Text, ForeignKey, UniqueConstraint, text
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Index,
+    Text,
+    ForeignKey,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -31,6 +39,23 @@ class MailThread(Base):
             "user_id",
             text("last_message_at DESC NULLS LAST"),
             text("created_at DESC"),
+        ),
+        # Snoozed_until and snoozed_at are set/cleared together (see the
+        # snoozed_until column comment below) -- one is never null while the
+        # other is set.
+        CheckConstraint(
+            "(snoozed_until IS NULL) = (snoozed_at IS NULL)",
+            name="ck_mail_thread_snooze_pair",
+        ),
+        # Belt-and-braces (docs/plans/2026-08-13-snooze-plan.md §3.3): done
+        # and active-snooze are mutually exclusive at the application layer
+        # (set_thread_done/snooze_thread in app/routes/mailbox.py both clear
+        # the other lifecycle state on write) -- this CHECK makes a future
+        # code path that reintroduces that race fail loudly instead of
+        # corrupting state.
+        CheckConstraint(
+            "NOT (done_at IS NOT NULL AND snoozed_until IS NOT NULL)",
+            name="ck_mail_thread_done_snooze_excl",
         ),
     )
 
@@ -61,6 +86,17 @@ class MailThread(Base):
     # docs/plans/2026-08-13-reply-plan.md §3.5). Only advances (greatest()),
     # only through app/services/mail_send/common.py's fence/resolve helper.
     replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Snooze wake time: null = not snoozed, timestamp = when the thread
+    # reappears in triage -- or sooner, if new mail lands first (see the
+    # active-snooze predicate in app/routes/mailbox.py). Always set/cleared
+    # together with snoozed_at (CHECK ck_mail_thread_snooze_pair) and never
+    # alongside a non-null done_at (CHECK ck_mail_thread_done_snooze_excl).
+    # docs/plans/2026-08-13-snooze-plan.md §3.1/§3.3.
+    snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When the current snooze was set, on OUR clock -- the active-snooze
+    # predicate compares this against last_message_at to tell "time passed"
+    # from "new mail woke it early".
+    snoozed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()")
     )

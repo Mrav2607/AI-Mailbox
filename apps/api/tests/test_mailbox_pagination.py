@@ -149,12 +149,13 @@ def test_counts_statements_carry_provider_account_predicate_when_set(client):
     resp = c.get(f"/api/v1/mail/counts?provider_account_id={account_id}")
     assert resp.status_code == 200
     statements = [call.args[0] for call in db.execute.call_args_list]
-    # The grouped open-buckets query and the done-count query must carry the
-    # predicate, so counts["all"] (from the grouped query) and counts["done"]
-    # agree on the same account scope; the third statement is the actions
+    # The grouped open-buckets query, the done-count query, and the
+    # snoozed-count query must all carry the predicate, so counts["all"]
+    # (from the grouped query), counts["done"], and counts["snoozed"] agree
+    # on the same account scope; the fourth statement is the actions
     # aggregate, which must NOT carry it -- the agenda is always cross-account.
-    assert len(statements) == 3
-    bucket_statements, actions_statement = statements[:2], statements[2]
+    assert len(statements) == 4
+    bucket_statements, actions_statement = statements[:3], statements[3]
     for statement in bucket_statements:
         compiled = _compiled(statement)
         assert f"mail_thread.provider_account_id = '{account_id.hex}'" in compiled

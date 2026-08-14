@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { SEEN_CAP, THREAD_SEEN_KEY_PREFIX, isUnseen, loadSeen, markSeen } from "./seen";
+import { SEEN_CAP, THREAD_SEEN_KEY_PREFIX, isUnseen, loadSeen, markSeen, unmarkSeen } from "./seen";
 
 const USER = "user-1";
 
@@ -113,6 +113,41 @@ describe("seen store", () => {
       JSON.stringify({ t1: "2026-07-01T00:00:00Z" }),
     );
     expect(loadSeen(USER).size).toBe(0);
+  });
+
+  it("unmarkSeen removes an entry and persists the removal", () => {
+    const map = loadSeen(USER);
+    markSeen(map, USER, "t1", "2026-07-01T00:00:00Z");
+    unmarkSeen(map, USER, "t1");
+
+    expect(map.has("t1")).toBe(false);
+    expect(loadSeen(USER).has("t1")).toBe(false);
+  });
+
+  it("unmarkSeen only removes the thread it's told to", () => {
+    const map = loadSeen(USER);
+    markSeen(map, USER, "t1", "2026-07-01T00:00:00Z");
+    markSeen(map, USER, "t2", "2026-07-01T00:00:00Z");
+    unmarkSeen(map, USER, "t1");
+
+    expect(map.has("t1")).toBe(false);
+    expect(map.has("t2")).toBe(true);
+  });
+
+  it("unmarkSeen on a thread with no entry is a harmless no-op", () => {
+    const map = loadSeen(USER);
+    expect(() => unmarkSeen(map, USER, "never-seen")).not.toThrow();
+    expect(map.has("never-seen")).toBe(false);
+  });
+
+  it("re-marking after unmarkSeen restores unread state, and can be seen again", () => {
+    const map = loadSeen(USER);
+    markSeen(map, USER, "t1", "2026-07-01T00:00:00Z");
+    unmarkSeen(map, USER, "t1");
+    expect(isUnseen(map, "t1", "2026-07-01T00:00:00Z")).toBe(true);
+
+    markSeen(map, USER, "t1", "2026-07-01T00:00:00Z");
+    expect(isUnseen(map, "t1", "2026-07-01T00:00:00Z")).toBe(false);
   });
 
   it("markSeen swallows a storage.setItem failure without throwing", () => {

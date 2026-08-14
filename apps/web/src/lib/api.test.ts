@@ -356,6 +356,75 @@ describe("setActionStatus", () => {
   });
 });
 
+describe("snoozeThread", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("posts { until } to /mail/thread/{id}/snooze", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({
+      thread_id: "t1",
+      snoozed_until: "2026-08-15T08:00:00Z",
+      snoozed_at: "2026-08-14T10:00:00Z",
+    });
+    const res = await api.snoozeThread("t1", "2026-08-15T08:00:00Z");
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(new URL(url as string).pathname).toBe("/api/v1/mail/thread/t1/snooze");
+    expect((opts as RequestInit).method).toBe("POST");
+    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({
+      until: "2026-08-15T08:00:00Z",
+    });
+    expect(res.snoozed_until).toBe("2026-08-15T08:00:00Z");
+  });
+
+  it("posts { until: null } to clear an existing snooze", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ thread_id: "t1", snoozed_until: null, snoozed_at: null });
+    const res = await api.snoozeThread("t1", null);
+    expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({
+      until: null,
+    });
+    expect(res.snoozed_until).toBeNull();
+    expect(res.snoozed_at).toBeNull();
+  });
+
+  it("URL-encodes the thread id", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ thread_id: "t/1", snoozed_until: null, snoozed_at: null });
+    await api.snoozeThread("t/1", null);
+    expect(new URL(fetchMock.mock.calls[0][0] as string).pathname).toBe(
+      "/api/v1/mail/thread/t%2F1/snooze",
+    );
+  });
+
+  it("surfaces the server's structured snooze_too_soon code", async () => {
+    const api = await importLiveApi();
+    stubFetch(
+      { detail: { code: "snooze_too_soon", message: "until must be more than 60s in the future" } },
+      422,
+    );
+    await expect(api.snoozeThread("t1", "2026-08-14T10:00:30Z")).rejects.toMatchObject({
+      status: 422,
+      code: "snooze_too_soon",
+    });
+  });
+
+  it("in mock mode, round-trips a snooze/unsnooze against the demo mailbox", async () => {
+    const api = await importMockApi();
+    const { items } = await api.getTriage("all", 1);
+    const id = items[0].thread_id;
+    const until = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+
+    const res = await api.snoozeThread(id, until);
+    expect(res.snoozed_until).toBe(until);
+
+    const cleared = await api.snoozeThread(id, null);
+    expect(cleared.snoozed_until).toBeNull();
+  });
+});
+
 describe("backfillActions", () => {
   afterEach(() => {
     vi.unstubAllGlobals();

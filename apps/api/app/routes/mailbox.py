@@ -4,7 +4,7 @@ from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
-from sqlalchemy import select, desc, insert, or_, func, update
+from sqlalchemy import and_, case, select, desc, insert, or_, func, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -17,6 +17,8 @@ from app.db.schemas.mailbox import (
     Queued,
     Reclassified,
     Search,
+    SnoozeRequest,
+    SnoozeResult,
     SyncHealth,
     SyncRun,
     SyncRunList,
@@ -77,12 +79,18 @@ _MAX_INGEST_RESULTS = 500
 # a request open for minutes).
 _MAX_INLINE_BACKFILL = 50
 # Valid triage filters: every classifier label plus the synthetic buckets.
-_TRIAGE_BUCKETS = frozenset(LABELS) | {"all", "unclassified", "done"}
+_TRIAGE_BUCKETS = frozenset(LABELS) | {"all", "unclassified", "done", "snoozed"}
 # Valid triage orderings: recency (default) or grouped by connected account.
 _TRIAGE_SORTS = frozenset({"recency", "account"})
-# Backfill scopes by classification state, not done-ness, so it doesn't take
-# the "done" bucket.
-_BACKFILL_BUCKETS = _TRIAGE_BUCKETS - {"done"}
+# Backfill scopes by classification state, not lifecycle state, so it doesn't
+# take the "done" or "snoozed" buckets (mirrors done -- see
+# docs/plans/2026-08-13-snooze-plan.md §3.2).
+_BACKFILL_BUCKETS = _TRIAGE_BUCKETS - {"done", "snoozed"}
+# Snooze bounds (docs/plans/2026-08-13-snooze-plan.md §3.4): far enough out
+# that a snooze meaningfully defers the thread, and bounded so a fat-fingered
+# date doesn't bury it for years.
+_SNOOZE_MIN_LEAD_SECONDS = 60
+_SNOOZE_MAX_LEAD_DAYS = 366
 # Classifier backends a caller may request per run (see services.nlp.classify).
 # "gemini" is the old name for "llm" -- still accepted so existing deployments
 # and saved requests don't break, but it's no longer the name we document. The
@@ -108,6 +116,41 @@ class DoneRequest(BaseModel):
     done: bool
 
 
+def _active_snooze_predicate(now: datetime):
+    """The ONE definition of "this thread is actively snoozed" (frozen SQL,
+    docs/plans/2026-08-13-snooze-plan.md §3.1) -- reused verbatim by the
+    triage/counts bucket filters and the snoozed_until projection below,
+    never re-derived. `now` is captured once in Python per request and bound
+    in, so this is testable offline and immune to transaction-start-time
+    skew.
+
+    The explicit `last_message_at IS NULL` arm matters: a bare
+    `last_message_at <= snoozed_at` comparison against a NULL is SQL
+    unknown, which would silently drop a future-snoozed, never-messaged
+    thread from every bucket instead of keeping it snoozed.
+    """
+    return and_(
+        MailThread.snoozed_until.is_not(None),
+        MailThread.snoozed_until > now,
+        or_(
+            MailThread.last_message_at.is_(None),
+            MailThread.last_message_at <= MailThread.snoozed_at,
+        ),
+    )
+
+
+def _projected_active_snoozed_until(now: datetime):
+    """`CASE WHEN <the predicate above> THEN snoozed_until ELSE NULL END`,
+    labelled for selection alongside thread rows (P1-6/P2-1 in the plan) --
+    the mechanism that exposes snooze state to triage/search/detail without
+    a per-row query or a second, Python-side re-derivation of the predicate.
+    """
+    return case(
+        (_active_snooze_predicate(now), MailThread.snoozed_until),
+        else_=None,
+    ).label("active_snoozed_until")
+
+
 def _recency_order() -> tuple:
     """Shared ORDER BY for triage and search: newest first, with an id
     tiebreak.
@@ -123,10 +166,18 @@ def _recency_order() -> tuple:
     )
 
 
-def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]:
+def _assemble_triage_items(
+    db: Session,
+    threads: list[MailThread],
+    snoozed_until_by_thread: dict[UUID, datetime | None] | None = None,
+) -> list[dict]:
     """Build triage item dicts for an ordered list of threads: each thread's
     latest message plus that message's latest classification. Shared by the
-    triage and search endpoints so both return the same shape."""
+    triage and search endpoints so both return the same shape.
+
+    ``snoozed_until_by_thread`` is the per-request SQL projection from
+    ``_projected_active_snoozed_until`` (thread id -> its projected value,
+    or absent/None when not actively snoozed) -- never re-derived here."""
     thread_ids = [t.id for t in threads]
     latest_message_by_thread = latest_messages_by_thread(
         db,
@@ -177,6 +228,7 @@ def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]
         else {}
     )
 
+    snoozed_until_by_thread = snoozed_until_by_thread or {}
     items = []
     for thread in threads:
         latest_message = latest_message_by_thread.get(thread.id)
@@ -195,6 +247,7 @@ def _assemble_triage_items(db: Session, threads: list[MailThread]) -> list[dict]
                 },
                 "account_email": account_emails.get(thread.provider_account_id),
                 "replied_at": thread.replied_at,
+                "snoozed_until": snoozed_until_by_thread.get(thread.id),
             }
         )
     return items
@@ -223,15 +276,22 @@ def get_triage(
             status_code=422,
             detail=f"Invalid sort '{sort}'. Valid: {sorted(_TRIAGE_SORTS)}",
         )
-    query = select(MailThread).where(MailThread.user_id == current_user.id)
+    now = datetime.now(timezone.utc)
+    active_snoozed = _active_snooze_predicate(now)
+    query = select(MailThread, _projected_active_snoozed_until(now)).where(
+        MailThread.user_id == current_user.id
+    )
     # Filter by bucket in SQL, before the limit, so a specific-label view returns
     # up to `limit` matching threads instead of whatever matches happen to fall
     # inside the `limit` most-recent threads overall. Done threads live only in
-    # the `done` bucket; every open bucket (including `all`) excludes them.
+    # the `done` bucket; snoozed threads live only in the `snoozed` bucket;
+    # every other open bucket (including `all`) excludes both.
     if bucket == "done":
         query = query.where(MailThread.done_at.is_not(None))
+    elif bucket == "snoozed":
+        query = query.where(MailThread.done_at.is_(None), active_snoozed)
     else:
-        query = query.where(MailThread.done_at.is_(None))
+        query = query.where(MailThread.done_at.is_(None), ~active_snoozed)
         if bucket == "unclassified":
             query = query.where(latest_label_subquery().is_(None))
         elif bucket != "all":
@@ -242,25 +302,42 @@ def get_triage(
         # a non-owned or unknown id just yields an empty page, never a 404.
         query = query.where(MailThread.provider_account_id == provider_account_id)
 
-    recency_order = _recency_order()
-    if sort == "account":
-        query = query.join(
-            ProviderAccount, ProviderAccount.id == MailThread.provider_account_id
-        ).order_by(
-            func.coalesce(
-                ProviderAccount.display_email, ProviderAccount.external_user_id
-            ).asc(),
-            *recency_order,
-        )
+    if bucket == "snoozed":
+        # Frozen sort contract (§3.2): soonest wake first -- the list answers
+        # "what comes back next", not "what happened most recently".
+        wake_order = (MailThread.snoozed_until.asc(), MailThread.id.desc())
+        if sort == "account":
+            query = query.join(
+                ProviderAccount, ProviderAccount.id == MailThread.provider_account_id
+            ).order_by(
+                func.coalesce(
+                    ProviderAccount.display_email, ProviderAccount.external_user_id
+                ).asc(),
+                *wake_order,
+            )
+        else:
+            query = query.order_by(*wake_order)
     else:
-        query = query.order_by(*recency_order)
+        recency_order = _recency_order()
+        if sort == "account":
+            query = query.join(
+                ProviderAccount, ProviderAccount.id == MailThread.provider_account_id
+            ).order_by(
+                func.coalesce(
+                    ProviderAccount.display_email, ProviderAccount.external_user_id
+                ).asc(),
+                *recency_order,
+            )
+        else:
+            query = query.order_by(*recency_order)
 
-    threads = list(
-        db.execute(query.offset(offset).limit(limit))
-        .scalars()
-        .all()
-    )
-    return {"bucket": bucket, "items": _assemble_triage_items(db, threads)}
+    rows = db.execute(query.offset(offset).limit(limit)).all()
+    threads = [row[0] for row in rows]
+    snoozed_until_by_thread = {row[0].id: row[1] for row in rows}
+    return {
+        "bucket": bucket,
+        "items": _assemble_triage_items(db, threads, snoozed_until_by_thread),
+    }
 
 
 @router.get("/counts", response_model=Counts)
@@ -272,24 +349,36 @@ def get_counts(
     """Total thread count per bucket for the sidebar.
 
     Grouped in SQL so the counts reflect the whole mailbox rather than a single
-    truncated page. Keys cover every triage bucket, including `all` (the total)
-    and `unclassified`. When `provider_account_id` is given, both the open-bucket
-    grouping and the done count are scoped to that account, so `all` still equals
-    the filtered open total.
+    truncated page. Keys cover every triage bucket, including `all` (the open,
+    non-snoozed total) and `unclassified`. `done` and `snoozed` are counted
+    separately (same active-snooze predicate get_triage's buckets use). When
+    `provider_account_id` is given, the open-bucket grouping and the done/
+    snoozed counts are all scoped to that account, so `all` still equals the
+    filtered open total.
     """
+    now = datetime.now(timezone.utc)
+    active_snoozed = _active_snooze_predicate(now)
     bucket_label = latest_label_subquery().label("bucket_label")
     open_predicates = [
         MailThread.user_id == current_user.id,
-        # Open buckets only; done threads are counted separately below.
+        # Open, non-snoozed buckets only; done and snoozed threads are
+        # counted separately below, same predicate get_triage's buckets use.
         MailThread.done_at.is_(None),
+        ~active_snoozed,
     ]
     done_predicates = [
         MailThread.user_id == current_user.id,
         MailThread.done_at.is_not(None),
     ]
+    snoozed_predicates = [
+        MailThread.user_id == current_user.id,
+        MailThread.done_at.is_(None),
+        active_snoozed,
+    ]
     if provider_account_id is not None:
         open_predicates.append(MailThread.provider_account_id == provider_account_id)
         done_predicates.append(MailThread.provider_account_id == provider_account_id)
+        snoozed_predicates.append(MailThread.provider_account_id == provider_account_id)
 
     grouped = (
         select(bucket_label)
@@ -316,6 +405,11 @@ def get_counts(
         .select_from(MailThread)
         .where(*done_predicates)
     ).scalar_one()
+    counts["snoozed"] = db.execute(
+        select(func.count())
+        .select_from(MailThread)
+        .where(*snoozed_predicates)
+    ).scalar_one()
     # Deliberately NOT scoped by provider_account_id -- the agenda is always
     # cross-account (see Counts.actions' docstring), so this sidebar badge
     # must not narrow when a bucket-account filter is active.
@@ -335,6 +429,14 @@ def get_thread(
     # 404 (not 403) for another user's thread so we don't leak that it exists.
     if not thread or thread.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Thread not found")
+    # Same projection triage/search use (§3.4/P2-1) -- the agenda opens
+    # threads outside any loaded bucket list, so the detail response has to
+    # carry snooze state itself rather than reuse a row the console already
+    # fetched.
+    now = datetime.now(timezone.utc)
+    active_snoozed_until = db.execute(
+        select(_projected_active_snoozed_until(now)).where(MailThread.id == thread_id)
+    ).scalar_one()
     # A thread's account always exists (FK cascade guarantees it).
     account_row = db.execute(
         select(
@@ -380,6 +482,7 @@ def get_thread(
             "done": thread.done_at is not None,
             "account_email": account_email,
             "replied_at": thread.replied_at,
+            "snoozed_until": active_snoozed_until,
         },
         "messages": [
             {
@@ -583,52 +686,169 @@ def set_thread_done(
 
     Done is the non-destructive exit from the triage buckets: the thread moves
     to the ``done`` bucket and stays searchable, unlike delete. Idempotent —
-    re-marking a done thread keeps its original ``done_at``.
+    re-marking a done thread keeps its original ``done_at``. Also clears any
+    snooze (done and snoozed are mutually exclusive -- CHECK
+    ``ck_mail_thread_done_snooze_excl``, docs/plans/2026-08-13-snooze-plan.md
+    §3.3).
+
+    Full-row FOR UPDATE, always, before any branch decision: an earlier
+    version snapshotted an ORM row pre-lock and locked only the `done_at`
+    scalar, which a racing snooze commit could silently clobber (this route
+    would "clear" the snooze pair from a stale in-memory ``None`` -- no SQL
+    emitted, both states left set). Locking the whole row first and re-
+    reading every lifecycle field off THAT locked row closes it; `now` is
+    captured only after the lock so both requests agree on who won. Frozen
+    lock order (repo-wide for these two tables): MailThread -> ActionItem.
+    Sessions are autoflush=False, so inferring lock order from code order
+    isn't safe -- this explicit FOR UPDATE establishes the real order,
+    closing a deadlock against the claim transaction (which locks the thread
+    first too) and a stranded-open race against it without a pre-existing
+    row.
     """
     thread = db.get(MailThread, thread_id)
     # 404 (not 403) for another user's thread so we don't leak that it exists.
     if not thread or thread.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    if payload.done and thread.done_at is None:
-        # Frozen lock order (repo-wide for these two tables): MailThread ->
-        # ActionItem. Sessions are autoflush=False, so the ORM `done_at`
-        # mutation below only flushes at COMMIT -- after the bulk UPDATE
-        # issued in between it and the commit -- and inferring lock order
-        # from code order isn't safe. This explicit FOR UPDATE establishes
-        # the real order, closing a deadlock against the claim transaction
-        # (which locks the thread first too) and a stranded-open race
-        # against it without a pre-existing row.
-        #
-        # Read done_at itself under the lock, not just the row's existence:
-        # the pre-lock `db.get` snapshot above can't see a concurrent
-        # done=true request that raced ahead and already committed, and
-        # trusting that snapshot would let a second request clobber the
-        # first one's done_at with a later timestamp. Only the locked read
-        # tells us whether we actually won the race.
-        locked_done_at = db.execute(
-            select(MailThread.done_at).where(MailThread.id == thread_id).with_for_update()
-        ).scalar_one()
-        now = datetime.now(timezone.utc)
-        thread.done_at = now if locked_done_at is None else locked_done_at
-        # Every open item on this thread resolves to done, regardless of its
-        # extraction outcome -- an in-flight claim's later record must land
-        # already resolved, so a still-pending row is included too. Un-done
-        # deliberately does NOT reverse this; items reopen individually via
-        # the status route.
-        db.execute(
-            update(ActionItem)
-            .where(ActionItem.thread_id == thread_id, ActionItem.status == "open")
-            .values(status="done", status_at=now)
-        )
-    elif not payload.done:
-        thread.done_at = None
+    locked = db.execute(
+        # populate_existing: the pre-lock db.get put this row in the identity
+        # map, and without it this select hands back that same object with its
+        # STALE attributes -- the locked re-read would see nothing a concurrent
+        # commit changed (the exact bug the reply fence had, PR #45 review).
+        select(MailThread)
+        .where(MailThread.id == thread_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+    now = datetime.now(timezone.utc)
+
+    if payload.done:
+        # Only the locked read tells us whether we actually won a race
+        # against a concurrent done=true request -- the pre-lock `db.get`
+        # snapshot above can't see one that already committed.
+        if locked.done_at is None:
+            locked.done_at = now
+            # By the CHECK above, a done thread already has no snooze -- this
+            # is the write-time half of that invariant (the loser of a
+            # snooze-then-done race lands here having just re-read the
+            # winner's snoozed_until under this same lock).
+            locked.snoozed_until = None
+            locked.snoozed_at = None
+            # Every open item on this thread resolves to done, regardless of
+            # its extraction outcome -- an in-flight claim's later record
+            # must land already resolved, so a still-pending row is included
+            # too. Un-done deliberately does NOT reverse this; items reopen
+            # individually via the status route.
+            db.execute(
+                update(ActionItem)
+                .where(ActionItem.thread_id == thread_id, ActionItem.status == "open")
+                .values(status="done", status_at=now)
+            )
+        # else: already done -- idempotent no-op, original done_at stands.
+    else:
+        locked.done_at = None
     db.commit()
 
     return {
         "thread_id": str(thread_id),
-        "done": thread.done_at is not None,
-        "done_at": thread.done_at,
+        "done": locked.done_at is not None,
+        "done_at": locked.done_at,
+    }
+
+
+@router.post(
+    "/thread/{thread_id}/snooze",
+    response_model=SnoozeResult,
+    dependencies=[Depends(user_rate_limit("snooze", 60, 300))],
+)
+def snooze_thread(
+    thread_id: UUID,
+    payload: SnoozeRequest,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Snooze a thread until a future instant, or clear an existing snooze.
+
+    No scheduler backs this (docs/plans/2026-08-13-snooze-plan.md §3.1): a
+    thread is "actively snoozed" purely by a read-time predicate, so this
+    endpoint only ever writes the two columns that predicate reads -- time
+    passing or new mail arriving both wake it later with zero further code
+    here. ``until`` non-null sets/overwrites the snooze (last write wins,
+    idempotent-ish) and clears ``done_at``; ``until`` null clears both snooze
+    columns.
+
+    Same full-row FOR UPDATE shape as ``set_thread_done`` (§3.3): the whole
+    row locks first, every lifecycle field is re-read off that locked row,
+    and `now` is captured only after the lock so a racing done/snooze pair
+    can't clobber each other's committed state. No ActionItem writes here
+    (§3.4/D5) -- snoozing hides the thread, not its agenda items.
+    """
+    thread = db.get(MailThread, thread_id)
+    # 404 (not 403) for another user's thread so we don't leak that it exists.
+    if not thread or thread.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    until = payload.until
+    if until is not None:
+        if until.tzinfo is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "naive_datetime",
+                    "message": "until must be timezone-aware",
+                },
+            )
+        until = until.astimezone(timezone.utc)
+
+    locked = db.execute(
+        # populate_existing: the pre-lock db.get put this row in the identity
+        # map, and without it this select hands back that same object with its
+        # STALE attributes -- the locked re-read would see nothing a concurrent
+        # commit changed (the exact bug the reply fence had, PR #45 review).
+        select(MailThread)
+        .where(MailThread.id == thread_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+    now = datetime.now(timezone.utc)
+
+    if until is not None:
+        if until <= now + timedelta(seconds=_SNOOZE_MIN_LEAD_SECONDS):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "snooze_too_soon",
+                    "message": (
+                        f"until must be more than {_SNOOZE_MIN_LEAD_SECONDS}s "
+                        "in the future"
+                    ),
+                },
+            )
+        if until > now + timedelta(days=_SNOOZE_MAX_LEAD_DAYS):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "snooze_too_far",
+                    "message": (
+                        f"until must be at most {_SNOOZE_MAX_LEAD_DAYS} days out"
+                    ),
+                },
+            )
+        locked.snoozed_until = until
+        locked.snoozed_at = now
+        # Done and active-snooze are mutually exclusive (CHECK
+        # ck_mail_thread_done_snooze_excl) -- clear done_at unconditionally,
+        # mirroring set_thread_done's inverse clear.
+        locked.done_at = None
+    else:
+        locked.snoozed_until = None
+        locked.snoozed_at = None
+    db.commit()
+
+    return {
+        "thread_id": str(thread_id),
+        "snoozed_until": locked.snoozed_until,
+        "snoozed_at": locked.snoozed_at,
     }
 
 
@@ -674,7 +894,12 @@ def search_threads(
         )
         .exists()
     )
-    query = select(MailThread).where(
+    # Same projection triage uses (§3.4/P2-1) -- search is the documented way
+    # to reach a thread outside the open buckets, so its results have to carry
+    # snooze state too instead of always reporting null. One `now` captured
+    # here, same as get_triage.
+    now = datetime.now(timezone.utc)
+    query = select(MailThread, _projected_active_snoozed_until(now)).where(
         MailThread.user_id == current_user.id,
         or_(MailThread.subject.ilike(pattern, escape="\\"), message_match),
     )
@@ -682,16 +907,17 @@ def search_threads(
         # Same self-scoping predicate as triage -- a non-owned or unknown id
         # just yields an empty page, never a 404.
         query = query.where(MailThread.provider_account_id == provider_account_id)
-    threads = list(
-        db.execute(
-            query.order_by(*_recency_order())
-            .offset(offset)
-            .limit(limit)
-        )
-        .scalars()
-        .all()
-    )
-    return {"query": q, "items": _assemble_triage_items(db, threads)}
+    rows = db.execute(
+        query.order_by(*_recency_order())
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    threads = [row[0] for row in rows]
+    snoozed_until_by_thread = {row[0].id: row[1] for row in rows}
+    return {
+        "query": q,
+        "items": _assemble_triage_items(db, threads, snoozed_until_by_thread),
+    }
 
 
 # response_model=None: a 204 carries no body, so there is nothing to validate

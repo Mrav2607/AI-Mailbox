@@ -277,8 +277,12 @@ function BackfillForm({
   // Same string-state trick as IngestForm: parse/clamp on submit so a cleared
   // field never submits NaN.
   const [limit, setLimit] = useState("200");
+  // Backfill scopes by classification state, not lifecycle state -- both
+  // lifecycle buckets (done, snoozed) map to "all" (docs/plans/2026-08-13-
+  // snooze-plan.md §3.6/P2-4), and the force/labeled state below derives
+  // from that mapped value, not from currentBucket directly.
   const [bucket, setBucket] = useState<BucketKey>(
-    currentBucket === "done" ? "all" : currentBucket,
+    currentBucket === "done" || currentBucket === "snoozed" ? "all" : currentBucket,
   );
   const [backend, setBackend] = useState<ClassifierBackend>("local");
   // Only false disables -- null means the settings fetch hasn't landed.
@@ -312,8 +316,9 @@ function BackfillForm({
           }}
           className={control}
         >
-          {/* No "done" here: backfill scopes by classification, not done-ness. */}
-          {BUCKETS.filter((b) => b !== "done").map((b) => (
+          {/* No "done"/"snoozed" here: backfill scopes by classification,
+              not lifecycle state. */}
+          {BUCKETS.filter((b) => b !== "done" && b !== "snoozed").map((b) => (
             <option key={b} value={b}>
               {bucketLabel(b)}
             </option>

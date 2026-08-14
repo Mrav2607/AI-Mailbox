@@ -26,6 +26,12 @@ class TriageItem(Response):
     # never replied from CortexMail, timestamp = when a reply attempt last
     # completed. Powers the "replied" indicator without a second call.
     replied_at: datetime | None
+    # The projected active-snooze wake time (docs/plans/2026-08-13-snooze-
+    # plan.md §3.4/P2-1): null when not actively snoozed, otherwise the
+    # thread's snoozed_until. Comes straight off the request's SQL
+    # projection, never re-derived here -- drives the wake-time column and
+    # the Unsnooze affordance.
+    snoozed_until: datetime | None
 
 
 class Triage(Response):
@@ -39,8 +45,11 @@ class Search(Response):
 
 
 class Counts(Response):
-    # One entry per bucket, plus `all` and `unclassified`. Left open rather than
-    # pinned to a literal set so adding a bucket doesn't silently drop it here.
+    # One entry per bucket, plus `all`, `unclassified`, `done`, and `snoozed`.
+    # Left open rather than pinned to a literal set so adding a bucket doesn't
+    # silently drop it here. `all` is the open, non-snoozed total; `snoozed`
+    # counts actively-snoozed open threads separately (see
+    # docs/plans/2026-08-13-snooze-plan.md §3.2).
     counts: dict[str, int]
     # Agenda counts, ALWAYS cross-account: unlike the bucket counts above,
     # there's no per-account filter here on purpose -- the agenda's whole
@@ -64,6 +73,8 @@ class ThreadSummary(Response):
     # See TriageItem.replied_at -- same fence, same composer-seeding use
     # (docs/plans/2026-08-13-reply-plan.md §3.9).
     replied_at: datetime | None
+    # See TriageItem.snoozed_until -- same projected active-snooze value.
+    snoozed_until: datetime | None
 
 
 class ThreadMessage(Response):
@@ -94,6 +105,24 @@ class ThreadDone(Response):
     thread_id: UUID
     done: bool
     done_at: datetime | None
+
+
+class SnoozeRequest(Response):
+    """POST body for /mail/thread/{thread_id}/snooze. `until` non-null sets
+    a snooze; `until` null (or omitted) clears one (see
+    docs/plans/2026-08-13-snooze-plan.md §3.4 for the server-side bounds
+    this is validated against -- not enforced here, since it needs `now`
+    captured under the row lock)."""
+
+    until: datetime | None = None
+
+
+class SnoozeResult(Response):
+    thread_id: UUID
+    # Both null on unsnooze; both set (last write wins) on a successful
+    # snooze/re-snooze.
+    snoozed_until: datetime | None
+    snoozed_at: datetime | None
 
 
 class SyncRun(Response):

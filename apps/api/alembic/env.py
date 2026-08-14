@@ -44,6 +44,7 @@ MIGRATION_ONLY_INDEXES = {
     "ix_mail_thread_account_recency",
     "ix_mail_thread_open_user_recency",
     "ix_reply_attempt_reconcile",
+    "ix_mail_thread_snooze",
 }
 
 

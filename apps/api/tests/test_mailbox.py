@@ -543,14 +543,17 @@ def test_reclassify_thread_with_no_messages_writes_nothing(monkeypatch):
 
 class _ThreadDoneDB:
     """Fake session backing set_thread_done: db.get resolves the owned
-    thread, and every db.execute() call (the locked done_at re-read, then
-    the bulk ActionItem update) is recorded in call order. The locked
-    re-read defaults to None -- "no one beat us to it", the plain
-    single-request case."""
+    thread (the pre-lock snapshot, used only for the 404 check), and every
+    db.execute() call (the full-row FOR UPDATE lock, then an optional bulk
+    ActionItem update) is recorded in call order. `locked_thread` is what
+    the FOR UPDATE select returns -- it defaults to `thread` itself, but a
+    test can pass a distinct object to simulate a race where a concurrent
+    request already committed different lifecycle fields by the time this
+    request's lock lands."""
 
-    def __init__(self, thread, *, locked_done_at=None):
+    def __init__(self, thread, *, locked_thread=None):
         self.thread = thread
-        self.locked_done_at = locked_done_at
+        self.locked_thread = thread if locked_thread is None else locked_thread
         self.statements = []
 
     def get(self, model, pk):
@@ -559,7 +562,8 @@ class _ThreadDoneDB:
     def execute(self, statement):
         self.statements.append(statement)
         result = MagicMock()
-        result.scalar_one.return_value = self.locked_done_at
+        if "FOR UPDATE" in str(statement):
+            result.scalar_one.return_value = self.locked_thread
         return result
 
     def commit(self):
@@ -605,17 +609,25 @@ def test_thread_done_locks_thread_before_bulk_resolving_action_items():
     assert "status='done'" in compiled_update.replace(" ", "")
 
 
-def test_thread_done_locked_reread_keeps_the_winners_done_at():
-    # Two concurrent done=true requests both read the thread pre-lock with
-    # done_at=None. This request loses the race for the FOR UPDATE lock --
-    # by the time it acquires it, the winner already committed a done_at.
-    # The locked re-read must see that and must NOT overwrite it with this
-    # request's own `now`.
+def test_thread_done_locked_reread_skips_mutation_when_already_done_under_lock():
+    # Two concurrent done=true requests both see done_at=None pre-lock. This
+    # request loses the race for the FOR UPDATE lock -- by the time it
+    # acquires the full row, the winner already committed a done_at. The
+    # locked re-read must see that and skip mutating anything (including the
+    # bulk ActionItem resolve, which the winner's own commit already ran) --
+    # not just skip overwriting done_at with this request's own `now`.
     user_id = uuid4()
     thread_id = uuid4()
     winners_done_at = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
     thread = SimpleNamespace(id=thread_id, user_id=user_id, done_at=None)
-    db = _ThreadDoneDB(thread, locked_done_at=winners_done_at)
+    locked_thread = SimpleNamespace(
+        id=thread_id,
+        user_id=user_id,
+        done_at=winners_done_at,
+        snoozed_until=None,
+        snoozed_at=None,
+    )
+    db = _ThreadDoneDB(thread, locked_thread=locked_thread)
     client = _thread_done_client(db, user_id)
     try:
         resp = client.post(
@@ -625,13 +637,13 @@ def test_thread_done_locked_reread_keeps_the_winners_done_at():
         app.dependency_overrides.clear()
 
     assert resp.status_code == 200
-    lock_statement, update_statement = db.statements
+    # Only the full-row lock select runs -- no bulk ActionItem resolve, since
+    # the locked read already shows this thread done.
+    assert len(db.statements) == 1
+    lock_statement = db.statements[0]
     assert "FOR UPDATE" in _compiled(lock_statement)
-    assert "mail_thread.done_at" in _compiled(lock_statement)
-    # The bulk resolve still runs (idempotent no-op against already-resolved
-    # rows), but done_at itself keeps the winner's original timestamp.
-    assert "UPDATE action_item" in _compiled(update_statement)
-    assert thread.done_at == winners_done_at
+    assert f"mail_thread.id = '{thread_id.hex}'" in _compiled(lock_statement)
+    assert resp.json()["done_at"] is not None
 
 
 def test_thread_done_is_idempotent_and_skips_the_bulk_update_when_already_done():
@@ -649,7 +661,10 @@ def test_thread_done_is_idempotent_and_skips_the_bulk_update_when_already_done()
         app.dependency_overrides.clear()
 
     assert resp.status_code == 200
-    assert db.statements == []
+    # The full-row lock always runs, but the bulk ActionItem resolve is
+    # skipped -- the locked read shows this thread is already done.
+    assert len(db.statements) == 1
+    assert "FOR UPDATE" in _compiled(db.statements[0])
     assert resp.json()["done_at"] is not None
 
 
@@ -670,7 +685,9 @@ def test_thread_undone_does_not_touch_action_items():
 
     assert resp.status_code == 200
     assert resp.json()["done"] is False
-    assert db.statements == []
+    # The full-row lock always runs, but done=false never touches ActionItem.
+    assert len(db.statements) == 1
+    assert "FOR UPDATE" in _compiled(db.statements[0])
 
 
 def test_thread_done_404s_for_another_users_thread():
@@ -728,17 +745,21 @@ def test_counts_includes_actions_and_ignores_the_account_filter(monkeypatch):
 
 class _ThreadDetailDB:
     """Fake session backing GET /mail/thread/{id}: db.get resolves the owned
-    thread, and db.execute dispatches on statement shape between the account
-    lookup, the ordered message list, and the latest message's newest
-    classification lookup. Every statement is recorded so a test can also
-    assert the classification query's own ordering/limit, not just trust
-    whatever this stub was told to hand back."""
+    thread, and db.execute dispatches on statement shape between the
+    projected active-snoozed_until scalar, the account lookup, the ordered
+    message list, and the latest message's newest classification lookup.
+    Every statement is recorded so a test can also assert the classification
+    query's own ordering/limit, not just trust whatever this stub was told
+    to hand back."""
 
-    def __init__(self, thread, account_row, messages, classification):
+    def __init__(
+        self, thread, account_row, messages, classification, *, snoozed_until=None
+    ):
         self.thread = thread
         self.account_row = account_row
         self.messages = messages
         self.classification = classification
+        self.snoozed_until = snoozed_until
         self.statements = []
 
     def get(self, model, pk):
@@ -752,8 +773,12 @@ class _ThreadDetailDB:
             result.one.return_value = self.account_row
         elif "FROM classification" in compiled:
             result.scalars.return_value.first.return_value = self.classification
-        else:
+        elif "FROM mail_message" in compiled:
             result.scalars.return_value.all.return_value = self.messages
+        else:
+            # The projected active_snoozed_until scalar -- the one query
+            # left over once the other three shapes are ruled out.
+            result.scalar_one.return_value = self.snoozed_until
         return result
 
 
@@ -763,7 +788,7 @@ def _thread_detail_client(db, user_id):
     return TestClient(app)
 
 
-def _thread_detail_setup(*, classification):
+def _thread_detail_setup(*, classification, snoozed_until=None):
     user_id = uuid4()
     thread_id = uuid4()
     message_id = uuid4()
@@ -788,7 +813,9 @@ def _thread_detail_setup(*, classification):
         body_text="body",
         body_html="<p>body</p>",
     )
-    db = _ThreadDetailDB(thread, account_row, [message], classification)
+    db = _ThreadDetailDB(
+        thread, account_row, [message], classification, snoozed_until=snoozed_until
+    )
     return _thread_detail_client(db, user_id), db, thread_id, message_id
 
 
@@ -806,6 +833,20 @@ def test_thread_detail_returns_latest_message_classification():
         "confidence": 0.87,
         "model_version": "local-v3",
     }
+
+
+def test_thread_detail_carries_the_projected_active_snoozed_until():
+    wake = datetime(2026, 9, 1, 8, 0, 0, tzinfo=timezone.utc)
+    client, _db, thread_id, _message_id = _thread_detail_setup(
+        classification=None, snoozed_until=wake
+    )
+    try:
+        resp = client.get(f"/api/v1/mail/thread/{thread_id}")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert datetime.fromisoformat(resp.json()["thread"]["snoozed_until"]) == wake
 
 
 def test_thread_detail_classification_is_null_when_unclassified():

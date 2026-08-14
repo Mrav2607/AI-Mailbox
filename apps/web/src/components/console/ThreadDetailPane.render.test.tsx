@@ -25,6 +25,7 @@ function threadDetail(id: string): ThreadDetail {
       done: false,
       account_email: "operator@gmail.com",
       replied_at: null,
+      snoozed_until: null,
     },
     messages: [
       {
