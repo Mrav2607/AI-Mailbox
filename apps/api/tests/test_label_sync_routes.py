@@ -301,7 +301,7 @@ def test_patch_connection_enable_marks_resync_and_retains_the_applied_pair(auth_
 
     update_stmt = db.execute.call_args_list[2].args[0]
     compiled = _compiled(update_stmt)
-    assert "mail_thread SET label_resync_needed=true" in compiled.replace(" ", " ")
+    assert "mail_thread SET label_resync_needed=true" in compiled
     assert "synced_label" not in compiled.split("SET")[1].split("WHERE")[0]
     assert "synced_message_id" not in compiled.split("SET")[1].split("WHERE")[0]
     # The WHERE clause covers a live classification OR a populated applied
@@ -382,10 +382,11 @@ def test_connections_list_carries_drift_count_for_enabled_accounts(auth_client):
 
 
 class _ReclassifyIsolationDB:
-    def __init__(self, thread, message, *, label_sync_enabled):
+    def __init__(self, thread, message, *, label_sync_enabled, label_sync_lookup_should_raise=False):
         self.thread = thread
         self.message = message
         self.label_sync_enabled = label_sync_enabled
+        self.label_sync_lookup_should_raise = label_sync_lookup_should_raise
 
     def get(self, model, pk):
         return self.thread if pk == self.thread.id else None
@@ -396,6 +397,13 @@ class _ReclassifyIsolationDB:
         if "FROM mail_message" in compiled:
             result.scalars.return_value.first.return_value = self.message
         elif "FROM provider_account" in compiled:
+            # Post-commit eligibility lookup (L1 regression coverage): the
+            # session's `thread` row is already expired by the commit above,
+            # so this is a fresh SELECT, not a lazy-load off the stale ORM
+            # object -- simulate it raising (e.g. a raced account deletion)
+            # to prove that no longer 500s a committed reclassify.
+            if self.label_sync_lookup_should_raise:
+                raise RuntimeError("connection dropped")
             result.scalar_one_or_none.return_value = self.label_sync_enabled
         elif "FROM classification" in compiled:
             result.scalars.return_value.first.return_value = None
@@ -419,7 +427,7 @@ class _FakeTask:
 
 
 def _reclassify_isolation_setup(monkeypatch, *, label_sync_enabled, extraction_should_raise=False,
-                                 label_sync_should_raise=False):
+                                 label_sync_should_raise=False, label_sync_lookup_should_raise=False):
     user = SimpleNamespace(id=uuid4())
     thread_id = uuid4()
     message_id = uuid4()
@@ -427,7 +435,12 @@ def _reclassify_isolation_setup(monkeypatch, *, label_sync_enabled, extraction_s
         id=thread_id, user_id=user.id, subject="Renewal notice", provider_account_id=uuid4()
     )
     message = SimpleNamespace(id=message_id, snippet="snip", body_text="body")
-    db = _ReclassifyIsolationDB(thread, message, label_sync_enabled=label_sync_enabled)
+    db = _ReclassifyIsolationDB(
+        thread,
+        message,
+        label_sync_enabled=label_sync_enabled,
+        label_sync_lookup_should_raise=label_sync_lookup_should_raise,
+    )
     extraction_task = _FakeTask(should_raise=extraction_should_raise)
     label_sync_task = _FakeTask(should_raise=label_sync_should_raise)
 
@@ -508,3 +521,23 @@ def test_reclassify_extraction_enqueue_survives_a_label_sync_broker_failure(monk
     assert resp.status_code == 200
     assert extraction_task.calls == [str(message_id)]
     assert label_sync_task.calls == [str(thread_id)]
+
+
+def test_reclassify_survives_a_raising_post_commit_eligibility_lookup(monkeypatch):
+    # L1 regression: the eligibility SELECT and the .delay() call both live
+    # inside the same try/except now, so a raise from the lookup itself
+    # (not just the enqueue) must still return 200, not 500.
+    client, extraction_task, label_sync_task, thread_id, message_id = _reclassify_isolation_setup(
+        monkeypatch, label_sync_enabled=True, label_sync_lookup_should_raise=True
+    )
+    try:
+        resp = client.post(
+            f"/api/v1/mail/thread/{thread_id}/classification",
+            json={"label": "action_required"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert extraction_task.calls == [str(message_id)]
+    assert label_sync_task.calls == []

@@ -67,6 +67,20 @@ class DeltaExpiredError(Exception):
     must start a fresh baseline generation for that folder."""
 
 
+class MissingEtagError(Exception):
+    """Graph's $select=categories response omitted @odata.etag -- rare, but
+    passing `None` straight into an If-Match header would fail inside httpx
+    with a confusing TypeError instead of a clear, catchable signal.
+    Deliberately NOT a ValueError: label sync's token-refresh path gives
+    ValueError a specific "account paused" meaning
+    (app/workers/tasks_label_sync.py), and this has nothing to do with
+    that -- it's a normal per-item provider failure, retried next tick."""
+
+    def __init__(self, message_id: str):
+        super().__init__(f"Outlook message {message_id} has no @odata.etag")
+        self.message_id = message_id
+
+
 def _graph_error_code(resp: httpx.Response) -> str:
     try:
         body = resp.json()
@@ -241,6 +255,11 @@ class OutlookClient:
         needs the etag to avoid clobbering a category the user adds between
         this read and that write (label-sync plan §3.2). Returns None on
         404, same "message truly gone" contract as get_message.
+
+        Raises MissingEtagError if Graph's response omits @odata.etag (rare
+        but documented as possible) -- better a clear, catchable exception
+        here than a None etag reaching the If-Match header and blowing up
+        inside httpx.
         """
         resp = self._get_bounded(
             f"{_BASE_URL}/me/messages/{message_id}",
@@ -251,7 +270,10 @@ class OutlookClient:
             return None
         resp.raise_for_status()
         body = resp.json()
-        return {"categories": body.get("categories") or [], "etag": body.get("@odata.etag")}
+        etag = body.get("@odata.etag")
+        if etag is None:
+            raise MissingEtagError(message_id)
+        return {"categories": body.get("categories") or [], "etag": etag}
 
     def set_message_categories(
         self, message_id: str, categories: list[str], *, etag: str

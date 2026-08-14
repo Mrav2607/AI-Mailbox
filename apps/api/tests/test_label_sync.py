@@ -7,6 +7,8 @@ orchestration, and beat registration.
 
 from __future__ import annotations
 
+import json
+import logging
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -847,6 +849,20 @@ def _fake_pooled_client(**method_side_effects):
     return fake
 
 
+def test_outlook_get_message_categories_missing_etag_raises_missing_etag_error(monkeypatch):
+    # L3: Graph may omit @odata.etag from a $select response -- must raise a
+    # clear, dedicated exception instead of letting a None etag reach the
+    # If-Match header downstream.
+    ok = _http_resp(200, {"categories": ["CortexMail: FYI"]})  # no @odata.etag
+    fake = _fake_pooled_client(get=[ok])
+    monkeypatch.setattr(outlook_client, "_client", lambda: fake)
+
+    with pytest.raises(outlook_client.MissingEtagError) as excinfo:
+        OutlookClient("tok").get_message_categories("m1")
+
+    assert excinfo.value.message_id == "m1"
+
+
 def test_outlook_get_message_categories_huge_retry_after_fails_without_sleeping(monkeypatch):
     slept = []
     monkeypatch.setattr(outlook_client.time, "sleep", lambda s: slept.append(s))
@@ -1015,6 +1031,9 @@ def test_sync_thread_labels_outlook_happy_path_skips_gmail_map_persist(monkeypat
 
 
 def test_sync_thread_labels_invalid_grant_pauses(monkeypatch):
+    # L2 regression: the task only catches `_AccountPaused` now, never a
+    # bare `ValueError` -- `_token_retry` is the one that does the
+    # classification, so this fakes ITS output rather than bypassing it.
     claim = _claim_result()
     monkeypatch.setattr(tasks_label_sync, "claim_thread", lambda db, tid: claim)
     monkeypatch.setattr(tasks_label_sync, "set_pending_target", lambda *a, **k: True)
@@ -1023,13 +1042,97 @@ def test_sync_thread_labels_invalid_grant_pauses(monkeypatch):
         "_token_retry",
         lambda account: (
             lambda: MagicMock(),
-            MagicMock(side_effect=ValueError("Gmail authorization was revoked.")),
+            MagicMock(side_effect=tasks_label_sync._AccountPaused()),
         ),
     )
 
     result = tasks_label_sync.sync_thread_labels.run(str(claim.thread_id))
 
     assert result["status"] == "paused"
+
+
+def test_sync_thread_labels_refresh_json_decode_error_is_error_not_paused(monkeypatch, caplog):
+    # L2: a malformed 2xx token body raises json.JSONDecodeError, a
+    # ValueError subclass -- but the account was never paused for it, so
+    # this must land as a logged "error", not the silent "paused" a blanket
+    # ValueError catch used to produce.
+    claim = _claim_result()
+    monkeypatch.setattr(tasks_label_sync, "claim_thread", lambda db, tid: claim)
+    monkeypatch.setattr(tasks_label_sync, "set_pending_target", lambda *a, **k: True)
+    monkeypatch.setattr(
+        tasks_label_sync,
+        "_refresh_gmail_access_token",
+        MagicMock(side_effect=json.JSONDecodeError("bad body", "doc", 0)),
+    )
+    monkeypatch.setattr(tasks_label_sync, "_account_is_paused", lambda account_id: False)
+    monkeypatch.setattr(
+        tasks_label_sync, "apply_gmail_labels", MagicMock(side_effect=_http_error(401))
+    )
+
+    with caplog.at_level(logging.ERROR, logger="cortexmail"):
+        result = tasks_label_sync.sync_thread_labels.run(str(claim.thread_id))
+
+    assert result["status"] == "error"
+    assert "ValueError but the account isn't paused" in caplog.text
+
+
+def test_account_is_paused_reads_the_fresh_row(monkeypatch):
+    account_id = uuid4()
+    db = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = datetime.now(timezone.utc)
+    monkeypatch.setattr(tasks_label_sync, "SessionLocal", lambda: nullcontext(db))
+
+    assert tasks_label_sync._account_is_paused(account_id) is True
+
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    assert tasks_label_sync._account_is_paused(account_id) is False
+
+
+def test_token_retry_refresh_gmail_invalid_grant_raises_account_paused(monkeypatch):
+    account = service.AccountSnapshot(
+        id=uuid4(),
+        provider="gmail",
+        access_token="at",
+        refresh_token="rt",
+        scope="https://www.googleapis.com/auth/gmail.modify",
+        gmail_label_map=None,
+    )
+    monkeypatch.setattr(
+        tasks_label_sync,
+        "_refresh_gmail_access_token",
+        MagicMock(side_effect=ValueError("Gmail authorization was revoked.")),
+    )
+    monkeypatch.setattr(tasks_label_sync, "_account_is_paused", lambda account_id: True)
+
+    _get_client, with_retry = tasks_label_sync._token_retry(account)
+
+    with pytest.raises(tasks_label_sync._AccountPaused):
+        with_retry(lambda: (_ for _ in ()).throw(_http_error(401)))
+
+
+def test_token_retry_refresh_reraises_a_non_pause_valueerror(monkeypatch, caplog):
+    account = service.AccountSnapshot(
+        id=uuid4(),
+        provider="gmail",
+        access_token="at",
+        refresh_token="rt",
+        scope="https://www.googleapis.com/auth/gmail.modify",
+        gmail_label_map=None,
+    )
+    monkeypatch.setattr(
+        tasks_label_sync,
+        "_refresh_gmail_access_token",
+        MagicMock(side_effect=json.JSONDecodeError("bad body", "doc", 0)),
+    )
+    monkeypatch.setattr(tasks_label_sync, "_account_is_paused", lambda account_id: False)
+
+    _get_client, with_retry = tasks_label_sync._token_retry(account)
+
+    with caplog.at_level(logging.ERROR, logger="cortexmail"):
+        with pytest.raises(json.JSONDecodeError):
+            with_retry(lambda: (_ for _ in ()).throw(_http_error(401)))
+
+    assert "ValueError but the account isn't paused" in caplog.text
 
 
 def test_sync_thread_labels_budget_exceeded(monkeypatch):
@@ -1047,6 +1150,34 @@ def test_sync_thread_labels_budget_exceeded(monkeypatch):
 
     assert result["status"] == "budget_exceeded"
     apply_mock.assert_not_called()
+
+
+def test_sync_thread_labels_outlook_missing_etag_is_a_per_item_error(monkeypatch):
+    # L3 end-to-end: MissingEtagError is neither a ValueError (no "paused"
+    # misclassification, L2) nor swallowed -- it's a normal per-item
+    # failure, logged and reported "error" so the next tick retries it.
+    claim = _claim_result(
+        account=service.AccountSnapshot(
+            id=uuid4(),
+            provider="outlook",
+            access_token="at",
+            refresh_token="rt",
+            scope="mail.readwrite",
+            gmail_label_map=None,
+        ),
+    )
+    monkeypatch.setattr(tasks_label_sync, "claim_thread", lambda db, tid: claim)
+    monkeypatch.setattr(tasks_label_sync, "set_pending_target", lambda *a, **k: True)
+    _patch_passthrough_token_retry(monkeypatch)
+    monkeypatch.setattr(
+        tasks_label_sync,
+        "apply_outlook_category",
+        MagicMock(side_effect=outlook_client.MissingEtagError("m1")),
+    )
+
+    result = tasks_label_sync.sync_thread_labels.run(str(claim.thread_id))
+
+    assert result["status"] == "error"
 
 
 def test_sync_thread_labels_unexpected_error_is_caught(monkeypatch):

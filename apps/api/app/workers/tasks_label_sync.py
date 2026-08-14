@@ -68,6 +68,17 @@ class _BudgetExceeded(Exception):
     """Raised when this task's cumulative provider-retry budget is spent."""
 
 
+class _AccountPaused(Exception):
+    """Raised by `_token_retry`'s `refresh()` once it's confirmed the
+    account is paused -- the ONLY thing `sync_thread_labels` should map to
+    the quiet "paused" status. Deliberately not a `ValueError`: the ingest
+    refresh helpers raise plain `ValueError` for two different reasons (an
+    actually-dead grant they've already paused the account for, but also
+    e.g. a malformed 2xx token body via `json.JSONDecodeError`, which IS a
+    `ValueError` subclass) -- `refresh()` re-checks the account row to tell
+    those apart before choosing which exception to raise."""
+
+
 class _Budget:
     def __init__(self, seconds: float = _PROVIDER_RETRY_BUDGET_SECONDS):
         self._deadline = monotonic() + seconds
@@ -81,6 +92,21 @@ def _make_client(provider: str, token: str) -> GmailClient | OutlookClient:
     return GmailClient(token) if provider == "gmail" else OutlookClient(token)
 
 
+def _account_is_paused(account_id: UUID) -> bool:
+    """Fresh-session re-read of `sync_paused_at` -- `refresh()`'s own
+    `ValueError` classification uses this to confirm the ingest helper it
+    just called actually paused the account (rather than assuming every
+    `ValueError` means that). A missing row reads as "not paused"; that's
+    an even stranger failure than a bad token body, and gets the same
+    logged-and-reraised generic error treatment.
+    """
+    with SessionLocal() as db:
+        paused_at = db.execute(
+            select(ProviderAccount.sync_paused_at).where(ProviderAccount.id == account_id)
+        ).scalar_one_or_none()
+    return paused_at is not None
+
+
 def _token_retry(account: AccountSnapshot):
     """Mirrors gmail_ingest.py's/outlook_ingest.py's with_token_retry +
     refresh_client shape, adapted for label sync's independent-session
@@ -88,35 +114,51 @@ def _token_retry(account: AccountSnapshot):
     session, so there's no shared page transaction to piggyback a token
     write onto the way ingest does.
 
-    Returns (get_client, with_retry). `refresh()` propagates ValueError on
+    Returns (get_client, with_retry). `refresh()` raises `_AccountPaused` on
     a permanently dead grant -- the underlying helpers have ALREADY paused
     the account (same pause-write shape ingest uses) by the time that
-    happens, so the caller only needs to stop, not pause again.
+    happens, so the caller only needs to stop, not pause again. Any OTHER
+    `ValueError` out of those helpers (they're never reimplemented here, so
+    this stays a blind boundary -- e.g. `json.JSONDecodeError` from a
+    malformed 2xx token body IS a `ValueError` subclass) is logged and
+    re-raised as-is, landing in the caller's generic logged "error" path
+    instead of being silently misreported as "paused".
     """
     state = {"token": account.access_token, "refresh_token": account.refresh_token}
     holder = {"client": _make_client(account.provider, state["token"])}
 
     def refresh() -> bool:
-        if account.provider == "gmail":
-            fake_row = SimpleNamespace(id=account.id, refresh_token=state["refresh_token"])
-            new_token, token_expiry = _refresh_gmail_access_token(fake_row)
-            if not new_token:
-                return False
-            with SessionLocal() as db:
-                db.execute(
-                    update(ProviderAccount)
-                    .where(ProviderAccount.id == account.id)
-                    .values(access_token=new_token, token_expiry=token_expiry)
-                )
-                db.commit()
-            state["token"] = new_token
-        else:
-            refreshed = _refresh_outlook_access_token(account.id, state["refresh_token"])
-            if not refreshed:
-                return False
-            new_token, new_refresh_token, _expiry = refreshed
-            state["token"] = new_token
-            state["refresh_token"] = new_refresh_token
+        try:
+            if account.provider == "gmail":
+                fake_row = SimpleNamespace(id=account.id, refresh_token=state["refresh_token"])
+                new_token, token_expiry = _refresh_gmail_access_token(fake_row)
+                if not new_token:
+                    return False
+                with SessionLocal() as db:
+                    db.execute(
+                        update(ProviderAccount)
+                        .where(ProviderAccount.id == account.id)
+                        .values(access_token=new_token, token_expiry=token_expiry)
+                    )
+                    db.commit()
+                state["token"] = new_token
+            else:
+                refreshed = _refresh_outlook_access_token(account.id, state["refresh_token"])
+                if not refreshed:
+                    return False
+                new_token, new_refresh_token, _expiry = refreshed
+                state["token"] = new_token
+                state["refresh_token"] = new_refresh_token
+        except ValueError:
+            if _account_is_paused(account.id):
+                raise _AccountPaused() from None
+            logger.exception(
+                "token refresh for account %s raised ValueError but the "
+                "account isn't paused -- not an invalid_grant, treating as "
+                "a normal task failure",
+                account.id,
+            )
+            raise
         holder["client"] = _make_client(account.provider, state["token"])
         return True
 
@@ -244,7 +286,7 @@ def sync_thread_labels(self, thread_id: str) -> dict:
             account.id,
         )
         return {"status": "budget_exceeded", "thread_id": thread_id}
-    except ValueError:
+    except _AccountPaused:
         # invalid_grant -- the refresh helper already paused the account
         # (see _token_retry's docstring); nothing left to do here.
         return {"status": "paused", "thread_id": thread_id}

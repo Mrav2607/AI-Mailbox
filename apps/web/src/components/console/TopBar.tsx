@@ -473,7 +473,24 @@ function LabelSyncRow({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    setOverride(null);
+    // Only clear the overlay once the parent's props actually AGREE with
+    // it. A functional update (reading `current` from React, not the
+    // `override` closure) means this effect doesn't need `override` in its
+    // deps -- if it did, every toggle would re-run this same effect right
+    // after setting the override, clearing it immediately. Without this
+    // guard, a refresh carrying an EARLIER toggle's result landing after a
+    // NEWER toggle would wipe the newer optimistic state and flash the
+    // stale server value until the next refresh catches up.
+    setOverride((current) => {
+      if (
+        current &&
+        (current.label_sync_enabled !== connection.label_sync_enabled ||
+          current.label_sync_drift !== connection.label_sync_drift)
+      ) {
+        return current;
+      }
+      return null;
+    });
     setErrorCode(null);
     setErrorMessage(null);
   }, [connection.label_sync_enabled, connection.label_sync_drift]);
