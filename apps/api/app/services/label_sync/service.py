@@ -717,9 +717,15 @@ def record_sync_result(
     together with the claim.
     """
     locked = db.execute(
+        # populate_existing: if this session ever loaded the thread earlier,
+        # the identity map would hand back that stale object -- same lesson
+        # as the reply fence and the enable route (PR #45/#47 reviews). The
+        # claim-token WHERE is evaluated server-side either way; this keeps
+        # the returned attributes honest too.
         select(MailThread)
         .where(MailThread.id == thread_id, MailThread.label_sync_claim_token == claim_token)
         .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if locked is None:
         db.rollback()
