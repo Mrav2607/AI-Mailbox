@@ -340,6 +340,24 @@ describe("mock snooze", () => {
     expect(order).toEqual([b, c, a]);
   });
 
+  it("breaks a tied wake time with id DESC, not insertion order (S-4)", () => {
+    const { items } = mockTriage("all", 3);
+    const [a, b, c] = items.map((i) => i.thread_id);
+    touched.push(a, b, c);
+    const until = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+    // Snooze in an order that doesn't match id-sorted order, so a bug that
+    // falls back to insertion order would produce a different sequence than
+    // the id-DESC tiebreak.
+    mockSnoozeThread(b, until);
+    mockSnoozeThread(a, until);
+    mockSnoozeThread(c, until);
+
+    const order = mockTriage("snoozed", 10_000)
+      .items.map((i) => i.thread_id)
+      .filter((id) => [a, b, c].includes(id));
+    expect(order).toEqual([a, b, c].sort((x, y) => y.localeCompare(x)));
+  });
+
   it("clears the snooze on until: null, restoring the thread to its open bucket", () => {
     const id = pickThreadId();
     mockSnoozeThread(id, new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString());

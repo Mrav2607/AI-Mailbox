@@ -448,7 +448,9 @@ export function mockTriage(
   }
   if (bucket === "snoozed") {
     // Frozen sort contract (§3.2): soonest wake first, optionally grouped by
-    // account first -- same two-key shape as the server's ORDER BY.
+    // account first -- same two-key shape as the server's ORDER BY. Server
+    // breaks ties on identical wake instants with `id DESC` (S-4); mirror
+    // that here instead of falling back to insertion order.
     items = [...items].sort((a, b) => {
       if (sort === "account") {
         const byAccount = a.account_email.localeCompare(b.account_email);
@@ -456,7 +458,9 @@ export function mockTriage(
       }
       const au = SNOOZED.get(a.thread_id)?.until ?? "";
       const bu = SNOOZED.get(b.thread_id)?.until ?? "";
-      return au.localeCompare(bu);
+      const byWake = au.localeCompare(bu);
+      if (byWake !== 0) return byWake;
+      return b.thread_id.localeCompare(a.thread_id);
     });
   } else if (sort === "account") {
     // ALL is already in recency order, and Array#sort is stable, so grouping
