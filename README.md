@@ -184,7 +184,9 @@ Each ingested message is classified into one of six labels: `needs_reply`,
 `action_required`, `fyi`, `promotional`, `security_alert`, `spam`. The backend is
 chosen by `CLASSIFIER_BACKEND` in `.env`:
 
-- `local` (default) — a fine-tuned encoder loaded from `CLASSIFIER_MODEL_PATH`
+- `local` (the code default, though both deploy templates set `heuristic`, so
+  copying one to `deploy/.env` selects the no-model backend) — a fine-tuned
+  encoder loaded from `CLASSIFIER_MODEL_PATH`
   (default `models/email-classifier`). Needs the `local-classifier` extra. If
   torch or the model files are missing, it falls back to the heuristic, so the
   API still runs without a trained model. If the model directory contains a
@@ -325,3 +327,7 @@ billing you instead would be the wrong default.
   (`/api/v1/mail/*`, `/api/v1/analytics/overview`, `/api/v1/auth/connections`);
   the user is derived from the token, so no `user_id` is passed. In the
   interactive docs (`/docs`), click **Authorize** and paste the token.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
