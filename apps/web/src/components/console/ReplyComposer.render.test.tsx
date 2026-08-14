@@ -30,7 +30,7 @@ vi.mock("@/lib/api", () => ({
 }));
 
 import { ApiError, draftReply, sendReply } from "@/lib/api";
-import { ReplyComposer } from "./ReplyComposer";
+import { ReplyComposer, type ReplyStateRefetch } from "./ReplyComposer";
 import type { ReplySent, ThreadMessage } from "@/lib/types";
 
 const MESSAGES: ThreadMessage[] = [
@@ -66,9 +66,11 @@ function replySent(overrides?: Partial<ReplySent>): ReplySent {
 function Harness({
   initialOpen = true,
   onSent = vi.fn(),
+  onRefetchReplyState = async () => ({ ok: true, repliedAt: null }),
 }: {
   initialOpen?: boolean;
   onSent?: (threadId: string, r: ReplySent) => void;
+  onRefetchReplyState?: (threadId: string) => Promise<ReplyStateRefetch>;
 }) {
   const [open, setOpen] = useState(initialOpen);
   return (
@@ -81,7 +83,7 @@ function Harness({
       open={open}
       onOpenChange={setOpen}
       onSent={onSent}
-      onRefetchReplyState={async () => null}
+      onRefetchReplyState={onRefetchReplyState}
     />
   );
 }
@@ -241,6 +243,102 @@ describe("ReplyComposer send", () => {
     });
     expect(onSent).toHaveBeenCalledTimes(1);
   });
+
+  it("clears the reply_in_flight banner when the abandon-and-resend hits a different error", async () => {
+    vi.mocked(sendReply)
+      .mockRejectedValueOnce(
+        new ApiError(409, "A reply to this thread is already in progress.", undefined, "reply_in_flight", {
+          attempt_id: "attempt-42",
+        }),
+      )
+      .mockRejectedValueOnce(
+        new ApiError(429, "Too many replies sent recently.", undefined, "rate_limited"),
+      );
+
+    await act(async () => {
+      root.render(<Harness />);
+    });
+    const textarea = container.querySelector("textarea")!;
+    act(() => setTextareaValue(textarea, "hello again"));
+
+    await act(async () => {
+      findButton(container, "Send").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const abandonBtn = findButton(container, "Abandon and send anyway");
+
+    await act(async () => {
+      abandonBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The stale "abandon and resend" prompt from the first failure must not
+    // linger over a second failure with a completely different cause.
+    expect(
+      Array.from(container.querySelectorAll("button")).some((b) =>
+        b.textContent?.includes("Abandon and send anyway"),
+      ),
+    ).toBe(false);
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "Too many replies sent recently",
+    );
+  });
+});
+
+describe("ReplyComposer reply_state_stale recovery", () => {
+  it("offers Send anyway once a successful refetch confirms the fresh replied_at", async () => {
+    vi.mocked(sendReply).mockRejectedValueOnce(
+      new ApiError(409, "This thread changed since you opened it.", undefined, "reply_state_stale"),
+    );
+    const onRefetchReplyState = vi.fn(async () => ({
+      ok: true as const,
+      repliedAt: "2026-08-13T12:00:00Z",
+    }));
+
+    await act(async () => {
+      root.render(<Harness onRefetchReplyState={onRefetchReplyState} />);
+    });
+    const textarea = container.querySelector("textarea")!;
+    act(() => setTextareaValue(textarea, "hello"));
+
+    await act(async () => {
+      findButton(container, "Send").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(findButton(container, "Send anyway")).toBeTruthy();
+  });
+
+  it("shows a plain retryable error, not Send anyway, when the refetch itself fails", async () => {
+    vi.mocked(sendReply).mockRejectedValueOnce(
+      new ApiError(409, "This thread changed since you opened it.", undefined, "reply_state_stale"),
+    );
+    const onRefetchReplyState = vi.fn(async () => ({ ok: false as const }));
+
+    await act(async () => {
+      root.render(<Harness onRefetchReplyState={onRefetchReplyState} />);
+    });
+    const textarea = container.querySelector("textarea")!;
+    act(() => setTextareaValue(textarea, "hello"));
+
+    await act(async () => {
+      findButton(container, "Send").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // A failed refetch must never enable Send anyway -- that would resubmit
+    // with a null fence and bypass reply_state_stale on a mere network blip.
+    expect(
+      Array.from(container.querySelectorAll("button")).some((b) =>
+        b.textContent?.includes("Send anyway"),
+      ),
+    ).toBe(false);
+    expect(container.querySelector('[role="alert"]')).toBeTruthy();
+  });
 });
 
 describe("ReplyComposer draft with AI", () => {
@@ -284,5 +382,45 @@ describe("ReplyComposer draft with AI", () => {
 
     const textarea = container.querySelector("textarea")!;
     expect(textarea.value).toBe("Thanks, sounds good.");
+  });
+
+  it("leaves the button enabled and shows a clearable message on reply_draft_failed", async () => {
+    vi.mocked(draftReply)
+      .mockRejectedValueOnce(
+        new ApiError(502, "Couldn't generate a draft reply.", undefined, "reply_draft_failed"),
+      )
+      .mockResolvedValueOnce({
+        draft_text: "Second try worked.",
+        provider: "openai",
+        model: "gpt-4o-mini",
+      });
+
+    await act(async () => {
+      root.render(<Harness />);
+    });
+    const draftBtn = findButton(container, "Draft with AI");
+
+    await act(async () => {
+      draftBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // reply_draft_failed is retryable -- the button must stay enabled, unlike
+    // the credential codes above.
+    expect(draftBtn.disabled).toBe(false);
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "Couldn't generate a draft reply",
+    );
+
+    await act(async () => {
+      draftBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const textarea = container.querySelector("textarea")!;
+    expect(textarea.value).toBe("Second try worked.");
+    expect(container.querySelector('[role="alert"]')).toBeNull();
   });
 });
