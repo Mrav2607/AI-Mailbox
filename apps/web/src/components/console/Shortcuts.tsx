@@ -14,6 +14,8 @@ const ROWS: [string, string, boolean?][] = [
   ["⌘ A / Ctrl A", "select all threads", true],
   ["l then 1 – 6", "relabel focused thread", true],
   ["o", "open focused thread in Gmail"],
+  ["Shift R", "reply to the open thread"],
+  ["Ctrl ↵", "send the reply while composing"],
   ["/", "search threads (↵ = all buckets)", true],
   ["c", "cycle sort: recent · conf ↑ · conf ↓ · account", true],
   ["[ / ]", "toggle sidebar / detail pane"],
@@ -21,7 +23,7 @@ const ROWS: [string, string, boolean?][] = [
   ["r", "refresh the current view"],
   ["⌘ K / Ctrl K", "command palette"],
   ["Shift ?", "this cheatsheet"],
-  ["Esc", "clear search · close overlay"],
+  ["Esc", "clear search · close overlay/composer"],
 ];
 
 export function Shortcuts({

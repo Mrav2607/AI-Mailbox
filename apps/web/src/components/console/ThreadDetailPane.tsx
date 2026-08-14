@@ -9,6 +9,7 @@ import {
   PanelBottomClose,
   PanelLeftClose,
   PanelRightClose,
+  Reply as ReplyIcon,
   Trash2,
   Undo2,
 } from "lucide-react";
@@ -22,11 +23,12 @@ import {
 } from "@/lib/labels";
 import { emailLocalPart } from "@/lib/sender";
 import { absTime } from "@/lib/time";
-import type { Classification, Label, ThreadDetail, ThreadMessage } from "@/lib/types";
+import type { Classification, Label, ReplySent, ThreadDetail, ThreadMessage } from "@/lib/types";
 import { ALL_LABELS } from "@/lib/types";
 import type { ReadingSide } from "@/lib/layout";
 import { gmailThreadUrl } from "@/lib/utils";
 import { PaneDragHandle } from "./ConsoleLayout";
+import { ReplyComposer } from "./ReplyComposer";
 
 const COLLAPSE_ICONS = {
   right: PanelRightClose,
@@ -123,6 +125,15 @@ interface Props {
   side?: ReadingSide;
   predictionOpen?: boolean;
   onTogglePrediction?: () => void;
+  // Reply composer wiring (docs/plans/2026-08-13-reply-plan.md §3.10). All
+  // optional together: omitting them just leaves the Reply control off,
+  // which is how this pane already handles onDone/onDelete being absent.
+  composerOpen?: boolean;
+  onComposerOpenChange?: (open: boolean) => void;
+  composerFocusToken?: number;
+  onReplySent?: (threadId: string, result: ReplySent) => void;
+  onReconnect?: () => void;
+  onRefetchReplyState?: (threadId: string) => Promise<string | null>;
 }
 
 export function ThreadDetailPane({
@@ -139,6 +150,12 @@ export function ThreadDetailPane({
   side = "right",
   predictionOpen = true,
   onTogglePrediction,
+  composerOpen,
+  onComposerOpenChange,
+  composerFocusToken,
+  onReplySent,
+  onReconnect,
+  onRefetchReplyState,
 }: Props) {
   const CollapseIcon = COLLAPSE_ICONS[side];
   if (error) {
@@ -236,8 +253,19 @@ export function ThreadDetailPane({
       <header className="px-4 py-3 border-b border-border bg-[var(--color-panel)] panel-lift">
         <div className="flex items-center gap-2">
           {onBack && <BackToList onBack={onBack} />}
-          <div className="flex-1 min-w-0 text-[11px] text-muted-foreground font-mono lowercase truncate">
-            {data.thread.provider} · {absTime(data.thread.last_message_at)}
+          <div className="flex-1 min-w-0 flex items-center gap-1.5 text-[11px] text-muted-foreground font-mono lowercase truncate">
+            <span className="truncate">
+              {data.thread.provider} · {absTime(data.thread.last_message_at)}
+            </span>
+            {data.thread.replied_at && (
+              <span
+                title={`Replied ${absTime(data.thread.replied_at)}`}
+                aria-label={`Replied ${absTime(data.thread.replied_at)}`}
+                className="inline-flex shrink-0 items-center text-muted-foreground/80"
+              >
+                <ReplyIcon className="h-3 w-3" />
+              </span>
+            )}
           </div>
           {showAccountBadge && (
             <span
@@ -259,6 +287,17 @@ export function ThreadDetailPane({
             >
               <ExternalLink className="h-3.5 w-3.5" />
             </a>
+          )}
+          {onComposerOpenChange && (
+            <button
+              onClick={() => onComposerOpenChange(!composerOpen)}
+              aria-label={composerOpen ? "Hide reply composer" : "Reply"}
+              aria-pressed={!!composerOpen}
+              title={composerOpen ? "Hide reply ( Shift R )" : "Reply ( Shift R )"}
+              className="inline-flex items-center justify-center max-md:h-10 max-md:w-10 text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+            >
+              <ReplyIcon className="h-3.5 w-3.5" />
+            </button>
           )}
           {onDone && (
             <button
@@ -404,9 +443,31 @@ export function ThreadDetailPane({
               </span>
             </header>
             <MessageBody m={m} fill={fillBody} />
+            {m.pending && (
+              <p className="mt-1.5 text-[10.5px] font-mono text-muted-foreground italic">
+                sending — will appear in the thread after your mailbox syncs
+              </p>
+            )}
           </article>
         ))}
       </div>
+
+      {onComposerOpenChange && onReplySent && onRefetchReplyState && (
+        <ReplyComposer
+          key={data.thread.id}
+          threadId={data.thread.id}
+          provider={data.thread.provider}
+          repliedAt={data.thread.replied_at}
+          messages={data.messages}
+          selfAddress={data.thread.account_email}
+          open={!!composerOpen}
+          onOpenChange={onComposerOpenChange}
+          onSent={onReplySent}
+          onReconnect={onReconnect}
+          onRefetchReplyState={onRefetchReplyState}
+          focusToken={composerFocusToken}
+        />
+      )}
     </div>
   );
 }

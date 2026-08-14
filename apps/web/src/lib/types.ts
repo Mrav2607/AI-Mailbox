@@ -44,6 +44,10 @@ export interface TriageItem {
   classification: Classification;
   // Which connected Gmail account this thread belongs to.
   account_email: string;
+  // The reply fence (docs/plans/2026-08-13-reply-plan.md §3.5/§3.9): null =
+  // never replied from CortexMail, timestamp = when a reply attempt last
+  // completed. Powers the "replied" indicator without a second call.
+  replied_at: string | null;
 }
 
 export interface TriageResponse {
@@ -158,6 +162,12 @@ export interface ThreadMessage {
   snippet: string | null;
   body_text: string | null;
   body_html: string | null;
+  // Client-only, never sent by the API: true for the synthetic Outlook
+  // reply representation the composer renders immediately after a send
+  // (docs/plans/2026-08-13-reply-plan.md §3.4) — Outlook writes no message
+  // row at send time, so this stands in until the real Sent Items copy
+  // syncs in and a later getThread() replaces it wholesale.
+  pending?: boolean;
 }
 
 export interface ThreadDetail {
@@ -171,12 +181,47 @@ export interface ThreadDetail {
     done: boolean;
     // Which connected Gmail account this thread belongs to.
     account_email: string;
+    // See TriageItem.replied_at — same fence, also the composer's
+    // expected_replied_at seed (plan §3.9).
+    replied_at: string | null;
   };
   messages: ThreadMessage[];
   // The latest message's classification, so a detail pane opened from
   // somewhere other than the bucket list (the agenda) can still show the
   // prediction bar. Null when nothing has classified this thread yet.
   classification: Classification | null;
+}
+
+// The sent reply, shaped like ThreadMessage plus the recipients the send
+// pipeline computed server-side (docs/plans/2026-08-13-reply-plan.md §3.4).
+// For Outlook, `id` is the reply_attempt row's own id, NOT a MailMessage.id
+// (§3.4/P7-3) — client-display-only, never sent back to any mutation.
+export interface MessageOut {
+  id: string;
+  sent_at: string | null;
+  sender: string | null;
+  recipient: string[] | null;
+  cc: string[] | null;
+  snippet: string | null;
+  body_text: string | null;
+  body_html: string | null;
+}
+
+// POST /mail/thread/{id}/reply response (plan §4.1). `replied_at` is always
+// non-null here — a successful send always advances the fence.
+export interface ReplySent {
+  thread_id: string;
+  message: MessageOut;
+  replied_at: string;
+  resolved_action_items: number;
+}
+
+// POST /mail/thread/{id}/reply-draft response — stateless, BYOK-only
+// (plan §3.7).
+export interface ReplyDraft {
+  draft_text: string;
+  provider: string;
+  model: string;
 }
 
 // A connected Gmail account (GET /auth/connections). `reauth_required` means
@@ -260,7 +305,7 @@ export interface LlmTestResult {
 // Which background pipeline paid for a call. Kept as a plain union (not
 // reusing ClassifierBackend) because it mirrors the API's CHECK-constrained
 // `stage` column, not the classifier's backend selector.
-export type LlmUsageStage = "classification" | "extraction";
+export type LlmUsageStage = "classification" | "extraction" | "reply_draft";
 
 // Shared by totals/by_stage/by_provider -- same counters, different grouping.
 // `calls_with_total_tokens` can be less than `calls`: a provider can answer

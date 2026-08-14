@@ -63,6 +63,7 @@ import type {
   IngestOptions,
   Label,
   Overview,
+  ReplySent,
   ThreadDetail,
   TriageItem,
   TriageSort,
@@ -246,6 +247,21 @@ export default function Console() {
   const [threadLoading, setThreadLoading] = useState(false);
   const [threadError, setThreadError] = useState<string | null>(null);
 
+  // Reply composer (docs/plans/2026-08-13-reply-plan.md §3.10) — collapsed by
+  // default, lifted here (not local to ThreadDetailPane) so Shift+R and Esc
+  // can reach it from the global hotkey handler below.
+  const [composerOpen, setComposerOpen] = useState(false);
+  // Bumped on every Shift+R so the composer re-focuses its textarea even
+  // when it was already open, not just on the closed -> open transition.
+  const [composerFocusToken, setComposerFocusToken] = useState(0);
+
+  // A new thread selection always starts with the composer collapsed and
+  // empty — carrying an open draft over onto an unrelated thread would be
+  // a good way to reply to the wrong person.
+  useEffect(() => {
+    setComposerOpen(false);
+  }, [selectedId]);
+
   const [ingesting, setIngesting] = useState(false);
   const [backfilling, setBackfilling] = useState(false);
   const [ingestOpen, setIngestOpen] = useState(false);
@@ -308,6 +324,11 @@ export default function Console() {
   );
   const panelsRef = useRef(panels);
   panelsRef.current = panels;
+  // Guards the reply composer's stale-guard refetch (see
+  // refetchReplyState below) against landing on `thread` after the operator
+  // has already navigated to a different one.
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
   const itemsRef = useRef<TriageItem[]>([]);
   itemsRef.current = items;
   const accountFilterRef = useRef(accountFilter);
@@ -1126,6 +1147,78 @@ export default function Console() {
       cancelled = true;
     };
   }, [selectedId, handleSessionExpired]);
+
+  // Reply send/stale-recovery wiring (plan §3.9/§3.10) — the composer itself
+  // owns the send/draft calls and their error states; this is just the two
+  // places it has to reach back into shared app state.
+  //
+  // reply_state_stale recovery: refetch the thread (which also refreshes the
+  // rest of the pane, not just the fence) and hand the composer back the
+  // freshest replied_at to resubmit with on explicit confirm.
+  const refetchReplyState = useCallback(
+    async (threadId: string): Promise<string | null> => {
+      try {
+        const d = await getThread(threadId);
+        // The operator may have navigated to a different thread while this
+        // was in flight — don't let a stale response clobber what's on
+        // screen now.
+        if (selectedIdRef.current === threadId) setThread(d);
+        return d.thread.replied_at;
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) handleSessionExpired();
+        return null;
+      }
+    },
+    [handleSessionExpired],
+  );
+
+  // A successful send (plan §3.6 completion / §3.4 Outlook ephemeral
+  // representation): toast, splice the sent message into the loaded thread,
+  // stamp replied_at everywhere that fence is cached, and refresh the agenda
+  // when the send resolved open action items — the same
+  // refreshActions({ quiet: true }) + refreshCounts() pattern doDone already
+  // uses for its own server-side action resolution.
+  const handleReplySent = useCallback(
+    (threadId: string, result: ReplySent) => {
+      toast.success("Reply sent");
+      setThread((prev) =>
+        prev && prev.thread.id === threadId
+          ? {
+              ...prev,
+              thread: { ...prev.thread, replied_at: result.replied_at },
+              messages: [
+                {
+                  id: result.message.id,
+                  sent_at: result.message.sent_at,
+                  sender: result.message.sender,
+                  snippet: result.message.snippet,
+                  body_text: result.message.body_text,
+                  body_html: result.message.body_html,
+                  // Outlook writes no message row at send time (plan §3.4) --
+                  // this is the synthetic createReply representation until
+                  // the real Sent Items copy syncs in and replaces `thread`
+                  // wholesale via the next getThread(). Gmail's response IS
+                  // the real row, so it never carries this flag.
+                  pending: prev.thread.provider === "outlook",
+                },
+                ...prev.messages,
+              ],
+            }
+          : prev,
+      );
+      setItems((prev) =>
+        prev.map((i) => (i.thread_id === threadId ? { ...i, replied_at: result.replied_at } : i)),
+      );
+      setSearchResults((prev) =>
+        prev.map((i) => (i.thread_id === threadId ? { ...i, replied_at: result.replied_at } : i)),
+      );
+      if (result.resolved_action_items > 0) {
+        refreshActions({ quiet: true });
+        refreshCounts();
+      }
+    },
+    [refreshActions, refreshCounts],
+  );
 
   // ---- derived: sorted items ----------------------------------------------
   // "recent" and "account" both come back already ordered from the server;
@@ -2221,10 +2314,17 @@ export default function Console() {
         lPressedAt.current = 0;
       }
 
-      // Escape priority: overlay/tour handling above already returned; a live
-      // bulk selection is next, then search clears (works even while the
-      // search box has focus, since useHotkeys lets Escape through).
+      // Escape priority: overlay/tour handling above already returned; the
+      // reply composer is next (it can hold focus itself, via its textarea,
+      // and useHotkeys lets Escape through even while typing there), then a
+      // live bulk selection, then search clears (works even while the
+      // search box has focus, same reason).
       if (e.key === "Escape") {
+        if (composerOpen) {
+          e.preventDefault();
+          setComposerOpen(false);
+          return;
+        }
         // The caret sitting in an empty search box shouldn't trap the
         // operator there — Escape backs out of it before anything else gets
         // a turn.
@@ -2314,6 +2414,17 @@ export default function Console() {
           refreshOverview();
           refreshCounts();
         }
+        return;
+      }
+      // Shift+R opens the reply composer for whatever thread the detail pane
+      // has loaded (plan §3.10) — `r` above is refresh, this is the shifted
+      // "R" character, so the two never collide. A no-op with nothing loaded,
+      // or on narrow layouts where the reading pane isn't the visible one.
+      if (e.key === "R") {
+        if (!thread || (isNarrow && narrowPane !== "reading")) return;
+        e.preventDefault();
+        setComposerOpen(true);
+        setComposerFocusToken((n) => n + 1);
         return;
       }
       // Agenda view early-return: its j/k/Enter/e/x mean something different
@@ -2530,6 +2641,8 @@ export default function Console() {
       panels,
       selectedId,
       showPanel,
+      thread,
+      composerOpen,
     ],
   );
 
@@ -2985,6 +3098,12 @@ export default function Console() {
       side={arrangement.reading}
       predictionOpen={panels.prediction}
       onTogglePrediction={() => togglePanel("prediction")}
+      composerOpen={composerOpen}
+      onComposerOpenChange={setComposerOpen}
+      composerFocusToken={composerFocusToken}
+      onReplySent={handleReplySent}
+      onReconnect={thread ? () => reconnectFor(thread.thread.provider)() : undefined}
+      onRefetchReplyState={refetchReplyState}
     />
   );
 

@@ -6,6 +6,7 @@ import type { LlmProvider, LlmUsage, LlmUsageDailyPoint } from "./types";
 export const STAGE_LABELS: Record<string, string> = {
   classification: "Sorting",
   extraction: "Agenda",
+  reply_draft: "AI drafts",
 };
 
 export const PROVIDER_LABELS: Record<LlmProvider, string> = {

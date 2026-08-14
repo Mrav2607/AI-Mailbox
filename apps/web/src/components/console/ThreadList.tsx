@@ -1,6 +1,6 @@
 import { Fragment } from "react";
 import type { ReactNode } from "react";
-import { Check, Inbox } from "lucide-react";
+import { Check, Inbox, Reply as ReplyIcon } from "lucide-react";
 import {
   LABEL_META,
   confidenceColor,
@@ -52,6 +52,21 @@ function AccountBadge({ email }: { email: string }) {
       title={email}
     >
       {emailLocalPart(email)}
+    </span>
+  );
+}
+
+// Same icon language as ThreadDetailPane's header indicator — a small reply
+// arrow, muted rather than colored, so it reads as metadata and doesn't
+// compete with the classification dot for attention.
+function RepliedBadge() {
+  return (
+    <span
+      title="Replied"
+      aria-label="Replied"
+      className="shrink-0 inline-flex items-center text-muted-foreground/70"
+    >
+      <ReplyIcon className="h-3 w-3" />
     </span>
   );
 }
@@ -186,6 +201,7 @@ export function ThreadList({
                     >
                       {confPct == null ? "—" : `${confPct}%`}
                     </span>
+                    {it.replied_at && <RepliedBadge />}
                     {showAccount && <AccountBadge email={it.account_email} />}
                     <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground font-mono">
                       {relTime(it.last_message_at)}
@@ -323,6 +339,8 @@ export function ThreadList({
                     {it.latest_message_snippet ?? ""}
                   </span>
                 </span>
+
+                {it.replied_at && <RepliedBadge />}
 
                 {showAccount && <AccountBadge email={it.account_email} />}
 
