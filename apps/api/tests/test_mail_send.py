@@ -634,12 +634,78 @@ def test_gmail_send_message_429_retries_are_bounded(monkeypatch):
     assert fake_client.post.call_count == 3
 
 
+def test_gmail_send_message_caps_per_request_timeout_to_remaining(monkeypatch):
+    """R-8 (final review): the per-request timeout passed to the transport
+    must be capped to whatever's left of the caller's deadline, not the
+    client's fixed 20s default."""
+    fake_client = MagicMock()
+    fake_client.post = MagicMock(return_value=_resp(200, {"id": "sent-1"}))
+    monkeypatch.setattr(gmail_client, "_client", lambda: fake_client)
+    monkeypatch.setattr(gmail_client.time, "monotonic", lambda: 100.0)
+
+    GmailClient("tok").send_message(raw="x", thread_id="t1", remaining_seconds=7.0)
+
+    assert fake_client.post.call_args.kwargs["timeout"] == 7.0
+
+
+def test_gmail_send_message_429_sequence_exceeding_budget_raises_within_it(monkeypatch):
+    """R-8's required regression test: a 429 sequence that would exceed the
+    45s route budget must stop and raise WITHIN that budget -- never make
+    another request once the remaining deadline is gone, and never fall
+    back to the client's fixed per-request timeout."""
+    monkeypatch.setattr(gmail_client.time, "sleep", lambda s: None)
+    # monotonic() is called: (1) to anchor the deadline, (2) before the
+    # first POST's timeout, (3) before computing the backoff sleep after
+    # the first 429, (4) before the retry POST's timeout -- by which point
+    # the simulated clock has jumped past the 5s budget.
+    monkeypatch.setattr(
+        gmail_client.time, "monotonic", MagicMock(side_effect=[0.0, 0.1, 0.2, 10.0])
+    )
+    throttled = _resp(429)
+    fake_client = MagicMock()
+    fake_client.post = MagicMock(return_value=throttled)
+    monkeypatch.setattr(gmail_client, "_client", lambda: fake_client)
+
+    with pytest.raises(httpx.ReadTimeout):
+        GmailClient("tok").send_message(raw="x", thread_id="t1", remaining_seconds=5.0)
+
+    # Only the first request was actually made -- the retry never went out
+    # once the budget was gone, unlike the bounded-but-uncapped default.
+    assert fake_client.post.call_count == 1
+
+
+def test_gmail_send_message_remaining_seconds_none_preserves_old_behavior(monkeypatch):
+    """`remaining_seconds=None` (the default) must not change the
+    fixed-timeout, uncapped-backoff shape any existing caller relies on."""
+    monkeypatch.setattr(gmail_client.time, "sleep", lambda s: None)
+    throttled = _resp(429)
+    ok = _resp(200, {"id": "sent-1"})
+    fake_client = MagicMock()
+    fake_client.post = MagicMock(side_effect=[throttled, ok])
+    monkeypatch.setattr(gmail_client, "_client", lambda: fake_client)
+
+    result = GmailClient("tok").send_message(raw="x", thread_id="t1")
+
+    assert result == {"id": "sent-1"}
+    for call in fake_client.post.call_args_list:
+        assert "timeout" not in call.kwargs
+
+
 def test_gmail_send_reply_wraps_client(monkeypatch):
     client = MagicMock()
     client.send_message.return_value = {"id": "sent-1"}
     result = gmail_send.send_reply(client, raw="x", provider_thread_id="t1")
     assert result == {"id": "sent-1"}
-    client.send_message.assert_called_once_with(raw="x", thread_id="t1")
+    client.send_message.assert_called_once_with(raw="x", thread_id="t1", remaining_seconds=None)
+
+
+def test_gmail_send_reply_threads_remaining_seconds(monkeypatch):
+    """R-8 (final review): the route's remaining-deadline slice must reach
+    `GmailClient.send_message`, not just get checked between calls."""
+    client = MagicMock()
+    client.send_message.return_value = {"id": "sent-1"}
+    gmail_send.send_reply(client, raw="x", provider_thread_id="t1", remaining_seconds=12.5)
+    client.send_message.assert_called_once_with(raw="x", thread_id="t1", remaining_seconds=12.5)
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +751,82 @@ def test_outlook_send_draft_posts_with_no_body(monkeypatch):
     assert call.args[0].endswith("/me/messages/draft-1/send")
     assert call.kwargs["json"] is None
     assert call.kwargs["headers"]["Prefer"] == 'IdType="ImmutableId"'
+
+
+def test_outlook_create_reply_caps_timeout_to_remaining_seconds(monkeypatch):
+    """R-8 (final review), Outlook half: a small remaining budget must cap
+    the ACTUAL per-request HTTP timeout passed to the transport, not just
+    the pre-flight guard."""
+    fake_client = MagicMock()
+    fake_client.post = MagicMock(return_value=_resp(200, {"id": "draft-1"}))
+    monkeypatch.setattr(outlook_client, "_client", lambda: fake_client)
+
+    OutlookClient("tok").create_reply(
+        "msg-1", reply_all=False, comment="hi", remaining_seconds=3.0
+    )
+
+    assert fake_client.post.call_args.kwargs["timeout"] == 3.0
+
+
+def test_outlook_create_reply_timeout_never_exceeds_client_default(monkeypatch):
+    """The cap is `min(default, remaining)` -- a generous remaining budget
+    must not widen the request past the client's own fixed timeout."""
+    fake_client = MagicMock()
+    fake_client.post = MagicMock(return_value=_resp(200, {"id": "draft-1"}))
+    monkeypatch.setattr(outlook_client, "_client", lambda: fake_client)
+
+    OutlookClient("tok").create_reply(
+        "msg-1", reply_all=False, comment="hi", remaining_seconds=999.0
+    )
+
+    assert fake_client.post.call_args.kwargs["timeout"] == outlook_client._TIMEOUT
+
+
+def test_outlook_create_reply_no_remaining_seconds_omits_timeout_override(monkeypatch):
+    """`remaining_seconds=None` (the default) must not send a `timeout`
+    override at all -- preserving the client's own fixed default exactly
+    as before this change."""
+    fake_client = MagicMock()
+    fake_client.post = MagicMock(return_value=_resp(200, {"id": "draft-1"}))
+    monkeypatch.setattr(outlook_client, "_client", lambda: fake_client)
+
+    OutlookClient("tok").create_reply("msg-1", reply_all=False, comment="hi")
+
+    assert "timeout" not in fake_client.post.call_args.kwargs
+
+
+def test_outlook_send_draft_caps_timeout_to_remaining_seconds(monkeypatch):
+    fake_client = MagicMock()
+    fake_client.post = MagicMock(return_value=_resp(200))
+    monkeypatch.setattr(outlook_client, "_client", lambda: fake_client)
+
+    OutlookClient("tok").send_draft("draft-1", remaining_seconds=2.5)
+
+    assert fake_client.post.call_args.kwargs["timeout"] == 2.5
+
+
+def test_outlook_send_reply_draft_module_threads_remaining_seconds_to_client(monkeypatch):
+    """R-8: `outlook_send.send_reply_draft` must pass `remaining_seconds`
+    through to `OutlookClient.send_draft`, not just check it locally."""
+    client = MagicMock()
+    outlook_send.send_reply_draft(client, draft_id="draft-1", remaining_seconds=4.2)
+    client.send_draft.assert_called_once_with("draft-1", remaining_seconds=4.2)
+
+
+def test_outlook_create_reply_draft_module_threads_remaining_seconds_to_client():
+    """Same for `create_reply_draft`."""
+    client = MagicMock()
+    client.create_reply.return_value = {
+        "id": "draft-1",
+        "toRecipients": [],
+        "ccRecipients": [],
+    }
+    outlook_send.create_reply_draft(
+        client, message_id="msg-1", reply_all=False, comment="hi", remaining_seconds=4.2
+    )
+    client.create_reply.assert_called_once_with(
+        "msg-1", reply_all=False, comment="hi", remaining_seconds=4.2
+    )
 
 
 def test_outlook_delete_draft_sends_delete_with_immutable_id_header(monkeypatch):

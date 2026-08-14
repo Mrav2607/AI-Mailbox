@@ -15,12 +15,25 @@ from typing import Any
 from app.services.ingest.gmail_client import GmailClient
 
 
-def send_reply(client: GmailClient, *, raw: str, provider_thread_id: str) -> dict[str, Any]:
+def send_reply(
+    client: GmailClient,
+    *,
+    raw: str,
+    provider_thread_id: str,
+    remaining_seconds: float | None = None,
+) -> dict[str, Any]:
     """Thin wrapper over `GmailClient.send_message` -- kept as its own
     function so the send call site reads the same shape as
     `outlook_send.py`'s, and so a later wave has one obvious place to add
-    telemetry/logging around the actual provider contact."""
-    return client.send_message(raw=raw, thread_id=provider_thread_id)
+    telemetry/logging around the actual provider contact.
+
+    `remaining_seconds` (R-8, final review) passes the route's remaining
+    45s-budget slice straight through -- see `GmailClient.send_message`'s
+    docstring for why this matters (its own retry loop can otherwise burn
+    well past the route's between-calls deadline check)."""
+    return client.send_message(
+        raw=raw, thread_id=provider_thread_id, remaining_seconds=remaining_seconds
+    )
 
 
 def sent_at_now() -> datetime:

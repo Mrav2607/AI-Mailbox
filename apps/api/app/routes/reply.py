@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from app.core.logging import logger
 from app.core.ratelimit import user_rate_limit
+from app.db.base import SessionLocal
 from app.db.models import MailMessage, MailThread, ProviderAccount, ReplyAttempt
 from app.db.schemas.reply import ReplyDraft, ReplySent
 from app.deps import get_current_user, get_db
@@ -300,6 +301,83 @@ def _unknown_send(db: Session, *, attempt_id: UUID, provider_account_id: UUID) -
     )
 
 
+def _fail_after_draft_created_db_error(
+    db: Session, *, client: OutlookClient, draft_id: str | None, attempt_id: UUID
+) -> NoReturn:
+    """R-5(a) (final review): createReply already succeeded on the provider,
+    but recording the draft id (or committing that write) failed -- left
+    alone, the `inflight` attempt row survives with NO correlation id for a
+    draft that was never sent, which reconciliation can never match
+    (it keys on `provider_message_id`). Rolls back the broken transaction,
+    best-effort deletes the orphan draft (nothing was ever SENT from it --
+    only createReply ran), and settles the attempt `failed` in a fresh
+    session, since `db`'s own transaction is the one that just failed and
+    may not be safely reusable for further writes.
+    """
+    db.rollback()
+    if draft_id:
+        try:
+            client.delete_draft(draft_id)
+        except httpx.HTTPError:
+            logger.warning(
+                "failed to delete orphan Outlook reply draft %s for attempt %s",
+                draft_id,
+                attempt_id,
+            )
+    try:
+        with SessionLocal() as fresh_db:
+            mark_failed(fresh_db, attempt_id=attempt_id)
+            fresh_db.commit()
+    except Exception:
+        logger.exception(
+            "failed to settle attempt %s as failed after draft-record DB error", attempt_id
+        )
+    raise _http_error(
+        "send_rejected",
+        "The reply was rejected and was not sent. It's safe to try again.",
+        502,
+    )
+
+
+def _unknown_after_completion_db_error(
+    db: Session, *, attempt_id: UUID, provider_account_id: UUID
+) -> NoReturn:
+    """R-5(b) (final review): a completion-transaction failure AFTER a
+    successful provider send must never escape unhandled -- the mail
+    already left, so from here on this is exactly the ambiguous outcome,
+    never a 500. Rolls back `db` (whose own commit is what failed) and CASes
+    the attempt to `unknown` in a FRESH session, then enqueues the same
+    timeliness-only reconciliation task `_unknown_send` does -- both
+    best-effort, since the durable attempt row (still `inflight` after the
+    rollback) is what actually keeps the in-flight guard closed either way.
+    """
+    db.rollback()
+    try:
+        with SessionLocal() as fresh_db:
+            mark_unknown(fresh_db, attempt_id=attempt_id)
+            fresh_db.commit()
+    except Exception:
+        logger.exception(
+            "failed to CAS attempt %s to unknown after completion-txn DB error", attempt_id
+        )
+    try:
+        reconcile_reply_attempt.apply_async(
+            args=[str(provider_account_id)], countdown=_RECONCILE_COUNTDOWN_SECONDS
+        )
+    except Exception:
+        logger.warning(
+            "reconcile_reply_attempt enqueue failed after completion-txn DB error for "
+            "attempt %s",
+            attempt_id,
+        )
+    raise _http_error(
+        "send_outcome_unknown",
+        "Your reply may have been sent. The thread will update once your "
+        "mailbox syncs -- don't resend unless it's still missing after that.",
+        502,
+    )
+
+
 def _handle_provider_exception(
     exc: httpx.HTTPError, db: Session, *, attempt_id: UUID, provider_account_id: UUID
 ) -> NoReturn:
@@ -395,20 +473,8 @@ def send_reply(
 
     _check_scope(account)
 
-    messages = (
-        db.execute(select(MailMessage).where(MailMessage.thread_id == thread_id))
-        .scalars()
-        .all()
-    )
-    if not messages:
-        raise _http_error("no_reply_target", "This thread has no messages to reply to.", 409)
-
     try:
         self_address = resolve_self_address(account)
-        target = select_reply_target(messages, self_address)
-        recipients = compute_recipients(
-            target_message=target, self_address=self_address, reply_all=payload.reply_all
-        )
     except SendError as exc:
         raise _send_error_response(exc) from exc
 
@@ -420,7 +486,6 @@ def send_reply(
     access_token = _ensure_fresh_access_token(db, account)
     provider_thread_id = thread.provider_thread_id
     subject = thread.subject
-    target_provider_message_id = target.provider_message_id
     gmail_message_id_header = generate_message_id() if provider == "gmail" else None
 
     # Txn A (plan §3.6 step 1): validate + claim, under a short lock_timeout
@@ -458,6 +523,43 @@ def send_reply(
             "This thread changed since you loaded it. Refresh and try again.",
             409,
         )
+
+    # R-2 (final review) -- deliberate deviation from the frozen §3.6 step-1
+    # ordering, documented here per the review's instruction: the message
+    # set and target/recipient computation used to run BEFORE this lock was
+    # acquired. A concurrently ingested newer inbound message (a different
+    # sender/Reply-To) doesn't change `replied_at`, so the stale guard above
+    # would pass while the reply still targeted the STALE correspondent --
+    # and the fence (`replied_at = attempt.created_at`) would then resolve
+    # the newer message's obligation as answered too. Reading messages and
+    # computing target/recipients/threading HERE, under the thread lock (which
+    # ingest also holds while inserting new messages -- see gmail_ingest.py/
+    # outlook_ingest.py's own MailThread lock around message upserts), means
+    # any concurrent ingest has either fully committed before we got the
+    # lock (so we see its newest message) or is blocked behind us (so it
+    # can't land a newer message mid-computation). No caller above this
+    # point queries `MailMessage` for this thread, so there's no stale
+    # identity-map snapshot to worry about here the way there was for
+    # `replied_at` above.
+    messages = (
+        db.execute(select(MailMessage).where(MailMessage.thread_id == thread_id))
+        .scalars()
+        .all()
+    )
+    if not messages:
+        db.rollback()
+        raise _http_error("no_reply_target", "This thread has no messages to reply to.", 409)
+
+    try:
+        target = select_reply_target(messages, self_address)
+        recipients = compute_recipients(
+            target_message=target, self_address=self_address, reply_all=payload.reply_all
+        )
+    except SendError as exc:
+        db.rollback()
+        raise _send_error_response(exc) from exc
+
+    target_provider_message_id = target.provider_message_id
 
     # Stale-preparing expiry runs under the lock, before this request admits
     # itself (P5-1), so the in-flight guard below never blocks on a row that
@@ -534,8 +636,16 @@ def send_reply(
         if _deadline_exceeded(deadline):
             _unknown_send(db, attempt_id=attempt_id, provider_account_id=provider_account_id)
         try:
+            # R-8 (final review): thread the REMAINING slice of the 45s
+            # budget into the send call itself, not just the between-calls
+            # check above -- send_message's own 429 retry loop can
+            # otherwise burn 3x its 20s per-request timeout plus backoff
+            # well past this request's deadline.
             response = gmail_send_reply(
-                client, raw=raw, provider_thread_id=provider_thread_id
+                client,
+                raw=raw,
+                provider_thread_id=provider_thread_id,
+                remaining_seconds=max(0.0, deadline - time.monotonic()),
             )
         except httpx.HTTPError as exc:
             _handle_provider_exception(
@@ -552,29 +662,39 @@ def send_reply(
             # the same as any other ambiguous outcome rather than guess.
             _unknown_send(db, attempt_id=attempt_id, provider_account_id=provider_account_id)
         sent_headers = _headers_from_raw_mime(raw)
-        return _complete_gmail_send(
-            db,
-            thread_id=thread_id,
-            attempt_id=attempt_id,
-            attempt_created_at=attempt_created_at,
-            self_address=self_address,
-            recipients=recipients,
-            body_text=payload.body_text,
-            headers=sent_headers,
-            provider_message_id=provider_message_id,
-            current_user_id=current_user.id,
-        )
+        try:
+            return _complete_gmail_send(
+                db,
+                thread_id=thread_id,
+                attempt_id=attempt_id,
+                attempt_created_at=attempt_created_at,
+                self_address=self_address,
+                recipients=recipients,
+                body_text=payload.body_text,
+                headers=sent_headers,
+                provider_message_id=provider_message_id,
+                current_user_id=current_user.id,
+            )
+        except SQLAlchemyError:
+            # R-5(b): the Gmail send already succeeded -- this can only be a
+            # completion-transaction DB failure, never a reason to 500.
+            _unknown_after_completion_db_error(
+                db, attempt_id=attempt_id, provider_account_id=provider_account_id
+            )
 
     # Outlook: createReply -> record draft id -> send (plan §3.1/§3.6 step 2).
     client = OutlookClient(access_token)
     if _deadline_exceeded(deadline):
         _unknown_send(db, attempt_id=attempt_id, provider_account_id=provider_account_id)
     try:
+        # R-8 (final review): remaining-seconds pre-flight guard plus the
+        # actual per-request HTTP timeout, capped by OutlookClient itself.
         draft = create_reply_draft(
             client,
             message_id=target_provider_message_id,
             reply_all=payload.reply_all,
             comment=payload.body_text,
+            remaining_seconds=max(0.0, deadline - time.monotonic()),
         )
     except SendError as exc:
         # A locally-decided rejection (missing draft id, or the §3.3 cap
@@ -592,15 +712,32 @@ def send_reply(
         logger.exception("unexpected error creating Outlook reply draft for attempt %s", attempt_id)
         _unknown_send(db, attempt_id=attempt_id, provider_account_id=provider_account_id)
 
-    record_provider_message_id(
-        db, attempt_id=attempt_id, provider_message_id=draft.get("id")
-    )
-    db.commit()
+    try:
+        record_provider_message_id(
+            db, attempt_id=attempt_id, provider_message_id=draft.get("id")
+        )
+        db.commit()
+    except SQLAlchemyError:
+        # R-5(a) (final review): createReply already succeeded -- the draft
+        # exists on the provider -- but recording its id / committing that
+        # failed. Left alone, the `inflight` attempt survives with NO
+        # correlation id for an unsent draft: reconciliation matches on
+        # `provider_message_id`, so this would be unreconcilable forever.
+        # Nothing was ever sent from this draft (only createReply ran), so
+        # this settles `failed`, not `unknown`.
+        _fail_after_draft_created_db_error(
+            db, client=client, draft_id=draft.get("id"), attempt_id=attempt_id
+        )
 
     if _deadline_exceeded(deadline):
         _unknown_send(db, attempt_id=attempt_id, provider_account_id=provider_account_id)
     try:
-        send_reply_draft(client, draft_id=draft["id"])
+        # R-8: same remaining-seconds pre-flight guard as createReply above.
+        send_reply_draft(
+            client,
+            draft_id=draft["id"],
+            remaining_seconds=max(0.0, deadline - time.monotonic()),
+        )
     except SendError as exc:
         # F6: a Graph 403 on the send step too (permission revoked between
         # the up-front scope check and now) -- draft-stage failure, nothing
@@ -617,17 +754,24 @@ def send_reply(
         _unknown_send(db, attempt_id=attempt_id, provider_account_id=provider_account_id)
 
     sent_at = datetime.now(timezone.utc)
-    return _complete_outlook_send(
-        db,
-        thread_id=thread_id,
-        account_id=provider_account_id,
-        attempt_id=attempt_id,
-        attempt_created_at=attempt_created_at,
-        draft=draft,
-        self_address=self_address,
-        recipients=recipients,
-        sent_at=sent_at,
-    )
+    try:
+        return _complete_outlook_send(
+            db,
+            thread_id=thread_id,
+            account_id=provider_account_id,
+            attempt_id=attempt_id,
+            attempt_created_at=attempt_created_at,
+            draft=draft,
+            self_address=self_address,
+            recipients=recipients,
+            sent_at=sent_at,
+        )
+    except SQLAlchemyError:
+        # R-5(b): the Outlook send already succeeded -- this can only be a
+        # completion-transaction DB failure, never a reason to 500.
+        _unknown_after_completion_db_error(
+            db, attempt_id=attempt_id, provider_account_id=provider_account_id
+        )
 
 
 def _complete_gmail_send(

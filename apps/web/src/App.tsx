@@ -1939,7 +1939,9 @@ export default function Console() {
 
       const bucketIdx = items.findIndex((i) => i.thread_id === id);
       const removedFromBucket = bucketIdx >= 0 ? items[bucketIdx] : null;
-      if (view === "buckets" && selectedId === id) {
+      // Snoozed threads stay searchable and stay in searchResults (S-3), so
+      // only the buckets view needs to hand selection to a neighbour.
+      if (view === "buckets" && selectedId === id && !searchMode) {
         const vi = visibleItems.findIndex((i) => i.thread_id === id);
         if (vi >= 0) {
           const next = visibleItems[vi + 1] ?? visibleItems[vi - 1] ?? null;
@@ -1980,8 +1982,15 @@ export default function Console() {
               onClick: () => {
                 void (async () => {
                   try {
-                    await snoozeThread(id, null);
-                    if (wasDone) await setThreadDone(id, true);
+                    // A wasDone undo must be one atomic call: setThreadDone(id, true)
+                    // marks done AND clears the snooze columns server-side (exclusivity
+                    // CHECK), so there's no window where a mid-restore failure could
+                    // leave the thread open and unsnoozed instead of fully reverted (S-1).
+                    if (wasDone) {
+                      await setThreadDone(id, true);
+                    } else {
+                      await snoozeThread(id, null);
+                    }
                     if (user) {
                       if (priorSeenEntry !== undefined) {
                         markSeen(seenRef.current, user.id, id, priorSeenEntry);
@@ -2011,7 +2020,7 @@ export default function Console() {
         }
       })();
     },
-    [selectedId, thread, items, visibleItems, view, user, refreshCounts, refreshActions],
+    [selectedId, thread, items, visibleItems, view, searchMode, user, refreshCounts, refreshActions],
   );
 
   // The same control, in its Unsnooze state (snoozed_until already set) --
@@ -2027,7 +2036,9 @@ export default function Console() {
 
     const bucketIdx = items.findIndex((i) => i.thread_id === id);
     const removedFromBucket = bucketIdx >= 0 ? items[bucketIdx] : null;
-    if (view === "buckets" && selectedId === id) {
+    // Same S-3 reasoning as doSnooze: unsnoozed threads stay in searchResults,
+    // so search mode shouldn't jump selection off the row.
+    if (view === "buckets" && selectedId === id && !searchMode) {
       const vi = visibleItems.findIndex((i) => i.thread_id === id);
       if (vi >= 0) {
         const next = visibleItems[vi + 1] ?? visibleItems[vi - 1] ?? null;
@@ -2082,7 +2093,7 @@ export default function Console() {
         toast.error((e as Error).message ?? "unsnooze failed");
       }
     })();
-  }, [selectedId, thread, items, visibleItems, view, refreshCounts]);
+  }, [selectedId, thread, items, visibleItems, view, searchMode, refreshCounts]);
 
   // Jump to the thread in the Gmail web UI (default signed-in account).
   const openInGmail = useCallback(() => {
@@ -3303,6 +3314,14 @@ export default function Console() {
   const detailThreadId =
     focusedItem?.thread_id ??
     (thread && thread.thread.id === selectedId ? thread.thread.id : undefined);
+  // Same stale-thread guard as the Shift+R hotkey above and detailThreadId's
+  // done/delete fallback: while a newer selectedId's fetch is in flight,
+  // `thread` (and therefore the composer's `data`) is still the PREVIOUS
+  // thread. Withholding the composer callbacks here — not just closing
+  // `composerOpen` — is what actually removes the Reply button and unmounts
+  // an already-open composer for that window; ThreadDetailPane's
+  // composerEnabled requires all three.
+  const threadMatchesSelection = !!thread && thread.thread.id === selectedId;
   const detailPane = (
     <ThreadDetailPane
       data={thread}
@@ -3323,11 +3342,11 @@ export default function Console() {
       predictionOpen={panels.prediction}
       onTogglePrediction={() => togglePanel("prediction")}
       composerOpen={composerOpen}
-      onComposerOpenChange={setComposerOpen}
+      onComposerOpenChange={threadMatchesSelection ? setComposerOpen : undefined}
       composerFocusToken={composerFocusToken}
-      onReplySent={handleReplySent}
+      onReplySent={threadMatchesSelection ? handleReplySent : undefined}
       onReconnect={thread ? () => reconnectFor(thread.thread.provider)() : undefined}
-      onRefetchReplyState={refetchReplyState}
+      onRefetchReplyState={threadMatchesSelection ? refetchReplyState : undefined}
     />
   );
 

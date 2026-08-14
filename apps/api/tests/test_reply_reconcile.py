@@ -10,6 +10,7 @@ SQL shape is tested separately from extraction_run.py's control flow).
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -19,6 +20,7 @@ from sqlalchemy.dialects import postgresql
 
 from app.db.models import MailThread, ReplyAttempt
 from app.services.mail_send import reconcile
+from app.workers import tasks_ingest
 
 
 def _compiled_sql(stmt, literal_binds=True):
@@ -72,10 +74,22 @@ class _FakeDB:
     needs to understand their SQL.
     """
 
-    def __init__(self, *, attempts=(), threads=(), verified_at_reads=None):
+    def __init__(
+        self,
+        *,
+        attempts=(),
+        threads=(),
+        verified_at_reads=None,
+        status_reads=None,
+        classification_reads=None,
+    ):
         self._attempts = {a.id: a for a in attempts}
         self._threads = {t.id: t for t in threads}
         self._verified_at_reads = list(verified_at_reads) if verified_at_reads is not None else None
+        self._status_reads = list(status_reads) if status_reads is not None else None
+        self._classification_reads = (
+            list(classification_reads) if classification_reads is not None else None
+        )
         self.commits = 0
         self.rollbacks = 0
         self.executed = []
@@ -94,6 +108,16 @@ class _FakeDB:
         if "reply_attempt.verified_at" in sql:
             if self._verified_at_reads is not None:
                 result.scalar_one_or_none.return_value = self._verified_at_reads.pop(0)
+            else:
+                result.scalar_one_or_none.return_value = None
+        elif "reply_attempt.status" in sql:
+            if self._status_reads is not None:
+                result.scalar_one.return_value = self._status_reads.pop(0)
+            else:
+                result.scalar_one.return_value = "sent"
+        elif "classification.message_id" in sql:
+            if self._classification_reads is not None:
+                result.scalar_one_or_none.return_value = self._classification_reads.pop(0)
             else:
                 result.scalar_one_or_none.return_value = None
         return result
@@ -237,7 +261,7 @@ def _patch_settle(monkeypatch, *, mark_sent_result=True, resolved=1):
         calls["advance_fence"].append(kwargs)
         return resolved
 
-    monkeypatch.setattr(reconcile, "mark_sent", fake_mark_sent)
+    monkeypatch.setattr(reconcile, "mark_sent_reconciled", fake_mark_sent)
     monkeypatch.setattr(reconcile, "advance_fence_and_resolve", fake_advance)
     return calls
 
@@ -300,6 +324,55 @@ def test_settle_match_skips_mark_sent_when_already_sent(monkeypatch):
     reconcile._settle_match(db, attempt=attempt, thread_id=attempt.thread_id, message=message)
 
     assert calls["mark_sent"] == []
+
+
+def test_settle_match_settles_an_unknown_attempt(monkeypatch):
+    """R-1 (final review): an `unknown` attempt is exactly what
+    reconciliation exists to settle -- it must go through the widened
+    `mark_sent_reconciled` CAS and advance the fence, not stay blocking."""
+    calls = _patch_settle(monkeypatch, resolved=1)
+    attempt = _attempt(status="unknown")
+    message = _message()
+    db = _FakeDB()
+
+    outcome = reconcile._settle_match(db, attempt=attempt, thread_id=attempt.thread_id, message=message)
+
+    assert outcome == {"resolved_action_items": 1}
+    assert len(calls["mark_sent"]) == 1
+    assert db.commits == 1
+    assert db.rollbacks == 0
+
+
+def test_settle_match_cas_loss_rereads_and_proceeds_when_already_sent(monkeypatch):
+    """A lost CAS race (another worker/route settled it first) is confirmed
+    by a re-read under the same lock, not treated as a failure -- fence
+    resolution still runs."""
+    _patch_settle(monkeypatch, mark_sent_result=False, resolved=3)
+    attempt = _attempt(status="unknown")
+    message = _message()
+    db = _FakeDB(status_reads=["sent"])
+
+    outcome = reconcile._settle_match(db, attempt=attempt, thread_id=attempt.thread_id, message=message)
+
+    assert outcome == {"resolved_action_items": 3}
+    assert db.commits == 1
+
+
+def test_settle_match_cas_loss_anomaly_does_not_advance_fence(monkeypatch):
+    """R-1: a failed CAS whose re-read shows anything OTHER than `sent` is a
+    genuine anomaly -- must roll back and return None rather than silently
+    advancing the fence for an attempt that isn't actually settled."""
+    calls = _patch_settle(monkeypatch, mark_sent_result=False)
+    attempt = _attempt(status="unknown")
+    message = _message()
+    db = _FakeDB(status_reads=["failed"])
+
+    outcome = reconcile._settle_match(db, attempt=attempt, thread_id=attempt.thread_id, message=message)
+
+    assert outcome is None
+    assert calls["advance_fence"] == []
+    assert db.rollbacks == 1
+    assert db.commits == 0
 
 
 def test_classify_and_stamp_null_winner_classifies_and_stamps(monkeypatch):
@@ -365,6 +438,69 @@ def test_classify_and_stamp_classification_failure_leaves_unverified(monkeypatch
     assert db.commits == 0
 
 
+def test_classify_and_stamp_existing_classification_stamps_without_classifying(monkeypatch):
+    """R-3 (final review): a classification-enabled sync already classified
+    this message in its own page loop -- the END pass's claim must find the
+    existing Classification row and just stamp verified_at, never call the
+    classifier again (double BYOK charge / verdict-overwrite risk)."""
+    calls, stamp_calls = _patch_classification(monkeypatch)
+    attempt = _attempt(provider="outlook", verified_at=None)
+    message = _message()
+    db = _FakeDB(verified_at_reads=[None], classification_reads=[uuid4()])
+
+    won = reconcile._classify_and_stamp(
+        db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id, user_id=uuid4()
+    )
+
+    assert won is True
+    assert calls["classify"] == 0
+    assert len(stamp_calls) == 1
+    assert db.commits == 1
+    assert db.rollbacks == 0
+
+
+def test_classify_and_stamp_user_override_stamps_without_overwriting(monkeypatch):
+    """R-3: a user-override Classification row is treated the same way --
+    stamped, never reclassified or overwritten."""
+    calls, stamp_calls = _patch_classification(monkeypatch)
+    attempt = _attempt(provider="outlook", verified_at=None)
+    message = _message()
+    db = _FakeDB(verified_at_reads=[None], classification_reads=[uuid4()])
+
+    won = reconcile._classify_and_stamp(
+        db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id, user_id=uuid4()
+    )
+
+    assert won is True
+    assert calls["classify"] == 0
+
+
+def test_classify_and_stamp_passes_subject_from_stored_headers(monkeypatch):
+    """R-7 (final review): the Subject header must be read case-insensitively
+    from the stored `headers` JSONB and passed through, the same as ingest
+    does -- a None subject would classify this message differently than an
+    identical one classified via normal ingest."""
+    captured = {}
+
+    def fake_build_text(subject, snippet, body_text):
+        captured["subject"] = subject
+        return "text"
+
+    # _patch_classification stubs build_classification_text too -- override
+    # it again afterward so this capturing fake wins.
+    _patch_classification(monkeypatch)
+    monkeypatch.setattr(reconcile, "build_classification_text", fake_build_text)
+    attempt = _attempt(provider="outlook", verified_at=None)
+    message = _message(headers={"sUbJeCt": "Re: quarterly numbers"})
+    db = _FakeDB(verified_at_reads=[None], classification_reads=[None])
+
+    reconcile._classify_and_stamp(
+        db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id, user_id=uuid4()
+    )
+
+    assert captured["subject"] == "Re: quarterly numbers"
+
+
 def test_reconcile_one_attempt_settles_first_even_when_classification_fails(monkeypatch):
     """A provably delivered attempt must never stay blocking because
     classification later fails -- settle (mark_sent/fence) commits
@@ -421,6 +557,23 @@ def test_reconcile_one_attempt_no_match_returns_none_and_rolls_back(monkeypatch)
 
     assert outcome is None
     assert db.rollbacks == 1
+
+
+def test_reconcile_one_attempt_settle_anomaly_returns_none_and_skips_classification(monkeypatch):
+    """R-1: when `_settle_match` reports a genuine anomaly (None), there's
+    nothing settled to classify -- the classification branch must not run."""
+    monkeypatch.setattr(reconcile, "_settle_match", lambda db, **k: None)
+    calls, stamp_calls = _patch_classification(monkeypatch)
+    thread = _thread()
+    attempt = _attempt(provider="outlook", thread_id=thread.id, status="unknown", verified_at=None)
+    message = _message(thread_id=thread.id)
+    monkeypatch.setattr(reconcile, "_match_message", lambda db, **k: message)
+    db = _FakeDB(attempts=[attempt], threads=[thread])
+
+    outcome = reconcile._reconcile_one_attempt(db, attempt_id=attempt.id, classify_messages=True)
+
+    assert outcome is None
+    assert calls["classify"] == 0
 
 
 def test_reconcile_one_attempt_missing_attempt_or_thread_returns_none():
@@ -554,3 +707,99 @@ def test_run_reconciliation_pass_counts_matches_with_nothing_yet_as_incomplete(m
     )
 
     assert result == {"attempts_checked": 2, "completed": 0, "classified": 0}
+
+
+# ---------------------------------------------------------------------------
+# app.workers.tasks_ingest.reconcile_reply_attempt -- R-4 (final review): the
+# level pass must run directly, independent of the sync claim outcome.
+# ---------------------------------------------------------------------------
+
+
+def _account(*, account_id=None, user_id=None, provider="gmail"):
+    return SimpleNamespace(
+        id=account_id or uuid4(),
+        user_id=user_id or uuid4(),
+        refresh_token="tok",
+        sync_paused_at=None,
+        provider=provider,
+    )
+
+
+def test_reconcile_reply_attempt_runs_level_pass_on_deduplicated_claim(monkeypatch):
+    """R-4: dedup + an already-persisted matching message must settle the
+    attempt NOW, not wait for the stale sync lease or the one-shot
+    re-enqueue -- the level pass runs regardless of the claim outcome."""
+    account = _account()
+    state_db = MagicMock()
+    state_db.get.return_value = account
+    recon_db = MagicMock()
+    sessions = iter([state_db, recon_db])
+    monkeypatch.setattr(tasks_ingest, "SessionLocal", lambda: nullcontext(next(sessions)))
+    monkeypatch.setattr(
+        tasks_ingest, "start_sync_run", lambda *a, **k: (SimpleNamespace(id=uuid4()), True)
+    )
+    pass_calls = []
+    monkeypatch.setattr(
+        tasks_ingest,
+        "run_reconciliation_pass",
+        lambda db, **kwargs: pass_calls.append(kwargs) or {"completed": 1},
+    )
+    monkeypatch.setattr(tasks_ingest.reconcile_reply_attempt, "apply_async", MagicMock())
+
+    result = tasks_ingest.reconcile_reply_attempt.run(str(account.id), retry_count=0)
+
+    assert len(pass_calls) == 1
+    assert pass_calls[0] == {
+        "provider_account_id": account.id,
+        "provider": "gmail",
+        "classify_messages": True,
+    }
+    # Dedup + first attempt still defers the one-shot re-enqueue -- the
+    # level pass above is what actually closes the gap, this is only
+    # secondary timeliness.
+    assert result["status"] == "deferred"
+
+
+def test_reconcile_reply_attempt_runs_level_pass_on_won_claim_too(monkeypatch):
+    """A won claim's new ingest run does its own START/END passes -- this is
+    redundant-but-harmless there, never skipped."""
+    account = _account(provider="outlook")
+    state_db = MagicMock()
+    state_db.get.return_value = account
+    recon_db = MagicMock()
+    sessions = iter([state_db, recon_db])
+    monkeypatch.setattr(tasks_ingest, "SessionLocal", lambda: nullcontext(next(sessions)))
+    monkeypatch.setattr(
+        tasks_ingest, "start_sync_run", lambda *a, **k: (SimpleNamespace(id=uuid4()), False)
+    )
+    pass_calls = []
+    monkeypatch.setattr(
+        tasks_ingest,
+        "run_reconciliation_pass",
+        lambda db, **kwargs: pass_calls.append(kwargs) or {"completed": 0},
+    )
+
+    result = tasks_ingest.reconcile_reply_attempt.run(str(account.id), retry_count=0)
+
+    assert len(pass_calls) == 1
+    assert pass_calls[0]["provider"] == "outlook"
+    assert result["status"] == "enqueued"
+
+
+def test_reconcile_reply_attempt_skipped_account_never_runs_level_pass(monkeypatch):
+    """A paused/missing account skips everything, including the level pass
+    -- there's nothing this account's attempts can be reconciled against."""
+    state_db = MagicMock()
+    state_db.get.return_value = None
+    monkeypatch.setattr(tasks_ingest, "SessionLocal", lambda: nullcontext(state_db))
+    pass_calls = []
+    monkeypatch.setattr(
+        tasks_ingest,
+        "run_reconciliation_pass",
+        lambda db, **kwargs: pass_calls.append(kwargs),
+    )
+
+    result = tasks_ingest.reconcile_reply_attempt.run(str(uuid4()), retry_count=0)
+
+    assert pass_calls == []
+    assert result["status"] == "skipped"
