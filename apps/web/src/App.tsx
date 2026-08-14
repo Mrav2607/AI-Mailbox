@@ -43,6 +43,7 @@ import {
   setThreadDone,
   revokeAllTokens,
   setToken,
+  snoozeThread,
   sumIngestResults,
   testLlmSettings,
   waitForTask,
@@ -103,7 +104,7 @@ import { ConsoleLayout } from "@/components/console/ConsoleLayout";
 import { NarrowShell } from "@/components/console/NarrowShell";
 import { TOUR_VERSION, UI_KEY, loadUi } from "@/lib/layout";
 import type { Arrangement, Density, PaneLayout, PaneSizes } from "@/lib/layout";
-import { isUnseen, loadSeen, markSeen } from "@/lib/seen";
+import { isUnseen, loadSeen, markSeen, unmarkSeen } from "@/lib/seen";
 import {
   useOnboardingTour,
   type TourDeps,
@@ -212,6 +213,7 @@ export default function Console() {
     all: 0,
     unclassified: 0,
     done: 0,
+    snoozed: 0,
   });
   // Agenda's own data — always cross-account, never paginated (the API caps
   // at 500 and cursor pagination is a deferred follow-up).
@@ -262,10 +264,21 @@ export default function Console() {
     setComposerOpen(false);
   }, [selectedId]);
 
+  // Same reasoning as the composer above: a new thread selection shouldn't
+  // carry over an open snooze popover onto an unrelated thread.
+  useEffect(() => {
+    setSnoozePopoverOpen(false);
+  }, [selectedId]);
+
   const [ingesting, setIngesting] = useState(false);
   const [backfilling, setBackfilling] = useState(false);
   const [ingestOpen, setIngestOpen] = useState(false);
   const [backfillOpen, setBackfillOpen] = useState(false);
+  // Snooze preset popover (docs/plans/2026-08-13-snooze-plan.md §3.6/P2-5).
+  // Lifted here (not local to ThreadDetailPane) so it can be included in the
+  // console-hotkey suppression check below -- the custom Popover has no
+  // dialog role, so the hook's role="dialog" backstop doesn't cover it.
+  const [snoozePopoverOpen, setSnoozePopoverOpen] = useState(false);
 
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -1904,6 +1917,169 @@ export default function Console() {
     [bucket, items, searchMode, selectedId, visibleItems, refreshCounts, refreshActions],
   );
 
+  // ---- snooze (clock button + `z`; done idiom, not delete's, per P1-9:
+  // calls the server immediately and undoes with the inverse call -- no
+  // deferred call, no pagehide queue) --------------------------------------
+  const doSnooze = useCallback(
+    (until: Date, idArg?: string) => {
+      const id = idArg ?? selectedId;
+      if (!id || !thread || thread.thread.id !== id) return;
+      // Full-restore snapshot (P2-2): snoozing always clears done_at
+      // server-side, so undo has to re-mark done if this thread WAS done,
+      // and has to restore the exact seen entry unmarkSeen is about to drop
+      // -- snoozing a done, read thread and clicking undo must return it
+      // done and visually seen, not open and unread.
+      const wasDone = thread.thread.done;
+      const priorSeenEntry = user ? seenRef.current.get(id) : undefined;
+      const untilIso = until.toISOString();
+
+      const bucketIdx = items.findIndex((i) => i.thread_id === id);
+      const removedFromBucket = bucketIdx >= 0 ? items[bucketIdx] : null;
+      if (view === "buckets" && selectedId === id) {
+        const vi = visibleItems.findIndex((i) => i.thread_id === id);
+        if (vi >= 0) {
+          const next = visibleItems[vi + 1] ?? visibleItems[vi - 1] ?? null;
+          setSelectedId(next?.thread_id ?? null);
+        }
+      }
+      setItems((prev) => prev.filter((i) => i.thread_id !== id));
+
+      const restoreRow = () => {
+        if (removedFromBucket) {
+          setItems((prev) => {
+            const copy = [...prev];
+            copy.splice(Math.min(bucketIdx, copy.length), 0, removedFromBucket);
+            return copy;
+          });
+        }
+        setSelectedId(id);
+      };
+
+      void (async () => {
+        try {
+          const res = await snoozeThread(id, untilIso);
+          setThread((prev) =>
+            prev && prev.thread.id === id
+              ? { ...prev, thread: { ...prev.thread, snoozed_until: res.snoozed_until, done: false } }
+              : prev,
+          );
+          // Only after the server call succeeds (P1-10) -- a rejected
+          // snooze must leave read/unread state exactly as it was.
+          if (user) {
+            unmarkSeen(seenRef.current, user.id, id);
+            setSeenVersion((v) => v + 1);
+          }
+          refreshCounts();
+          toast("thread snoozed", {
+            action: {
+              label: "undo",
+              onClick: () => {
+                void (async () => {
+                  try {
+                    await snoozeThread(id, null);
+                    if (wasDone) await setThreadDone(id, true);
+                    if (user) {
+                      if (priorSeenEntry !== undefined) {
+                        markSeen(seenRef.current, user.id, id, priorSeenEntry);
+                      } else {
+                        unmarkSeen(seenRef.current, user.id, id);
+                      }
+                      setSeenVersion((v) => v + 1);
+                    }
+                    setThread((prev) =>
+                      prev && prev.thread.id === id
+                        ? { ...prev, thread: { ...prev.thread, snoozed_until: null, done: wasDone } }
+                        : prev,
+                    );
+                    restoreRow();
+                    refreshCounts();
+                    refreshActions({ quiet: true });
+                  } catch (e) {
+                    toast.error((e as Error).message ?? "undo failed");
+                  }
+                })();
+              },
+            },
+          });
+        } catch (e) {
+          restoreRow();
+          toast.error((e as Error).message ?? "snooze failed");
+        }
+      })();
+    },
+    [selectedId, thread, items, visibleItems, view, user, refreshCounts, refreshActions],
+  );
+
+  // The same control, in its Unsnooze state (snoozed_until already set) --
+  // immediate call, undo re-snoozes with the SAME until (P1-9's "in the
+  // snoozed bucket the same control reads Unsnooze" ruling). Unsnooze never
+  // touches done_at (an actively-snoozed thread is never done, by the
+  // exclusivity CHECK), so there's no wasDone/seen bookkeeping here.
+  const doUnsnooze = useCallback((idArg?: string) => {
+    const id = idArg ?? selectedId;
+    if (!id || !thread || thread.thread.id !== id) return;
+    const priorUntil = thread.thread.snoozed_until;
+    if (!priorUntil) return;
+
+    const bucketIdx = items.findIndex((i) => i.thread_id === id);
+    const removedFromBucket = bucketIdx >= 0 ? items[bucketIdx] : null;
+    if (view === "buckets" && selectedId === id) {
+      const vi = visibleItems.findIndex((i) => i.thread_id === id);
+      if (vi >= 0) {
+        const next = visibleItems[vi + 1] ?? visibleItems[vi - 1] ?? null;
+        setSelectedId(next?.thread_id ?? null);
+      }
+    }
+    setItems((prev) => prev.filter((i) => i.thread_id !== id));
+
+    const restoreRow = () => {
+      if (removedFromBucket) {
+        setItems((prev) => {
+          const copy = [...prev];
+          copy.splice(Math.min(bucketIdx, copy.length), 0, removedFromBucket);
+          return copy;
+        });
+      }
+      setSelectedId(id);
+    };
+
+    void (async () => {
+      try {
+        await snoozeThread(id, null);
+        setThread((prev) =>
+          prev && prev.thread.id === id
+            ? { ...prev, thread: { ...prev.thread, snoozed_until: null } }
+            : prev,
+        );
+        refreshCounts();
+        toast("thread unsnoozed", {
+          action: {
+            label: "undo",
+            onClick: () => {
+              void (async () => {
+                try {
+                  const res = await snoozeThread(id, priorUntil);
+                  setThread((prev) =>
+                    prev && prev.thread.id === id
+                      ? { ...prev, thread: { ...prev.thread, snoozed_until: res.snoozed_until } }
+                      : prev,
+                  );
+                  restoreRow();
+                  refreshCounts();
+                } catch (e) {
+                  toast.error((e as Error).message ?? "undo failed");
+                }
+              })();
+            },
+          },
+        });
+      } catch (e) {
+        restoreRow();
+        toast.error((e as Error).message ?? "unsnooze failed");
+      }
+    })();
+  }, [selectedId, thread, items, visibleItems, view, refreshCounts]);
+
   // Jump to the thread in the Gmail web UI (default signed-in account).
   const openInGmail = useCallback(() => {
     const t = thread?.thread;
@@ -2061,12 +2237,14 @@ export default function Console() {
       const id = selectedId;
       if (!id) return;
       // Flow mode: a relabeled thread leaves a bucket it no longer matches,
-      // and the selection moves on either way. "all", "done", and search
-      // results keep the row (with its new label) in place.
+      // and the selection moves on either way. "all", "done", "snoozed",
+      // and search results keep the row (with its new label) in place --
+      // relabeling doesn't unsnooze (docs/plans/2026-08-13-snooze-plan.md
+      // §3.6), so the snoozed bucket never optimistically drops the row.
       const leavesBucket =
         !searchMode &&
         (bucket === "unclassified" ||
-          (bucket !== "all" && bucket !== "done" && bucket !== label));
+          (bucket !== "all" && bucket !== "done" && bucket !== "snoozed" && bucket !== label));
       const bucketIdx = items.findIndex((i) => i.thread_id === id);
       const removed = bucketIdx >= 0 ? items[bucketIdx] : null;
       // Same rule as doDone/doDelete: advancing the selection is a bucket-view
@@ -2165,7 +2343,7 @@ export default function Console() {
       const leavesBucket =
         !searchMode &&
         (bucket === "unclassified" ||
-          (bucket !== "all" && bucket !== "done" && bucket !== label));
+          (bucket !== "all" && bucket !== "done" && bucket !== "snoozed" && bucket !== label));
 
       const bucketSnapshot = new Map(
         ids
@@ -2271,7 +2449,16 @@ export default function Console() {
           paletteOpen,
           shortcutsOpen,
           tourActive,
-          ingestOpen || backfillOpen || layoutOpen || accountsOpen || llmSettingsOpen || llmUsageOpen,
+          // The snooze popover has no dialog role (docs/plans/2026-08-13-
+          // snooze-plan.md §3.6/P2-5), so it needs its own entry here --
+          // useHotkeys' role="dialog" backstop doesn't see it.
+          ingestOpen ||
+            backfillOpen ||
+            layoutOpen ||
+            accountsOpen ||
+            llmSettingsOpen ||
+            llmUsageOpen ||
+            snoozePopoverOpen,
         )
       ) {
         if (e.key === "Escape") {
@@ -2425,6 +2612,19 @@ export default function Console() {
         e.preventDefault();
         setComposerOpen(true);
         setComposerFocusToken((n) => n + 1);
+        return;
+      }
+      // `z` opens the snooze preset popover for whatever thread the detail
+      // pane has loaded (docs/plans/2026-08-13-snooze-plan.md §3.6) --
+      // same guard shape as Shift+R above, since it acts on the loaded
+      // thread rather than the bucket list. Mirrors the clock button's own
+      // binary behavior: already snoozed unsnoozes directly instead of
+      // opening a popover with nothing to pick.
+      if (e.key === "z") {
+        if (!thread || (isNarrow && narrowPane !== "reading")) return;
+        e.preventDefault();
+        if (thread.thread.snoozed_until) doUnsnooze();
+        else setSnoozePopoverOpen((v) => !v);
         return;
       }
       // Agenda view early-return: its j/k/Enter/e/x mean something different
@@ -2603,6 +2803,8 @@ export default function Console() {
       accountsOpen,
       llmSettingsOpen,
       llmUsageOpen,
+      snoozePopoverOpen,
+      doUnsnooze,
       skipTour,
       searchMode,
       query,
@@ -3045,13 +3247,18 @@ export default function Console() {
               markThreadSeen(id);
               if (isNarrow) setNarrowPane("reading");
             }}
-            showLabel={searchMode || bucket === "all" || bucket === "done"}
+            showLabel={searchMode || bucket === "all" || bucket === "done" || bucket === "snoozed"}
             showAccount={multiAccount}
             narrow={isNarrow}
             loading={listLoading || searching}
             error={listError}
             density={density}
-            grouped={!searchMode && sortMode === "recent"}
+            // Date grouping is disabled in the snoozed bucket (docs/plans/
+            // 2026-08-13-snooze-plan.md §3.6/P2-6): the list is wake-
+            // ordered, not recency-ordered, so last_message_at-based
+            // today/older headers would interleave nonsensically.
+            grouped={!searchMode && bucket !== "snoozed" && sortMode === "recent"}
+            wakeColumn={!searchMode && bucket === "snoozed"}
             isUnseen={isUnseenFor}
             bulkIds={isNarrow ? undefined : bulkIds}
             onToggleBulk={isNarrow ? undefined : toggleBulk}
@@ -3094,6 +3301,10 @@ export default function Console() {
       onCollapse={isNarrow ? undefined : () => togglePanel("detail")}
       onDone={detailThreadId ? () => doDone(detailThreadId) : undefined}
       onDelete={detailThreadId ? () => doDelete(detailThreadId) : undefined}
+      onSnooze={detailThreadId ? (d) => doSnooze(d, detailThreadId) : undefined}
+      onUnsnooze={detailThreadId ? () => doUnsnooze(detailThreadId) : undefined}
+      snoozePopoverOpen={snoozePopoverOpen}
+      onSnoozePopoverOpenChange={setSnoozePopoverOpen}
       showAccountBadge={multiAccount}
       side={arrangement.reading}
       predictionOpen={panels.prediction}

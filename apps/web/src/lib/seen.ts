@@ -68,6 +68,18 @@ export function markSeen(
   persist(userId, map);
 }
 
+// Reverses markSeen for one thread, persisting the removal (docs/plans/
+// 2026-08-13-snooze-plan.md §3.6/P1-10) -- a session-only ref deletion would
+// resurrect on the next reload, since loadSeen re-reads from storage. Used
+// after a successful snooze (a snoozed thread should read unread again if
+// it wakes before the operator otherwise reopens it) and by its own undo
+// (which restores the prior entry via markSeen instead, so this is never
+// called to "partially" undo one).
+export function unmarkSeen(map: Map<string, string>, userId: string, threadId: string): void {
+  map.delete(threadId);
+  persist(userId, map);
+}
+
 export function isUnseen(
   map: Map<string, string>,
   threadId: string,

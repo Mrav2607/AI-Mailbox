@@ -23,6 +23,7 @@ import type {
   ReplyDraft,
   ReplySent,
   SearchResponse,
+  SnoozeResult,
   ThreadDetail,
   TriageItem,
   TriageResponse,
@@ -132,6 +133,11 @@ function makeItems(count: number): TriageItem[] {
       // the composer's expected_replied_at seeding have something to demo
       // without requiring an actual send in preview mode.
       replied_at: i % 7 === 0 ? new Date(now - minutesAgo * 60 * 1000 + 60_000).toISOString() : null,
+      // Static placeholder -- the real, read-time value comes from
+      // withSnoozedUntil() (mirroring the server's projected-column
+      // mechanism, docs/plans/2026-08-13-snooze-plan.md §3.4/P2-1) applied
+      // wherever a TriageItem actually leaves this module.
+      snoozed_until: null,
     });
   }
   return out;
@@ -146,6 +152,37 @@ const ALL = makeItems(450);
 // Thread ids the operator has marked done — the mock's stand-in for the
 // server's done_at column. Done threads leave every open bucket.
 const DONE = new Set<string>();
+
+// The mock's stand-in for the server's snoozed_until/snoozed_at columns
+// (docs/plans/2026-08-13-snooze-plan.md §3.1) -- a thread is "actively
+// snoozed" purely by a read-time predicate here too, same shared shape the
+// real one uses (checked once, reused everywhere, never re-derived).
+const SNOOZED = new Map<string, { until: string; at: string }>();
+
+function isActivelySnoozed(item: TriageItem, now = Date.now()): boolean {
+  const s = SNOOZED.get(item.thread_id);
+  if (!s) return false;
+  if (new Date(s.until).getTime() <= now) return false;
+  // Same explicit-null-arm reasoning as the server's predicate: a thread
+  // with no last_message_at can't have "new mail since the snooze", so it
+  // stays snoozed until the deadline passes.
+  if (!item.last_message_at) return true;
+  return new Date(item.last_message_at).getTime() <= new Date(s.at).getTime();
+}
+
+function projectedSnoozedUntil(item: TriageItem, now = Date.now()): string | null {
+  const s = SNOOZED.get(item.thread_id);
+  return s && isActivelySnoozed(item, now) ? s.until : null;
+}
+
+// Applied wherever a TriageItem actually leaves this module -- the
+// underlying store only ever holds the `null` placeholder from makeItems,
+// so every response computes the live value fresh (mirrors the server's
+// per-request projection, never a value re-derived or cached on the item).
+function withSnoozedUntil(item: TriageItem, now = Date.now()): TriageItem {
+  const projected = projectedSnoozedUntil(item, now);
+  return projected === item.snoozed_until ? item : { ...item, snoozed_until: projected };
+}
 
 function hoursFromNow(h: number): string {
   return new Date(Date.now() + h * 60 * 60 * 1000).toISOString();
@@ -396,8 +433,10 @@ export function mockTriage(
 ): TriageResponse {
   let items: TriageItem[];
   if (bucket === "done") items = ALL.filter((i) => DONE.has(i.thread_id));
-  else {
-    const open = ALL.filter((i) => !DONE.has(i.thread_id));
+  else if (bucket === "snoozed") {
+    items = ALL.filter((i) => !DONE.has(i.thread_id) && isActivelySnoozed(i));
+  } else {
+    const open = ALL.filter((i) => !DONE.has(i.thread_id) && !isActivelySnoozed(i));
     if (bucket === "all") items = open;
     else if (bucket === "unclassified")
       items = open.filter((i) => !i.classification.label);
@@ -407,12 +446,24 @@ export function mockTriage(
     const email = connectionEmail(accountId);
     items = email ? items.filter((i) => i.account_email === email) : [];
   }
-  if (sort === "account") {
+  if (bucket === "snoozed") {
+    // Frozen sort contract (§3.2): soonest wake first, optionally grouped by
+    // account first -- same two-key shape as the server's ORDER BY.
+    items = [...items].sort((a, b) => {
+      if (sort === "account") {
+        const byAccount = a.account_email.localeCompare(b.account_email);
+        if (byAccount !== 0) return byAccount;
+      }
+      const au = SNOOZED.get(a.thread_id)?.until ?? "";
+      const bu = SNOOZED.get(b.thread_id)?.until ?? "";
+      return au.localeCompare(bu);
+    });
+  } else if (sort === "account") {
     // ALL is already in recency order, and Array#sort is stable, so grouping
     // by email alone leaves each group internally sorted by recency for free.
     items = [...items].sort((a, b) => a.account_email.localeCompare(b.account_email));
   }
-  return { bucket, items: items.slice(offset, offset + limit) };
+  return { bucket, items: items.slice(offset, offset + limit).map((i) => withSnoozedUntil(i)) };
 }
 
 // Bucket counts stay per-account (accountId scopes them, same as triage);
@@ -429,6 +480,7 @@ export function mockCounts(accountId?: string | null): CountsResponse {
     all: 0,
     unclassified: 0,
     done: 0,
+    snoozed: 0,
   };
   const email = accountId ? connectionEmail(accountId) : undefined;
   // An unknown/disconnected id self-scopes to all-zero counts rather than
@@ -438,6 +490,10 @@ export function mockCounts(accountId?: string | null): CountsResponse {
     if (email && item.account_email !== email) continue;
     if (DONE.has(item.thread_id)) {
       counts.done += 1;
+      continue;
+    }
+    if (isActivelySnoozed(item)) {
+      counts.snoozed += 1;
       continue;
     }
     counts.all += 1;
@@ -477,6 +533,7 @@ export function mockIngest(accountIds?: string[]): number {
       },
       account_email: targets[(ingestSeq - 1) % targets.length].email_address,
       replied_at: null,
+      snoozed_until: null,
     });
   }
   return 2;
@@ -494,7 +551,57 @@ export function mockSetDone(threadId: string, done: boolean) {
     for (const a of ACTIONS) {
       if (a.thread_id === threadId && a.status === "open") a.status = "done";
     }
+    // Done and actively-snoozed are mutually exclusive (docs/plans/2026-08-
+    // 13-snooze-plan.md §3.3) -- mirrors the server clearing both snooze
+    // columns unconditionally when a thread is marked done.
+    SNOOZED.delete(threadId);
   }
+}
+
+// Snooze bounds mirror the server's (mailbox.py's _SNOOZE_MIN_LEAD_SECONDS/
+// _SNOOZE_MAX_LEAD_DAYS) so the mock's error codes and the console's
+// ApiError.code-driven copy stay exercisable in preview mode too.
+const SNOOZE_MIN_LEAD_SECONDS = 60;
+const SNOOZE_MAX_LEAD_DAYS = 366;
+
+export function mockSnoozeThread(threadId: string, until: string | null): SnoozeResult {
+  const item = ALL.find((i) => i.thread_id === threadId);
+  if (!item) throw new ApiError(404, `Thread not found: ${threadId}`);
+
+  if (until === null) {
+    SNOOZED.delete(threadId);
+    return { thread_id: threadId, snoozed_until: null, snoozed_at: null };
+  }
+
+  const now = Date.now();
+  const untilMs = new Date(until).getTime();
+  if (Number.isNaN(untilMs)) {
+    throw new ApiError(422, "until must be timezone-aware", undefined, "naive_datetime");
+  }
+  if (untilMs <= now + SNOOZE_MIN_LEAD_SECONDS * 1000) {
+    throw new ApiError(
+      422,
+      `until must be more than ${SNOOZE_MIN_LEAD_SECONDS}s in the future`,
+      undefined,
+      "snooze_too_soon",
+    );
+  }
+  if (untilMs > now + SNOOZE_MAX_LEAD_DAYS * 24 * 60 * 60 * 1000) {
+    throw new ApiError(
+      422,
+      `until must be at most ${SNOOZE_MAX_LEAD_DAYS} days out`,
+      undefined,
+      "snooze_too_far",
+    );
+  }
+
+  const untilIso = new Date(untilMs).toISOString();
+  const atIso = new Date(now).toISOString();
+  SNOOZED.set(threadId, { until: untilIso, at: atIso });
+  // Mutually exclusive with done (§3.3) -- mirrors the server clearing
+  // done_at unconditionally on a successful snooze.
+  DONE.delete(threadId);
+  return { thread_id: threadId, snoozed_until: untilIso, snoozed_at: atIso };
 }
 
 export function mockThread(id: string): ThreadDetail {
@@ -529,6 +636,7 @@ export function mockThread(id: string): ThreadDetail {
       done: DONE.has(id),
       account_email: item.account_email,
       replied_at: item.replied_at,
+      snoozed_until: projectedSnoozedUntil(item),
     },
     messages,
     classification: item.classification,
@@ -632,7 +740,11 @@ export function mockSearch(
     const email = connectionEmail(accountId);
     items = email ? items.filter((i) => i.account_email === email) : [];
   }
-  return { query: q, items: items.slice(0, limit) };
+  // Search is untouched by snooze (docs/plans/2026-08-13-snooze-plan.md
+  // §3.2) -- snoozed threads stay searchable, like done ones, so nothing
+  // filters `items` on snooze state, only the projected value each row
+  // carries.
+  return { query: q, items: items.slice(0, limit).map((i) => withSnoozedUntil(i)) };
 }
 
 export function mockDeleteThread(id: string) {

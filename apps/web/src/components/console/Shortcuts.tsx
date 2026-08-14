@@ -10,6 +10,7 @@ const ROWS: [string, string, boolean?][] = [
   ["↵", "open / close focused thread"],
   ["g g / G", "jump to top / bottom"],
   ["e", "mark done"],
+  ["z", "snooze / unsnooze the open thread"],
   ["x", "select thread · dismiss action"],
   ["⌘ A / Ctrl A", "select all threads", true],
   ["l then 1 – 6", "relabel focused thread", true],

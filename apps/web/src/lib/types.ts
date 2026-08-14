@@ -15,7 +15,7 @@ export const ALL_LABELS: Label[] = [
   "spam",
 ];
 
-export type BucketKey = Label | "all" | "unclassified" | "done";
+export type BucketKey = Label | "all" | "unclassified" | "done" | "snoozed";
 
 export const BUCKETS: BucketKey[] = [
   "needs_reply",
@@ -27,6 +27,7 @@ export const BUCKETS: BucketKey[] = [
   "all",
   "unclassified",
   "done",
+  "snoozed",
 ];
 
 export interface Classification {
@@ -48,6 +49,11 @@ export interface TriageItem {
   // never replied from CortexMail, timestamp = when a reply attempt last
   // completed. Powers the "replied" indicator without a second call.
   replied_at: string | null;
+  // The projected active-snooze wake time (docs/plans/2026-08-13-snooze-
+  // plan.md §3.4/P2-1): null when not actively snoozed, otherwise the
+  // thread's snoozed_until. Drives the snoozed bucket's wake-time column
+  // and the Unsnooze affordance everywhere a row can be opened from.
+  snoozed_until: string | null;
 }
 
 export interface TriageResponse {
@@ -184,6 +190,8 @@ export interface ThreadDetail {
     // See TriageItem.replied_at — same fence, also the composer's
     // expected_replied_at seed (plan §3.9).
     replied_at: string | null;
+    // See TriageItem.snoozed_until — same projected active-snooze value.
+    snoozed_until: string | null;
   };
   messages: ThreadMessage[];
   // The latest message's classification, so a detail pane opened from
@@ -222,6 +230,15 @@ export interface ReplyDraft {
   draft_text: string;
   provider: string;
   model: string;
+}
+
+// POST /mail/thread/{id}/snooze response (docs/plans/2026-08-13-snooze-
+// plan.md §3.4). Both fields null on unsnooze; both set (last write wins)
+// on a successful snooze/re-snooze.
+export interface SnoozeResult {
+  thread_id: string;
+  snoozed_until: string | null;
+  snoozed_at: string | null;
 }
 
 // A connected Gmail account (GET /auth/connections). `reauth_required` means

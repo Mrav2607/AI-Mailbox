@@ -69,7 +69,11 @@ export const LABEL_META: Record<
   },
 };
 
-export const BUCKET_KEYS: Record<BucketKey, string> = {
+// Partial, not exhaustive (docs/plans/2026-08-13-snooze-plan.md §3.6/P1-7):
+// "snoozed" deliberately has no digit (P2-3, reached by click or the
+// command palette only) -- an exhaustive Record can't express "no
+// shortcut" for one key without lying about it having one.
+export const BUCKET_KEYS: Partial<Record<BucketKey, string>> = {
   needs_reply: "1",
   action_required: "2",
   fyi: "3",
@@ -85,6 +89,7 @@ export function bucketLabel(b: BucketKey): string {
   if (b === "all") return "all";
   if (b === "unclassified") return "unclassified";
   if (b === "done") return "done";
+  if (b === "snoozed") return "snoozed";
   return LABEL_META[b].name;
 }
 

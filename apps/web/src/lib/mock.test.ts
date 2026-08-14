@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   mockActions,
@@ -14,7 +14,10 @@ import {
   mockPutLlmSettings,
   mockSearch,
   mockSetActionStatus,
+  mockSetDone,
+  mockSnoozeThread,
   mockTestLlmSettings,
+  mockThread,
   mockTriage,
 } from "./mock";
 import { ApiError } from "./api";
@@ -274,6 +277,139 @@ describe("mock classifier mix", () => {
 
 // Deletes a connection for real — must run last, after every test above that
 // relies on the full seed data (both accounts' mail AND agenda rows).
+// Unsnoozes anything a test snoozed, so leftover module-level SNOOZED state
+// can't bleed into a later block's bucket-count assertions (same reasoning
+// as the "mock llm settings" block's placement comment below).
+describe("mock snooze", () => {
+  const touched: string[] = [];
+  afterEach(() => {
+    for (const id of touched.splice(0)) {
+      try {
+        mockSnoozeThread(id, null);
+      } catch {
+        // Already unsnoozed (or never snoozed) by the test itself — fine.
+      }
+    }
+  });
+
+  function pickThreadId(): string {
+    const { items } = mockTriage("all", 1);
+    const id = items[0].thread_id;
+    touched.push(id);
+    return id;
+  }
+
+  it("moves a thread into the snoozed bucket and out of 'all', with snoozed_until exposed", () => {
+    const id = pickThreadId();
+    const until = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+
+    const res = mockSnoozeThread(id, until);
+    expect(res.thread_id).toBe(id);
+    expect(res.snoozed_until).toBe(until);
+    expect(res.snoozed_at).not.toBeNull();
+
+    expect(mockTriage("all", 10_000).items.some((i) => i.thread_id === id)).toBe(false);
+    const snoozedItems = mockTriage("snoozed", 10_000).items;
+    const row = snoozedItems.find((i) => i.thread_id === id);
+    expect(row).toBeDefined();
+    expect(row!.snoozed_until).toBe(until);
+  });
+
+  it("counts.snoozed and counts.all both reflect an active snooze", () => {
+    const id = pickThreadId();
+    const before = mockCounts(null).counts;
+
+    mockSnoozeThread(id, new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString());
+    const after = mockCounts(null).counts;
+
+    expect(after.snoozed).toBe(before.snoozed + 1);
+    expect(after.all).toBe(before.all - 1);
+  });
+
+  it("sorts the snoozed bucket by soonest wake first", () => {
+    const { items } = mockTriage("all", 3);
+    const [a, b, c] = items.map((i) => i.thread_id);
+    touched.push(a, b, c);
+    mockSnoozeThread(a, new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString());
+    mockSnoozeThread(b, new Date(Date.now() + 1 * 60 * 60 * 1000).toISOString());
+    mockSnoozeThread(c, new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString());
+
+    const order = mockTriage("snoozed", 10_000)
+      .items.map((i) => i.thread_id)
+      .filter((id) => [a, b, c].includes(id));
+    expect(order).toEqual([b, c, a]);
+  });
+
+  it("clears the snooze on until: null, restoring the thread to its open bucket", () => {
+    const id = pickThreadId();
+    mockSnoozeThread(id, new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString());
+    expect(mockTriage("snoozed", 10_000).items.some((i) => i.thread_id === id)).toBe(true);
+
+    const res = mockSnoozeThread(id, null);
+    expect(res.snoozed_until).toBeNull();
+    expect(res.snoozed_at).toBeNull();
+    expect(mockTriage("snoozed", 10_000).items.some((i) => i.thread_id === id)).toBe(false);
+    expect(mockTriage("all", 10_000).items.some((i) => i.thread_id === id)).toBe(true);
+  });
+
+  it("rejects an until less than the minimum lead with snooze_too_soon", () => {
+    const id = pickThreadId();
+    let caught: ApiError | undefined;
+    try {
+      mockSnoozeThread(id, new Date(Date.now() + 30 * 1000).toISOString());
+    } catch (e) {
+      caught = e as ApiError;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    expect(caught!.status).toBe(422);
+    expect(caught!.code).toBe("snooze_too_soon");
+  });
+
+  it("rejects an until past the maximum lead with snooze_too_far", () => {
+    const id = pickThreadId();
+    let caught: ApiError | undefined;
+    try {
+      mockSnoozeThread(id, new Date(Date.now() + 400 * 24 * 60 * 60 * 1000).toISOString());
+    } catch (e) {
+      caught = e as ApiError;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    expect(caught!.status).toBe(422);
+    expect(caught!.code).toBe("snooze_too_far");
+  });
+
+  it("404s snoozing a thread id that doesn't exist", () => {
+    expect(() =>
+      mockSnoozeThread("not-a-real-id", new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString()),
+    ).toThrow(ApiError);
+  });
+
+  it("snoozing clears done (mutual exclusivity), and marking done clears an active snooze", () => {
+    const id = pickThreadId();
+    mockSetDone(id, true);
+    expect(mockThread(id).thread.done).toBe(true);
+
+    mockSnoozeThread(id, new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString());
+    expect(mockThread(id).thread.done).toBe(false);
+    expect(mockThread(id).thread.snoozed_until).not.toBeNull();
+
+    mockSetDone(id, true);
+    expect(mockThread(id).thread.done).toBe(true);
+    expect(mockThread(id).thread.snoozed_until).toBeNull();
+    mockSetDone(id, false);
+  });
+
+  it("mockThread and mockSearch both expose the projected snoozed_until", () => {
+    const id = pickThreadId();
+    const until = new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString();
+    mockSnoozeThread(id, until);
+
+    expect(mockThread(id).thread.snoozed_until).toBe(until);
+    const found = mockSearch("", 10_000).items.find((i) => i.thread_id === id);
+    expect(found?.snoozed_until).toBe(until);
+  });
+});
+
 describe("mock delete connection", () => {
   it("round-trips listConnections/deleteConnection, cascading the removed account's mail and agenda rows", () => {
     const before = mockListConnections();

@@ -12,6 +12,7 @@ import { emailLocalPart, senderName } from "@/lib/sender";
 import type { TriageItem } from "@/lib/types";
 import { dateGroup, relTime } from "@/lib/time";
 import type { DateGroup } from "@/lib/time";
+import { formatWakeTime } from "@/lib/snooze";
 import type { Density } from "@/lib/layout";
 
 interface Props {
@@ -27,6 +28,12 @@ interface Props {
   error?: string | null;
   density?: Density;
   grouped?: boolean;
+  // The snoozed bucket's own time column: a relative wake phrase ("wakes
+  // tomorrow 08:00") in place of the usual "when it last had activity"
+  // column (docs/plans/2026-08-13-snooze-plan.md §3.6) -- the list is
+  // wake-ordered, not recency-ordered, so the recency column would be
+  // reading the wrong axis entirely.
+  wakeColumn?: boolean;
   isUnseen?: (item: TriageItem) => boolean;
   bulkIds?: ReadonlySet<string>;
   onToggleBulk?: (id: string) => void;
@@ -82,6 +89,7 @@ export function ThreadList({
   error,
   density = "comfortable",
   grouped = false,
+  wakeColumn = false,
   isUnseen,
   bulkIds,
   onToggleBulk,
@@ -204,7 +212,7 @@ export function ThreadList({
                     {it.replied_at && <RepliedBadge />}
                     {showAccount && <AccountBadge email={it.account_email} />}
                     <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground font-mono">
-                      {relTime(it.last_message_at)}
+                      {wakeColumn ? formatWakeTime(it.snoozed_until) : relTime(it.last_message_at)}
                     </span>
                   </span>
                   <span className="w-full min-w-0 flex items-baseline gap-2 overflow-hidden">
@@ -344,8 +352,16 @@ export function ThreadList({
 
                 {showAccount && <AccountBadge email={it.account_email} />}
 
-                <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground font-mono w-9 text-right">
-                  {relTime(it.last_message_at)}
+                <span
+                  className={[
+                    "shrink-0 text-[11px] tabular-nums text-muted-foreground font-mono text-right",
+                    // The wake phrase ("wakes tomorrow 08:00") runs longer
+                    // than a relative time ("3h") -- the fixed w-9 that fits
+                    // the latter would clip it.
+                    wakeColumn ? "w-auto whitespace-nowrap" : "w-9",
+                  ].join(" ")}
+                >
+                  {wakeColumn ? formatWakeTime(it.snoozed_until) : relTime(it.last_message_at)}
                 </span>
               </button>
             </li>
