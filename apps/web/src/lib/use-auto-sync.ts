@@ -121,6 +121,21 @@ function useSyncLeader(enabled: boolean, userId: string | null): boolean {
   return leader;
 }
 
+// Pure warn/dedupe/reset logic behind the "N left unclassified" toast
+// (docs/plans/2026-08-14-llm-failure-visibility-plan.md phase 2) -- kept
+// standalone (and exported) so this semantics can be unit tested directly,
+// without mounting the hook's leader-election/broadcast-channel/timer
+// machinery. `alreadyWarned` is the caller's current streak flag; the
+// return says both what to do THIS run and what the flag should become.
+export function nextLeftUnclassifiedWarning(
+  finals: SyncRunStatus[],
+  alreadyWarned: boolean,
+): { total: number; shouldWarn: boolean; warned: boolean } {
+  const total = finals.reduce((sum, f) => sum + (f.result?.left_unclassified ?? 0), 0);
+  if (total > 0) return { total, shouldWarn: !alreadyWarned, warned: true };
+  return { total, shouldWarn: false, warned: false };
+}
+
 function readSeenMs(userId: string): number {
   try {
     const raw = window.localStorage.getItem(seenKey(userId));
@@ -295,6 +310,20 @@ export function useAutoSync({
     };
   }, [enabled, userId, checkNew]);
 
+  // Thin wrapper around nextLeftUnclassifiedWarning that owns this hook's
+  // streak ref -- shared by the normal completion path below AND the
+  // reload/reattach path, so a tab reloaded mid-sync still gets told its
+  // mail went unclassified instead of the warning only firing for a run
+  // that happened to finish while the tab stayed open.
+  const warnLeftUnclassified = useCallback((finals: SyncRunStatus[]) => {
+    const { total, shouldWarn, warned } = nextLeftUnclassifiedWarning(
+      finals,
+      leftUnclassifiedWarnedRef.current,
+    );
+    leftUnclassifiedWarnedRef.current = warned;
+    if (shouldWarn) toast.warning(leftUnclassifiedMessage(total));
+  }, []);
+
   const clearNew = useCallback(() => {
     // Optimistically drop the pill, then persist the acknowledgment against
     // fresh server data so anything even newer immediately re-counts.
@@ -348,25 +377,13 @@ export function useAutoSync({
         const changed =
           finals.some((f) => !f.ready) ||
           finals.some((f) => (f.result?.threads_upserted ?? 0) > 0);
-        const leftUnclassified = finals.reduce(
-          (sum, f) => sum + (f.result?.left_unclassified ?? 0),
-          0,
-        );
         if (cancelled) return;
         failStreakRef.current = 0;
         setSyncFailed(false);
         if (changed) await onSyncedRef.current();
         // This is otherwise a silent loop, but mail going unclassified is
-        // exactly the thing this feature exists to surface -- warn once per
-        // streak rather than every cycle while the provider stays down.
-        if (leftUnclassified > 0) {
-          if (!leftUnclassifiedWarnedRef.current) {
-            toast.warning(leftUnclassifiedMessage(leftUnclassified));
-            leftUnclassifiedWarnedRef.current = true;
-          }
-        } else {
-          leftUnclassifiedWarnedRef.current = false;
-        }
+        // exactly the thing this feature exists to surface.
+        warnLeftUnclassified(finals);
         // Always re-derive: mail can also land via another tab's manual
         // ingest, and the check is one cheap unthrottled GET.
         await checkNew();
@@ -407,10 +424,16 @@ export function useAutoSync({
       .then(async (active) => {
         if (active.length === 0 || cancelled) return;
         const settled = await waitForSyncRuns(active, { signal: controller.signal });
-        const anySucceeded = settled.some(
-          (s) => s.status === "fulfilled" && s.value.status === "succeeded",
-        );
-        if (!cancelled && anySucceeded) {
+        const finals = settled
+          .filter((s): s is PromiseFulfilledResult<SyncRunStatus> => s.status === "fulfilled")
+          .map((s) => s.value);
+        if (cancelled) return;
+        // A run that finished while this tab was reloading carries the same
+        // result payload as one that finished with the tab open -- without
+        // this, reloading mid-sync silently drops the warning entirely.
+        warnLeftUnclassified(finals);
+        const anySucceeded = finals.some((f) => f.status === "succeeded");
+        if (anySucceeded) {
           await Promise.all([onSyncedRef.current(), checkNew()]);
           channelRef.current?.postMessage({ type: "sync-complete" });
         }
@@ -424,7 +447,7 @@ export function useAutoSync({
       controller.abort();
       if (timerRef.current) clearTimeout(timerRef.current);
     };
-  }, [enabled, intervalSec, checkNew, leader]);
+  }, [enabled, intervalSec, checkNew, leader, warnLeftUnclassified]);
 
   return { pendingNew, clearNew, syncFailed, health };
 }

@@ -266,13 +266,28 @@ def _patch_settle(monkeypatch, *, mark_sent_result=True, resolved=1):
     return calls
 
 
-def _patch_classification(monkeypatch, *, raises=None):
-    calls = {"classify": 0}
+def _patch_classification(monkeypatch, *, raises=None, no_verdict=False):
+    # calls["upsert"] tracks every upsert_classification invocation -- used
+    # by the phase 2 no-verdict tests to assert directly that NO row is ever
+    # written (not just inferred from outcome["classified"]).
+    calls = {"classify": 0, "upsert": []}
 
     def fake_classify(text, *, routing):
         calls["classify"] += 1
         if raises:
             raise raises
+        if no_verdict:
+            # Phase 2 (D-C): a failed BYOK call with no local fallback
+            # served -- see classifier.ClassificationAttempt's own docstring
+            # for why this is the one case `verdict` is None.
+            return SimpleNamespace(
+                verdict=None,
+                provider_call_succeeded=False,
+                usage=None,
+                llm_attempted=True,
+                fallback_used=False,
+                failure_category="connection_failed",
+            )
         return SimpleNamespace(
             verdict=("needs_reply", 0.9, "why", "heuristic-fallback"),
             provider_call_succeeded=False,
@@ -295,7 +310,10 @@ def _patch_classification(monkeypatch, *, raises=None):
     monkeypatch.setattr(reconcile, "build_classification_text", lambda *a: "text")
     monkeypatch.setattr(reconcile, "ClassificationRouter", _FakeRouter)
     monkeypatch.setattr(reconcile, "classify_with_usage", fake_classify)
-    monkeypatch.setattr(reconcile, "upsert_classification", lambda db, **k: "written")
+    monkeypatch.setattr(
+        reconcile, "upsert_classification",
+        lambda db, **k: calls["upsert"].append(k) or "written",
+    )
     monkeypatch.setattr(
         reconcile, "stamp_verified", lambda db, **kwargs: stamp_calls.append(kwargs)
     )
@@ -390,6 +408,73 @@ def test_classify_and_stamp_null_winner_classifies_and_stamps(monkeypatch):
     assert len(stamp_calls) == 1
     assert db.commits == 1
     assert db.rollbacks == 0
+
+
+def test_classify_and_stamp_no_verdict_stamps_verified_without_classifying(monkeypatch):
+    """Codex-caught bug fix (phase 2): `verdict is None` (a failed BYOK call
+    with no local fallback served) must still stamp_verified and commit --
+    the SEND itself is genuinely verified, that's a separate fact from
+    classification succeeding (see _classify_and_stamp's own docstring).
+    Skipping the stamp here left the attempt permanently eligible, which
+    would re-issue the same already-known-to-fail BYOK call on every future
+    sync forever. No Classification row is ever written either -- the
+    message stays a genuine backfill candidate."""
+    calls, stamp_calls = _patch_classification(monkeypatch, no_verdict=True)
+    attempt = _attempt(provider="outlook", verified_at=None)
+    message = _message()
+    db = _FakeDB(verified_at_reads=[None])
+
+    won = reconcile._classify_and_stamp(
+        db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id, user_id=uuid4()
+    )
+
+    assert won is False  # not classified
+    assert calls["classify"] == 1
+    assert calls["upsert"] == []  # never a null-label row
+    assert len(stamp_calls) == 1  # but the send IS verified
+    assert db.commits == 1
+    assert db.rollbacks == 0
+
+
+def test_classify_and_stamp_no_verdict_then_a_later_sync_never_reclassifies(monkeypatch):
+    """The bounded-cost guarantee Codex asked us to document (phase 2): a
+    no-verdict pass stamps verified_at (see the test above), so the NEXT
+    reconciliation pass -- representing a later sync, whether that's the END
+    pass right behind a page-loop's own already-failed classification, or a
+    wholly separate later sync's START/END pass -- sees a non-null
+    verified_at and skips straight to the loser-of-race early return without
+    ever calling the classifier again. Total real-world cost for one message
+    is bounded at "however many calls happened before the first stamp",
+    never unbounded."""
+    calls, stamp_calls = _patch_classification(monkeypatch, no_verdict=True)
+    attempt = _attempt(provider="outlook", verified_at=None)
+    message = _message()
+
+    # Pass 1: verified_at is still NULL -- this is the first call reconcile.py
+    # itself ever sees for this attempt (a page-loop classification that
+    # already failed and left no Classification row looks IDENTICAL to this
+    # state; reconcile.py can't and needn't distinguish the two).
+    db_pass_1 = _FakeDB(verified_at_reads=[None])
+    outcome_1 = reconcile._classify_and_stamp(
+        db_pass_1, attempt_id=attempt.id, message=message,
+        thread_id=attempt.thread_id, user_id=uuid4(),
+    )
+    assert outcome_1 is False
+    assert calls["classify"] == 1
+    assert len(stamp_calls) == 1
+
+    # Pass 2 (a later sync's own reconciliation pass): verified_at is now
+    # non-null, stamped by pass 1 above.
+    db_pass_2 = _FakeDB(verified_at_reads=[datetime.now(timezone.utc)])
+    outcome_2 = reconcile._classify_and_stamp(
+        db_pass_2, attempt_id=attempt.id, message=message,
+        thread_id=attempt.thread_id, user_id=uuid4(),
+    )
+    assert outcome_2 is False
+    assert calls["classify"] == 1  # no new call
+    assert calls["upsert"] == []  # still no Classification row, ever
+    assert len(stamp_calls) == 1  # no new stamp either
+    assert db_pass_2.rollbacks == 1
 
 
 def test_classify_and_stamp_two_workers_racing_classify_exactly_once(monkeypatch):

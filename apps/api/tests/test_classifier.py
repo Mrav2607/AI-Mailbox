@@ -1317,15 +1317,20 @@ def test_classify_with_usage_provider_call_succeeded_matches_whether_provider_an
     whether the LLM call reached the provider, not what ultimately produced
     the verdict. usage.py returns early when provider_call_succeeded is
     False, so an LlmCallError never emits a usage row while a malformed
-    response does -- unaffected by whether the encoder or keyword rules
-    served the fallback label."""
+    response does.
+
+    Both subcases here are default-fallback_local (False) + encoder
+    unavailable, so under D-H neither the encoder nor the keyword heuristic
+    serves a fallback anymore -- `verdict` is `None` in both (Codex review:
+    this must be asserted explicitly, not left to fall out as a side effect
+    of the usage assertions, so the matrix records every changed outcome)."""
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(local_model, "try_predict", lambda text: None)
     credential = LlmCredential(
         provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
     )
-    routing = ClassificationRouting(mode="user", credential=credential)
+    routing = ClassificationRouting(mode="user", credential=credential)  # fallback_local=False
 
     def failing_call(*args, **kwargs):
         raise LlmCallError("connection_failed", None)
@@ -1334,6 +1339,7 @@ def test_classify_with_usage_provider_call_succeeded_matches_whether_provider_an
     attempt = classify_with_usage(
         "Security alert: new login detected", backend="llm", routing=routing
     )
+    assert attempt.verdict is None
     assert attempt.provider_call_succeeded is False
     assert attempt.usage is None
 
@@ -1343,6 +1349,7 @@ def test_classify_with_usage_provider_call_succeeded_matches_whether_provider_an
         lambda *a, **k: LlmCallResult(content="not json at all", usage=usage),
     )
     attempt = classify_with_usage("Invoice #1842 is due Friday", backend="llm", routing=routing)
+    assert attempt.verdict is None
     assert attempt.provider_call_succeeded is True
     assert attempt.usage is usage
 

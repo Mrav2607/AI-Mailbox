@@ -168,9 +168,45 @@ def _classify_and_stamp(
     (`MailThread` -> `ReplyAttempt` lock order, the same one used by every
     reconciliation path), re-reads `verified_at`, and only the null-winner
     classifies and stamps -- guaranteeing exactly one classifier invocation
-    even when two workers race this same attempt. A classification failure
-    rolls back only this attempt's work and leaves `verified_at` NULL for a
-    later pass; it never touches phase 1's already-committed settlement.
+    even when two workers race this same attempt.
+
+    `verified_at` and "classification succeeded" are DELIBERATELY
+    independent facts (Codex review, phase 2 correction): `verified_at`
+    means the authoritative provider copy was confirmed (`reply_attempt.py`'s
+    own docstring) -- for Outlook, that's THIS reconciliation pass finding
+    the sentitems row, which genuinely happened whether or not classification
+    did. `_settle_match` already stamps/settles unconditionally on a match,
+    regardless of whether classification later succeeds -- this is the same
+    principle applied to the classification phase's own outcomes:
+
+    - `verdict is None` (D-C: a BYOK failure with no local fallback opted
+      into): the send is still genuinely verified, so `stamp_verified` runs
+      and commits same as a normal success -- just with no Classification
+      row. Leaving `verified_at` NULL here would make this attempt eligible
+      forever (`_eligible_attempt_ids`'s Outlook `verified_at IS NULL`
+      predicate), and with no row ever written to trip the duplicate-call
+      guard above, EVERY future sync's reconciliation pass would re-issue
+      the same already-known-to-fail BYOK call -- an unbounded retry loop
+      that keeps billing the user and directly violates D-I (unclassified
+      mail waits for a MANUAL backfill, nothing retries it automatically).
+    - A genuine exception below (`except Exception`) is a DIFFERENT, unknown
+      state -- not a clean "the call ran and produced nothing" like the
+      `verdict is None` case above, but "something broke and we don't know
+      what state this left things in". Retrying a genuinely-unknown failure
+      is defensible, so it still leaves `verified_at` NULL for a later pass;
+      it never touches phase 1's already-committed settlement. These two
+      paths look similar but are a DELIBERATE divergence, not an oversight
+      -- do not "simplify" them back to matching each other.
+
+    Same-sync double call (Codex review): a `classify_messages=True` sync's
+    own page loop can already have made one failed BYOK call for this
+    message before the END reconciliation pass reaches here -- with no
+    Classification row written (D-C), the duplicate-call guard above can't
+    see that first attempt, so this can issue a second one. Left as-is
+    rather than contorting the design for it: the stamp fix above bounds it
+    at exactly 2 calls total, ever, for a given message (after this pass
+    stamps `verified_at`, `_eligible_attempt_ids` never selects it again) --
+    a one-time, bounded cost, not a loop.
     """
     db.execute(select(MailThread).where(MailThread.id == thread_id).with_for_update())
     current_verified_at = db.execute(
@@ -220,14 +256,21 @@ def _classify_and_stamp(
                 provider_call_succeeded=attempt_result.provider_call_succeeded,
             )
             acc.flush(db)
-        # Phase 2 (D-C): `verdict is None` means a failed BYOK call with no
-        # local fallback served -- same treatment as a caught classification
-        # exception below: leave verified_at NULL for a later pass rather
-        # than stamp a send as verified alongside a write that never
-        # happened, and never write a null-label row (it would strand the
-        # message). Usage above still commits -- the call may have genuinely
-        # billed the user even though it produced nothing to classify with.
+        # Phase 2 correction (Codex review, D-C/D-I): `verdict is None` means
+        # a failed BYOK call with no local fallback served -- but the SEND
+        # itself is still genuinely verified (see this function's own
+        # docstring for why that's a separate fact from classification
+        # succeeding), so stamp_verified runs and commits here same as a
+        # normal success. Skipping the stamp was the bug Codex caught: with
+        # no Classification row ever written to trip the duplicate-call
+        # guard above, and this attempt staying eligible forever, every
+        # future sync's reconciliation pass would re-issue the same
+        # already-known-to-fail BYOK call forever. Never write a null-label
+        # row regardless (it would strand the message); usage above still
+        # commits either way -- the call may have genuinely billed the user
+        # even though it produced nothing to classify with.
         if attempt_result.verdict is None:
+            stamp_verified(db, attempt_id=attempt_id)
             db.commit()
             return False
         label, confidence, rationale, model_version = attempt_result.verdict
