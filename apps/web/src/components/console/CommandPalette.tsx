@@ -39,6 +39,8 @@ interface Props {
   onBackfillActions: () => void;
   onOpenLlmSettings: () => void;
   onOpenLlmUsage: () => void;
+  // Opens the settings dialog at the accounts tab (settings-card plan §3.3).
+  onOpenSettings: () => void;
   onSelectAll: () => void;
   // False in the narrow layout and in the agenda view, where there's no bulk
   // selection to fill — the command hides rather than sitting there dead.
@@ -69,6 +71,7 @@ export function CommandPalette({
   onBackfillActions,
   onOpenLlmSettings,
   onOpenLlmUsage,
+  onOpenSettings,
   onSelectAll,
   canSelectAll,
 }: Props) {
@@ -186,6 +189,12 @@ export function CommandPalette({
                 value="extract actions backfill agenda"
               >
                 extract actions
+              </CommandItem>
+              <CommandItem
+                onSelect={() => run(onOpenSettings)}
+                value="settings accounts connect disconnect"
+              >
+                settings…
               </CommandItem>
               <CommandItem
                 onSelect={() => run(onOpenLlmSettings)}

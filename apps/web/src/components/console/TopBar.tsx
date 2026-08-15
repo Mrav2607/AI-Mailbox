@@ -19,7 +19,7 @@ import { Popover } from "./Popover";
 import { LayoutPicker } from "./LayoutPicker";
 import { bucketLabel } from "@/lib/labels";
 import { cn } from "@/lib/utils";
-import { ApiError, updateConnection } from "@/lib/api";
+import { fieldLabel, control } from "@/lib/ui";
 import { BUCKETS } from "@/lib/types";
 import type { Arrangement, Density } from "@/lib/layout";
 import { THEME_PREFS } from "@/lib/theme";
@@ -65,12 +65,14 @@ interface Props {
   health: SyncHealth | null;
   accountsOpen: boolean;
   onAccountsOpenChange: (v: boolean) => void;
-  onConnectGmail: () => void;
-  // Undefined when the deployment has no Microsoft OAuth configured — hides
-  // "Connect Outlook" instead of offering a flow that'd just 503.
-  onConnectOutlook?: () => void;
-  onDisconnect: (connectionId: string) => void;
-  onOpenLlmSettings: () => void;
+  // Opens the settings dialog at the accounts tab -- the popover itself is
+  // read-only now, connect/disconnect/label-sync management all live there
+  // (settings-card plan §3.1).
+  onOpenSettings: () => void;
+  // Opens the settings dialog at the ai tab -- only the backfill form's
+  // inline link needs this one; the popover's own AI-settings button is
+  // gone.
+  onOpenAiSettings: () => void;
   // Would picking the "llm" backend actually reach an LLM? null while the
   // settings fetch is in flight -- an unloaded fetch must not disable the
   // option, since "we don't know yet" isn't "you can't".
@@ -115,10 +117,6 @@ function Stat({
     </div>
   );
 }
-
-const fieldLabel = "font-mono text-[11px] text-muted-foreground";
-const control =
-  "w-full bg-[var(--color-panel)] border border-border rounded px-2 py-1 text-[12px] font-mono text-foreground";
 
 function IngestForm({
   busy,
@@ -424,184 +422,32 @@ function accountStatus(
   return "ok";
 }
 
-// ENABLE-time failure copy (docs/plans/2026-08-13-label-sync-plan.md §3.3),
-// mirrored from the API's own routes/auth.py:_ENABLE_FAILURE_MESSAGES so
-// this row and the backend read the same words. label_sync_busy's wording
-// is frozen verbatim by the plan.
-const LABEL_SYNC_ERROR_COPY: Record<string, string> = {
-  missing_scope: "This account needs to be reconnected to grant label-sync permission.",
-  reauth_required: "This account needs to be reconnected before label sync can turn on.",
-  account_paused:
-    "This account is paused and needs to be reconnected before label sync can turn on.",
-  label_sync_busy: "a sync is finishing — try again in a few minutes",
-};
-
-// Same shape as ReplyComposer's RECONNECT_CODES -- these three are only
-// fixable by reconnecting. label_sync_busy is transient (a task's lease
-// expires on its own) and gets no reconnect action, just the wait-and-retry
-// copy above; the toggle itself stays off either way (plan §3.3 -- ENABLE
-// never changes the flag on failure).
-const LABEL_SYNC_RECONNECT_CODES = new Set([
-  "missing_scope",
-  "reauth_required",
-  "account_paused",
-]);
-
-function LabelSyncRow({
-  connection,
-  onConnectGmail,
-  onConnectOutlook,
-  disabled,
-}: {
-  connection: Connection;
-  onConnectGmail: () => void;
-  onConnectOutlook?: () => void;
-  disabled?: boolean;
-}) {
-  // Local overlay on top of the connection prop -- this row owns its own
-  // PATCH call (the plan scopes W3 to lib/types+api+mock plus this
-  // component, not App's connections state), so a successful toggle updates
-  // here rather than waiting on the next full GET /auth/connections. A
-  // fresh prop (the parent's own refresh landing) always wins -- see the
-  // effect below -- so this never goes stale forever.
-  //
-  // `label_sync_enabled` is the ONLY optimistic part. Drift keeps moving
-  // long after a toggle (120 -> 75 -> 0 as sync catches up), so it never
-  // "agrees" with a fixed snapshot the way enabled does -- waiting on that
-  // agreement to clear the overlay left the row stuck on "syncing" forever
-  // (L-3). `drift` here only seeds the row's count from the PATCH response
-  // itself, for the brief window before the enabled flag's first agreeing
-  // refresh; once that happens the overlay drops entirely and drift always
-  // renders straight off the server prop.
-  const [override, setOverride] = useState<{
-    label_sync_enabled: boolean;
-    drift: number | null;
-  } | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [errorCode, setErrorCode] = useState<string | null>(null);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-
-  useEffect(() => {
-    // Only clear the overlay once the parent's enabled prop actually AGREES
-    // with it. A functional update (reading `current` from React, not the
-    // `override` closure) means this effect doesn't need `override` in its
-    // deps -- if it did, every toggle would re-run this same effect right
-    // after setting the override, clearing it immediately. Without this
-    // guard, a refresh carrying an EARLIER toggle's result landing after a
-    // NEWER toggle would wipe the newer optimistic state and flash the
-    // stale server value until the next refresh catches up.
-    setOverride((current) => {
-      if (current && current.label_sync_enabled !== connection.label_sync_enabled) {
-        return current;
-      }
-      return null;
-    });
-    setErrorCode(null);
-    setErrorMessage(null);
-  }, [connection.label_sync_enabled, connection.label_sync_drift]);
-
-  const enabled = override?.label_sync_enabled ?? connection.label_sync_enabled;
-  const drift = override ? override.drift : connection.label_sync_drift;
-
-  async function handleToggle() {
-    if (busy || disabled) return;
-    setBusy(true);
-    setErrorCode(null);
-    setErrorMessage(null);
-    try {
-      const updated = await updateConnection(connection.id, {
-        label_sync_enabled: !enabled,
-      });
-      setOverride({
-        label_sync_enabled: updated.label_sync_enabled,
-        drift: updated.label_sync_drift,
-      });
-    } catch (e) {
-      if (e instanceof ApiError && e.code && LABEL_SYNC_ERROR_COPY[e.code]) {
-        setErrorCode(e.code);
-        setErrorMessage(LABEL_SYNC_ERROR_COPY[e.code]);
-      } else {
-        setErrorMessage((e as Error).message || "Couldn't update label sync for this account.");
-      }
-    } finally {
-      setBusy(false);
-    }
+// One read-only line under each account (settings-card plan §3.1) --
+// reauth takes precedence over everything else, since an enabled-but-paused
+// account must not read "synced" just because label_sync_enabled is true.
+function labelSyncStatusLine(connection: Connection): string {
+  if (connection.label_sync_enabled && connection.reauth_required) {
+    return "labels paused — reconnect";
   }
-
-  const reconnect = connection.provider === "outlook" ? onConnectOutlook : onConnectGmail;
-  const showReconnect = !!errorCode && LABEL_SYNC_RECONNECT_CODES.has(errorCode) && !!reconnect;
-
-  return (
-    <div className="pl-3.5 space-y-1">
-      <label
-        className={cn(
-          "flex items-center gap-2 text-[11px] font-mono text-foreground/80",
-          busy || disabled ? "cursor-not-allowed opacity-70" : "cursor-pointer",
-        )}
-      >
-        <input
-          type="checkbox"
-          checked={enabled}
-          disabled={busy || disabled}
-          onChange={() => void handleToggle()}
-          className="accent-primary"
-        />
-        Sync labels to {connection.provider === "outlook" ? "Outlook" : "Gmail"}
-      </label>
-      <p className="text-[10px] font-mono text-muted-foreground leading-snug">
-        creates CortexMail labels in your mailbox
-      </p>
-      {enabled && !!drift && (
-        <p className="text-[10px] font-mono text-muted-foreground leading-snug">
-          syncing — {drift} remaining
-        </p>
-      )}
-      {errorMessage && (
-        <div className="flex items-center justify-between gap-2 flex-wrap">
-          <span className="text-[10px] font-mono text-destructive leading-snug">
-            {errorMessage}
-          </span>
-          {showReconnect && (
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                reconnect?.();
-              }}
-              className="shrink-0 h-5 px-1.5 rounded border border-destructive/50 font-mono text-[10px] text-foreground hover:bg-destructive/10 cursor-pointer transition-colors"
-            >
-              reconnect
-            </button>
-          )}
-        </div>
-      )}
-    </div>
-  );
+  if (!connection.label_sync_enabled) return "labels off";
+  const drift = connection.label_sync_drift ?? 0;
+  if (drift > 0) return `labels syncing — ${drift} remaining`;
+  return "labels synced";
 }
 
 function AccountsMenu({
   connections,
   health,
-  onDisconnect,
-  onConnectGmail,
-  onConnectOutlook,
-  onOpenLlmSettings,
+  onOpenSettings,
   actionsLocked,
 }: {
   connections: Connection[];
   health: SyncHealth | null;
-  onDisconnect: (connectionId: string) => void;
-  onConnectGmail: () => void;
-  onConnectOutlook?: () => void;
-  onOpenLlmSettings: () => void;
-  // Mirrors the popover's own lockOpen: while the tour is anchored here, a
-  // click on any of these buttons must not stack a modal or fire an
-  // OAuth redirect / disconnect underneath it.
+  onOpenSettings: () => void;
+  // Mirrors the popover's own lockOpen: while the tour is anchored here, the
+  // settings button must not stack a modal underneath it.
   actionsLocked?: boolean;
 }) {
-  // Two-step confirm: first click arms it, second fires. Armed state lives
-  // here (not lifted) so it resets for free whenever the popover closes.
-  const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const accounts = health?.accounts ?? [];
   return (
     <div className="flex flex-col max-h-[min(60vh,calc(100vh-8rem))] space-y-2.5">
@@ -611,16 +457,9 @@ function AccountsMenu({
           no accounts connected
         </p>
       ) : (
-        <ul
-          className="min-h-0 flex-1 overflow-y-auto space-y-1.5"
-          // Escape hatch: a click anywhere else in the list disarms an armed
-          // confirm. The disconnect button stops its own click from bubbling
-          // here, so arming/confirming a row doesn't immediately undo itself.
-          onClick={() => setConfirmingId(null)}
-        >
+        <ul className="min-h-0 flex-1 overflow-y-auto space-y-1.5">
           {connections.map((c) => {
             const status = accountStatus(c, accounts);
-            const confirming = confirmingId === c.id;
             return (
               <li
                 key={c.id}
@@ -645,51 +484,10 @@ function AccountsMenu({
                   >
                     {c.email_address}
                   </span>
-                  <button
-                    type="button"
-                    disabled={actionsLocked}
-                    onClick={(e) => {
-                      // Don't let this reach the list's onClick, which
-                      // disarms on any click outside the button itself.
-                      e.stopPropagation();
-                      if (confirming) {
-                        setConfirmingId(null);
-                        onDisconnect(c.id);
-                      } else {
-                        // Arming a different account's confirm disarms this
-                        // one — there's only ever one confirmingId.
-                        setConfirmingId(c.id);
-                      }
-                    }}
-                    title={
-                      confirming
-                        ? "disconnect — deletes its synced mail; reconnecting resyncs from scratch"
-                        : "disconnect this account"
-                    }
-                    className={cn(
-                      "shrink-0 font-mono text-[10.5px] px-1.5 py-0.5 rounded border cursor-pointer transition-colors",
-                      confirming
-                        ? "border-destructive/60 bg-destructive/15 text-destructive"
-                        : "border-border text-muted-foreground hover:text-destructive hover:border-destructive/40",
-                    )}
-                  >
-                    {confirming ? "confirm" : "disconnect"}
-                  </button>
                 </div>
-                {/* Visible, not just a hover title — a touch device (or anyone
-                    who doesn't hover) still has to see this before a
-                    mail-deleting confirm. */}
-                {confirming && (
-                  <p className="pl-3.5 text-[10.5px] font-mono text-destructive leading-snug">
-                    deletes this account&apos;s synced mail — reconnecting resyncs from scratch
-                  </p>
-                )}
-                <LabelSyncRow
-                  connection={c}
-                  onConnectGmail={onConnectGmail}
-                  onConnectOutlook={onConnectOutlook}
-                  disabled={actionsLocked}
-                />
+                <p className="pl-3.5 text-[10px] font-mono text-muted-foreground leading-snug">
+                  {labelSyncStatusLine(c)}
+                </p>
               </li>
             );
           })}
@@ -697,30 +495,12 @@ function AccountsMenu({
       )}
       <button
         type="button"
-        disabled={actionsLocked}
-        onClick={onConnectGmail}
-        className="w-full h-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
-      >
-        connect another gmail
-      </button>
-      {onConnectOutlook && (
-        <button
-          type="button"
-          disabled={actionsLocked}
-          onClick={onConnectOutlook}
-          className="w-full h-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
-        >
-          connect outlook
-        </button>
-      )}
-      <button
-        type="button"
         data-tour="llm-settings"
         disabled={actionsLocked}
-        onClick={onOpenLlmSettings}
+        onClick={onOpenSettings}
         className="w-full h-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
       >
-        AI settings
+        settings
       </button>
     </div>
   );
@@ -755,10 +535,8 @@ export function TopBar({
   health,
   accountsOpen,
   onAccountsOpenChange,
-  onConnectGmail,
-  onConnectOutlook,
-  onDisconnect,
-  onOpenLlmSettings,
+  onOpenSettings,
+  onOpenAiSettings,
   llmUsable,
   ingestLocked,
   accountsLocked,
@@ -860,7 +638,7 @@ export function TopBar({
             llmUsable={llmUsable}
             onOpenLlmSettings={() => {
               onBackfillOpenChange(false);
-              onOpenLlmSettings();
+              onOpenAiSettings();
             }}
             onSubmit={(o) => {
               onBackfillOpenChange(false);
@@ -930,10 +708,10 @@ export function TopBar({
           <AccountsMenu
             connections={connections}
             health={health}
-            onDisconnect={onDisconnect}
-            onConnectGmail={onConnectGmail}
-            onConnectOutlook={onConnectOutlook}
-            onOpenLlmSettings={onOpenLlmSettings}
+            onOpenSettings={() => {
+              guardedAccountsOpenChange(false);
+              onOpenSettings();
+            }}
             actionsLocked={accountsLocked}
           />
         </Popover>

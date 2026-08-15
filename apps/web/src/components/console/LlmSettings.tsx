@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { fieldLabel, control } from "@/lib/ui";
 import type {
   ClassifierMixEntry,
@@ -54,49 +53,6 @@ export interface LlmSettingsSectionProps {
   usageError: boolean;
   // Switches to the usage tab/dialog -- the cost signal belongs here where
   // the key is configured, but the full breakdown lives there.
-  onOpenUsage: () => void;
-  // Which classifier labeled the mail this user currently has (plan §7) --
-  // point-in-time state, not a time-windowed history. Same null-while-in-
-  // flight / real payload / separate error flag contract as `usage` above.
-  // Rendered regardless of whether this user has a credential at all -- see
-  // the render site below for why it can't live behind the BYOK gate.
-  classifierMix: ClassifierMixEntry[] | null;
-  classifierMixError: boolean;
-}
-
-interface Props {
-  open: boolean;
-  onOpenChange: (v: boolean) => void;
-  // Null until the first fetch after login lands -- the modal just doesn't
-  // render yet rather than show a half-built form.
-  settings: LlmSettings | null;
-  onSave: (input: {
-    provider: LlmProvider;
-    // Absent when the user leaves the field blank to keep an existing key --
-    // required only when there's nothing stored yet.
-    api_key?: string;
-    model: string;
-    base_url?: string;
-    classification_byok?: boolean;
-  }) => void;
-  saving: boolean;
-  onTest: () => void;
-  testing: boolean;
-  testResult: LlmTestResult | null;
-  onRemove: () => void;
-  removing: boolean;
-  // Null while the fetch is in flight (or hasn't started) and no prior error
-  // -- fetched fresh every time this modal opens, since usage keeps moving
-  // even when the credential itself hasn't changed. Only feeds the one-line
-  // summary here; the full breakdown lives in the usage card.
-  usage: LlmUsage | null;
-  // True when the usage fetch failed. Kept separate from `usage` being null
-  // so the panel can tell "still loading" apart from "unavailable" -- an
-  // outage here must never make the rest of this modal look broken.
-  usageError: boolean;
-  // Opens the separate usage card (charts, breakdowns, dashboard links) --
-  // the cost signal belongs here where the key is configured, but the detail
-  // lives there.
   onOpenUsage: () => void;
   // Which classifier labeled the mail this user currently has (plan §7) --
   // point-in-time state, not a time-windowed history. Same null-while-in-
@@ -178,7 +134,7 @@ function classifierMixSummary(mix: ClassifierMixEntry[]): string {
 /**
  * The AI extraction settings form content -- provider/model/key fields, the
  * classifier-mix summary, test/save/remove actions, and the usage summary
- * footer. Extracted from the standalone `LlmSettingsModal` dialog so the
+ * footer. Extracted from the old standalone AI-settings dialog so the
  * settings dialog's `ai model` tab can render the exact same content without
  * a nested dialog (settings-card plan §3.2).
  *
@@ -192,15 +148,14 @@ function classifierMixSummary(mix: ClassifierMixEntry[]): string {
  * (a test/save/remove refresh must never clobber an unsaved edit). The
  * `hydratedRef` flag is what "once" means here; it's cleared whenever `open`
  * goes false, so the next open re-hydrates fresh. `open` is deliberately
- * this section's own prop (not "is this the active tab") -- both callers
- * thread it as the containing dialog's overall open state: `LlmSettingsModal`
- * passes its own `open` straight through, and the settings dialog passes its
- * `open` to every tab's section even while inactive, since all three stay
- * mounted across a tab switch (unmounting one would drop unsaved AI-form
- * edits on an ai → usage → ai round trip). This also means a shell that
- * opens before `settings` has loaded now hydrates the moment it lands,
- * instead of never hydrating at all (the bug in the old `[open]`-only
- * effect, which read `settings` through a ref specifically to skip re-runs).
+ * this section's own prop (not "is this the active tab") -- the settings
+ * dialog passes its own `open` to every tab's section even while inactive,
+ * since all three stay mounted across a tab switch (unmounting one would
+ * drop unsaved AI-form edits on an ai → usage → ai round trip). This also
+ * means a shell that opens before `settings` has loaded now hydrates the
+ * moment it lands, instead of never hydrating at all (the bug in the old
+ * `[open]`-only effect, which read `settings` through a ref specifically to
+ * skip re-runs).
  */
 export function LlmSettingsSection({
   open,
@@ -517,55 +472,5 @@ export function LlmSettingsSection({
         </div>
       </form>
     </div>
-  );
-}
-
-/**
- * Thin `Dialog` wrapper around `LlmSettingsSection`, kept for the entry
- * points that still open a standalone modal. `settingsError`/`onRetrySettings`
- * default to false/no-op so this call site's props stay unchanged -- App
- * doesn't (yet) have a load-failure signal to hand it.
- */
-export function LlmSettingsModal({
-  open,
-  onOpenChange,
-  settings,
-  onSave,
-  saving,
-  onTest,
-  testing,
-  testResult,
-  onRemove,
-  removing,
-  usage,
-  usageError,
-  onOpenUsage,
-  classifierMix,
-  classifierMixError,
-}: Props) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-md bg-[var(--color-panel)] border-border">
-        <DialogTitle className="font-mono text-[11px] tracking-wide text-muted-foreground mb-1 font-normal">
-          AI extraction settings
-        </DialogTitle>
-        <LlmSettingsSection
-          open={open}
-          settings={settings}
-          onSave={onSave}
-          saving={saving}
-          onTest={onTest}
-          testing={testing}
-          testResult={testResult}
-          onRemove={onRemove}
-          removing={removing}
-          usage={usage}
-          usageError={usageError}
-          onOpenUsage={onOpenUsage}
-          classifierMix={classifierMix}
-          classifierMixError={classifierMixError}
-        />
-      </DialogContent>
-    </Dialog>
   );
 }

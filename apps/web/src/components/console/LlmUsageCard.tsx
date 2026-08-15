@@ -1,4 +1,3 @@
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { fieldLabel } from "@/lib/ui";
 import type { LlmUsage, LlmUsageByProvider, LlmUsageByStage } from "@/lib/types";
 import {
@@ -19,11 +18,6 @@ export interface LlmUsageSectionProps {
   usageError: boolean;
   days: number;
   onDaysChange: (days: number) => void;
-}
-
-interface Props extends LlmUsageSectionProps {
-  open: boolean;
-  onOpenChange: (v: boolean) => void;
 }
 
 const RANGE_CHOICES = [7, 30, 90] as const;
@@ -175,7 +169,7 @@ function StatTile({ value, caption }: { value: string; caption: string }) {
 
 /**
  * The AI usage content -- range picker, stat tiles, daily chart, and the
- * pipeline/provider split bars. Extracted from the standalone `LlmUsageCard`
+ * pipeline/provider split bars. Extracted from the old standalone usage
  * dialog so the settings dialog's `usage` tab can render the exact same
  * content without a nested dialog (settings-card plan §3.2). Stateless: every
  * render state derives straight from props, so there's no hydration lifecycle
@@ -296,30 +290,6 @@ export function LlmUsageSection({ usage, usageError, days, onDaysChange }: LlmUs
         </div>
       )}
     </div>
-  );
-}
-
-/**
- * Thin `Dialog` wrapper around `LlmUsageSection`, kept for the entry points
- * that still open a standalone modal.
- */
-export function LlmUsageCard({ open, onOpenChange, usage, usageError, days, onDaysChange }: Props) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      {/* This card is read-only, so don't hand focus to the first control on
-          open -- that put a focus ring on the 7d button and made it look like
-          the selected range. Radix falls back to focusing the dialog itself,
-          which is what a screen reader should land on anyway. */}
-      <DialogContent
-        className="max-w-2xl bg-[var(--color-panel)] border-border"
-        onOpenAutoFocus={(e) => e.preventDefault()}
-      >
-        <DialogTitle className="font-mono text-[11px] tracking-wide text-muted-foreground mb-0.5 font-normal">
-          AI usage
-        </DialogTitle>
-        <LlmUsageSection usage={usage} usageError={usageError} days={days} onDaysChange={onDaysChange} />
-      </DialogContent>
-    </Dialog>
   );
 }
 
