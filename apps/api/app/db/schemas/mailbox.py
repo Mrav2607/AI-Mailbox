@@ -200,6 +200,14 @@ class BackfillDone(Response):
     # overrode them -- see run_backfill's docstring. Defaults to 0 so an old
     # Celery result recorded before this field existed still parses.
     skipped_user_overrides: int = 0
+    # Failure-visibility fields (plan: 2026-08-14-llm-failure-visibility) --
+    # see run_backfill's docstring for the ClassificationAttempt facts these
+    # are aggregated from. Defaulted the same way as skipped_user_overrides
+    # above, so an old Celery result recorded before this change still parses.
+    llm_attempted: int = 0
+    llm_failed: int = 0
+    fell_back: int = 0
+    failure_categories: dict[str, int] = {}
 
 
 class Queued(Response):

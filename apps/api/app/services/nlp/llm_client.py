@@ -64,6 +64,30 @@ class LlmCallError(Exception):
         super().__init__(category)
 
 
+# Categories raised BEFORE any request leaves the process -- currently only
+# the destination-policy rejection (`pin_custom_destination` below), which
+# runs and can reject before the request body is even built. This matters to
+# callers tracking `llm_attempted` (plan: 2026-08-14-llm-failure-visibility):
+# a future spend/quota surface reading that flag would overcount billable
+# calls if a preflight refusal counted as "issued". `timed_out` is only raised
+# once a response has started coming back, so it really was issued.
+#
+# `connection_failed` is the honest grey area: it catches httpx.HTTPError
+# wholesale, which spans "DNS never resolved" (nothing sent, nothing billable)
+# and "connection dropped mid-response" (sent, possibly billed). It counts as
+# issued deliberately -- for a feature whose job is surfacing failures,
+# over-counting an attempt is safer than quietly under-counting one. Split it
+# only if a spend/quota surface ever needs the distinction.
+PREFLIGHT_CATEGORIES = frozenset({"blocked_by_policy"})
+
+
+def request_was_issued(category: str) -> bool:
+    """Whether an `LlmCallError` of this `category` means a request actually
+    left the process -- see `PREFLIGHT_CATEGORIES` for why `blocked_by_policy`
+    is the one exception."""
+    return category not in PREFLIGHT_CATEGORIES
+
+
 # A TCP connect slower than this is a dead host no matter how slow the model
 # behind it is, so it gets its own cap well inside the overall budget.
 _CONNECT_TIMEOUT_S = 5.0

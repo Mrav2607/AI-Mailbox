@@ -157,8 +157,22 @@ export interface BackfillOptions {
 
 // Small backfills run inline and report counts; over the API's inline cap the
 // server queues a worker task and answers 202 with its id.
+//
+// llm_attempted/llm_failed/fell_back/failure_categories are always present
+// on a current API (0 / {} when nothing applies) but stay optional here so a
+// stale/older API response still parses instead of breaking the toast --
+// same convention as skipped_user_overrides above.
 export type BackfillResult =
-  | { status: "ok"; created: number; scanned: number; skipped_user_overrides: number }
+  | {
+      status: "ok";
+      created: number;
+      scanned: number;
+      skipped_user_overrides: number;
+      llm_attempted?: number;
+      llm_failed?: number;
+      fell_back?: number;
+      failure_categories?: Record<string, number>;
+    }
   | { status: "queued"; task_id: string };
 
 export interface ThreadMessage {

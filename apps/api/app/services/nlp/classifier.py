@@ -8,7 +8,7 @@ import httpx
 
 from app.core.config import settings
 from app.core.logging import logger
-from app.services.nlp.llm_client import LlmCallError, LlmUsage, call_chat_completion
+from app.services.nlp.llm_client import LlmCallError, LlmUsage, call_chat_completion, request_was_issued
 from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
 LABELS = (
@@ -40,19 +40,47 @@ class ClassificationAttempt:
     already answered (and, on BYOK, already billed the user) by the time
     parsing happens, so undercounting it would recreate the exact
     quota-blindness this feature exists to fix.
+
+    `llm_attempted` / `fallback_used` / `failure_category` are the failure-
+    visibility fields (plan: `docs/plans/2026-08-14-llm-failure-visibility-
+    plan.md`). They are explicit facts set at each construction site, NEVER
+    derived from `routing.mode` or `provider_call_succeeded` -- an explicit
+    `backend="local"` and a healthy `backend="auto"` both return the encoder
+    before any LLM call is even considered, and `provider_call_succeeded` is
+    `False` for every heuristic/local verdict that never intended a call in
+    the first place. `llm_attempted` means a provider request was actually
+    issued (not merely "an LLM path was reached" -- an SDK import failure or
+    a destination-policy preflight rejection, `failure_category ==
+    "blocked_by_policy"`, both leave it `False`; see
+    `llm_client.request_was_issued`). `fallback_used` means an LLM call
+    FAILED and something else (encoder or heuristic) served the verdict
+    instead -- true even for a preflight rejection, where `llm_attempted` is
+    `False` but a fallback still genuinely served. `failure_category` mirrors
+    `LlmCallError.category`, or is `"invalid_response"` for a malformed body
+    that isn't an `LlmCallError` at all.
     """
 
     verdict: tuple[str, float, str, str]
     provider_call_succeeded: bool
     usage: LlmUsage | None
+    llm_attempted: bool = False
+    fallback_used: bool = False
+    failure_category: str | None = None
 
 
 def _heuristic_attempt(text: str) -> ClassificationAttempt:
     """The heuristic never touches a provider, on any path that reaches it --
     shared by the `backend="heuristic"` route and every LLM-path fallback
-    that decides not to call anyone (routing `off`, a missing credential)."""
+    that decides not to call anyone (routing `off`, a missing credential).
+    `llm_attempted` is `False` here, not just `fallback_used` -- nothing was
+    ever attempted for this to be a fallback FROM."""
     return ClassificationAttempt(
-        verdict=_heuristic_classify(text), provider_call_succeeded=False, usage=None
+        verdict=_heuristic_classify(text),
+        provider_call_succeeded=False,
+        usage=None,
+        llm_attempted=False,
+        fallback_used=False,
+        failure_category=None,
     )
 
 
@@ -242,8 +270,15 @@ def _classify_attempt(
 
         result = try_predict(text)
         if result is not None:
+            # The encoder served without ever consulting an LLM -- not a
+            # fallback, whether or not this call happens to be opted into BYOK.
             return ClassificationAttempt(
-                verdict=result, provider_call_succeeded=False, usage=None
+                verdict=result,
+                provider_call_succeeded=False,
+                usage=None,
+                llm_attempted=False,
+                fallback_used=False,
+                failure_category=None,
             )
 
         # Local unavailable. An explicit backend="local" stops here --
@@ -373,6 +408,34 @@ def _classify_llm(
     return _classify_llm_server(text)
 
 
+def _native_failure_category(exc: Exception) -> str | None:
+    """Map a native google-genai failure onto `llm_client`'s category names.
+
+    The operator path talks to Gemini through its own SDK, which raises its own
+    exception types rather than `LlmCallError`, so without this its failures
+    would land in `failure_categories` as nothing at all. Ordered most specific
+    first: `genai_errors.APIError` carries an HTTP status, so it maps to the
+    same `http_<status>` shape the BYOK path produces; a bare `TimeoutError`
+    never got an answer; anything else httpx raises is a transport failure.
+    Returns None for an unrecognised type rather than guessing.
+    """
+    # Imported lazily for the same reason the caller does it: the SDK is an
+    # optional dependency and may not be installed.
+    try:
+        from google.genai import errors as genai_errors
+    except ImportError:
+        genai_errors = None
+
+    if genai_errors is not None and isinstance(exc, genai_errors.APIError):
+        code = getattr(exc, "code", None)
+        return f"http_{code}" if code else "invalid_response"
+    if isinstance(exc, TimeoutError):
+        return "timed_out"
+    if isinstance(exc, httpx.HTTPError):
+        return "connection_failed"
+    return None
+
+
 def _classify_llm_server(text: str) -> ClassificationAttempt:
     """LLM-backed classifier with heuristic fallback, on the operator's
     Gemini key. Unchanged from before BYOK classification existed."""
@@ -383,22 +446,33 @@ def _classify_llm_server(text: str) -> ClassificationAttempt:
     # `except Exception` also swallowed our own bugs -- a typo in here came back as
     # a confident heuristic answer instead of a 500, which is exactly how a broken
     # classifier hides in plain sight.
-    def fallback(reason: str, exc: Exception) -> ClassificationAttempt:
+    def fallback(reason: str, exc: Exception, *, llm_attempted: bool) -> ClassificationAttempt:
         # Every path through here never reached (or never finished talking
-        # to) Gemini, so `provider_call_succeeded` stays False.
+        # to) Gemini, so `provider_call_succeeded` stays False. `llm_attempted`
+        # distinguishes "a request never went out" (the SDK itself is
+        # unavailable) from "a request went out and failed" -- only the
+        # latter is a real fallback for reporting purposes.
         logger.warning("Gemini classify %s, falling back to heuristic: %s", reason, exc)
         label, confidence, rationale, _ = _heuristic_classify(text)
         return ClassificationAttempt(
             verdict=(label, confidence, rationale, "heuristic-fallback"),
             provider_call_succeeded=False,
             usage=None,
+            llm_attempted=llm_attempted,
+            fallback_used=llm_attempted,
+            # The native genai SDK doesn't raise LlmCallError, so map its
+            # failures onto the same taxonomy the BYOK path uses
+            # (llm_client.py). Without this the operator path reports a
+            # fallback with no reason, and the toast can only say "something
+            # degraded" -- which is the vagueness this feature exists to kill.
+            failure_category=_native_failure_category(exc),
         )
 
     try:
         from google.genai import errors as genai_errors
         from google.genai import types
     except ImportError as exc:
-        return fallback("SDK is unavailable", exc)
+        return fallback("SDK is unavailable", exc, llm_attempted=False)
 
     try:
         response = _genai_client().models.generate_content(
@@ -409,7 +483,7 @@ def _classify_llm_server(text: str) -> ClassificationAttempt:
     except (genai_errors.APIError, httpx.HTTPError, TimeoutError) as exc:
         # Gemini refused, rate-limited us, or never answered -- no call
         # completed.
-        return fallback("call failed", exc)
+        return fallback("call failed", exc, llm_attempted=True)
 
     # A response came back: the call reached Gemini and completed, whatever
     # its content turns out to be. `provider_call_succeeded` is True from
@@ -425,6 +499,9 @@ def _classify_llm_server(text: str) -> ClassificationAttempt:
             verdict=(label, confidence, rationale, "heuristic-fallback"),
             provider_call_succeeded=True,
             usage=None,
+            llm_attempted=True,
+            fallback_used=True,
+            failure_category="invalid_response",
         )
 
     return ClassificationAttempt(
@@ -435,6 +512,9 @@ def _classify_llm_server(text: str) -> ClassificationAttempt:
         # parsing `response.usage_metadata` here would be dead code implying
         # a capability we don't actually expose. Don't "fix" this.
         usage=None,
+        llm_attempted=True,
+        fallback_used=False,
+        failure_category=None,
     )
 
 
@@ -444,6 +524,7 @@ def _llm_user_failure_fallback(
     *,
     provider_call_succeeded: bool,
     usage: LlmUsage | None,
+    failure_category: str,
 ) -> ClassificationAttempt:
     """
     Shared by both `_classify_llm_user` failure paths (D2): try the local
@@ -456,16 +537,32 @@ def _llm_user_failure_fallback(
     through unchanged regardless of which fallback ends up serving (D3):
     a malformed-but-received response still billed the user even if the
     encoder, not the heuristic, ends up supplying the label.
+
+    Both callers only reach here after an LLM call FAILED, so `fallback_used`
+    is always True -- something else genuinely served the verdict. But
+    "failed" isn't the same as "attempted": a destination-policy preflight
+    rejection (`failure_category == "blocked_by_policy"`) never issues a
+    request at all (`llm_client.request_was_issued`), so `llm_attempted`
+    tracks the category instead of being hardcoded. The encoder branch stamps
+    `+fallback` on its `model_version` (contract: plan's "Fallback
+    provenance"): without it, this row would be byte-identical to a healthy
+    local-backend run, which is the exact silent-degrade bug the plan exists
+    to fix. `heuristic-fallback` needs no suffix -- it's already unambiguous.
     """
+    llm_attempted = request_was_issued(failure_category)
     if not local_tried:
         from app.services.nlp.local_model import try_predict
 
         result = try_predict(text)
         if result is not None:
+            label, confidence, rationale, model_version = result
             return ClassificationAttempt(
-                verdict=result,
+                verdict=(label, confidence, rationale, f"{model_version}+fallback"),
                 provider_call_succeeded=provider_call_succeeded,
                 usage=usage,
+                llm_attempted=llm_attempted,
+                fallback_used=True,
+                failure_category=failure_category,
             )
 
     label, confidence, rationale, _ = _heuristic_classify(text)
@@ -473,6 +570,9 @@ def _llm_user_failure_fallback(
         verdict=(label, confidence, rationale, "heuristic-fallback"),
         provider_call_succeeded=provider_call_succeeded,
         usage=usage,
+        llm_attempted=llm_attempted,
+        fallback_used=True,
+        failure_category=failure_category,
     )
 
 
@@ -504,7 +604,8 @@ def _classify_llm_user(
             "Classification call failed for provider %s: %s", credential.provider, exc.category
         )
         return _llm_user_failure_fallback(
-            text, local_tried, provider_call_succeeded=False, usage=None
+            text, local_tried, provider_call_succeeded=False, usage=None,
+            failure_category=exc.category,
         )
 
     # The call reached the provider and came back -- it already billed the
@@ -518,11 +619,15 @@ def _classify_llm_user(
             credential.provider, type(exc).__name__,
         )
         return _llm_user_failure_fallback(
-            text, local_tried, provider_call_succeeded=True, usage=result.usage
+            text, local_tried, provider_call_succeeded=True, usage=result.usage,
+            failure_category="invalid_response",
         )
 
     return ClassificationAttempt(
         verdict=(label, confidence, rationale, f"{credential.provider}:{credential.model}"),
         provider_call_succeeded=True,
         usage=result.usage,
+        llm_attempted=True,
+        fallback_used=False,
+        failure_category=None,
     )

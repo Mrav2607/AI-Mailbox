@@ -167,6 +167,14 @@ def classify_latest_threads(
         "created": result["task_created"],
         "processed": result["task_processed"],
         "skipped_user_overrides": result["skipped_user_overrides"],
+        # Failure-visibility counters (plan: 2026-08-14-llm-failure-visibility)
+        # -- forwarded, not reshaped, same as backfill_threads_for_user's
+        # **result. Dropping these here would let a queued run over this
+        # route look like plain success even when the LLM failed.
+        "llm_attempted": result["llm_attempted"],
+        "llm_failed": result["llm_failed"],
+        "fell_back": result["fell_back"],
+        "failure_categories": result["failure_categories"],
     }
 
 

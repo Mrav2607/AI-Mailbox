@@ -3,6 +3,7 @@
 
 import json
 
+import httpx
 import pytest
 
 from app.services.nlp.classifier import (
@@ -719,9 +720,16 @@ def test_classify_with_usage_heuristic_backend_never_touched_provider(monkeypatc
     assert attempt.provider_call_succeeded is False
     assert attempt.usage is None
     assert attempt.verdict[0] == "security_alert"
+    assert attempt.llm_attempted is False
+    assert attempt.fallback_used is False
+    assert attempt.failure_category is None
 
 
 def test_classify_with_usage_local_backend_never_touched_provider(monkeypatch):
+    """The predicate trap the plan calls out by name: a CLASSIFIER_BACKEND=
+    local run must report llm_attempted=False / fallback_used=False -- it
+    never even considered an LLM, so it must never be counted as a degraded
+    run just because routing.mode happens to say "user"."""
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
@@ -732,6 +740,9 @@ def test_classify_with_usage_local_backend_never_touched_provider(monkeypatch):
     assert attempt.provider_call_succeeded is False
     assert attempt.usage is None
     assert attempt.verdict == ("fyi", 0.5, "local rationale", "local:test")
+    assert attempt.llm_attempted is False
+    assert attempt.fallback_used is False
+    assert attempt.failure_category is None
 
 
 def test_classify_with_usage_routing_off_never_touched_provider(monkeypatch):
@@ -776,6 +787,39 @@ def test_classify_with_usage_user_mode_call_error_never_touched_provider(monkeyp
     attempt = classify_with_usage("Security alert: new login detected", routing=routing)
     assert attempt.provider_call_succeeded is False
     assert attempt.usage is None
+
+
+def test_classify_with_usage_user_mode_real_preflight_rejection_never_attempted_llm(monkeypatch):
+    """A REAL destination-policy rejection (not a stubbed category), same
+    fix and same pattern as test_extractor.py's counterpart -- drives the
+    actual call_chat_completion (not classifier.call_chat_completion mocked
+    away) through a fake pin_custom_destination that raises
+    DestinationRejected. blocked_by_policy rejects BEFORE any request
+    leaves the process, so llm_attempted must be False even though a
+    fallback genuinely did serve the verdict (Codex review)."""
+    from app.services.nlp import classifier, local_model
+    from app.services.nlp import llm_client as llm_client_module
+    from app.services.nlp.providers import DestinationRejected
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
+
+    def fake_pin(url):
+        raise DestinationRejected("destination_rejected", "nope")
+
+    monkeypatch.setattr(llm_client_module, "pin_custom_destination", fake_pin)
+    credential = LlmCredential(
+        provider="custom", base_url="https://ollama.example.com/v1", api_key="k", model="llama3"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+
+    attempt = classify_with_usage("Security alert: new login detected", routing=routing)
+
+    assert attempt.verdict[3] == "heuristic-fallback"
+    assert attempt.provider_call_succeeded is False
+    assert attempt.llm_attempted is False
+    assert attempt.fallback_used is True
+    assert attempt.failure_category == "blocked_by_policy"
 
 
 def test_classify_with_usage_user_mode_success_carries_usage_through(monkeypatch):
@@ -845,6 +889,111 @@ def test_classify_with_usage_server_path_success_reports_call_but_no_usage(monke
         assert attempt.provider_call_succeeded is True
         assert attempt.usage is None
         assert attempt.verdict[3] == "gemini-2.5-flash"
+        assert attempt.llm_attempted is True
+        assert attempt.fallback_used is False
+        assert attempt.failure_category is None
+
+
+def test_classify_with_usage_server_path_no_key_never_attempted_llm(monkeypatch):
+    """No operator key configured: the server path stops before ever trying
+    to reach Gemini -- llm_attempted must be False, not just
+    provider_call_succeeded."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", None)
+
+    attempt = classify_with_usage("Can you review this?")
+    assert attempt.llm_attempted is False
+    assert attempt.fallback_used is False
+    assert attempt.failure_category is None
+
+
+def test_classify_with_usage_server_path_call_failure_reports_attempted_fallback(monkeypatch):
+    """A Gemini call that goes out and fails (rate limit, timeout, ...) is a
+    real attempt-then-fallback -- unlike an unconfigured key or a missing
+    SDK, which never issue a request at all."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
+
+    class _ExplodingModels:
+        def generate_content(self, **kwargs):
+            raise TimeoutError("gemini took too long")
+
+    class _ExplodingClient:
+        models = _ExplodingModels()
+
+    monkeypatch.setattr(classifier, "_genai_client", lambda: _ExplodingClient())
+
+    attempt = classify_with_usage("Can you review this?")
+    assert attempt.verdict[3] == "heuristic-fallback"
+    assert attempt.llm_attempted is True
+    assert attempt.fallback_used is True
+    # The native genai SDK raises its own exception types, but its failures are
+    # mapped onto the same category names the BYOK path uses -- otherwise the
+    # operator path reports a fallback the toast can give no reason for.
+    assert attempt.failure_category == "timed_out"
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (httpx.ConnectError("dns is having a day"), "connection_failed"),
+        (TimeoutError("gemini took too long"), "timed_out"),
+    ],
+)
+def test_classify_server_path_maps_native_failures_to_shared_categories(
+    monkeypatch, exc, expected
+):
+    """Each native SDK failure type lands on the taxonomy `failure_categories`
+    is aggregated from, so an operator-key deployment gets the same "why" a
+    BYOK one does."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
+
+    class _ExplodingModels:
+        def generate_content(self, **kwargs):
+            raise exc
+
+    class _ExplodingClient:
+        models = _ExplodingModels()
+
+    monkeypatch.setattr(classifier, "_genai_client", lambda: _ExplodingClient())
+
+    assert classify_with_usage("Can you review this?").failure_category == expected
+
+
+def test_classify_with_usage_server_path_malformed_response_is_invalid_response(monkeypatch):
+    """A Gemini reply that doesn't parse still counts as an attempt (the call
+    itself succeeded) and is categorized invalid_response, same taxonomy as
+    the BYOK path's malformed-response case."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
+
+    class _BadResponse:
+        text = "not json at all"
+
+    class _BadModels:
+        def generate_content(self, **kwargs):
+            return _BadResponse()
+
+    class _BadClient:
+        models = _BadModels()
+
+    monkeypatch.setattr(classifier, "_genai_client", lambda: _BadClient())
+
+    attempt = classify_with_usage("Can you review this?")
+    assert attempt.verdict[3] == "heuristic-fallback"
+    assert attempt.provider_call_succeeded is True
+    assert attempt.llm_attempted is True
+    assert attempt.fallback_used is True
+    assert attempt.failure_category == "invalid_response"
 
 
 # ---------------------------------------------------------------------------
@@ -1033,7 +1182,9 @@ def test_classify_user_key_call_error_falls_back_to_encoder_not_heuristic(monkey
     """Case 9 (D2): a transient provider error on a BYOK call now falls back
     to the local encoder, not straight to keyword rules -- an opted-in user
     with a flaky provider shouldn't get worse labels than someone who never
-    opted in."""
+    opted in. The encoder's model_version carries the `+fallback` provenance
+    marker (plan: 2026-08-14-llm-failure-visibility) -- without it this row
+    would be byte-identical to a healthy local-backend run."""
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(
@@ -1051,16 +1202,21 @@ def test_classify_user_key_call_error_falls_back_to_encoder_not_heuristic(monkey
     attempt = classify_with_usage(
         "Security alert: new login detected", backend="llm", routing=routing
     )
-    assert attempt.verdict == ("fyi", 0.6, "local rationale", "local:test")
+    assert attempt.verdict == ("fyi", 0.6, "local rationale", "local:test+fallback")
     assert attempt.provider_call_succeeded is False  # the call never reached the provider
     assert attempt.usage is None
+    assert attempt.llm_attempted is True
+    assert attempt.fallback_used is True
+    assert attempt.failure_category == "connection_failed"
 
 
 def test_classify_user_key_malformed_response_falls_back_to_encoder(monkeypatch):
     """Case 10 (D2): a malformed BYOK response also falls back to the local
     encoder before keyword rules. provider_call_succeeded/usage still
     reflect that the provider answered and billed the user (D3) -- only the
-    verdict's source changes."""
+    verdict's source changes. The encoder's model_version carries the
+    `+fallback` provenance marker, and the failure is categorized as
+    `invalid_response` even though it never raised an `LlmCallError`."""
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(
@@ -1077,9 +1233,12 @@ def test_classify_user_key_malformed_response_falls_back_to_encoder(monkeypatch)
     )
     routing = ClassificationRouting(mode="user", credential=credential)
     attempt = classify_with_usage("Invoice #1842 is due Friday", backend="llm", routing=routing)
-    assert attempt.verdict == ("action_required", 0.6, "local rationale", "local:test")
+    assert attempt.verdict == ("action_required", 0.6, "local rationale", "local:test+fallback")
     assert attempt.provider_call_succeeded is True
     assert attempt.usage is usage
+    assert attempt.llm_attempted is True
+    assert attempt.fallback_used is True
+    assert attempt.failure_category == "invalid_response"
 
 
 def test_classify_user_key_failure_with_encoder_unavailable_uses_heuristic_fallback(monkeypatch):

@@ -74,6 +74,7 @@ import { ALL_LABELS } from "@/lib/types";
 import { toast } from "sonner";
 import { createLiveSearch, type LiveSearchController } from "@/lib/live-search";
 import { emailLocalPart } from "@/lib/sender";
+import { backfillToastOutcome, extractionToastOutcome } from "@/lib/task-toasts";
 
 import { LandingPage } from "@/components/landing/LandingPage";
 import { AgendaList } from "@/components/console/AgendaList";
@@ -2210,7 +2211,10 @@ export default function Console() {
     async (
       taskId: string,
       label: string,
-      summarize: (res: TaskResult) => string,
+      // A plain string is always a clean success; return { warn: true } to
+      // route through toast.warning instead when the result carries any LLM
+      // degradation (docs/plans/2026-08-14-llm-failure-visibility-plan.md).
+      summarize: (res: TaskResult) => string | { message: string; warn: boolean },
     ) => {
       const t = toast.loading(`${label} running…`);
       const final = await waitForTask(taskId, {
@@ -2228,7 +2232,10 @@ export default function Console() {
       if (!final.ready) {
         toast.message(`${label} still running — showing what's landed so far`, { id: t });
       } else {
-        toast.success(summarize(res ?? {}), { id: t });
+        const summary = summarize(res ?? {});
+        const { message, warn } =
+          typeof summary === "string" ? { message: summary, warn: false } : summary;
+        (warn ? toast.warning : toast.success)(message, { id: t });
       }
       await refreshAll();
     },
@@ -2307,16 +2314,20 @@ export default function Console() {
         const r = await classifyBackfill(opts);
         if (r.status === "queued") {
           // Big batch went to the worker; wait it out like ingest does.
-          await trackTask(
-            r.task_id,
-            "backfill",
-            (res) =>
+          await trackTask(r.task_id, "backfill", (res) =>
+            backfillToastOutcome(
+              res,
               `backfill complete · ${res.created ?? 0} classified · ` +
-              `${res.scanned ?? 0} scanned`,
+                `${res.scanned ?? 0} scanned`,
+            ),
           );
           return;
         }
-        toast.success(`classified ${r.created} · scanned ${r.scanned}`);
+        const { message, warn } = backfillToastOutcome(
+          r,
+          `classified ${r.created} · scanned ${r.scanned}`,
+        );
+        (warn ? toast.warning : toast.success)(message);
         await refreshAll();
       } catch (e) {
         toast.error((e as Error).message ?? "backfill failed");
@@ -2332,11 +2343,7 @@ export default function Console() {
   const doBackfillActions = useCallback(async () => {
     try {
       const r = await backfillActions();
-      await trackTask(
-        r.task_id,
-        "extract actions",
-        (res) => `action extraction complete · ${res.processed ?? 0} processed`,
-      );
+      await trackTask(r.task_id, "extract actions", (res) => extractionToastOutcome(res));
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         toast.error("action extraction is disabled for this deployment");

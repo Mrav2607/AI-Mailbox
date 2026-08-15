@@ -47,7 +47,13 @@ _RESULT_BUCKETS = ("extracted", "no_action", "ineligible", "failed", "skipped")
 
 
 def _empty_counts() -> dict:
-    return {"processed": 0, **{bucket: 0 for bucket in _RESULT_BUCKETS}}
+    # failure_categories rides alongside the buckets rather than replacing
+    # `failed` -- it's a breakdown (plan: 2026-08-14-llm-failure-visibility),
+    # e.g. {"http_429": 8}, populated by run_extraction_sweep only; other
+    # callers of _empty_counts() (run_extraction_for_message, the disabled
+    # shape) legitimately leave it empty, same as an old result predating
+    # this field.
+    return {"processed": 0, **{bucket: 0 for bucket in _RESULT_BUCKETS}, "failure_categories": {}}
 
 
 def _disabled_result() -> dict:
@@ -116,6 +122,7 @@ def _claim_extract_record(
     force: bool = False,
     call_context: CallContext | None = None,
     acc: UsageAccumulator | None = None,
+    failure_categories: dict[str, int] | None = None,
 ) -> tuple[str, UUID | None]:
     """One claim -> extract -> record cycle for ``message_id``.
 
@@ -135,6 +142,13 @@ def _claim_extract_record(
     issued). ``acc`` mirrors this: the sweep's one shared accumulator when
     given, otherwise a fresh one built here once the user id is known --
     that single call is a run of one.
+
+    ``failure_categories`` is an out-param, not a return value: when given, a
+    call whose attempt actually failed (``attempt.failure_category`` set)
+    increments its bucket in place. Threading it through the return tuple
+    instead would mean every existing caller (and the many tests unpacking
+    ``bucket, user_id = ...``) has to change shape for a count only
+    ``run_extraction_sweep`` needs -- ``None`` (the default) just skips it.
     """
     message = db.get(MailMessage, message_id)
     if message is None:
@@ -194,6 +208,10 @@ def _claim_extract_record(
             credential=call_context.credential,
         )
         result = attempt.result
+        if failure_categories is not None and attempt.failure_category is not None:
+            failure_categories[attempt.failure_category] = (
+                failure_categories.get(attempt.failure_category, 0) + 1
+            )
 
         # Lock the classification row BEFORE reading its label and hold it
         # through the record commit: a concurrent reclassify-back upserts
@@ -473,7 +491,8 @@ def run_extraction_sweep(
         counts["processed"] += 1
         try:
             bucket, _user_id = _claim_extract_record(
-                db, message_id, force=force, call_context=call_context, acc=acc
+                db, message_id, force=force, call_context=call_context, acc=acc,
+                failure_categories=counts["failure_categories"],
             )
         except Exception:
             # _claim_extract_record already fences its OWN pre-claim/

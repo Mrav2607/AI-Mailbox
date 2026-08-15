@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from datetime import datetime, time as dtime, timezone
 
 from app.core.logging import logger
-from app.services.nlp.llm_client import LlmCallError, LlmCallResult, LlmUsage, call_chat_completion
+from app.services.nlp.llm_client import (
+    LlmCallError,
+    LlmCallResult,
+    LlmUsage,
+    call_chat_completion,
+    request_was_issued,
+)
 from app.services.nlp.providers import LlmCredential
 
 # Kept as an alias so existing importers of the old name (tests included)
@@ -80,11 +86,25 @@ class ExtractionAttempt:
     a perfectly good call. A response that comes back fine but fails to
     parse still has `provider_call_succeeded=True` and possibly `usage=None`:
     the user already paid for that call, so it must still be counted.
+
+    `llm_attempted` / `fallback_used` / `failure_category` are the failure-
+    visibility fields (plan: `docs/plans/2026-08-14-llm-failure-visibility-
+    plan.md`), the same contract as `ClassificationAttempt`. Extraction has
+    no encoder/heuristic fallback, so `fallback_used` is always False here.
+    `llm_attempted` is True for every real attempt EXCEPT a destination-
+    policy preflight rejection (`failure_category == "blocked_by_policy"`),
+    which rejects before any request leaves the process -- see
+    `llm_client.request_was_issued`. `failure_category` mirrors
+    `LlmCallError.category`, or is `"invalid_response"` for a malformed body
+    that isn't an `LlmCallError` at all.
     """
 
     result: ExtractedAction | NoAction | None
     provider_call_succeeded: bool
     usage: LlmUsage | None
+    llm_attempted: bool = False
+    fallback_used: bool = False
+    failure_category: str | None = None
 
 
 def _build_message_text(
@@ -289,7 +309,18 @@ def _extract_attempt(
         logger.warning(
             "Action extraction failed for provider %s: %s", credential.provider, exc.category
         )
-        return ExtractionAttempt(result=None, provider_call_succeeded=False, usage=None)
+        return ExtractionAttempt(
+            result=None,
+            provider_call_succeeded=False,
+            usage=None,
+            # A destination-policy rejection (blocked_by_policy) raises
+            # BEFORE the request ever leaves the process -- see
+            # llm_client.request_was_issued. Every other category implies a
+            # real request went out and failed.
+            llm_attempted=request_was_issued(exc.category),
+            fallback_used=False,
+            failure_category=exc.category,
+        )
 
     try:
         result = _parse_extraction(
@@ -300,9 +331,23 @@ def _extract_attempt(
             "Action extraction returned an unusable response for provider %s: %s",
             credential.provider, type(exc).__name__,
         )
-        return ExtractionAttempt(result=None, provider_call_succeeded=True, usage=call_result.usage)
+        return ExtractionAttempt(
+            result=None,
+            provider_call_succeeded=True,
+            usage=call_result.usage,
+            llm_attempted=True,
+            fallback_used=False,
+            failure_category="invalid_response",
+        )
 
-    return ExtractionAttempt(result=result, provider_call_succeeded=True, usage=call_result.usage)
+    return ExtractionAttempt(
+        result=result,
+        provider_call_succeeded=True,
+        usage=call_result.usage,
+        llm_attempted=True,
+        fallback_used=False,
+        failure_category=None,
+    )
 
 
 def extract_action(

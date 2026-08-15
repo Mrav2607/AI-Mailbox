@@ -127,6 +127,10 @@ def test_backfill_valid_params_pass_validation(client):
         "created": 0,
         "scanned": 0,
         "skipped_user_overrides": 0,
+        "llm_attempted": 0,
+        "llm_failed": 0,
+        "fell_back": 0,
+        "failure_categories": {},
     }
 
 

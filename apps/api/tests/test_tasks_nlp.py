@@ -33,6 +33,10 @@ def test_classify_latest_threads_delegates_to_the_shared_backfill(monkeypatch):
             "skipped_user_overrides": 1,
             "task_created": 2,
             "task_processed": 3,
+            "llm_attempted": 0,
+            "llm_failed": 0,
+            "fell_back": 0,
+            "failure_categories": {},
         }
 
     monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(MagicMock()))
@@ -51,7 +55,43 @@ def test_classify_latest_threads_delegates_to_the_shared_backfill(monkeypatch):
         "created": 2,
         "processed": 3,
         "skipped_user_overrides": 1,
+        "llm_attempted": 0,
+        "llm_failed": 0,
+        "fell_back": 0,
+        "failure_categories": {},
     }
+
+
+def test_classify_latest_threads_forwards_failure_visibility_counters(monkeypatch):
+    """Codex finding: this route rebuilds its result dict from a legacy key
+    subset, which used to silently drop run_backfill's failure-visibility
+    counters -- a queued LLM failure here would look like plain success on
+    the task-status endpoint. Non-zero values must survive the reshape."""
+    user_id = uuid4()
+
+    def fake_run_backfill(db, uid, **kwargs):
+        return {
+            "status": "ok",
+            "created": 1,
+            "scanned": 5,
+            "skipped_user_overrides": 0,
+            "task_created": 1,
+            "task_processed": 5,
+            "llm_attempted": 4,
+            "llm_failed": 2,
+            "fell_back": 2,
+            "failure_categories": {"http_429": 2},
+        }
+
+    monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(MagicMock()))
+    monkeypatch.setattr(tasks_nlp, "run_backfill", fake_run_backfill)
+
+    result = tasks_nlp.classify_latest_threads.run(str(user_id), limit=25, force=True)
+
+    assert result["llm_attempted"] == 4
+    assert result["llm_failed"] == 2
+    assert result["fell_back"] == 2
+    assert result["failure_categories"] == {"http_429": 2}
 
 
 # ---------------------------------------------------------------------------
