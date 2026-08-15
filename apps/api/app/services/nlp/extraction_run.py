@@ -17,9 +17,11 @@ transaction (classification row locked, done_at re-read) commits the result.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
+from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -55,6 +57,16 @@ _RESULT_BUCKETS = ("extracted", "no_action", "ineligible", "failed", "skipped")
 # and the counter resets to zero on any non-"failed" bucket, so only a
 # genuine losing streak trips it. Each attempt this stop prevents can be a
 # real BYOK-billed call very likely to fail the same way as the last few.
+#
+# This streak is fed ONLY by a genuine LLM-result failure -- the "failed"
+# bucket _claim_extract_record returns itself, which always means an actual
+# extraction attempt reached (or tried to reach) a provider and came back
+# empty (see ExtractionAttempt's docstring: `result is None` iff the call or
+# its parse failed). It is deliberately NOT fed by a containment/DB failure
+# (run_extraction_sweep's own fan-out `except Exception` below) -- those
+# carry no failure_category and say nothing about the LLM provider's health,
+# so counting them here would misdiagnose a Postgres hiccup as "the user's
+# provider is rate-limited" (Codex review, phase 3 should-fix).
 _CONSECUTIVE_FAILURE_LIMIT = 3
 
 
@@ -125,6 +137,32 @@ def _fence_claim_to_failed(message_id: UUID, claim_token: UUID) -> None:
             .values(outcome="failed", claim_token=None)
         )
         fresh.commit()
+
+
+def _rollback_discard_and_fence(
+    db: Session, acc: UsageAccumulator, message_id: UUID, claim_token: UUID, exc: BaseException
+) -> None:
+    """Shared cleanup for every failure branch of `_claim_extract_record`'s
+    claim -> extract -> record try block, including `SoftTimeLimitExceeded`
+    -- roll back, discard the batched usage (a rolled-back batch must never
+    survive into the next flush, or it gets double-counted alongside
+    whatever this run records next), and fence the live claim to `failed`
+    so a retry's sweep can reclaim it rather than leaving it stuck pending
+    for the full `PENDING_LEASE`.
+
+    Raises (chained from the fencing failure) if the fence itself couldn't
+    commit -- `exc`, not the fencing exception, is what a caller must
+    propagate: the claim is stuck pending with no fence, and swallowing
+    THAT would look like success to Celery's autoretry and end the retry
+    chain on a row nothing will ever reclaim until the recovery tick's
+    lease expires.
+    """
+    db.rollback()
+    acc.discard()
+    try:
+        _fence_claim_to_failed(message_id, claim_token)
+    except Exception as fencing_exc:
+        raise exc from fencing_exc
 
 
 def _claim_extract_record(
@@ -306,21 +344,20 @@ def _claim_extract_record(
                 acc.discard()
         db.commit()
         acc.committed()
+    except SoftTimeLimitExceeded as exc:
+        # Celery's soft time limit is a plain Exception, so the generic
+        # `except Exception` below WOULD otherwise catch it -- and
+        # run_extraction_sweep's fan-out loop would then count it as an
+        # ordinary per-message failure and keep grinding toward the HARD
+        # kill instead of stopping cleanly (Codex review, phase 3 blocker).
+        # This must be caught and re-raised BEFORE the generic handler, so
+        # the claim still gets fenced exactly like any other mid-call
+        # failure (a live pending row must still become claimable-failed),
+        # but the signal itself propagates instead of being swallowed.
+        _rollback_discard_and_fence(db, acc, message.id, claim_token, exc)
+        raise
     except Exception as exc:
-        db.rollback()
-        # A rolled-back batch must never survive into the next flush --
-        # otherwise it gets double-counted alongside whatever this run
-        # records next.
-        acc.discard()
-        try:
-            _fence_claim_to_failed(message.id, claim_token)
-        except Exception as fencing_exc:
-            # The claim is stuck pending with no fence -- a task that
-            # swallowed this would look like success to Celery's autoretry
-            # and end the retry chain on a row nothing will ever reclaim
-            # until the recovery tick's lease expires. Propagate the
-            # ORIGINAL failure, not the fencing one.
-            raise exc from fencing_exc
+        _rollback_discard_and_fence(db, acc, message.id, claim_token, exc)
         return "failed", user_id
 
     if not recorded:
@@ -466,6 +503,7 @@ def run_extraction_sweep(
     force: bool = False,
     since_days: int = _DEFAULT_SINCE_DAYS,
     recovery: bool = False,
+    deadline: float | None = None,
 ) -> dict:
     """Claim -> extract -> record for up to ``limit`` of a user's candidate
     messages.
@@ -485,6 +523,22 @@ def run_extraction_sweep(
     alongside who pays for it) and one shared ``UsageAccumulator`` for the
     whole run then thread through every ``_claim_extract_record`` call this
     sweep makes.
+
+    ``deadline`` (plan: phase 3 of the LLM-failure work, Codex review
+    blocker) is an absolute ``time.monotonic()`` value, threaded from the
+    CALLER -- this function never guesses one, same "thread it, don't guess"
+    rule as ``RetryPolicy``. It exists because per-message retry budgets
+    alone don't bound a sweep where every call keeps SUCCEEDING: with
+    ``WORKER_RETRIES`` a single message can legitimately burn up to ~60s of
+    waits plus its call time, so a long sweep of all-successful candidates
+    can still run for a very long time even though nothing ever trips
+    ``_CONSECUTIVE_FAILURE_LIMIT``. Checked once per candidate, BEFORE
+    claiming it, so a candidate this stops never gets touched at all --
+    this is a proactive backstop, not a replacement for Celery's own soft
+    time limit (``SoftTimeLimitExceeded`` is still handled below, and fires
+    independently of this check). ``None`` (the default) means unbounded,
+    for callers that don't have (or don't need) a caller-side deadline,
+    e.g. the reclassify hook's single-message ``run_extraction_for_message``.
     """
     if not extraction_feature_enabled():
         return _disabled_result()
@@ -508,16 +562,38 @@ def run_extraction_sweep(
     counts = _empty_counts()
     # _CONSECUTIVE_FAILURE_LIMIT's early stop (plan: phase 3 of the
     # LLM-failure work, mirroring Phase 2's run_backfill treatment) -- reset
-    # on any bucket other than "failed", tripped after 3 in a row.
+    # on any bucket other than "failed", tripped after 3 in a row. Fed ONLY
+    # by _claim_extract_record's own "failed" return (a genuine LLM-result
+    # failure) -- see this module's _CONSECUTIVE_FAILURE_LIMIT comment for
+    # why a containment/DB failure (the `except Exception` branch below)
+    # must never touch this counter.
     consecutive_failures = 0
-    stopped_early = False
+    # Distinct from consecutive_failures: which early-stop tripped, if any,
+    # decides the reported status. "llm_unavailable" is a diagnosis about
+    # the provider and must only ever come from a genuine LLM failure
+    # streak; "timed_out" is a neutral, no-diagnosis stop for the deadline
+    # backstop and for Celery's own soft time limit (mirrors
+    # extraction_recovery_tick's existing status name for the same signal).
+    stop_reason: str | None = None
     for message_id in message_ids:
+        if deadline is not None and time.monotonic() >= deadline:
+            stop_reason = "timed_out"
+            break
         counts["processed"] += 1
         try:
             bucket, _user_id = _claim_extract_record(
                 db, message_id, force=force, call_context=call_context, acc=acc,
                 failure_categories=counts["failure_categories"],
             )
+        except SoftTimeLimitExceeded:
+            # Already fenced by _claim_extract_record -- propagate
+            # immediately (before the generic handler below, which would
+            # otherwise catch this plain-Exception subclass and count it as
+            # an ordinary per-message failure) so Celery's soft-limit
+            # handling gets a chance to run instead of grinding on toward
+            # the hard kill (Codex review, phase 3 blocker).
+            db.rollback()
+            raise
         except Exception:
             # _claim_extract_record already fences its OWN pre-claim/
             # containment failures to a `failed` row and re-raises only when
@@ -526,15 +602,22 @@ def run_extraction_sweep(
             # message must never abort the sweep for the rest. Roll back
             # first, or every later candidate this sweep would fail with
             # PendingRollbackError on the shared session.
+            #
+            # This is a CONTAINMENT failure -- a DB error, or anything
+            # _claim_extract_record itself couldn't recover from -- not an
+            # LLM result: it carries no failure_category and must NOT feed
+            # consecutive_failures/llm_unavailable below, or a single
+            # Postgres hiccup would misreport as "the user's LLM provider
+            # is rate-limited, try again later" (Codex review, phase 3
+            # should-fix).
             db.rollback()
             logger.exception(
                 "action extraction sweep failed for message %s", message_id
             )
-            bucket = "failed"
             counts["failed"] += 1
-        else:
-            counts[bucket] += 1
+            continue
 
+        counts[bucket] += 1
         if bucket == "failed":
             consecutive_failures += 1
             if consecutive_failures >= _CONSECUTIVE_FAILURE_LIMIT:
@@ -542,15 +625,17 @@ def run_extraction_sweep(
                 # way -- stop spending BYOK-billed attempts on it. The
                 # counts collected so far are still exactly right; the loop
                 # just never reaches the rest of message_ids.
-                stopped_early = True
+                stop_reason = "llm_unavailable"
                 break
         else:
             consecutive_failures = 0
     # Reporting "ok" for a run that quit early would be the same lie this
     # whole plan exists to remove: the counts would be truthful about what was
     # attempted and silent about the candidates never reached. Mirrors
-    # run_backfill's status so both jobs say "I stopped" the same way.
-    return {"status": "llm_unavailable" if stopped_early else "ok", **counts}
+    # run_backfill's status so both jobs say "I stopped" the same way --
+    # except run_backfill only ever has one reason to stop early; this has
+    # two, and they are NOT interchangeable (see stop_reason's own comment).
+    return {"status": stop_reason or "ok", **counts}
 
 
 def users_with_claimable_action_items(db: Session) -> list[UUID]:

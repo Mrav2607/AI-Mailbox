@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -34,6 +35,26 @@ _RECOVERY_SWEEP_LIMIT = 25
 # needs both Augusts still on the table. Don't "tidy" this down to 90; that
 # would quietly break year-over-year usage comparisons (plan §8).
 _USAGE_RETENTION = timedelta(days=400)
+
+# extract_actions_for_user's own soft time limit (the decorator below) --
+# named so the deadline handed to run_extraction_sweep can be computed FROM
+# it instead of duplicating the same number as an independent magic constant
+# that could silently drift out of sync with the decorator.
+_EXTRACT_ACTIONS_SOFT_TIME_LIMIT_S = 1740.0
+# Margin under that soft limit for run_extraction_sweep's own deadline check
+# to trip BEFORE Celery's signal does (plan: phase 3 of the LLM-failure
+# work, Codex review blocker: per-message retry budgets alone don't bound a
+# sweep where every call keeps succeeding) -- gives the task time to finish
+# its current commit and return a clean partial result instead of racing an
+# asynchronously-delivered SoftTimeLimitExceeded that could land mid-write.
+_SWEEP_DEADLINE_MARGIN_S = 120.0
+
+# extraction_recovery_tick's own soft time limit and margin -- much smaller
+# than the dedicated sweep task's, since a tick shares its whole budget
+# across TWO sweep passes (row-driven and message-driven) plus its own
+# candidate-selection queries.
+_RECOVERY_TICK_SOFT_TIME_LIMIT_S = 270.0
+_RECOVERY_TICK_DEADLINE_MARGIN_S = 20.0
 
 
 @celery_app.task
@@ -219,7 +240,7 @@ def extract_action_for_message(message_id: str) -> dict:
     max_retries=3,
     retry_backoff=True,
     time_limit=1800,
-    soft_time_limit=1740,
+    soft_time_limit=_EXTRACT_ACTIONS_SOFT_TIME_LIMIT_S,
 )
 def extract_actions_for_user(
     user_id: str, limit: int = 100, force: bool = False, since_days: int = 30
@@ -227,13 +248,24 @@ def extract_actions_for_user(
     """Run an action-extraction sweep off the request path -- the backfill
     route enqueues us, and the ingest hook fires us after mail lands."""
     with SessionLocal() as db:
+        # deadline: a proactive backstop against a sweep that keeps
+        # succeeding (see run_extraction_sweep's own docstring) -- computed
+        # from this task's own soft time limit, not a guess, so it can never
+        # fire LATER than Celery's own signal would.
         result = run_extraction_sweep(
-            db, UUID(user_id), limit=limit, force=force, since_days=since_days
+            db,
+            UUID(user_id),
+            limit=limit,
+            force=force,
+            since_days=since_days,
+            deadline=time.monotonic()
+            + _EXTRACT_ACTIONS_SOFT_TIME_LIMIT_S
+            - _SWEEP_DEADLINE_MARGIN_S,
         )
     return {"user_id": user_id, **result}
 
 
-@celery_app.task(ignore_result=True, time_limit=300, soft_time_limit=270)
+@celery_app.task(ignore_result=True, time_limit=300, soft_time_limit=_RECOVERY_TICK_SOFT_TIME_LIMIT_S)
 def extraction_recovery_tick() -> dict:
     """Beat-scheduled safety net (every 900s -- celery_app.py) so retryable
     rows don't depend on new mail arriving to get swept: a quiet sync, a
@@ -273,6 +305,14 @@ def extraction_recovery_tick() -> dict:
     if not extraction_feature_enabled():
         return {"status": "disabled"}
 
+    # One deadline for the WHOLE tick (both passes below), not one per
+    # run_extraction_sweep call -- a per-call deadline would let the
+    # row-driven pass alone use the tick's entire budget and leave nothing
+    # for the message-driven pass. Computed from this task's own soft time
+    # limit, same "thread it, don't guess" reasoning as
+    # extract_actions_for_user's deadline above.
+    deadline = time.monotonic() + _RECOVERY_TICK_SOFT_TIME_LIMIT_S - _RECOVERY_TICK_DEADLINE_MARGIN_S
+
     row_driven_swept = 0
     message_driven_swept = 0
     try:
@@ -283,7 +323,7 @@ def extraction_recovery_tick() -> dict:
             for user_id in row_driven_users:
                 try:
                     run_extraction_sweep(
-                        db, user_id, limit=_RECOVERY_SWEEP_LIMIT, recovery=True
+                        db, user_id, limit=_RECOVERY_SWEEP_LIMIT, recovery=True, deadline=deadline
                     )
                 except SoftTimeLimitExceeded:
                     raise
@@ -300,7 +340,9 @@ def extraction_recovery_tick() -> dict:
             message_driven_users = users_with_unclaimed_actionable_messages(db)
             for user_id in message_driven_users:
                 try:
-                    run_extraction_sweep(db, user_id, limit=_RECOVERY_SWEEP_LIMIT)
+                    run_extraction_sweep(
+                        db, user_id, limit=_RECOVERY_SWEEP_LIMIT, deadline=deadline
+                    )
                 except SoftTimeLimitExceeded:
                     raise
                 except Exception:
