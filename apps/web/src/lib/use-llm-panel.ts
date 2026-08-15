@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ApiError } from "@/lib/api";
-import type { SettingsTab } from "@/components/console/SettingsDialog";
 import type {
   ClassifierMixEntry,
   LlmProvider,
   LlmSettings,
   LlmTestResult,
   LlmUsage,
+  SettingsTab,
 } from "@/lib/types";
 
 // Mirrors the real api module's signatures for the six LLM endpoints this

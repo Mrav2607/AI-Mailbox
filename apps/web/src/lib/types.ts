@@ -256,6 +256,10 @@ export interface Connection {
   label_sync_drift: number | null;
 }
 
+// Which settings-dialog tab is active. Lives here (not in the component) so
+// lib code like use-llm-panel can name it without importing from components.
+export type SettingsTab = "accounts" | "ai" | "usage";
+
 export interface Overview {
   summary: { threads: number; messages: number; classified: number };
 }

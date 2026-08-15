@@ -7,9 +7,11 @@ import { LlmSettingsSection, type LlmSettingsSectionProps } from "./LlmSettings"
 import { LlmUsageSection, type LlmUsageSectionProps } from "./LlmUsageCard";
 import { cn } from "@/lib/utils";
 import type { AccountSyncHealth, SyncHealth } from "@/lib/api";
-import type { Connection } from "@/lib/types";
+import type { Connection, SettingsTab } from "@/lib/types";
 
-export type SettingsTab = "accounts" | "ai" | "usage";
+// Canonical definition lives in lib/types so lib code (use-llm-panel) never
+// has to import from components; re-exported here for the dialog's consumers.
+export type { SettingsTab } from "@/lib/types";
 
 const TABS: { key: SettingsTab; label: string }[] = [
   { key: "accounts", label: "accounts" },
