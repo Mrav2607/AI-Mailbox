@@ -1,4 +1,5 @@
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { fieldLabel } from "@/lib/ui";
 import type { LlmUsage, LlmUsageByProvider, LlmUsageByStage } from "@/lib/types";
 import {
   chartMax,
@@ -9,9 +10,7 @@ import {
   USAGE_DASHBOARD_URLS,
 } from "@/lib/usage";
 
-interface Props {
-  open: boolean;
-  onOpenChange: (v: boolean) => void;
+export interface LlmUsageSectionProps {
   // Same tri-state contract as LlmSettings' usage prop: null while a fetch is
   // in flight (or hasn't started), a real payload once one lands, and
   // `usageError` set on a failed fetch -- an outage here must never look
@@ -22,9 +21,12 @@ interface Props {
   onDaysChange: (days: number) => void;
 }
 
-const RANGE_CHOICES = [7, 30, 90] as const;
+interface Props extends LlmUsageSectionProps {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+}
 
-const fieldLabel = "font-mono text-[11px] text-muted-foreground";
+const RANGE_CHOICES = [7, 30, 90] as const;
 
 // Cycles through varying opacities of the single amber accent, plus a muted
 // tone for whatever's left over -- there's one accent color in this UI, so
@@ -171,9 +173,137 @@ function StatTile({ value, caption }: { value: string; caption: string }) {
   );
 }
 
-export function LlmUsageCard({ open, onOpenChange, usage, usageError, days, onDaysChange }: Props) {
+/**
+ * The AI usage content -- range picker, stat tiles, daily chart, and the
+ * pipeline/provider split bars. Extracted from the standalone `LlmUsageCard`
+ * dialog so the settings dialog's `usage` tab can render the exact same
+ * content without a nested dialog (settings-card plan §3.2). Stateless: every
+ * render state derives straight from props, so there's no hydration lifecycle
+ * to worry about here (unlike the AI settings form).
+ */
+export function LlmUsageSection({ usage, usageError, days, onDaysChange }: LlmUsageSectionProps) {
   const summary = usage ? summarizeUsage(usage) : null;
 
+  return (
+    <div className="space-y-3">
+      <p className="text-[11px] font-mono text-muted-foreground leading-relaxed">
+        Your account&apos;s background AI usage, tracked across whatever key
+        or provider was configured at the time.
+      </p>
+
+      <div className="flex items-center gap-1" role="group" aria-label="usage window">
+        {RANGE_CHOICES.map((d) => (
+          <button
+            key={d}
+            type="button"
+            aria-pressed={days === d}
+            onClick={() => onDaysChange(d)}
+            className={[
+              "h-6 px-2.5 rounded border text-[11px] font-mono cursor-pointer transition-colors",
+              // Solid fill for the active range, not a tint: at 15% opacity
+              // the selected button was indistinguishable from a merely
+              // focused one, so the card looked like it was showing 7 days
+              // while actually showing 30.
+              days === d
+                ? "border-primary bg-primary text-primary-foreground font-medium"
+                : "border-border bg-[var(--color-panel-hi)] text-muted-foreground hover:text-foreground",
+            ].join(" ")}
+          >
+            {d}d
+          </button>
+        ))}
+      </div>
+
+      {usageError ? (
+        <p className="text-[11px] font-mono text-muted-foreground leading-snug py-6 text-center">
+          Usage isn&apos;t available right now.
+        </p>
+      ) : !usage ? (
+        <p className="text-[11px] font-mono text-muted-foreground leading-snug py-6 text-center">
+          checking your usage…
+        </p>
+      ) : usage.totals.calls === 0 ? (
+        <p className="text-[11px] font-mono text-muted-foreground leading-snug py-6 text-center">
+          Your key hasn&apos;t been used yet.
+        </p>
+      ) : (
+        <div className="space-y-3">
+          <div className="flex flex-wrap gap-2">
+            <StatTile value={usage.totals.calls.toLocaleString()} caption="total calls" />
+            <StatTile
+              value={usage.totals.total_tokens.toLocaleString()}
+              caption="total tokens"
+            />
+            <StatTile
+              value={String(summary?.activeDays ?? 0)}
+              caption={`active day${summary?.activeDays === 1 ? "" : "s"}`}
+            />
+            <StatTile
+              value={
+                summary?.busiestDay
+                  ? `${summary.busiestDay.calls.toLocaleString()} · ${formatDayLabel(summary.busiestDay.date)}`
+                  : "—"
+              }
+              caption="busiest day"
+            />
+          </div>
+
+          <DailyBarChart usage={usage} />
+
+          <SplitBar
+            title="by pipeline"
+            entries={usage.by_stage.map((s: LlmUsageByStage) => ({
+              label: STAGE_LABELS[s.stage] ?? s.stage,
+              calls: s.calls,
+            }))}
+          />
+          <SplitBar
+            title="by provider"
+            entries={usage.by_provider.map((p: LlmUsageByProvider) => ({
+              label: PROVIDER_LABELS[p.provider] ?? p.provider,
+              calls: p.calls,
+            }))}
+          />
+
+          {usage.totals.calls_with_total_tokens < usage.totals.calls && (
+            <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+              {usage.totals.calls_with_total_tokens.toLocaleString()} of{" "}
+              {usage.totals.calls.toLocaleString()} calls reported token counts —
+              the rest succeeded but the provider didn&apos;t report a number.
+            </p>
+          )}
+
+          {/* Linked per provider that actually ran in the window, not the one
+              configured right now -- after a provider switch those differ,
+              and pointing at today's dashboard for last month's calls sends
+              people somewhere the money isn't. */}
+          <div className="flex flex-col gap-0.5 pt-1 border-t border-border/60">
+            {usage.by_provider
+              .filter((p) => USAGE_DASHBOARD_URLS[p.provider])
+              .map((p) => (
+                <a
+                  key={p.provider}
+                  href={USAGE_DASHBOARD_URLS[p.provider]}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[10.5px] font-mono text-primary underline underline-offset-2"
+                >
+                  See what this actually cost on{" "}
+                  {PROVIDER_LABELS[p.provider] ?? p.provider}
+                </a>
+              ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Thin `Dialog` wrapper around `LlmUsageSection`, kept for the entry points
+ * that still open a standalone modal.
+ */
+export function LlmUsageCard({ open, onOpenChange, usage, usageError, days, onDaysChange }: Props) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       {/* This card is read-only, so don't hand focus to the first control on
@@ -187,116 +317,9 @@ export function LlmUsageCard({ open, onOpenChange, usage, usageError, days, onDa
         <DialogTitle className="font-mono text-[11px] tracking-wide text-muted-foreground mb-0.5 font-normal">
           AI usage
         </DialogTitle>
-        <p className="text-[11px] font-mono text-muted-foreground leading-relaxed">
-          Your account&apos;s background AI usage, tracked across whatever key
-          or provider was configured at the time.
-        </p>
-
-        <div className="flex items-center gap-1" role="group" aria-label="usage window">
-          {RANGE_CHOICES.map((d) => (
-            <button
-              key={d}
-              type="button"
-              aria-pressed={days === d}
-              onClick={() => onDaysChange(d)}
-              className={[
-                "h-6 px-2.5 rounded border text-[11px] font-mono cursor-pointer transition-colors",
-                // Solid fill for the active range, not a tint: at 15% opacity
-                // the selected button was indistinguishable from a merely
-                // focused one, so the card looked like it was showing 7 days
-                // while actually showing 30.
-                days === d
-                  ? "border-primary bg-primary text-primary-foreground font-medium"
-                  : "border-border bg-[var(--color-panel-hi)] text-muted-foreground hover:text-foreground",
-              ].join(" ")}
-            >
-              {d}d
-            </button>
-          ))}
-        </div>
-
-        {usageError ? (
-          <p className="text-[11px] font-mono text-muted-foreground leading-snug py-6 text-center">
-            Usage isn&apos;t available right now.
-          </p>
-        ) : !usage ? (
-          <p className="text-[11px] font-mono text-muted-foreground leading-snug py-6 text-center">
-            checking your usage…
-          </p>
-        ) : usage.totals.calls === 0 ? (
-          <p className="text-[11px] font-mono text-muted-foreground leading-snug py-6 text-center">
-            Your key hasn&apos;t been used yet.
-          </p>
-        ) : (
-          <div className="space-y-3">
-            <div className="flex flex-wrap gap-2">
-              <StatTile value={usage.totals.calls.toLocaleString()} caption="total calls" />
-              <StatTile
-                value={usage.totals.total_tokens.toLocaleString()}
-                caption="total tokens"
-              />
-              <StatTile
-                value={String(summary?.activeDays ?? 0)}
-                caption={`active day${summary?.activeDays === 1 ? "" : "s"}`}
-              />
-              <StatTile
-                value={
-                  summary?.busiestDay
-                    ? `${summary.busiestDay.calls.toLocaleString()} · ${formatDayLabel(summary.busiestDay.date)}`
-                    : "—"
-                }
-                caption="busiest day"
-              />
-            </div>
-
-            <DailyBarChart usage={usage} />
-
-            <SplitBar
-              title="by pipeline"
-              entries={usage.by_stage.map((s: LlmUsageByStage) => ({
-                label: STAGE_LABELS[s.stage] ?? s.stage,
-                calls: s.calls,
-              }))}
-            />
-            <SplitBar
-              title="by provider"
-              entries={usage.by_provider.map((p: LlmUsageByProvider) => ({
-                label: PROVIDER_LABELS[p.provider] ?? p.provider,
-                calls: p.calls,
-              }))}
-            />
-
-            {usage.totals.calls_with_total_tokens < usage.totals.calls && (
-              <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-                {usage.totals.calls_with_total_tokens.toLocaleString()} of{" "}
-                {usage.totals.calls.toLocaleString()} calls reported token counts —
-                the rest succeeded but the provider didn&apos;t report a number.
-              </p>
-            )}
-
-            {/* Linked per provider that actually ran in the window, not the one
-                configured right now -- after a provider switch those differ,
-                and pointing at today's dashboard for last month's calls sends
-                people somewhere the money isn't. */}
-            <div className="flex flex-col gap-0.5 pt-1 border-t border-border/60">
-              {usage.by_provider
-                .filter((p) => USAGE_DASHBOARD_URLS[p.provider])
-                .map((p) => (
-                  <a
-                    key={p.provider}
-                    href={USAGE_DASHBOARD_URLS[p.provider]}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-[10.5px] font-mono text-primary underline underline-offset-2"
-                  >
-                    See what this actually cost on{" "}
-                    {PROVIDER_LABELS[p.provider] ?? p.provider}
-                  </a>
-                ))}
-            </div>
-          </div>
-        )}
+        <LlmUsageSection usage={usage} usageError={usageError} days={days} onDaysChange={onDaysChange} />
       </DialogContent>
     </Dialog>
   );
 }
+
