@@ -217,6 +217,16 @@ def run_backfill(
     pending: list[tuple[UUID, str | None, float | None, str | None, str | None]] = []
     usage_pending = False
 
+    # Failure-visibility counters (plan: 2026-08-14-llm-failure-visibility) --
+    # read straight off ClassificationAttempt's explicit facts, never derived
+    # from routing.mode or provider_call_succeeded (see that dataclass's
+    # docstring for why deriving is wrong: a CLASSIFIER_BACKEND=local run
+    # never touches an LLM at all, so it must report fell_back=0).
+    llm_attempted = 0
+    llm_failed = 0
+    fell_back = 0
+    failure_categories: dict[str, int] = {}
+
     def flush_pending() -> None:
         nonlocal created, task_created, skipped_user_overrides, usage_pending
         for message_id, label, confidence, rationale, model_version in pending:
@@ -269,6 +279,15 @@ def run_backfill(
             text_for_classification, backend=backend, routing=routing
         )
         label, confidence, rationale, model_version = attempt.verdict
+        if attempt.llm_attempted:
+            llm_attempted += 1
+        if attempt.fallback_used:
+            llm_failed += 1
+            fell_back += 1
+            if attempt.failure_category:
+                failure_categories[attempt.failure_category] = (
+                    failure_categories.get(attempt.failure_category, 0) + 1
+                )
         # `routing.credential` should always be set when mode is "user"
         # (classifier.py's `_classify_llm` degrades to the heuristic if that
         # invariant ever breaks) -- but guard it here too, same as the ingest
@@ -293,6 +312,10 @@ def run_backfill(
         "created": created,
         "scanned": scanned,
         "skipped_user_overrides": skipped_user_overrides,
+        "llm_attempted": llm_attempted,
+        "llm_failed": llm_failed,
+        "fell_back": fell_back,
+        "failure_categories": failure_categories,
     }
     if include_task_counts:
         result["task_created"] = task_created

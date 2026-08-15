@@ -379,6 +379,11 @@ def test_large_backfill_queues_task_and_returns_202(client, fake_backfill_delay)
 def test_small_backfill_runs_inline(client, fake_backfill_delay):
     # At or under the inline cap nothing is enqueued; the route classifies in
     # the request and reports counts (zero against the empty-result DB stub).
+    # This also exercises `BackfillDone` for real: `Response` sets
+    # extra="forbid" (schemas/common.py), so if run_backfill's new
+    # llm_attempted/llm_failed/fell_back/failure_categories keys weren't
+    # declared on the schema, FastAPI would 500 here instead of returning 200
+    # (plan: 2026-08-14-llm-failure-visibility, C1).
     resp = client.post("/api/v1/mail/classify/backfill?limit=50")
     assert resp.status_code == 200
     assert resp.json() == {
@@ -386,6 +391,10 @@ def test_small_backfill_runs_inline(client, fake_backfill_delay):
         "created": 0,
         "scanned": 0,
         "skipped_user_overrides": 0,
+        "llm_attempted": 0,
+        "llm_failed": 0,
+        "fell_back": 0,
+        "failure_categories": {},
     }
     fake_backfill_delay.assert_not_called()
 

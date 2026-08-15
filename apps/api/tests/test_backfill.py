@@ -25,7 +25,7 @@ from app.db.models import MailMessage
 from app.services.nlp import backfill
 from app.services.nlp import classifier as classifier_module
 from app.services.nlp.classifier import ClassificationAttempt
-from app.services.nlp.llm_client import LlmUsage
+from app.services.nlp.llm_client import LlmCallError, LlmUsage
 from app.services.nlp.persistence import OPERATOR_MODEL_VERSION
 from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
@@ -292,6 +292,88 @@ def test_run_backfill_custom_opt_in_credential_routes_off_with_no_server_call(mo
     result = backfill.run_backfill(db, user_id, limit=10, backend="llm")
 
     assert result["created"] == 1
+
+
+# ---------------------------------------------------------------------------
+# run_backfill: failure-visibility counters (plan: 2026-08-14-llm-failure-
+# visibility) -- llm_attempted/llm_failed/fell_back/failure_categories, read
+# straight off ClassificationAttempt's explicit facts. classify_with_usage is
+# deliberately NOT mocked in these two tests -- driving the real classifier
+# dispatch is the whole point: a fake attempt object could assert whatever
+# the test wants regardless of whether the real code actually sets it right.
+# ---------------------------------------------------------------------------
+
+
+def test_run_backfill_local_backend_reports_zero_llm_attempted_and_fell_back(monkeypatch):
+    """The predicate trap the plan calls out by name (first test to write):
+    a CLASSIFIER_BACKEND=local backfill must report fell_back=0 AND
+    llm_attempted=0 -- a naive implementation gating on routing.mode=="user"
+    would report this as 100% degraded even though no LLM was ever consulted."""
+    from app.services.nlp import local_model
+
+    monkeypatch.setattr(classifier_module.settings, "classifier_backend", "local")
+    monkeypatch.setattr(
+        local_model, "try_predict",
+        lambda text: ("fyi", 0.5, "local rationale", "local:test"),
+    )
+
+    user_id = uuid4()
+    db = _single_message_db()
+    # mode="server" (not "user") so the opt-in-goes-first-to-the-key branch
+    # never triggers -- this pins the encoder-serves-directly path.
+    routing = ClassificationRouting(mode="server", credential=None)
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
+
+    result = backfill.run_backfill(db, user_id, limit=10)
+
+    assert result["created"] == 1
+    assert result["llm_attempted"] == 0
+    assert result["llm_failed"] == 0
+    assert result["fell_back"] == 0
+    assert result["failure_categories"] == {}
+
+
+def test_run_backfill_llm_failure_falls_back_to_encoder_with_provenance_marker(monkeypatch):
+    """fell_back=1 in the aggregate AND the persisted row's model_version
+    carries the +fallback marker -- the exact silent-degrade case from the
+    plan's report (an LLM failure served by the encoder was byte-identical
+    to a healthy local-backend run, with no trace anywhere)."""
+    from app.services.nlp import local_model
+
+    monkeypatch.setattr(
+        local_model, "try_predict",
+        lambda text: ("fyi", 0.6, "local rationale", "local:test"),
+    )
+
+    def failing_call(*args, **kwargs):
+        raise LlmCallError("connection_failed", None)
+
+    monkeypatch.setattr(classifier_module, "call_chat_completion", failing_call)
+
+    user_id = uuid4()
+    db = _single_message_db()
+    routing = ClassificationRouting(mode="user", credential=_CRED)
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+
+    upserted_model_versions = []
+
+    def fake_upsert(db_arg, *, message_id, label, confidence, rationale, model_version):
+        upserted_model_versions.append(model_version)
+        return "written"
+
+    monkeypatch.setattr(backfill, "upsert_classification", fake_upsert)
+
+    # backend="llm" skips the local-first dispatch order so the encoder is
+    # reached only through the failure fallback, not the normal auto/local
+    # precedence -- isolating the case under test.
+    result = backfill.run_backfill(db, user_id, limit=10, backend="llm")
+
+    assert result["llm_attempted"] == 1
+    assert result["llm_failed"] == 1
+    assert result["fell_back"] == 1
+    assert result["failure_categories"] == {"connection_failed": 1}
+    assert upserted_model_versions == ["local:test+fallback"]
 
 
 # ---------------------------------------------------------------------------

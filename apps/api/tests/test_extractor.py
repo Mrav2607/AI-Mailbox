@@ -239,12 +239,20 @@ def test_extract_action_with_usage_success_carries_usage_and_marks_call_succeede
     assert isinstance(attempt.result, ExtractedAction)
     assert attempt.provider_call_succeeded is True
     assert attempt.usage == usage
+    # A successful extraction still issued a real request -- llm_attempted is
+    # always True for extraction (unlike classification, there's no encoder/
+    # heuristic path that skips the call entirely) -- but nothing failed.
+    assert attempt.llm_attempted is True
+    assert attempt.fallback_used is False
+    assert attempt.failure_category is None
 
 
 def test_extract_action_with_usage_parse_failure_after_wire_success_still_counts_the_call(monkeypatch):
     """A response that comes back over the wire fine but fails to parse still
     means the provider was reached (and, for BYOK, billed) -- it must count
-    as a real call even though there's no usable result."""
+    as a real call even though there's no usable result. It's also a failure
+    for reporting purposes, categorized invalid_response even though it never
+    raised an ExtractionCallError (plan: 2026-08-14-llm-failure-visibility)."""
     usage = LlmUsage(prompt_tokens=50, completion_tokens=None, total_tokens=None)
     monkeypatch.setattr(
         extractor, "call_chat_completion", _stub_returns("not json at all", usage=usage)
@@ -253,6 +261,9 @@ def test_extract_action_with_usage_parse_failure_after_wire_success_still_counts
     assert attempt.result is None
     assert attempt.provider_call_succeeded is True
     assert attempt.usage == usage
+    assert attempt.llm_attempted is True
+    assert attempt.fallback_used is False
+    assert attempt.failure_category == "invalid_response"
 
 
 def test_extract_action_with_usage_wire_failure_does_not_count_the_call(monkeypatch):
@@ -261,6 +272,27 @@ def test_extract_action_with_usage_wire_failure_does_not_count_the_call(monkeypa
     assert attempt.result is None
     assert attempt.provider_call_succeeded is False
     assert attempt.usage is None
+    # The wire call itself was still attempted and failed -- llm_attempted is
+    # True even though provider_call_succeeded (a different fact: did the
+    # request come back at all) is False.
+    assert attempt.llm_attempted is True
+    assert attempt.fallback_used is False
+    assert attempt.failure_category == "connection_failed"
+
+
+@pytest.mark.parametrize(
+    "category,status",
+    [("http_429", 429), ("timed_out", None), ("blocked_by_policy", None)],
+)
+def test_extract_action_with_usage_carries_llm_call_error_category_through(monkeypatch, category, status):
+    """Every ExtractionCallError category the wire call can raise (llm_client.py)
+    must survive onto ExtractionAttempt.failure_category, not just
+    connection_failed -- this is the count the extraction sweep's http_429
+    reporting depends on."""
+    monkeypatch.setattr(extractor, "call_chat_completion", _stub_raises(category, status))
+    attempt = extract_action_with_usage(**_default_kwargs())
+    assert attempt.result is None
+    assert attempt.failure_category == category
 
 
 def test_extract_action_with_usage_no_action_result_still_carries_call_succeeded(monkeypatch):
@@ -273,6 +305,9 @@ def test_extract_action_with_usage_no_action_result_still_carries_call_succeeded
     assert isinstance(attempt.result, NoAction)
     assert attempt.provider_call_succeeded is True
     assert attempt.usage == usage
+    assert attempt.llm_attempted is True
+    assert attempt.fallback_used is False
+    assert attempt.failure_category is None
 
 
 # ---------------------------------------------------------------------------

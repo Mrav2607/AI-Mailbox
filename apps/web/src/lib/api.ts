@@ -682,6 +682,17 @@ export interface TaskResult {
   // User-override rows a backfill/classify run left untouched (write-time
   // guard protecting operator corrections from being reclassified).
   skipped_user_overrides?: number;
+  // LLM failure visibility (docs/plans/2026-08-14-llm-failure-visibility-plan.md).
+  // Backfill reports llm_attempted/llm_failed/fell_back; the action-extraction
+  // sweep reports extracted/failed. failure_categories is shared by both, e.g.
+  // {"http_429": 38}. Always present on a current API (0 / {} when nothing
+  // applies) but optional here so an older API response still parses.
+  llm_attempted?: number;
+  llm_failed?: number;
+  fell_back?: number;
+  extracted?: number;
+  failed?: number;
+  failure_categories?: Record<string, number>;
 }
 
 export interface SyncRunStatus {

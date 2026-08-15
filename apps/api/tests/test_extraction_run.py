@@ -54,11 +54,18 @@ _CTX = CallContext(credential=_CRED, payer="operator")
 _USER_CTX = CallContext(credential=_CRED, payer="user")
 
 
-def _extraction_attempt(result, *, provider_call_succeeded=True, usage=None):
+def _extraction_attempt(
+    result, *, provider_call_succeeded=True, usage=None,
+    llm_attempted=True, fallback_used=False, failure_category=None,
+):
     """Build the ExtractionAttempt extract_action_with_usage's fakes return --
-    a thin helper so every test doesn't hand-roll the same three fields."""
+    a thin helper so every test doesn't hand-roll the same six fields.
+    Defaults describe a normal successful attempt (extraction always issues a
+    real request -- llm_attempted defaults True, unlike ClassificationAttempt);
+    failure-visibility tests override failure_category/result explicitly."""
     return ExtractionAttempt(
-        result=result, provider_call_succeeded=provider_call_succeeded, usage=usage
+        result=result, provider_call_succeeded=provider_call_succeeded, usage=usage,
+        llm_attempted=llm_attempted, fallback_used=fallback_used, failure_category=failure_category,
     )
 
 
@@ -739,6 +746,75 @@ def test_claim_extract_record_outcome_buckets(monkeypatch, label, result, expect
     assert user_id == thread.user_id
 
 
+def test_claim_extract_record_failure_categories_out_param_records_attempt_category(monkeypatch):
+    """failure_categories is an out-param, not part of the return tuple (so
+    every existing `bucket, user_id = ...` caller keeps working unchanged) --
+    a failed attempt increments its own category in the dict passed in."""
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(
+        message=message, thread=thread,
+        classification=_make_classification(), done_at_reads=[None],
+    )
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+    monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage",
+        lambda **k: _extraction_attempt(None, provider_call_succeeded=False, failure_category="http_429"),
+    )
+
+    categories: dict[str, int] = {}
+    bucket, _ = extraction_run._claim_extract_record(
+        session, message.id, call_context=_CTX, failure_categories=categories
+    )
+
+    assert bucket == "failed"
+    assert categories == {"http_429": 1}
+
+
+def test_claim_extract_record_failure_categories_none_is_a_silent_no_op(monkeypatch):
+    # The default -- run_extraction_for_message never passes this -- must not
+    # blow up on a failed attempt just because nobody wants the breakdown.
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(
+        message=message, thread=thread,
+        classification=_make_classification(), done_at_reads=[None],
+    )
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+    monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage",
+        lambda **k: _extraction_attempt(None, provider_call_succeeded=False, failure_category="http_429"),
+    )
+
+    bucket, _ = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+
+    assert bucket == "failed"
+
+
+def test_claim_extract_record_success_never_touches_failure_categories(monkeypatch):
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(
+        message=message, thread=thread,
+        classification=_make_classification(), done_at_reads=[None],
+    )
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+    monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage", lambda **k: _extraction_attempt(NoAction())
+    )
+
+    categories: dict[str, int] = {}
+    bucket, _ = extraction_run._claim_extract_record(
+        session, message.id, call_context=_CTX, failure_categories=categories
+    )
+
+    assert bucket == "no_action"
+    assert categories == {}
+
+
 def test_claim_extract_record_force_forwarded_to_claim(monkeypatch):
     message = _make_message()
     thread = _make_thread(id=message.thread_id)
@@ -1131,7 +1207,9 @@ def test_run_extraction_sweep_counts_a_bucket_per_message(monkeypatch):
     buckets = iter(["extracted", "no_action", "failed"])
     monkeypatch.setattr(
         extraction_run, "_claim_extract_record",
-        lambda db, mid, force=False, call_context=None, acc=None: (next(buckets), uuid4()),
+        lambda db, mid, force=False, call_context=None, acc=None, failure_categories=None: (
+            next(buckets), uuid4()
+        ),
     )
 
     result = extraction_run.run_extraction_sweep(MagicMock(), uuid4())
@@ -1140,6 +1218,48 @@ def test_run_extraction_sweep_counts_a_bucket_per_message(monkeypatch):
     assert result["extracted"] == 1
     assert result["no_action"] == 1
     assert result["failed"] == 1
+
+
+def test_run_extraction_sweep_rate_limited_llm_reports_failed_not_processed_as_success(monkeypatch):
+    """The exact bug report (plan: 2026-08-14-llm-failure-visibility): a
+    sweep hitting LlmCallError("http_429", ...) on every message must report
+    failed=N, extracted=0, and a failure_categories breakdown -- not the old
+    "N processed" that hid a fully rate-limited run. Drives the REAL
+    _claim_extract_record (only extract_action_with_usage is mocked), so this
+    exercises the actual failure_categories wiring, not a re-statement of it."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4(), uuid4(), uuid4()]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+    monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
+    monkeypatch.setattr(
+        extraction_run, "extract_action_with_usage",
+        lambda **k: _extraction_attempt(
+            None, provider_call_succeeded=False, failure_category="http_429"
+        ),
+    )
+
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    # All three candidates route through the same fake message/thread --
+    # _FakeSession.get() ignores the pk it's asked for, so this is enough to
+    # drive _claim_extract_record's real control flow three times over.
+    session = _FakeSession(
+        message=message, thread=thread,
+        classification=_make_classification(), done_at_reads=[None, None, None],
+    )
+
+    result = extraction_run.run_extraction_sweep(session, uuid4())
+
+    assert result["processed"] == 3
+    assert result["failed"] == 3
+    assert result["extracted"] == 0
+    assert result["failure_categories"] == {"http_429": 3}
 
 
 def test_run_extraction_sweep_isolates_one_bad_message_and_continues(monkeypatch):
@@ -1158,7 +1278,7 @@ def test_run_extraction_sweep_isolates_one_bad_message_and_continues(monkeypatch
         lambda *a, **k: [bad_message, good_message],
     )
 
-    def fake_claim(db, mid, force=False, call_context=None, acc=None):
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
         if mid == bad_message:
             raise RuntimeError("boom")
         return "extracted", uuid4()
@@ -1244,7 +1364,7 @@ def test_run_extraction_sweep_resolves_credential_once_and_threads_it(monkeypatc
     captured_call_contexts = []
     captured_accs = []
 
-    def fake_claim(db, mid, force=False, call_context=None, acc=None):
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
         captured_call_contexts.append(call_context)
         captured_accs.append(acc)
         return "extracted", uuid4()
