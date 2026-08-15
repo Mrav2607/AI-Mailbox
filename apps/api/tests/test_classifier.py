@@ -3,6 +3,7 @@
 
 import json
 
+import httpx
 import pytest
 
 from app.services.nlp.classifier import (
@@ -930,9 +931,40 @@ def test_classify_with_usage_server_path_call_failure_reports_attempted_fallback
     assert attempt.verdict[3] == "heuristic-fallback"
     assert attempt.llm_attempted is True
     assert attempt.fallback_used is True
-    # No structured category taxonomy exists for the native genai path (that
-    # taxonomy is BYOK-only, from llm_client.LlmCallError).
-    assert attempt.failure_category is None
+    # The native genai SDK raises its own exception types, but its failures are
+    # mapped onto the same category names the BYOK path uses -- otherwise the
+    # operator path reports a fallback the toast can give no reason for.
+    assert attempt.failure_category == "timed_out"
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (httpx.ConnectError("dns is having a day"), "connection_failed"),
+        (TimeoutError("gemini took too long"), "timed_out"),
+    ],
+)
+def test_classify_server_path_maps_native_failures_to_shared_categories(
+    monkeypatch, exc, expected
+):
+    """Each native SDK failure type lands on the taxonomy `failure_categories`
+    is aggregated from, so an operator-key deployment gets the same "why" a
+    BYOK one does."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
+
+    class _ExplodingModels:
+        def generate_content(self, **kwargs):
+            raise exc
+
+    class _ExplodingClient:
+        models = _ExplodingModels()
+
+    monkeypatch.setattr(classifier, "_genai_client", lambda: _ExplodingClient())
+
+    assert classify_with_usage("Can you review this?").failure_category == expected
 
 
 def test_classify_with_usage_server_path_malformed_response_is_invalid_response(monkeypatch):

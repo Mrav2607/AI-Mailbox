@@ -66,8 +66,13 @@ export function backfillToastOutcome(
   const fellBack = res.fell_back ?? 0;
   if (fellBack <= 0) return { message: cleanMessage, warn: false };
   const created = res.created ?? 0;
+  // "N of those" rather than "N of M": fell_back is a SUBSET of what was
+  // classified, and reading it as a separate total would double the apparent
+  // work. A literal `${fellBack} of ${created}` would be worse -- a user
+  // override landing mid-run increments fell_back but not created, so the
+  // denominator can legitimately come out smaller than the numerator.
   const message = appendDominantLabel(
-    `classified ${created} · ${fellBack} fell back to the built-in model`,
+    `classified ${created} · ${fellBack} of those fell back to the built-in model`,
     res.failure_categories,
   );
   return { message, warn: true };

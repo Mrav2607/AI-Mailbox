@@ -408,6 +408,34 @@ def _classify_llm(
     return _classify_llm_server(text)
 
 
+def _native_failure_category(exc: Exception) -> str | None:
+    """Map a native google-genai failure onto `llm_client`'s category names.
+
+    The operator path talks to Gemini through its own SDK, which raises its own
+    exception types rather than `LlmCallError`, so without this its failures
+    would land in `failure_categories` as nothing at all. Ordered most specific
+    first: `genai_errors.APIError` carries an HTTP status, so it maps to the
+    same `http_<status>` shape the BYOK path produces; a bare `TimeoutError`
+    never got an answer; anything else httpx raises is a transport failure.
+    Returns None for an unrecognised type rather than guessing.
+    """
+    # Imported lazily for the same reason the caller does it: the SDK is an
+    # optional dependency and may not be installed.
+    try:
+        from google.genai import errors as genai_errors
+    except ImportError:
+        genai_errors = None
+
+    if genai_errors is not None and isinstance(exc, genai_errors.APIError):
+        code = getattr(exc, "code", None)
+        return f"http_{code}" if code else "invalid_response"
+    if isinstance(exc, TimeoutError):
+        return "timed_out"
+    if isinstance(exc, httpx.HTTPError):
+        return "connection_failed"
+    return None
+
+
 def _classify_llm_server(text: str) -> ClassificationAttempt:
     """LLM-backed classifier with heuristic fallback, on the operator's
     Gemini key. Unchanged from before BYOK classification existed."""
@@ -432,9 +460,12 @@ def _classify_llm_server(text: str) -> ClassificationAttempt:
             usage=None,
             llm_attempted=llm_attempted,
             fallback_used=llm_attempted,
-            # No structured category exists for a native genai/SDK failure --
-            # LlmCallError.category is a BYOK-only taxonomy (llm_client.py).
-            failure_category=None,
+            # The native genai SDK doesn't raise LlmCallError, so map its
+            # failures onto the same taxonomy the BYOK path uses
+            # (llm_client.py). Without this the operator path reports a
+            # fallback with no reason, and the toast can only say "something
+            # degraded" -- which is the vagueness this feature exists to kill.
+            failure_category=_native_failure_category(exc),
         )
 
     try:

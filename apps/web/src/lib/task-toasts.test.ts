@@ -18,7 +18,7 @@ describe("backfillToastOutcome", () => {
     );
     expect(outcome.warn).toBe(true);
     expect(outcome.message).toBe(
-      "classified 12 · 38 fell back to the built-in model — rate limited by your provider",
+      "classified 12 · 38 of those fell back to the built-in model — rate limited by your provider",
     );
   });
 
@@ -28,7 +28,7 @@ describe("backfillToastOutcome", () => {
       "classified 0 · scanned 50",
     );
     expect(outcome).toEqual({
-      message: "classified 0 · 50 fell back to the built-in model — provider timed out",
+      message: "classified 0 · 50 of those fell back to the built-in model — provider timed out",
       warn: true,
     });
   });
@@ -39,7 +39,7 @@ describe("backfillToastOutcome", () => {
       "classified 5 · scanned 15",
     );
     expect(outcome).toEqual({
-      message: "classified 5 · 10 fell back to the built-in model",
+      message: "classified 5 · 10 of those fell back to the built-in model",
       warn: true,
     });
   });
