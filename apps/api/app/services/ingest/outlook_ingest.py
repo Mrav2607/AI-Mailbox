@@ -47,6 +47,7 @@ from app.services.ingest.outlook_client import (
     DeltaExpiredError,
     OutlookClient,
 )
+from app.services.nlp.classification_breaker import ClassificationBreaker
 from app.services.nlp.classifier import build_classification_text, classify_with_usage
 from app.services.nlp.llm_client import WORKER_RETRIES
 from app.services.nlp.persistence import upsert_classification
@@ -301,14 +302,18 @@ def _upsert_page_messages(
     classify_messages: bool,
     classification_router: ClassificationRouter,
     usage_acc: UsageAccumulator,
+    breaker: ClassificationBreaker,
 ) -> dict[str, Any]:
     """Upsert one delta page's messages (and their threads) for one folder.
 
-    ``classification_router`` and ``usage_acc`` are built ONCE by the caller
-    (`ingest_outlook_messages`), not here -- this helper runs once per delta
-    page, so constructing them in here would restart the router's 60s memo
-    (and re-query) every page instead of once per run, and would silently
-    drop any usage recorded on an earlier page in this same run.
+    ``classification_router``, ``usage_acc``, and ``breaker`` are built ONCE
+    by the caller (`ingest_outlook_messages`), not here -- this helper runs
+    once per delta page, so constructing them in here would restart the
+    router's 60s memo (and re-query) every page instead of once per run,
+    would silently drop any usage recorded on an earlier page in this same
+    run, and would let every page re-trip its own breaker from zero instead
+    of sharing one streak across the whole run (plan: phase 3 of the
+    LLM-failure work, Codex review blocker).
     """
     threads_upserted = 0
     messages_upserted = 0
@@ -318,6 +323,16 @@ def _upsert_page_messages(
     # the keyword heuristic -- counted here so a sync toast can name it. No
     # automatic recovery; the user has to run a backfill (D-I).
     left_unclassified = 0
+    # Every provider_message_id this page ACTUALLY called classify_with_usage
+    # for and got no verdict back -- handed to the caller, which accumulates
+    # it across every page and threads the whole-run set into the END
+    # reconciliation pass (Codex review, phase 3 should-fix): without it,
+    # reconciliation has no way to know this exact attempt was already made
+    # and would start a SECOND WORKER_RETRIES chain on the same message.
+    # Deliberately NOT populated by a breaker-skip (see below) -- a message
+    # never even attempted needs no marker, since the breaker itself is
+    # still tripped for the rest of this run and covers it directly.
+    no_verdict_provider_message_ids: set[str] = set()
     # Tells the caller whether this page put anything in usage_acc, since it
     # can't see usage_acc's internal buffer state from out there.
     usage_recorded = False
@@ -391,49 +406,67 @@ def _upsert_page_messages(
                 .first()
             )
             if not existing:
-                text_for_classification = build_classification_text(
-                    normalized.get("subject"),
-                    normalized.get("snippet"),
-                    normalized.get("body_text"),
-                )
-                routing = classification_router.routing_for(db)
-                # Ingest only ever runs off a Celery task -- same reasoning
-                # as gmail_ingest.py.
-                attempt = classify_with_usage(
-                    text_for_classification, routing=routing, policy=WORKER_RETRIES
-                )
-                # Only the user's own key gets recorded -- v1 tracks
-                # user-paid usage only (plan §1), same rule as Gmail's ingest.
-                # `routing.mode == "user"` is the single source of truth for
-                # who pays; the operator-paid server path never shows up
-                # here. Recorded regardless of verdict -- a failed call can
-                # still have reached (and billed) the provider before coming
-                # up empty (D3).
-                if routing.mode == "user" and routing.credential is not None:
-                    usage_acc.record(
-                        "classification",
-                        routing.credential.provider,
-                        attempt.usage,
-                        provider_call_succeeded=attempt.provider_call_succeeded,
-                    )
-                    usage_recorded = True
-                # Phase 2 (D-C): `verdict is None` means a failed BYOK call
-                # with no local fallback served -- never write a null-label
-                # row (it would strand the message, neither classified nor a
-                # backfill candidate again).
-                if attempt.verdict is None:
+                # Phase 3 (Codex review, blocker): once tripped, this run
+                # stops issuing classification calls entirely -- ingest
+                # itself keeps going (every message/thread still gets
+                # upserted, and the delta cursor still advances exactly as
+                # it would otherwise), but a message that never even gets
+                # attempted is exactly as unclassified as one whose call
+                # failed, so it counts into left_unclassified the same way.
+                if not breaker.should_call:
                     left_unclassified += 1
                 else:
-                    label, confidence, rationale, model_version = attempt.verdict
-                    upsert_classification(
-                        db,
-                        message_id=new_message_id,
-                        label=label,
-                        confidence=confidence,
-                        rationale=rationale,
-                        model_version=model_version,
+                    text_for_classification = build_classification_text(
+                        normalized.get("subject"),
+                        normalized.get("snippet"),
+                        normalized.get("body_text"),
                     )
-                    classified += 1
+                    routing = classification_router.routing_for(db)
+                    # Ingest only ever runs off a Celery task -- same reasoning
+                    # as gmail_ingest.py.
+                    attempt = classify_with_usage(
+                        text_for_classification, routing=routing, policy=WORKER_RETRIES
+                    )
+                    breaker.record(verdict_produced=attempt.verdict is not None)
+                    # Only the user's own key gets recorded -- v1 tracks
+                    # user-paid usage only (plan §1), same rule as Gmail's ingest.
+                    # `routing.mode == "user"` is the single source of truth for
+                    # who pays; the operator-paid server path never shows up
+                    # here. Recorded regardless of verdict -- a failed call can
+                    # still have reached (and billed) the provider before coming
+                    # up empty (D3).
+                    if routing.mode == "user" and routing.credential is not None:
+                        usage_acc.record(
+                            "classification",
+                            routing.credential.provider,
+                            attempt.usage,
+                            provider_call_succeeded=attempt.provider_call_succeeded,
+                        )
+                        usage_recorded = True
+                    # Phase 2 (D-C): `verdict is None` means a failed BYOK call
+                    # with no local fallback served -- never write a null-label
+                    # row (it would strand the message, neither classified nor a
+                    # backfill candidate again).
+                    if attempt.verdict is None:
+                        left_unclassified += 1
+                        # Codex review, phase 3 should-fix: mark this exact
+                        # attempt as made THIS run so the END reconciliation
+                        # pass -- which may match this SAME message against
+                        # a correlated ReplyAttempt -- doesn't start a
+                        # second WORKER_RETRIES chain on it (see
+                        # reconcile.py's _classify_and_stamp docstring).
+                        no_verdict_provider_message_ids.add(provider_message_id)
+                    else:
+                        label, confidence, rationale, model_version = attempt.verdict
+                        upsert_classification(
+                            db,
+                            message_id=new_message_id,
+                            label=label,
+                            confidence=confidence,
+                            rationale=rationale,
+                            model_version=model_version,
+                        )
+                        classified += 1
 
         if should_reopen:
             db.execute(update(MailThread).where(MailThread.id == thread_id).values(done_at=None))
@@ -443,6 +476,7 @@ def _upsert_page_messages(
         "messages_upserted": messages_upserted,
         "classified": classified,
         "left_unclassified": left_unclassified,
+        "no_verdict_provider_message_ids": no_verdict_provider_message_ids,
         "usage_recorded": usage_recorded,
     }
 
@@ -490,6 +524,16 @@ def ingest_outlook_messages(
     if not provider or not provider.access_token:
         raise ValueError("Outlook provider account not connected.")
 
+    # Per-run classification breaker (plan: phase 3 of the LLM-failure work,
+    # Codex review blocker): shared across the START reconciliation pass
+    # below, every delta page's classification loop, and the END pass -- one
+    # instance for the whole run, so a losing streak discovered in any phase
+    # stops classification calls in every later phase too, instead of each
+    # one starting its own fresh WORKER_RETRIES chain independently.
+    # Tripping this NEVER stops ingest itself; see ClassificationBreaker's
+    # own docstring.
+    classification_breaker = ClassificationBreaker()
+
     # Reply reconciliation START pass (plan §3.5): a level pass over this
     # account's reconciliation-eligible reply attempts, run BEFORE any
     # provider traversal begins -- own transactions, commits included. Never
@@ -502,6 +546,7 @@ def ingest_outlook_messages(
         provider_account_id=provider.id,
         provider="outlook",
         classify_messages=classify_messages,
+        breaker=classification_breaker,
     )
 
     access_token = provider.access_token
@@ -574,6 +619,12 @@ def ingest_outlook_messages(
         "messages_removed": 0,
         "fetched": 0,
     }
+    # Accumulated across every page this run -- handed to the END
+    # reconciliation pass so it doesn't re-attempt a message the page loop
+    # already classified (and got no verdict for) earlier in this same run
+    # (Codex review, phase 3 should-fix; see _upsert_page_messages' own
+    # comment and reconcile.py's _classify_and_stamp docstring).
+    no_verdict_provider_message_ids: set[str] = set()
 
     for folder_key in _FOLDERS:
         if remaining <= 0 or pages_done >= max_pages:
@@ -654,10 +705,11 @@ def ingest_outlook_messages(
 
             upsert_stats = _upsert_page_messages(
                 db, user_id, provider, folder_key, messages, classify_messages,
-                classification_router, usage_acc,
+                classification_router, usage_acc, classification_breaker,
             )
             if upsert_stats["usage_recorded"]:
                 usage_pending = True
+            no_verdict_provider_message_ids.update(upsert_stats["no_verdict_provider_message_ids"])
             removal_stats = with_token_retry(
                 lambda deduped_removed=deduped_removed: _apply_removals(
                     db, client, provider.id, deduped_removed
@@ -748,12 +800,19 @@ def ingest_outlook_messages(
     # Reply reconciliation END pass (plan §3.5): re-fetches AFTER this run's
     # final commit, catching both attempts created while the run was
     # ingesting AND messages the run itself just persisted (whose cursors
-    # have advanced past them).
+    # have advanced past them). Shares this run's classification_breaker
+    # (Codex review, phase 3 blocker) -- a losing streak the page loop
+    # already tripped must stop this pass from starting its own fresh
+    # retry chain too -- and no_verdict_provider_message_ids (should-fix)
+    # so it never re-attempts a message the page loop already classified
+    # (and got no verdict for) this run.
     end_reconciliation = run_reconciliation_pass(
         db,
         provider_account_id=provider.id,
         provider="outlook",
         classify_messages=classify_messages,
+        breaker=classification_breaker,
+        already_attempted_provider_message_ids=frozenset(no_verdict_provider_message_ids),
     )
     stats["left_unclassified"] += end_reconciliation["left_unclassified"]
 

@@ -436,6 +436,111 @@ def test_classify_and_stamp_no_verdict_stamps_verified_without_classifying(monke
     assert db.rollbacks == 0
 
 
+def test_classify_and_stamp_breaker_tripped_skips_the_call(monkeypatch):
+    """Codex review blocker (phase 3): a tripped breaker must stop this
+    pass from ever calling classify_with_usage -- the attempt still gets
+    stamped verified (same billing-loop-fix reasoning as a real no-verdict
+    outcome) and reports the same outcome, but zero wire calls happen."""
+    calls, stamp_calls = _patch_classification(monkeypatch)
+    attempt = _attempt(provider="outlook", verified_at=None)
+    message = _message()
+    db = _FakeDB(verified_at_reads=[None])
+    breaker = reconcile.ClassificationBreaker(tripped=True)
+
+    outcome = reconcile._classify_and_stamp(
+        db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id,
+        user_id=uuid4(), breaker=breaker,
+    )
+
+    assert outcome == reconcile._OUTCOME_NO_VERDICT
+    assert calls["classify"] == 0  # never called
+    assert calls["upsert"] == []
+    assert len(stamp_calls) == 1
+    assert db.commits == 1
+
+
+def test_classify_and_stamp_already_attempted_marker_skips_the_call(monkeypatch):
+    """Codex review should-fix (phase 3): the page loop already made THIS
+    exact attempt earlier in the same run and got no verdict -- the marker
+    set must stop the END pass from starting a second WORKER_RETRIES chain
+    on the same message, even when the breaker hasn't tripped at all."""
+    calls, stamp_calls = _patch_classification(monkeypatch)
+    attempt = _attempt(provider="outlook", verified_at=None)
+    message = _message(provider_message_id="already-tried-this-run")
+    db = _FakeDB(verified_at_reads=[None])
+
+    outcome = reconcile._classify_and_stamp(
+        db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id,
+        user_id=uuid4(),
+        already_attempted_provider_message_ids=frozenset({"already-tried-this-run"}),
+    )
+
+    assert outcome == reconcile._OUTCOME_NO_VERDICT
+    assert calls["classify"] == 0  # never called -- this is the fix
+    assert calls["upsert"] == []
+    assert len(stamp_calls) == 1
+    assert db.commits == 1
+
+
+def test_classify_and_stamp_marker_is_scoped_to_its_own_provider_message_id(monkeypatch):
+    """A DIFFERENT message's provider_message_id in the marker set must not
+    accidentally skip this one -- the marker is a targeted, per-message
+    fix, not a blanket "END pass never classifies anything" switch."""
+    calls, stamp_calls = _patch_classification(monkeypatch)
+    attempt = _attempt(provider="outlook", verified_at=None)
+    message = _message(provider_message_id="this-message")
+    db = _FakeDB(verified_at_reads=[None])
+
+    outcome = reconcile._classify_and_stamp(
+        db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id,
+        user_id=uuid4(),
+        already_attempted_provider_message_ids=frozenset({"some-other-message"}),
+    )
+
+    assert outcome == reconcile._OUTCOME_CLASSIFIED
+    assert calls["classify"] == 1
+
+
+def test_classify_and_stamp_feeds_the_breaker_on_no_verdict(monkeypatch):
+    """Three real no-verdict calls through _classify_and_stamp trip the
+    shared breaker -- proving the wiring, not just ClassificationBreaker's
+    own unit-tested behavior in isolation."""
+    _patch_classification(monkeypatch, no_verdict=True)
+    breaker = reconcile.ClassificationBreaker()
+
+    for _ in range(3):
+        message = _message(provider_message_id=str(uuid4()))
+        db = _FakeDB(verified_at_reads=[None])
+        reconcile._classify_and_stamp(
+            db, attempt_id=uuid4(), message=message, thread_id=uuid4(),
+            user_id=uuid4(), breaker=breaker,
+        )
+
+    assert breaker.tripped is True
+
+
+def test_classify_and_stamp_containment_failure_does_not_feed_the_breaker(monkeypatch):
+    """A genuine exception (_OUTCOME_FAILED) is an unknown/containment
+    state, not an LLM result -- it must never touch the breaker (same
+    reasoning as extraction_run.py's _CONSECUTIVE_FAILURE_LIMIT), or a run
+    of DB hiccups would misdiagnose as "the provider is failing" and stop
+    classifying mail that a healthy provider could otherwise handle fine."""
+    _patch_classification(monkeypatch, raises=RuntimeError("boom"))
+    breaker = reconcile.ClassificationBreaker()
+
+    for _ in range(5):
+        message = _message(provider_message_id=str(uuid4()))
+        db = _FakeDB(verified_at_reads=[None])
+        outcome = reconcile._classify_and_stamp(
+            db, attempt_id=uuid4(), message=message, thread_id=uuid4(),
+            user_id=uuid4(), breaker=breaker,
+        )
+        assert outcome == reconcile._OUTCOME_FAILED
+
+    assert breaker.tripped is False
+    assert breaker.should_call is True
+
+
 def test_classify_and_stamp_no_verdict_then_a_later_sync_never_reclassifies(monkeypatch):
     """The bounded-cost guarantee Codex asked us to document (phase 2): a
     no-verdict pass stamps verified_at (see the test above), so the NEXT
@@ -749,7 +854,8 @@ def test_run_reconciliation_pass_snapshot_before_attempt_created_end_pass_comple
     monkeypatch.setattr(
         reconcile,
         "_reconcile_one_attempt",
-        lambda db, *, attempt_id, classify_messages: reconciled.append(attempt_id)
+        lambda db, *, attempt_id, classify_messages, breaker=None,
+        already_attempted_provider_message_ids=frozenset(): reconciled.append(attempt_id)
         or {"resolved_action_items": 1, "classified": False, "left_unclassified": False},
     )
 
@@ -771,7 +877,7 @@ def test_run_reconciliation_pass_isolates_a_failing_attempt(monkeypatch):
     ids = [uuid4(), uuid4(), uuid4()]
     monkeypatch.setattr(reconcile, "_eligible_attempt_ids", lambda db, **k: ids)
 
-    def fake_reconcile(db, *, attempt_id, classify_messages):
+    def fake_reconcile(db, *, attempt_id, classify_messages, breaker=None, already_attempted_provider_message_ids=frozenset()):
         if attempt_id == ids[1]:
             raise RuntimeError("boom")
         return {
@@ -847,7 +953,7 @@ def test_run_reconciliation_pass_aggregates_left_unclassified_and_never_counts_f
     `_OUTCOME_NO_VERDICT` is a KNOWN "left unclassified" fact."""
     ids = [uuid4(), uuid4(), uuid4()]
 
-    def fake_reconcile(db, *, attempt_id, classify_messages):
+    def fake_reconcile(db, *, attempt_id, classify_messages, breaker=None, already_attempted_provider_message_ids=frozenset()):
         if attempt_id == ids[0]:
             return {"resolved_action_items": 1, "classified": False, "left_unclassified": True}
         if attempt_id == ids[1]:
