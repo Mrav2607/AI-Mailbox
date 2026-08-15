@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { fieldLabel, control } from "@/lib/ui";
 import type {
   ClassifierMixEntry,
   ClassifierMixKind,
@@ -10,12 +10,23 @@ import type {
 } from "@/lib/types";
 import { PROVIDER_LABELS } from "@/lib/usage";
 
-interface Props {
+export interface LlmSettingsSectionProps {
+  // Whether the containing dialog session is open right now -- purely a
+  // hydration-lifecycle signal (see the hydration effect below), not a
+  // visibility gate. The section always renders its content; a container
+  // that wants it hidden without unmounting (the settings dialog's inactive
+  // tabs) does that itself, e.g. with the `hidden` attribute.
   open: boolean;
-  onOpenChange: (v: boolean) => void;
-  // Null until the first fetch after login lands -- the modal just doesn't
-  // render yet rather than show a half-built form.
+  // Null while the fetch is in flight (or hasn't started) and no error --
+  // renders the loading state below rather than a half-built form.
   settings: LlmSettings | null;
+  // True on a failed settings load (never 401 -- that's a session bounce
+  // handled elsewhere). Only meaningful while `settings` is still null;
+  // once a settings snapshot has loaded once, a later background refresh
+  // failure doesn't blow the form away, it just leaves the last snapshot in
+  // place.
+  settingsError?: boolean;
+  onRetrySettings?: () => void;
   onSave: (input: {
     provider: LlmProvider;
     // Absent when the user leaves the field blank to keep an existing key --
@@ -32,17 +43,16 @@ interface Props {
   onRemove: () => void;
   removing: boolean;
   // Null while the fetch is in flight (or hasn't started) and no prior error
-  // -- fetched fresh every time this modal opens, since usage keeps moving
-  // even when the credential itself hasn't changed. Only feeds the one-line
-  // summary here; the full breakdown lives in the usage card.
+  // -- fetched fresh every time this section's session opens, since usage
+  // keeps moving even when the credential itself hasn't changed. Only feeds
+  // the one-line summary here; the full breakdown lives in the usage tab.
   usage: LlmUsage | null;
   // True when the usage fetch failed. Kept separate from `usage` being null
   // so the panel can tell "still loading" apart from "unavailable" -- an
-  // outage here must never make the rest of this modal look broken.
+  // outage here must never make the rest of this section look broken.
   usageError: boolean;
-  // Opens the separate usage card (charts, breakdowns, dashboard links) --
-  // the cost signal belongs here where the key is configured, but the detail
-  // lives there.
+  // Switches to the usage tab/dialog -- the cost signal belongs here where
+  // the key is configured, but the full breakdown lives there.
   onOpenUsage: () => void;
   // Which classifier labeled the mail this user currently has (plan §7) --
   // point-in-time state, not a time-windowed history. Same null-while-in-
@@ -121,14 +131,37 @@ function classifierMixSummary(mix: ClassifierMixEntry[]): string {
   return parts.length > 0 ? `Sorting your mail: ${parts.join(", ")}` : "nothing sorted yet";
 }
 
-const fieldLabel = "font-mono text-[11px] text-muted-foreground";
-const control =
-  "w-full bg-[var(--color-panel)] border border-border rounded px-2 py-1 text-[12px] font-mono text-foreground";
-
-export function LlmSettingsModal({
+/**
+ * The AI extraction settings form content -- provider/model/key fields, the
+ * classifier-mix summary, test/save/remove actions, and the usage summary
+ * footer. Extracted from the old standalone AI-settings dialog so the
+ * settings dialog's `ai model` tab can render the exact same content without
+ * a nested dialog (settings-card plan §3.2).
+ *
+ * Three render states, keyed on `settings`/`settingsError`: `loading…`
+ * while the fetch is in flight, an error state with a retry button when a
+ * load has actually failed, and the form once a settings snapshot exists.
+ *
+ * Hydration lifecycle (P1-2): the form fields reset to whatever's saved
+ * exactly ONCE per `open` session, the first time `settings` is non-null
+ * during that session -- not on every render, and not on a later refetch
+ * (a test/save/remove refresh must never clobber an unsaved edit). The
+ * `hydratedRef` flag is what "once" means here; it's cleared whenever `open`
+ * goes false, so the next open re-hydrates fresh. `open` is deliberately
+ * this section's own prop (not "is this the active tab") -- the settings
+ * dialog passes its own `open` to every tab's section even while inactive,
+ * since all three stay mounted across a tab switch (unmounting one would
+ * drop unsaved AI-form edits on an ai → usage → ai round trip). This also
+ * means a shell that opens before `settings` has loaded now hydrates the
+ * moment it lands, instead of never hydrating at all (the bug in the old
+ * `[open]`-only effect, which read `settings` through a ref specifically to
+ * skip re-runs).
+ */
+export function LlmSettingsSection({
   open,
-  onOpenChange,
   settings,
+  settingsError = false,
+  onRetrySettings = () => {},
   onSave,
   saving,
   onTest,
@@ -141,35 +174,51 @@ export function LlmSettingsModal({
   onOpenUsage,
   classifierMix,
   classifierMixError,
-}: Props) {
+}: LlmSettingsSectionProps) {
   const [provider, setProvider] = useState<LlmProvider>("openai");
   const [model, setModel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [classificationByok, setClassificationByok] = useState(false);
+  const hydratedRef = useRef(false);
 
-  // A Test while the modal's open refetches `settings` in App -- track the
-  // latest copy in a ref (not state) so that refetch doesn't retrigger the
-  // reset effect below and clobber whatever the user's mid-typing.
-  const settingsRef = useRef(settings);
-  settingsRef.current = settings;
-
-  // Reset the form to whatever's currently saved only when the modal opens
-  // -- never on a later settings refetch, which would blow away unsaved
-  // edits. The key never repopulates, since the server never sends it back.
   useEffect(() => {
-    if (!open) return;
-    const current = settingsRef.current;
-    if (!current) return;
-    setProvider(current.provider ?? "openai");
-    setModel(current.model ?? "");
+    if (!open) {
+      hydratedRef.current = false;
+      return;
+    }
+    if (hydratedRef.current || !settings) return;
+    hydratedRef.current = true;
+    setProvider(settings.provider ?? "openai");
+    setModel(settings.model ?? "");
     setApiKey("");
-    setBaseUrl(current.provider === "custom" ? (current.base_url ?? "") : "");
-    setClassificationByok(current.classification_byok);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+    setBaseUrl(settings.provider === "custom" ? (settings.base_url ?? "") : "");
+    setClassificationByok(settings.classification_byok);
+  }, [open, settings]);
 
-  if (!settings) return null;
+  if (!settings) {
+    if (settingsError) {
+      return (
+        <div className="flex flex-col items-center gap-2 py-6 text-center">
+          <p className="text-[11px] font-mono text-muted-foreground leading-snug">
+            Couldn&apos;t load your AI settings.
+          </p>
+          <button
+            type="button"
+            onClick={onRetrySettings}
+            className="h-7 px-3 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
+          >
+            retry
+          </button>
+        </div>
+      );
+    }
+    return (
+      <p className="text-[11px] font-mono text-muted-foreground leading-snug py-6 text-center">
+        loading…
+      </p>
+    );
+  }
 
   const providers = settings.custom_endpoints_enabled
     ? [...PRESET_PROVIDERS, "custom" as const]
@@ -182,251 +231,246 @@ export function LlmSettingsModal({
   const baseUrlBlank = provider === "custom" && baseUrl.trim() === "";
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-md bg-[var(--color-panel)] border-border">
-        <DialogTitle className="font-mono text-[11px] tracking-wide text-muted-foreground mb-1 font-normal">
-          AI extraction settings
-        </DialogTitle>
-        <p className="text-[11px] font-mono text-muted-foreground leading-relaxed">
-          save your own API key and CortexMail uses it to pull deadlines and
-          to-dos out of your mail.
+    <div className="space-y-2.5">
+      <p className="text-[11px] font-mono text-muted-foreground leading-relaxed">
+        save your own API key and CortexMail uses it to pull deadlines and
+        to-dos out of your mail.
+      </p>
+
+      {/* Which classifier is doing the work, for THIS user, regardless of
+          whether they hold a key -- see classifierMixSummary's comment for
+          why this can't move behind the BYOK checkbox below. */}
+      <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+        {classifierMixError
+          ? "Couldn't load how your mail is being sorted right now."
+          : !classifierMix
+            ? "checking how your mail is sorted…"
+            : classifierMixSummary(classifierMix)}
+      </p>
+
+      {settings.custom_blocked && (
+        <div className="rounded border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[11.5px] font-mono text-destructive leading-snug">
+          your custom endpoint isn&apos;t allowed right now, so extraction is
+          paused for your account. Fix the address below, or remove this
+          credential, to turn it back on.
+        </div>
+      )}
+
+      {!settings.configured && (
+        <p className="text-[11px] font-mono text-muted-foreground leading-snug">
+          {settings.fallback_active
+            ? "no key saved yet — the server's shared key is covering your extraction for now."
+            : "no key saved yet — extraction is off for your account until you add one."}
         </p>
+      )}
 
-        {/* Which classifier is doing the work, for THIS user, regardless of
-            whether they hold a key -- see classifierMixSummary's comment for
-            why this can't move behind the BYOK checkbox below. */}
-        <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-          {classifierMixError
-            ? "Couldn't load how your mail is being sorted right now."
-            : !classifierMix
-              ? "checking how your mail is sorted…"
-              : classifierMixSummary(classifierMix)}
-        </p>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (modelBlank || baseUrlBlank) return;
+          // A blank key on an already-configured credential means "keep
+          // what's stored" -- only a brand-new credential needs one.
+          const keepsExistingKey = apiKey.trim() === "" && settings.configured;
+          onSave({
+            provider,
+            ...(keepsExistingKey ? {} : { api_key: apiKey }),
+            model: model.trim(),
+            base_url: provider === "custom" ? baseUrl.trim() : undefined,
+            classification_byok: provider === "custom" ? false : classificationByok,
+          });
+        }}
+        className="space-y-2.5"
+      >
+        <label className="block space-y-1">
+          <span className={fieldLabel}>provider</span>
+          <select
+            value={provider}
+            onChange={(e) => {
+              const p = e.target.value as LlmProvider;
+              setProvider(p);
+              // A model name from one provider is almost never valid for
+              // another -- don't let a stale value slip through.
+              setModel("");
+              // Classification BYOK is presets-only -- a custom endpoint
+              // always saves with the flag cleared server-side, so clear
+              // it here too rather than show it checked next to a
+              // disabled, about-to-be-ignored control.
+              if (p === "custom") setClassificationByok(false);
+            }}
+            className={control}
+          >
+            {providers.map((p) => (
+              <option key={p} value={p}>
+                {PROVIDER_LABELS[p]}
+              </option>
+            ))}
+          </select>
+        </label>
 
-        {settings.custom_blocked && (
-          <div className="rounded border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[11.5px] font-mono text-destructive leading-snug">
-            your custom endpoint isn&apos;t allowed right now, so extraction is
-            paused for your account. Fix the address below, or remove this
-            credential, to turn it back on.
-          </div>
-        )}
+        <label className="block space-y-1">
+          <span className={fieldLabel}>model</span>
+          <input
+            type="text"
+            required
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder={MODEL_PLACEHOLDERS[provider]}
+            className={control}
+          />
+          {modelBlank && model.length > 0 && (
+            <span className="block text-[10.5px] text-destructive font-mono leading-snug">
+              model can&apos;t be just spaces
+            </span>
+          )}
+        </label>
 
-        {!settings.configured && (
-          <p className="text-[11px] font-mono text-muted-foreground leading-snug">
-            {settings.fallback_active
-              ? "no key saved yet — the server's shared key is covering your extraction for now."
-              : "no key saved yet — extraction is off for your account until you add one."}
-          </p>
-        )}
-
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (modelBlank || baseUrlBlank) return;
-            // A blank key on an already-configured credential means "keep
-            // what's stored" -- only a brand-new credential needs one.
-            const keepsExistingKey = apiKey.trim() === "" && settings.configured;
-            onSave({
-              provider,
-              ...(keepsExistingKey ? {} : { api_key: apiKey }),
-              model: model.trim(),
-              base_url: provider === "custom" ? baseUrl.trim() : undefined,
-              classification_byok: provider === "custom" ? false : classificationByok,
-            });
-          }}
-          className="space-y-2.5"
-        >
+        {provider === "custom" && (
           <label className="block space-y-1">
-            <span className={fieldLabel}>provider</span>
-            <select
-              value={provider}
-              onChange={(e) => {
-                const p = e.target.value as LlmProvider;
-                setProvider(p);
-                // A model name from one provider is almost never valid for
-                // another -- don't let a stale value slip through.
-                setModel("");
-                // Classification BYOK is presets-only -- a custom endpoint
-                // always saves with the flag cleared server-side, so clear
-                // it here too rather than show it checked next to a
-                // disabled, about-to-be-ignored control.
-                if (p === "custom") setClassificationByok(false);
-              }}
-              className={control}
-            >
-              {providers.map((p) => (
-                <option key={p} value={p}>
-                  {PROVIDER_LABELS[p]}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <label className="block space-y-1">
-            <span className={fieldLabel}>model</span>
+            <span className={fieldLabel}>endpoint URL</span>
             <input
               type="text"
               required
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder={MODEL_PLACEHOLDERS[provider]}
-              className={control}
-            />
-            {modelBlank && model.length > 0 && (
-              <span className="block text-[10.5px] text-destructive font-mono leading-snug">
-                model can&apos;t be just spaces
-              </span>
-            )}
-          </label>
-
-          {provider === "custom" && (
-            <label className="block space-y-1">
-              <span className={fieldLabel}>endpoint URL</span>
-              <input
-                type="text"
-                required
-                maxLength={200}
-                value={baseUrl}
-                onChange={(e) => setBaseUrl(e.target.value)}
-                placeholder="https://your-endpoint.example.com/v1"
-                className={control}
-              />
-              <span className="block text-[10.5px] text-muted-foreground font-mono leading-snug">
-                {settings.private_endpoints_enabled
-                  ? "must start with https:// — or http:// / a private address, since this server allows private endpoints"
-                  : "must start with https:// and point to a public address"}
-              </span>
-              {baseUrlBlank && baseUrl.length > 0 && (
-                <span className="block text-[10.5px] text-destructive font-mono leading-snug">
-                  endpoint URL can&apos;t be just spaces
-                </span>
-              )}
-            </label>
-          )}
-
-          <label className="block space-y-1">
-            <span className={fieldLabel}>API key</span>
-            <input
-              type="password"
-              autoComplete="new-password"
-              required={!settings.configured}
-              minLength={8}
-              maxLength={512}
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder={
-                settings.configured
-                  ? "leave blank to keep your saved key"
-                  : "paste your API key"
-              }
+              maxLength={200}
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              placeholder="https://your-endpoint.example.com/v1"
               className={control}
             />
             <span className="block text-[10.5px] text-muted-foreground font-mono leading-snug">
-              {settings.configured
-                ? `leave this blank to keep your saved key (currently ending in ••••${settings.key_suffix})`
-                : "your key is encrypted, stored, and never shown again after you save it"}
+              {settings.private_endpoints_enabled
+                ? "must start with https:// — or http:// / a private address, since this server allows private endpoints"
+                : "must start with https:// and point to a public address"}
             </span>
+            {baseUrlBlank && baseUrl.length > 0 && (
+              <span className="block text-[10.5px] text-destructive font-mono leading-snug">
+                endpoint URL can&apos;t be just spaces
+              </span>
+            )}
           </label>
+        )}
 
-          {settings.classifier_uses_llm && (
-            <div className="space-y-1">
-              <label className="flex items-start gap-1.5 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={classificationByok}
-                  disabled={provider === "custom"}
-                  onChange={(e) => setClassificationByok(e.target.checked)}
-                  className="mt-0.5"
-                />
-                <span className="text-[12px] font-mono text-foreground leading-snug">
-                  Also use my key to sort incoming mail
-                </span>
-              </label>
-              <p className="text-[10.5px] font-mono text-muted-foreground leading-snug pl-[18px]">
-                {provider === "custom"
-                  ? "Not available for a custom endpoint yet -- only the providers above."
-                  : "Sorting runs on every email you receive, so it uses far more of your quota than the Agenda does. Off by default."}
+        <label className="block space-y-1">
+          <span className={fieldLabel}>API key</span>
+          <input
+            type="password"
+            autoComplete="new-password"
+            required={!settings.configured}
+            minLength={8}
+            maxLength={512}
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder={
+              settings.configured
+                ? "leave blank to keep your saved key"
+                : "paste your API key"
+            }
+            className={control}
+          />
+          <span className="block text-[10.5px] text-muted-foreground font-mono leading-snug">
+            {settings.configured
+              ? `leave this blank to keep your saved key (currently ending in ••••${settings.key_suffix})`
+              : "your key is encrypted, stored, and never shown again after you save it"}
+          </span>
+        </label>
+
+        {settings.classifier_uses_llm && (
+          <div className="space-y-1">
+            <label className="flex items-start gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={classificationByok}
+                disabled={provider === "custom"}
+                onChange={(e) => setClassificationByok(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span className="text-[12px] font-mono text-foreground leading-snug">
+                Also use my key to sort incoming mail
+              </span>
+            </label>
+            <p className="text-[10.5px] font-mono text-muted-foreground leading-snug pl-[18px]">
+              {provider === "custom"
+                ? "Not available for a custom endpoint yet -- only the providers above."
+                : "Sorting runs on every email you receive, so it uses far more of your quota than the Agenda does. Off by default."}
+            </p>
+            {settings.classification_byok && !settings.classification_eligible && (
+              <p className="text-[11px] font-mono text-primary-tint-foreground leading-snug pl-[18px]">
+                Your key isn&apos;t set up to sort your mail — the built-in rules are being
+                used instead.
               </p>
-              {settings.classification_byok && !settings.classification_eligible && (
-                <p className="text-[11px] font-mono text-primary-tint-foreground leading-snug pl-[18px]">
-                  Your key isn&apos;t set up to sort your mail — the built-in rules are being
-                  used instead.
-                </p>
-              )}
-            </div>
-          )}
-
-          <div className="flex items-center gap-2 pt-1">
-            <button
-              type="submit"
-              disabled={saving || modelBlank || baseUrlBlank}
-              className="h-7 px-3 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
-            >
-              {saving ? "saving…" : "save"}
-            </button>
-            <button
-              type="button"
-              onClick={onTest}
-              disabled={!settings.configured || testing || saving || removing}
-              className="h-7 px-3 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
-            >
-              {testing ? "testing…" : "test"}
-            </button>
-            {settings.configured && (
-              <button
-                type="button"
-                onClick={onRemove}
-                disabled={removing}
-                className="ml-auto h-7 px-3 rounded border border-destructive/40 text-destructive hover:bg-destructive/10 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
-              >
-                {removing ? "removing…" : "remove"}
-              </button>
             )}
           </div>
+        )}
 
-          {testResult && (
-            <p
-              className={
-                testResult.ok
-                  ? "text-[11px] font-mono text-[var(--success)]"
-                  : "text-[11px] font-mono text-destructive"
-              }
-            >
-              {testResult.ok
-                ? `ok · ${testResult.latency_ms}ms`
-                : testErrorMessage(testResult.error ?? "")}
-            </p>
-          )}
-
-          {settings.configured && settings.last_verified_at && (
-            <p className="text-[10.5px] font-mono text-muted-foreground">
-              last verified {new Date(settings.last_verified_at).toLocaleString()}
-            </p>
-          )}
-
-          {/* Just the cost signal here -- the full breakdown (charts, per-stage
-              and per-provider splits, dashboard links) lives in its own card,
-              since this modal is about the key, not the usage detail. */}
-          <div className="flex items-center justify-between gap-2 pt-2 mt-1 border-t border-border/60">
-            <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
-              {usageError
-                ? "Usage isn't available right now."
-                : !usage
-                  ? "checking your usage…"
-                  : usage.totals.calls === 0
-                    ? "Your key hasn't been used yet."
-                    : `${usage.totals.calls.toLocaleString()} AI calls in the last ${usage.window_days} days.`}
-            </p>
+        <div className="flex items-center gap-2 pt-1">
+          <button
+            type="submit"
+            disabled={saving || modelBlank || baseUrlBlank}
+            className="h-7 px-3 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+          >
+            {saving ? "saving…" : "save"}
+          </button>
+          <button
+            type="button"
+            onClick={onTest}
+            disabled={!settings.configured || testing || saving || removing}
+            className="h-7 px-3 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+          >
+            {testing ? "testing…" : "test"}
+          </button>
+          {settings.configured && (
             <button
               type="button"
-              onClick={onOpenUsage}
-              className="shrink-0 h-6 px-2 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[10.5px] font-mono cursor-pointer transition-colors"
+              onClick={onRemove}
+              disabled={removing}
+              className="ml-auto h-7 px-3 rounded border border-destructive/40 text-destructive hover:bg-destructive/10 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
-              view usage
+              {removing ? "removing…" : "remove"}
             </button>
-          </div>
-        </form>
-      </DialogContent>
-    </Dialog>
+          )}
+        </div>
+
+        {testResult && (
+          <p
+            className={
+              testResult.ok
+                ? "text-[11px] font-mono text-[var(--success)]"
+                : "text-[11px] font-mono text-destructive"
+            }
+          >
+            {testResult.ok
+              ? `ok · ${testResult.latency_ms}ms`
+              : testErrorMessage(testResult.error ?? "")}
+          </p>
+        )}
+
+        {settings.configured && settings.last_verified_at && (
+          <p className="text-[10.5px] font-mono text-muted-foreground">
+            last verified {new Date(settings.last_verified_at).toLocaleString()}
+          </p>
+        )}
+
+        {/* Just the cost signal here -- the full breakdown (charts, per-stage
+            and per-provider splits, dashboard links) lives in its own card,
+            since this modal is about the key, not the usage detail. */}
+        <div className="flex items-center justify-between gap-2 pt-2 mt-1 border-t border-border/60">
+          <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+            {usageError
+              ? "Usage isn't available right now."
+              : !usage
+                ? "checking your usage…"
+                : usage.totals.calls === 0
+                  ? "Your key hasn't been used yet."
+                  : `${usage.totals.calls.toLocaleString()} AI calls in the last ${usage.window_days} days.`}
+          </p>
+          <button
+            type="button"
+            onClick={onOpenUsage}
+            className="shrink-0 h-6 px-2 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[10.5px] font-mono cursor-pointer transition-colors"
+          >
+            view usage
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }

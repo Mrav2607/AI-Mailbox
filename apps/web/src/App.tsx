@@ -84,8 +84,7 @@ import type { ReplyStateRefetch } from "@/components/console/ReplyComposer";
 import { TopBar } from "@/components/console/TopBar";
 import { CommandPalette } from "@/components/console/CommandPalette";
 import { Shortcuts } from "@/components/console/Shortcuts";
-import { LlmSettingsModal } from "@/components/console/LlmSettings";
-import { LlmUsageCard } from "@/components/console/LlmUsageCard";
+import { SettingsDialog, type SettingsTab } from "@/components/console/SettingsDialog";
 import { LoginScreen } from "@/components/console/LoginScreen";
 import { VerifyEmailScreen } from "@/components/console/VerifyEmailScreen";
 import { ResetPasswordScreen } from "@/components/console/ResetPasswordScreen";
@@ -245,6 +244,10 @@ export default function Console() {
   const [refreshedHealth, setRefreshedHealth] = useState<SyncHealth | null>(null);
   const [connections, setConnections] = useState<Connection[]>([]);
   const [accountsOpen, setAccountsOpen] = useState(false);
+  // The settings dialog's own open/tab state (settings-card plan §3.4) --
+  // null means closed, and every opener has to specify a tab (there's no
+  // "just open it" -- the dialog never guesses which one).
+  const [settingsPanel, setSettingsPanel] = useState<SettingsTab | null>(null);
   // Which OAuth providers this deployment has configured — gates "Connect
   // Outlook" everywhere it'd otherwise show up next to Gmail.
   const [authProviders, setAuthProviders] = useState<string[]>([]);
@@ -352,6 +355,13 @@ export default function Console() {
   itemsRef.current = items;
   const accountFilterRef = useRef(accountFilter);
   accountFilterRef.current = accountFilter;
+  // Always the LATEST signed-in identity -- handleConnectionUpdated's
+  // ownership check below needs this, since a plain `user?.id` read inside a
+  // useCallback closure only ever sees whichever identity was current when
+  // THAT particular function instance was created, not what's true when it
+  // actually fires (settings-card plan §3.2/P1-1).
+  const userIdRef = useRef<string | null>(user?.id ?? null);
+  userIdRef.current = user?.id ?? null;
   const serverSortRef = useRef(serverSort);
   serverSortRef.current = serverSort;
   // Belt-and-braces guard for the accountFilter effect below, which must
@@ -633,10 +643,22 @@ export default function Console() {
     [handleSessionExpired],
   );
 
+  // The hook's openLlmSettings/openLlmUsage need to reach handleSettingsTabChange
+  // below (it owns the tab-activation prefetch), but that function needs THIS
+  // hook's own refreshLlmUsage/refreshClassifierMix -- a proxy through a ref
+  // breaks the cycle instead of duplicating the prefetch logic in both places.
+  // Updated every render (same pattern as the other *Ref mirrors above), so by
+  // the time a click actually calls into it, it's always pointing at the
+  // latest closure.
+  const settingsTabChangeRef = useRef<(tab: SettingsTab) => void>(() => {});
+  const openSettings = useCallback(
+    (tab: SettingsTab) => settingsTabChangeRef.current(tab),
+    [],
+  );
+
   const {
     llmSettings,
-    llmSettingsOpen,
-    setLlmSettingsOpen,
+    llmSettingsError,
     llmSaving,
     llmTesting,
     llmRemoving,
@@ -645,17 +667,35 @@ export default function Console() {
     llmUsageError,
     classifierMix,
     classifierMixError,
-    llmUsageOpen,
-    setLlmUsageOpen,
     llmUsageDays,
     refreshLlmSettings,
+    retryLlmSettings,
+    refreshLlmUsage,
+    refreshClassifierMix,
     openLlmSettings,
     openLlmUsage,
     changeLlmUsageDays,
     doSaveLlmSettings,
     doTestLlmSettings,
     doRemoveLlmSettings,
-  } = useLlmPanel({ userId: user?.id ?? null, deps: llmPanelDeps });
+  } = useLlmPanel({ userId: user?.id ?? null, deps: llmPanelDeps, openSettings });
+
+  // The settings dialog's only tab-change entry point (settings-card plan
+  // §3.3) -- used directly by SettingsDialog's onTabChange, by TopBar's
+  // "settings" button and the palette's new "settings…" item (both open the
+  // accounts tab), and indirectly by the hook's openLlmSettings/openLlmUsage
+  // via the ref proxy above. Usage/classifier-mix have to refetch on every
+  // activation of a tab that needs them, not just the dialog's initial open --
+  // switching from accounts to ai and back still has to show current numbers.
+  const handleSettingsTabChange = useCallback(
+    (tab: SettingsTab) => {
+      setSettingsPanel(tab);
+      if (tab === "ai" || tab === "usage") void refreshLlmUsage(llmUsageDays);
+      if (tab === "ai") void refreshClassifierMix();
+    },
+    [refreshLlmUsage, llmUsageDays, refreshClassifierMix],
+  );
+  settingsTabChangeRef.current = handleSettingsTabChange;
 
   // ---- data fetching -------------------------------------------------------
   const refreshOverview = useCallback(async () => {
@@ -918,6 +958,31 @@ export default function Console() {
     [connections, refreshConnections, refreshAll],
   );
 
+  // The fenced merge (settings-card plan §3.2/P1-1): LabelSyncRow no longer
+  // keeps its own optimistic override, so a successful PATCH's response has
+  // to land straight in `connections` -- but merging it blindly re-creates
+  // the two races the override used to guard against, so this closes both:
+  //  - ownership: this closure's own `user?.id` reflects whoever was signed
+  //    in when the toggle that produced `updated` was clicked (LabelSyncRow's
+  //    async handler keeps whichever onConnectionUpdated instance was current
+  //    then). If a different account is signed in by the time the PATCH
+  //    resolves -- logout -> login while the request was in flight --
+  //    `userIdRef` (always current) won't match, and this update belongs to
+  //    nobody on screen.
+  //  - ordering: bump connectionsGenRef BEFORE merging, so a GET that started
+  //    before this PATCH and resolves after it (the drift poll racing a
+  //    toggle is the real case) gets discarded by refreshConnections' own
+  //    generation check instead of clobbering the merge with stale data.
+  const handleConnectionUpdated = useCallback(
+    (updated: Connection) => {
+      const owner = user?.id ?? null;
+      if (userIdRef.current !== owner) return; // account changed mid-flight -- drop it
+      connectionsGenRef.current++;
+      setConnections((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+    },
+    [user?.id],
+  );
+
   // What to say when mail isn't flowing. Ranked by what the operator can
   // actually do about it: reconnecting beats knowing the mailbox is behind,
   // and both beat "the scheduler is down" (which only we can fix).
@@ -1160,6 +1225,11 @@ export default function Console() {
     setSearchMode(false);
     setSearchResults([]);
     setQuery("");
+    // The settings dialog used to close via use-llm-panel's own boolean
+    // setters (PR #40) -- now that App owns its open state, this is where
+    // that reset has to live instead, or sign-out -> sign-in reopens the
+    // previous user's settings tab.
+    setSettingsPanel(null);
   }, [user?.id]);
 
   // thread detail
@@ -2500,8 +2570,7 @@ export default function Console() {
             backfillOpen ||
             layoutOpen ||
             accountsOpen ||
-            llmSettingsOpen ||
-            llmUsageOpen ||
+            settingsPanel !== null ||
             snoozePopoverOpen,
         )
       ) {
@@ -2854,8 +2923,7 @@ export default function Console() {
       backfillOpen,
       layoutOpen,
       accountsOpen,
-      llmSettingsOpen,
-      llmUsageOpen,
+      settingsPanel,
       snoozePopoverOpen,
       doUnsnooze,
       skipTour,
@@ -3424,10 +3492,8 @@ export default function Console() {
           health={activeHealth}
           accountsOpen={accountsOpen}
           onAccountsOpenChange={setAccountsOpen}
-          onConnectGmail={handleConnectGmail}
-          onConnectOutlook={outlookEnabled ? handleConnectOutlook : undefined}
-          onDisconnect={handleDisconnect}
-          onOpenLlmSettings={openLlmSettings}
+          onOpenSettings={() => handleSettingsTabChange("accounts")}
+          onOpenAiSettings={openLlmSettings}
           // null until the settings fetch lands, so the backfill form leaves
           // the LLM option alone rather than disabling it on a guess.
           llmUsable={llmSettings?.classification_llm_usable ?? null}
@@ -3530,12 +3596,25 @@ export default function Console() {
           onBackfillActions={doBackfillActions}
           onOpenLlmSettings={openLlmSettings}
           onOpenLlmUsage={openLlmUsage}
+          onOpenSettings={() => handleSettingsTabChange("accounts")}
         />
         <Shortcuts open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
-        <LlmSettingsModal
-          open={llmSettingsOpen}
-          onOpenChange={setLlmSettingsOpen}
+        <SettingsDialog
+          open={settingsPanel !== null}
+          onOpenChange={(v) => {
+            if (!v) setSettingsPanel(null);
+          }}
+          tab={settingsPanel ?? "accounts"}
+          onTabChange={handleSettingsTabChange}
+          connections={connections}
+          health={activeHealth}
+          onConnectGmail={handleConnectGmail}
+          onConnectOutlook={outlookEnabled ? handleConnectOutlook : undefined}
+          onDisconnect={handleDisconnect}
+          onConnectionUpdated={handleConnectionUpdated}
           settings={llmSettings}
+          settingsError={llmSettingsError}
+          onRetrySettings={retryLlmSettings}
           onSave={doSaveLlmSettings}
           saving={llmSaving}
           onTest={doTestLlmSettings}
@@ -3543,15 +3622,8 @@ export default function Console() {
           testResult={llmTestResult}
           onRemove={doRemoveLlmSettings}
           removing={llmRemoving}
-          usage={llmUsage}
-          usageError={llmUsageError}
-          onOpenUsage={openLlmUsage}
           classifierMix={classifierMix}
           classifierMixError={classifierMixError}
-        />
-        <LlmUsageCard
-          open={llmUsageOpen}
-          onOpenChange={setLlmUsageOpen}
           usage={llmUsage}
           usageError={llmUsageError}
           days={llmUsageDays}

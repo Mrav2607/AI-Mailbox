@@ -151,7 +151,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
   {
     slug: "accounts",
     title: "Mail accounts",
-    body: "Your connected accounts live behind your email up here — add Gmail and Outlook inboxes side by side, watch each one's sync health, and disconnect any you no longer want. With more than one connected, the thread list gains an account filter and badges.",
+    body: "Your connected accounts live behind your email up here — a status check for each one, at a glance. Add Gmail and Outlook inboxes, sync labels, or disconnect an account you no longer want from Settings. With more than one connected, the thread list gains an account filter and badges.",
     target: '[data-tour="accounts"]',
     preferredTarget: '[data-tour="accounts-panel"]',
     preconditions: ["open-accounts"],
@@ -161,7 +161,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
   {
     slug: "ai-settings",
     title: "AI extraction & your key",
-    body: "The agenda is powered by an AI model. After the tour, this is where you add your own key from OpenAI, Gemini, OpenRouter, Groq, or Mistral, see how much it gets used, and optionally let it sort incoming mail too.",
+    body: "The agenda is powered by an AI model. Behind settings you can connect accounts, sync labels, and add your own key from OpenAI, Gemini, OpenRouter, Groq, or Mistral — see how much it gets used, and optionally let it sort incoming mail too.",
     target: '[data-tour="llm-settings"]',
     preconditions: ["open-accounts"],
     fallback: {

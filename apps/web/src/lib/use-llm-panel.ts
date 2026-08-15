@@ -7,6 +7,7 @@ import type {
   LlmSettings,
   LlmTestResult,
   LlmUsage,
+  SettingsTab,
 } from "@/lib/types";
 
 // Mirrors the real api module's signatures for the six LLM endpoints this
@@ -36,13 +37,23 @@ interface UseLlmPanelOptions {
   // account, so a change here clears it all -- see the effect at the bottom.
   userId: string | null;
   deps: LlmPanelDeps;
+  // App owns the settings dialog's open/tab state (settings-card plan §3.3)
+  // -- this hook only ever needs to say WHICH tab an entry point wants open,
+  // never whether the dialog itself is open. `openLlmSettings`/`openLlmUsage`
+  // below are thin wrappers over this.
+  openSettings: (tab: SettingsTab) => void;
 }
 
-export function useLlmPanel({ userId, deps }: UseLlmPanelOptions) {
+export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) {
   // BYOK LLM credential -- fetched once per login alongside connections, no
   // polling; refreshed after every save/test/delete.
   const [llmSettings, setLlmSettings] = useState<LlmSettings | null>(null);
-  const [llmSettingsOpen, setLlmSettingsOpen] = useState(false);
+  // True on a failed load, current-generation, never a 401 (that's a session
+  // bounce, handled separately) -- lets the ai tab tell "still loading" apart
+  // from "actually failed" instead of an indefinite "loading…" (plan §3.2/
+  // P2-2). Cleared at the start of every fetch, on a success, and on user
+  // change -- never sticks around describing a stale account's failure.
+  const [llmSettingsError, setLlmSettingsError] = useState(false);
   const [llmSaving, setLlmSaving] = useState(false);
   const [llmTesting, setLlmTesting] = useState(false);
   const [llmRemoving, setLlmRemoving] = useState(false);
@@ -59,10 +70,6 @@ export function useLlmPanel({ userId, deps }: UseLlmPanelOptions) {
   // settings modal look broken.
   const [classifierMix, setClassifierMix] = useState<ClassifierMixEntry[] | null>(null);
   const [classifierMixError, setClassifierMixError] = useState(false);
-  // The usage card's own dialog + range selector -- separate from the
-  // settings modal above, since it opens independently (palette, or the
-  // settings modal's "view usage" button).
-  const [llmUsageOpen, setLlmUsageOpen] = useState(false);
   const [llmUsageDays, setLlmUsageDays] = useState(30);
 
   // Bumped on every save or remove of the LLM credential completes (success
@@ -101,11 +108,11 @@ export function useLlmPanel({ userId, deps }: UseLlmPanelOptions) {
     // with no reload and Console never remounts, so without this the next
     // person to sign in on this tab inherits it all.
     //
-    // llmSettings is the one that actually bites: openLlmSettings only fetches
-    // `if (!llmSettings)`, so a stale value isn't a brief flash before the real
-    // one lands -- it's what the panel shows until a save, remove, or test
-    // happens to refresh it. That panel renders `key_suffix`, the last four
-    // characters of the previous account's API key.
+    // llmSettings is the one that actually bites: it's what the panel shows
+    // until the next login's own refreshLlmSettings() call lands, not just a
+    // brief flash before the real one arrives. That panel renders
+    // `key_suffix`, the last four characters of the previous account's API
+    // key.
     //
     // Bumping each generation ref discards any fetch already in flight for the
     // old account, which would otherwise land after this clear and put the same
@@ -115,16 +122,15 @@ export function useLlmPanel({ userId, deps }: UseLlmPanelOptions) {
     llmUsageGenRef.current++;
     llmMixGenRef.current++;
     setLlmSettings(null);
+    setLlmSettingsError(false);
     setLlmUsage(null);
     setLlmUsageError(false);
     setLlmTestResult(null);
     setClassifierMix(null);
     setClassifierMixError(false);
-    // Close both panels too. They're plain booleans that nothing else resets,
-    // so without this the next person to sign in lands with an AI panel open
-    // that they never opened.
-    setLlmSettingsOpen(false);
-    setLlmUsageOpen(false);
+    // The settings dialog itself closes via App's own account-scoped reset
+    // (settingsPanel -> null alongside its other resets) -- this hook no
+    // longer owns that state, just the data it's built from.
     // NOTE ON TIMING: this is a post-commit effect, so it clears AFTER the
     // first render for a new user. That's only safe because every path that
     // installs a user runs while the previous one is already null -- signing
@@ -135,16 +141,45 @@ export function useLlmPanel({ userId, deps }: UseLlmPanelOptions) {
     // setUser, or B's first frame renders A's credential.
   }, [userId]);
 
-  const refreshLlmSettings = useCallback(async () => {
-    const generation = llmSettingsGenRef.current;
-    try {
-      const next = await deps.getLlmSettings();
-      if (generation !== llmSettingsGenRef.current) return; // account changed -- discard
-      setLlmSettings(next);
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 401) deps.onSessionExpired();
-    }
-  }, [deps]);
+  // Shared by the silent login-time refresh and the ai tab's user-initiated
+  // retry -- same fetch, same generation guard, same llmSettingsError
+  // bookkeeping. The only difference is whether a failure gets a toast
+  // (plan §3.2: the silent refresh must never surface an unsolicited one).
+  const fetchLlmSettings = useCallback(
+    async (opts: { toastOnError: boolean }) => {
+      const generation = llmSettingsGenRef.current;
+      setLlmSettingsError(false);
+      try {
+        const next = await deps.getLlmSettings();
+        if (generation !== llmSettingsGenRef.current) return; // account changed -- discard
+        setLlmSettings(next);
+        setLlmSettingsError(false);
+      } catch (e) {
+        if (generation !== llmSettingsGenRef.current) return; // stale failure -- discard
+        if (e instanceof ApiError && e.status === 401) {
+          deps.onSessionExpired();
+          return;
+        }
+        setLlmSettingsError(true);
+        if (opts.toastOnError) {
+          deps.toastError((e as Error).message || "could not load AI settings");
+        }
+      }
+    },
+    [deps],
+  );
+
+  const refreshLlmSettings = useCallback(
+    () => fetchLlmSettings({ toastOnError: false }),
+    [fetchLlmSettings],
+  );
+
+  // The ai tab's retry button (plan §3.2/P2-1) -- user-initiated, so unlike
+  // the silent refresh above, a failure here does get a toast.
+  const retryLlmSettings = useCallback(
+    () => fetchLlmSettings({ toastOnError: true }),
+    [fetchLlmSettings],
+  );
 
   // Usage changes constantly (every ingested message can add to it), so
   // unlike settings above it's never cached against a "do we already have
@@ -210,43 +245,27 @@ export function useLlmPanel({ userId, deps }: UseLlmPanelOptions) {
     }
   }, [deps]);
 
-  // Opening always starts the modal from a clean test result -- otherwise a
-  // stale ok/error from a previous visit would flash before the user does
-  // anything this time. If the post-login fetch never landed (settings is
-  // still null), retry it here and await it -- otherwise every entry point
-  // into this modal (palette, accounts menu, agenda CTA) would silently do
-  // nothing on a bad connection. Usage, unlike settings, is fetched every
-  // single time regardless of what's already loaded -- it's never stale-safe
-  // to skip.
-  const openLlmSettings = useCallback(async () => {
+  // Thin wrappers over App's openSettings (settings-card plan §3.3) -- the
+  // dialog itself now owns open/close and every tab stays mounted, so the ai
+  // tab renders its own loading/error/retry state off llmSettings/
+  // llmSettingsError instead of this hook re-fetching on open. The usage/mix
+  // prefetch-on-activation happens inside openSettings itself (App wires it
+  // to fire on the SAME tab switch this triggers, per plan §3.3's "must keep
+  // firing on tab switch, not just dialog open"), not duplicated here.
+  //
+  // Opening always starts from a clean test result -- otherwise a stale ok/
+  // error from a previous visit would flash before the user does anything
+  // this time.
+  const openLlmSettings = useCallback(() => {
     setLlmTestResult(null);
-    void refreshLlmUsage(llmUsageDays);
-    void refreshClassifierMix();
-    if (!llmSettings) {
-      const generation = llmSettingsGenRef.current;
-      try {
-        const next = await deps.getLlmSettings();
-        if (generation !== llmSettingsGenRef.current) return; // account changed -- discard
-        setLlmSettings(next);
-      } catch (e) {
-        if (e instanceof ApiError && e.status === 401) {
-          deps.onSessionExpired();
-        } else {
-          deps.toastError((e as Error).message || "could not load AI settings");
-        }
-        return;
-      }
-    }
-    setLlmSettingsOpen(true);
-  }, [llmSettings, deps, refreshLlmUsage, llmUsageDays, refreshClassifierMix]);
+    openSettings("ai");
+  }, [openSettings]);
 
-  // Opens the usage card directly (palette, or the settings modal's "view
-  // usage" button) -- same "always refetch, never stale-safe to skip" rule
-  // as the settings modal's own usage fetch above.
+  // Opens the usage tab directly (palette, or the ai tab's "view usage"
+  // button, which now just switches tabs -- see SettingsDialog).
   const openLlmUsage = useCallback(() => {
-    setLlmUsageOpen(true);
-    void refreshLlmUsage(llmUsageDays);
-  }, [refreshLlmUsage, llmUsageDays]);
+    openSettings("usage");
+  }, [openSettings]);
 
   // Changing the range invalidates whatever usage fetch is still in flight
   // for the old window, so an out-of-order response (a 7d answered after a
@@ -360,8 +379,7 @@ export function useLlmPanel({ userId, deps }: UseLlmPanelOptions) {
 
   return {
     llmSettings,
-    llmSettingsOpen,
-    setLlmSettingsOpen,
+    llmSettingsError,
     llmSaving,
     llmTesting,
     llmRemoving,
@@ -370,10 +388,9 @@ export function useLlmPanel({ userId, deps }: UseLlmPanelOptions) {
     llmUsageError,
     classifierMix,
     classifierMixError,
-    llmUsageOpen,
-    setLlmUsageOpen,
     llmUsageDays,
     refreshLlmSettings,
+    retryLlmSettings,
     refreshLlmUsage,
     refreshClassifierMix,
     openLlmSettings,

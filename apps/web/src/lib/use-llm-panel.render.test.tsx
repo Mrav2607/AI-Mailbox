@@ -3,6 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
 import { ApiError } from "@/lib/api";
+import type { SettingsTab } from "@/components/console/SettingsDialog";
 import type {
   ClassifierMixEntry,
   LlmProvider,
@@ -74,9 +75,12 @@ describe("useLlmPanel rendered lifecycle", () => {
   let onSessionExpired: Mock<() => void>;
   let toastSuccess: Mock<(message: string) => void>;
   let toastError: Mock<(message: string) => void>;
+  // Stands in for App's tab-activation handler -- this hook only ever needs
+  // to say WHICH tab an entry point wants open (settings-card plan §3.3).
+  let openSettings: Mock<(tab: SettingsTab) => void>;
 
   function Harness({ userId }: { userId: string | null }) {
-    api = useLlmPanel({ userId, deps });
+    api = useLlmPanel({ userId, deps, openSettings });
     return null;
   }
 
@@ -91,6 +95,7 @@ describe("useLlmPanel rendered lifecycle", () => {
     onSessionExpired = vi.fn<() => void>();
     toastSuccess = vi.fn<(message: string) => void>();
     toastError = vi.fn<(message: string) => void>();
+    openSettings = vi.fn<(tab: SettingsTab) => void>();
     // Individual tests overwrite whichever of these they need to control;
     // the rest just resolve to something harmless so an unrelated call
     // (e.g. openLlmSettings' own usage/mix side-fetches) doesn't hang.
@@ -378,21 +383,106 @@ describe("useLlmPanel rendered lifecycle", () => {
     expect(toastSuccess).toHaveBeenCalledWith("AI settings saved");
   });
 
-  it("an account change clears everything and closes both panels", () => {
-    act(() => {
-      api!.setLlmSettingsOpen(true);
-      api!.setLlmUsageOpen(true);
+  it("an account change clears everything, including a stuck settings error", async () => {
+    // The settings dialog itself now closes via App's own account-scoped
+    // reset (settingsPanel -> null, settings-card plan §3.4) -- this hook
+    // only owns the DATA a user change has to wipe, which is what's left to
+    // check here.
+    deps.getLlmSettings = vi.fn(() => Promise.reject(new Error("outage")));
+    await act(async () => {
+      await api!.refreshLlmSettings();
     });
-    expect(api!.llmSettingsOpen).toBe(true);
-    expect(api!.llmUsageOpen).toBe(true);
+    expect(api!.llmSettingsError).toBe(true);
 
     render("user-b");
 
-    expect(api!.llmSettingsOpen).toBe(false);
-    expect(api!.llmUsageOpen).toBe(false);
+    expect(api!.llmSettingsError).toBe(false);
     expect(api!.llmSettings).toBeNull();
     expect(api!.llmUsage).toBeNull();
     expect(api!.classifierMix).toBeNull();
     expect(api!.llmTestResult).toBeNull();
+  });
+
+  it("openLlmSettings clears a stale test result and opens the ai tab", async () => {
+    await act(async () => {
+      await api!.doTestLlmSettings();
+    });
+    expect(api!.llmTestResult).not.toBeNull();
+
+    act(() => {
+      api!.openLlmSettings();
+    });
+
+    expect(api!.llmTestResult).toBeNull();
+    expect(openSettings).toHaveBeenCalledWith("ai");
+  });
+
+  it("openLlmUsage opens the usage tab", () => {
+    act(() => {
+      api!.openLlmUsage();
+    });
+    expect(openSettings).toHaveBeenCalledWith("usage");
+  });
+
+  describe("llmSettingsError", () => {
+    it("is set on a load failure and does not toast (silent login-time refresh)", async () => {
+      deps.getLlmSettings = vi.fn(() => Promise.reject(new Error("outage")));
+
+      await act(async () => {
+        await api!.refreshLlmSettings();
+      });
+
+      expect(api!.llmSettingsError).toBe(true);
+      expect(toastError).not.toHaveBeenCalled();
+    });
+
+    it("retryLlmSettings toasts on failure -- it's user-initiated", async () => {
+      deps.getLlmSettings = vi.fn(() => Promise.reject(new Error("still down")));
+
+      await act(async () => {
+        await api!.retryLlmSettings();
+      });
+
+      expect(api!.llmSettingsError).toBe(true);
+      expect(toastError).toHaveBeenCalledWith("still down");
+    });
+
+    it("is cleared by a subsequent successful retry", async () => {
+      deps.getLlmSettings = vi.fn(() => Promise.reject(new Error("outage")));
+      await act(async () => {
+        await api!.refreshLlmSettings();
+      });
+      expect(api!.llmSettingsError).toBe(true);
+
+      deps.getLlmSettings = vi.fn(() => Promise.resolve(makeSettings()));
+      await act(async () => {
+        await api!.retryLlmSettings();
+      });
+
+      expect(api!.llmSettingsError).toBe(false);
+      expect(api!.llmSettings).toEqual(makeSettings());
+    });
+
+    it("a stale (superseded-generation) failure is discarded, not applied", async () => {
+      const settingsFetch = deferred<LlmSettings>();
+      deps.getLlmSettings = vi.fn(() => settingsFetch.promise);
+
+      await act(async () => {
+        void api!.refreshLlmSettings();
+      });
+      expect(api!.llmSettingsError).toBe(false);
+
+      // Switching accounts bumps llmSettingsGenRef -- the fetch above
+      // belongs to the previous generation.
+      render("user-b");
+
+      await act(async () => {
+        settingsFetch.reject(new Error("stale failure"));
+        await settingsFetch.promise.catch(() => {});
+      });
+
+      expect(api!.llmSettingsError).toBe(false);
+      expect(toastError).not.toHaveBeenCalled();
+    });
   });
 });
