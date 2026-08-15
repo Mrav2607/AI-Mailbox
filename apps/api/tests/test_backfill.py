@@ -87,11 +87,19 @@ class _BackfillFakeDB:
 
     def execute(self, stmt):
         cols = [c.key for c in stmt.selected_columns]
-        if cols == ["provider", "classification_byok"]:
+        if cols == ["provider", "classification_byok", "classification_fallback_local"]:
             if self._routing_row is None:
                 return _Result([])
             provider, byok = self._routing_row
-            return _Result([SimpleNamespace(provider=provider, classification_byok=byok)])
+            return _Result(
+                [
+                    SimpleNamespace(
+                        provider=provider,
+                        classification_byok=byok,
+                        classification_fallback_local=False,
+                    )
+                ]
+            )
         table = stmt.selected_columns[0].table.name
         if table == "mail_thread":
             return _Result(self._threads)
@@ -338,7 +346,9 @@ def test_run_backfill_llm_failure_falls_back_to_encoder_with_provenance_marker(m
     """fell_back=1 in the aggregate AND the persisted row's model_version
     carries the +fallback marker -- the exact silent-degrade case from the
     plan's report (an LLM failure served by the encoder was byte-identical
-    to a healthy local-backend run, with no trace anywhere)."""
+    to a healthy local-backend run, with no trace anywhere). Requires
+    fallback_local=True (phase 2, D-A/D-H) -- without the opt-in, this
+    scenario now yields verdict=None instead (see the D-C stop tests below)."""
     from app.services.nlp import local_model
 
     monkeypatch.setattr(
@@ -353,7 +363,7 @@ def test_run_backfill_llm_failure_falls_back_to_encoder_with_provenance_marker(m
 
     user_id = uuid4()
     db = _single_message_db()
-    routing = ClassificationRouting(mode="user", credential=_CRED)
+    routing = ClassificationRouting(mode="user", credential=_CRED, fallback_local=True)
     monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
 
     upserted_model_versions = []
@@ -383,7 +393,9 @@ def test_run_backfill_preflight_rejection_reports_fell_back_without_llm_attempte
     fell_back/failure_categories only. Without this, `llm_failed=1,
     llm_attempted=0` would be an incoherent shape (llm_failed <= llm_attempted
     is the invariant). Drives the real call_chat_completion via a fake
-    pin_custom_destination, same pattern as the two tests above."""
+    pin_custom_destination, same pattern as the two tests above. Requires
+    fallback_local=True (phase 2, D-A/D-H) so the encoder still serves this
+    fallback the same way it did before that opt-in existed."""
     from app.services.nlp import llm_client as llm_client_module
     from app.services.nlp import local_model
     from app.services.nlp.providers import DestinationRejected
@@ -403,7 +415,7 @@ def test_run_backfill_preflight_rejection_reports_fell_back_without_llm_attempte
     credential = LlmCredential(
         provider="custom", base_url="https://ollama.example.com/v1", api_key="k", model="llama3"
     )
-    routing = ClassificationRouting(mode="user", credential=credential)
+    routing = ClassificationRouting(mode="user", credential=credential, fallback_local=True)
     monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
     monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
 
@@ -442,6 +454,177 @@ def _fake_router_returning(routing):
             return routing
 
     return FakeRouter
+
+
+def _two_message_db(**kwargs):
+    return _n_message_db(2, **kwargs)
+
+
+def _n_message_db(n, **kwargs):
+    threads = []
+    latest_rows = []
+    for _ in range(n):
+        t, m = uuid4(), uuid4()
+        threads.append(SimpleNamespace(id=t, subject="s"))
+        latest_rows.append(SimpleNamespace(id=m, thread_id=t, snippet="hi", body_text="there"))
+    return _BackfillFakeDB(threads=threads, latest_rows=latest_rows, **kwargs)
+
+
+def _no_verdict_attempt(failure_category="connection_failed"):
+    return ClassificationAttempt(
+        verdict=None,
+        provider_call_succeeded=False,
+        usage=None,
+        llm_attempted=True,
+        fallback_used=False,
+        failure_category=failure_category,
+    )
+
+
+def _verdict_attempt(label="fyi"):
+    return ClassificationAttempt(
+        verdict=(label, 0.5, "r", "test-model"),
+        provider_call_succeeded=False,
+        usage=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# run_backfill: D-C's early stop after CONSECUTIVE no-verdict results, hit
+# regardless of fallback_local (plan: 2026-08-14-llm-failure-visibility
+# phase 2). A single odd message must never abort an otherwise-healthy run
+# -- see backfill._CONSECUTIVE_NO_VERDICT_LIMIT's own comment for the "why
+# not 1, why stop at all" reasoning these tests pin.
+# ---------------------------------------------------------------------------
+
+
+def test_run_backfill_stops_after_three_consecutive_no_verdicts_with_partial_counts(
+    monkeypatch,
+):
+    """Not opted into fallback_local -- three CONSECUTIVE verdict=None
+    results stop the run rather than continuing to spend the user's BYOK
+    budget on calls that will keep failing the same way. status becomes
+    "llm_unavailable", counts are partial, and the untouched fourth
+    candidate is rolled into left_unclassified too."""
+    user_id = uuid4()
+    db = _n_message_db(4)
+    routing = ClassificationRouting(mode="user", credential=_CRED)  # fallback_local=False
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+
+    calls = []
+
+    def fake_classify_with_usage(text, backend=None, routing=None):
+        calls.append(text)
+        return _no_verdict_attempt()
+
+    monkeypatch.setattr(backfill, "classify_with_usage", fake_classify_with_usage)
+    upserts = []
+    monkeypatch.setattr(
+        backfill, "upsert_classification",
+        lambda *a, **k: (upserts.append(k), "written")[1],
+    )
+
+    result = backfill.run_backfill(db, user_id, limit=10)
+
+    assert len(calls) == 3  # the fourth candidate was never even attempted
+    assert upserts == []  # never a null-label row
+    assert result["status"] == "llm_unavailable"
+    assert result["created"] == 0
+    assert result["scanned"] == 4
+    assert result["left_unclassified"] == 4  # the 3 attempted + the never-attempted one
+    assert result["failure_categories"] == {"connection_failed": 3}
+
+
+def test_run_backfill_opted_in_encoder_down_stops_after_threshold_not_immediately(
+    monkeypatch,
+):
+    """The contract bug this coordinator correction fixes: an opted-in user
+    whose encoder happens to be unavailable burns BYOK money identically to
+    an opted-out one, so the stop must NOT be gated on fallback_local -- it
+    stops after the same 3-consecutive threshold, not on the first failure
+    and not never."""
+    user_id = uuid4()
+    db = _n_message_db(5)
+    routing = ClassificationRouting(mode="user", credential=_CRED, fallback_local=True)
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+
+    calls = []
+
+    def fake_classify_with_usage(text, backend=None, routing=None):
+        calls.append(text)
+        return _no_verdict_attempt()
+
+    monkeypatch.setattr(backfill, "classify_with_usage", fake_classify_with_usage)
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
+
+    result = backfill.run_backfill(db, user_id, limit=10)
+
+    assert len(calls) == 3  # stopped after the threshold, not ground through all 5
+    assert result["status"] == "llm_unavailable"
+    assert result["left_unclassified"] == 5
+
+
+def test_run_backfill_isolated_no_verdicts_among_successes_never_stop_and_counter_resets(
+    monkeypatch,
+):
+    """An isolated no-verdict (or even two, separated by a success) must
+    never trip the stop -- the streak counter has to actually reset on a
+    verdict, not just accumulate a running total. Pattern: no-verdict,
+    success, no-verdict, no-verdict, success -- 3 no-verdicts total but the
+    longest CONSECUTIVE run is 2, under the threshold, so all 5 candidates
+    get attempted and the run finishes "ok"."""
+    user_id = uuid4()
+    db = _n_message_db(5)
+    routing = ClassificationRouting(mode="user", credential=_CRED)  # fallback_local=False
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+
+    outcomes = [
+        _no_verdict_attempt(),
+        _verdict_attempt(),
+        _no_verdict_attempt(),
+        _no_verdict_attempt(),
+        _verdict_attempt(),
+    ]
+    calls = []
+
+    def fake_classify_with_usage(text, backend=None, routing=None):
+        calls.append(text)
+        return outcomes[len(calls) - 1]
+
+    monkeypatch.setattr(backfill, "classify_with_usage", fake_classify_with_usage)
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
+
+    result = backfill.run_backfill(db, user_id, limit=10)
+
+    assert len(calls) == 5  # nothing stopped the run early
+    assert result["status"] == "ok"
+    assert result["created"] == 2  # the two verdicts that landed
+    assert result["left_unclassified"] == 3  # the three no-verdict messages
+
+
+def test_run_backfill_two_consecutive_no_verdicts_stay_under_the_stop_threshold(monkeypatch):
+    """Two consecutive no-verdicts (opted-in, encoder unavailable both
+    times) stay under the 3-consecutive threshold -- every candidate still
+    gets attempted and the run reports "ok", not "llm_unavailable"."""
+    user_id = uuid4()
+    db = _two_message_db()
+    routing = ClassificationRouting(mode="user", credential=_CRED, fallback_local=True)
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+
+    calls = []
+
+    def fake_classify_with_usage(text, backend=None, routing=None):
+        calls.append(text)
+        return _no_verdict_attempt()
+
+    monkeypatch.setattr(backfill, "classify_with_usage", fake_classify_with_usage)
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
+
+    result = backfill.run_backfill(db, user_id, limit=10)
+
+    assert len(calls) == 2  # both candidates attempted
+    assert result["status"] == "ok"
+    assert result["left_unclassified"] == 2
 
 
 def test_run_backfill_records_usage_only_for_user_mode_routing(monkeypatch):

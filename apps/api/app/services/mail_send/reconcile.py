@@ -211,7 +211,6 @@ def _classify_and_stamp(
         router = ClassificationRouter(user_id)
         routing = router.routing_for(db)
         attempt_result = classify_with_usage(text_for_classification, routing=routing)
-        label, confidence, rationale, model_version = attempt_result.verdict
         if routing.mode == "user" and routing.credential is not None:
             acc = UsageAccumulator(user_id)
             acc.record(
@@ -221,6 +220,17 @@ def _classify_and_stamp(
                 provider_call_succeeded=attempt_result.provider_call_succeeded,
             )
             acc.flush(db)
+        # Phase 2 (D-C): `verdict is None` means a failed BYOK call with no
+        # local fallback served -- same treatment as a caught classification
+        # exception below: leave verified_at NULL for a later pass rather
+        # than stamp a send as verified alongside a write that never
+        # happened, and never write a null-label row (it would strand the
+        # message). Usage above still commits -- the call may have genuinely
+        # billed the user even though it produced nothing to classify with.
+        if attempt_result.verdict is None:
+            db.commit()
+            return False
+        label, confidence, rationale, model_version = attempt_result.verdict
         upsert_classification(
             db,
             message_id=message.id,

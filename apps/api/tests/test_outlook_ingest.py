@@ -51,11 +51,12 @@ def _no_op_removals(*_args, **_kwargs):
     return {"verified": 0, "deleted": 0, "kept": 0}
 
 
-def _upsert_stub(threads=0, messages=0, classified=0, usage_recorded=False):
+def _upsert_stub(threads=0, messages=0, classified=0, left_unclassified=0, usage_recorded=False):
     return {
         "threads_upserted": threads,
         "messages_upserted": messages,
         "classified": classified,
+        "left_unclassified": left_unclassified,
         "usage_recorded": usage_recorded,
     }
 

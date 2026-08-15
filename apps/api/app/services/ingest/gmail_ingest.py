@@ -431,6 +431,11 @@ def ingest_gmail_messages(
     threads_upserted = 0
     messages_upserted = 0
     classified = 0
+    # Phase 2 (D-C/D-I): a failed BYOK call the user hasn't opted into local
+    # fallback for leaves the message unclassified rather than downgrading to
+    # the keyword heuristic -- counted here so a sync toast can name it. No
+    # automatic recovery; the user has to run a backfill (D-I).
+    left_unclassified = 0
     threads_reopened = 0
     threads_missing = 0
 
@@ -556,12 +561,13 @@ def ingest_gmail_messages(
                     attempt = classify_with_usage(
                         text_for_classification, routing=routing
                     )
-                    label, confidence, rationale, model_version = attempt.verdict
                     # Only the user's own key gets recorded -- v1 tracks
                     # user-paid usage only (plan §1). `routing.mode == "user"`
                     # is the single source of truth for who pays; the
                     # operator-paid server path must never show up in
-                    # someone's usage panel.
+                    # someone's usage panel. Recorded regardless of verdict --
+                    # a failed call can still have reached (and billed) the
+                    # provider before coming up empty (D3).
                     if routing.mode == "user" and routing.credential is not None:
                         usage_acc.record(
                             "classification",
@@ -570,15 +576,23 @@ def ingest_gmail_messages(
                             provider_call_succeeded=attempt.provider_call_succeeded,
                         )
                         usage_pending = True
-                    upsert_classification(
-                        db,
-                        message_id=new_message_id,
-                        label=label,
-                        confidence=confidence,
-                        rationale=rationale,
-                        model_version=model_version,
-                    )
-                    classified += 1
+                    # Phase 2 (D-C): `verdict is None` means a failed BYOK
+                    # call with no local fallback served -- never write a
+                    # null-label row (it would strand the message, neither
+                    # classified nor a backfill candidate again).
+                    if attempt.verdict is None:
+                        left_unclassified += 1
+                    else:
+                        label, confidence, rationale, model_version = attempt.verdict
+                        upsert_classification(
+                            db,
+                            message_id=new_message_id,
+                            label=label,
+                            confidence=confidence,
+                            rationale=rationale,
+                            model_version=model_version,
+                        )
+                        classified += 1
 
         if should_reopen:
             db.execute(
@@ -623,6 +637,7 @@ def ingest_gmail_messages(
         "threads_upserted": threads_upserted,
         "messages_upserted": messages_upserted,
         "classified": classified,
+        "left_unclassified": left_unclassified,
         "threads_reopened": threads_reopened,
         "fetched": len(thread_ids),
         "skipped_existing": skipped_existing,

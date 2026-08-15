@@ -10,6 +10,7 @@ import {
   type SyncHealth,
   type SyncRunStatus,
 } from "./api";
+import { leftUnclassifiedMessage } from "./task-toasts";
 
 // The server pulls mail on its own schedule now, so this only has to be often
 // enough that the user notices a broken mailbox in reasonable time
@@ -187,6 +188,11 @@ export function useAutoSync({
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const runningRef = useRef(false);
   const failStreakRef = useRef(0);
+  // True once this loop has already warned about mail left unclassified --
+  // reset the moment a run comes back clean, so a provider that recovers
+  // and fails again gets warned about it again instead of staying silent
+  // forever after the first toast.
+  const leftUnclassifiedWarnedRef = useRef(false);
   // Newest last_message_at the check has observed (server timestamp, so the
   // watermark never depends on the client clock once data exists).
   const newestRef = useRef<string | null>(null);
@@ -342,10 +348,25 @@ export function useAutoSync({
         const changed =
           finals.some((f) => !f.ready) ||
           finals.some((f) => (f.result?.threads_upserted ?? 0) > 0);
+        const leftUnclassified = finals.reduce(
+          (sum, f) => sum + (f.result?.left_unclassified ?? 0),
+          0,
+        );
         if (cancelled) return;
         failStreakRef.current = 0;
         setSyncFailed(false);
         if (changed) await onSyncedRef.current();
+        // This is otherwise a silent loop, but mail going unclassified is
+        // exactly the thing this feature exists to surface -- warn once per
+        // streak rather than every cycle while the provider stays down.
+        if (leftUnclassified > 0) {
+          if (!leftUnclassifiedWarnedRef.current) {
+            toast.warning(leftUnclassifiedMessage(leftUnclassified));
+            leftUnclassifiedWarnedRef.current = true;
+          }
+        } else {
+          leftUnclassifiedWarnedRef.current = false;
+        }
         // Always re-derive: mail can also land via another tab's manual
         // ingest, and the check is one cheap unthrottled GET.
         await checkNew();

@@ -84,16 +84,30 @@ describe("sumIngestResults", () => {
       run({ result: { status: "ok", threads_upserted: 3, messages_upserted: 9 } }),
       run({ result: { status: "ok", threads_upserted: 1, messages_upserted: 2 } }),
     ];
-    expect(sumIngestResults(finals)).toEqual({ threads: 4, messages: 11 });
+    expect(sumIngestResults(finals)).toEqual({ threads: 4, messages: 11, leftUnclassified: 0 });
   });
 
   it("falls back to new_threads when threads_upserted is missing", () => {
     const finals = [run({ result: { status: "ok", new_threads: 2 } })];
-    expect(sumIngestResults(finals)).toEqual({ threads: 2, messages: 0 });
+    expect(sumIngestResults(finals)).toEqual({ threads: 2, messages: 0, leftUnclassified: 0 });
   });
 
   it("treats a run with no result as contributing nothing", () => {
-    expect(sumIngestResults([run({ result: null })])).toEqual({ threads: 0, messages: 0 });
+    expect(sumIngestResults([run({ result: null })])).toEqual({
+      threads: 0,
+      messages: 0,
+      leftUnclassified: 0,
+    });
+  });
+
+  it("sums left_unclassified across every account's run", () => {
+    const finals = [
+      run({ result: { status: "ok", left_unclassified: 3 } }),
+      run({ result: { status: "ok", left_unclassified: 5 } }),
+      // Older/BYOK-off runs never send this field -- must not throw.
+      run({ result: { status: "ok" } }),
+    ];
+    expect(sumIngestResults(finals)).toEqual({ threads: 0, messages: 0, leftUnclassified: 8 });
   });
 });
 
@@ -667,6 +681,38 @@ describe("putLlmSettings", () => {
     });
     expect(res.classification_byok).toBe(true);
     expect(res.classification_eligible).toBe(true);
+  });
+
+  it("passes classification_fallback_local through to the request body when given", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({
+      configured: true,
+      provider: "groq",
+      model: "llama-3.1-8b-instant",
+      base_url: "https://api.groq.com/openai/v1",
+      key_suffix: "cdef",
+      last_verified_at: null,
+      extraction_enabled: true,
+      fallback_active: false,
+      custom_endpoints_enabled: false,
+      private_endpoints_enabled: false,
+      custom_blocked: false,
+      classification_byok: true,
+      classification_fallback_local: true,
+      classifier_uses_llm: true,
+      classifier_backend: "auto",
+      classification_eligible: true,
+    });
+    const input = {
+      provider: "groq" as const,
+      api_key: "gsk_live_abcdef",
+      model: "llama-3.1-8b-instant",
+      classification_byok: true,
+      classification_fallback_local: true,
+    };
+    const res = await api.putLlmSettings(input);
+    expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual(input);
+    expect(res.classification_fallback_local).toBe(true);
   });
 
   it("omits api_key from the request body when left out -- never sends an empty string", async () => {

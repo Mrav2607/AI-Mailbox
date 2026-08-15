@@ -395,6 +395,7 @@ def test_small_backfill_runs_inline(client, fake_backfill_delay):
         "llm_failed": 0,
         "fell_back": 0,
         "failure_categories": {},
+        "left_unclassified": 0,
     }
     fake_backfill_delay.assert_not_called()
 

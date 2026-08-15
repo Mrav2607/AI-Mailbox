@@ -569,6 +569,8 @@ describe("mock llm settings", () => {
     // Opted in on a preset provider from the start, so preview shows the
     // "local model handles most mail" notice on first load.
     expect(settings.classification_byok).toBe(true);
+    // A true opt-in, off by default even with classification_byok on.
+    expect(settings.classification_fallback_local).toBe(false);
     expect(settings.classifier_uses_llm).toBe(true);
     expect(settings.classifier_backend).toBe("auto");
     expect(settings.classification_eligible).toBe(true);
@@ -609,6 +611,38 @@ describe("mock llm settings", () => {
     });
     expect(updated.classification_byok).toBe(false);
     expect(updated.classification_eligible).toBe(false);
+  });
+
+  it("put leaves classification_fallback_local unchanged when the field is absent", () => {
+    const updated = mockPutLlmSettings({
+      provider: "groq",
+      api_key: "gsk_live_ignored456",
+      model: "llama-3.1-8b-instant",
+    });
+    expect(updated.classification_fallback_local).toBe(false);
+  });
+
+  it("put threads classification_fallback_local through on request", () => {
+    const updated = mockPutLlmSettings({
+      provider: "groq",
+      api_key: "gsk_live_abcd9012",
+      model: "llama-3.1-8b-instant",
+      classification_fallback_local: true,
+    });
+    expect(updated.classification_fallback_local).toBe(true);
+  });
+
+  it("put does not coerce classification_fallback_local off when classification_byok is off", () => {
+    // The real API leaves this stored but inert rather than clearing it --
+    // the mock mirrors that instead of silently zeroing the flag out.
+    const updated = mockPutLlmSettings({
+      provider: "groq",
+      api_key: "gsk_live_abcd3456",
+      model: "llama-3.1-8b-instant",
+      classification_byok: false,
+    });
+    expect(updated.classification_byok).toBe(false);
+    expect(updated.classification_fallback_local).toBe(true);
   });
 
   it("put marks classification_eligible false for a custom provider even with the flag on -- the out-of-band notice state", () => {
@@ -696,6 +730,7 @@ describe("mock llm settings", () => {
     // deployment default; the effective-backend fields are untouched by
     // deleting a credential.
     expect(settings.classification_byok).toBe(false);
+    expect(settings.classification_fallback_local).toBe(false);
     expect(settings.classification_eligible).toBe(false);
     // Preview has no operator key, so removing the credential leaves nothing
     // for the LLM backend to call -- the backfill form reads this to disable

@@ -35,6 +35,7 @@ export interface LlmSettingsSectionProps {
     model: string;
     base_url?: string;
     classification_byok?: boolean;
+    classification_fallback_local?: boolean;
   }) => void;
   saving: boolean;
   onTest: () => void;
@@ -180,6 +181,7 @@ export function LlmSettingsSection({
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [classificationByok, setClassificationByok] = useState(false);
+  const [fallbackLocal, setFallbackLocal] = useState(false);
   const hydratedRef = useRef(false);
 
   useEffect(() => {
@@ -194,6 +196,7 @@ export function LlmSettingsSection({
     setApiKey("");
     setBaseUrl(settings.provider === "custom" ? (settings.base_url ?? "") : "");
     setClassificationByok(settings.classification_byok);
+    setFallbackLocal(settings.classification_fallback_local);
   }, [open, settings]);
 
   if (!settings) {
@@ -277,6 +280,7 @@ export function LlmSettingsSection({
             model: model.trim(),
             base_url: provider === "custom" ? baseUrl.trim() : undefined,
             classification_byok: provider === "custom" ? false : classificationByok,
+            classification_fallback_local: fallbackLocal,
           });
         }}
         className="space-y-2.5"
@@ -397,6 +401,31 @@ export function LlmSettingsSection({
                 Your key isn&apos;t set up to sort your mail — the built-in rules are being
                 used instead.
               </p>
+            )}
+
+            {/* Meaningless while classification_byok is off, so it only shows
+                up once the checkbox above is checked -- reading the live
+                `classificationByok` state here (not settings.classification_byok)
+                so it appears/disappears the moment the user toggles that
+                checkbox, before they've even saved
+                (docs/plans/2026-08-14-llm-failure-visibility-plan.md phase 2). */}
+            {classificationByok && (
+              <div className="space-y-1 pl-[18px] pt-1">
+                <label className="flex items-start gap-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={fallbackLocal}
+                    onChange={(e) => setFallbackLocal(e.target.checked)}
+                    className="mt-0.5"
+                  />
+                  <span className="text-[12px] font-mono text-foreground leading-snug">
+                    If your LLM fails, classify with the built-in model instead
+                  </span>
+                </label>
+                <p className="text-[10.5px] font-mono text-muted-foreground leading-snug pl-[18px]">
+                  Off means affected mail stays unclassified until you run a backfill.
+                </p>
+              </div>
             )}
           </div>
         )}

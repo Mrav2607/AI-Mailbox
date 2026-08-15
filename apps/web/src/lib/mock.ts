@@ -913,6 +913,9 @@ let LLM_SETTINGS: LlmSettings = {
   private_endpoints_enabled: false,
   custom_blocked: false,
   classification_byok: true,
+  // Starts off -- a true opt-in, same default as the real column. Harmless
+  // in preview since the mock provider never fails a call to begin with.
+  classification_fallback_local: false,
   classifier_uses_llm: true,
   classifier_backend: "auto",
   classification_eligible: true,
@@ -937,6 +940,7 @@ export function mockPutLlmSettings(input: {
   model: string;
   base_url?: string;
   classification_byok?: boolean;
+  classification_fallback_local?: boolean;
 }): LlmSettings {
   const base_url =
     input.provider === "custom"
@@ -948,6 +952,11 @@ export function mockPutLlmSettings(input: {
   // classification_byok=true against a custom provider is exactly the
   // out-of-band shape the "isn't set up to sort your mail" notice covers.
   const classificationByok = input.classification_byok ?? LLM_SETTINGS.classification_byok;
+  // Same absent-means-unchanged rule, and same deliberate non-coercion: the
+  // real API leaves this stored but inert when classification_byok is off,
+  // so the mock does too rather than silently zeroing it out.
+  const fallbackLocal =
+    input.classification_fallback_local ?? LLM_SETTINGS.classification_fallback_local;
   const key_suffix = input.api_key ? input.api_key.slice(-4) : LLM_SETTINGS.key_suffix;
   const materialChanged =
     Boolean(input.api_key) ||
@@ -964,6 +973,7 @@ export function mockPutLlmSettings(input: {
     last_verified_at: materialChanged ? null : LLM_SETTINGS.last_verified_at,
     fallback_active: false,
     classification_byok: classificationByok,
+    classification_fallback_local: fallbackLocal,
     classification_eligible: input.provider === "custom" ? false : classificationByok,
     classification_llm_usable: input.provider === "custom" ? false : classificationByok,
   };
@@ -997,6 +1007,7 @@ export function mockDeleteLlmSettings(): void {
     // No credential left to opt in -- classification falls back to the
     // deployment default, same as extraction's fallback story above.
     classification_byok: false,
+    classification_fallback_local: false,
     classifier_uses_llm: LLM_SETTINGS.classifier_uses_llm,
     classifier_backend: LLM_SETTINGS.classifier_backend,
     classification_eligible: false,

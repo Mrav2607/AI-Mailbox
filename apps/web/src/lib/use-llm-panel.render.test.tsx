@@ -40,6 +40,7 @@ function makeSettings(overrides: Partial<LlmSettings> = {}): LlmSettings {
     private_endpoints_enabled: true,
     custom_blocked: false,
     classification_byok: false,
+    classification_fallback_local: false,
     classifier_uses_llm: true,
     classifier_backend: "heuristic",
     classification_eligible: true,
@@ -108,6 +109,7 @@ describe("useLlmPanel rendered lifecycle", () => {
           model: string;
           base_url?: string;
           classification_byok?: boolean;
+          classification_fallback_local?: boolean;
         }) => Promise.resolve(makeSettings({ provider: input.provider, model: input.model })),
       ),
       testLlmSettings: vi.fn(() =>

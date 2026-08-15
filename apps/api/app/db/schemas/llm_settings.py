@@ -46,6 +46,14 @@ class LlmSettingsOut(Response):
     # subset)? False for an unconfigured user -- there's no credential to
     # opt in.
     classification_byok: bool
+    # Per-credential opt-in (plan: 2026-08-14-llm-failure-visibility phase 2,
+    # D-A): if a BYOK classification call fails, serve the local encoder
+    # instead of leaving the message unclassified. Only meaningful when
+    # `classification_byok` is also true -- writable independently of it and
+    # persisted as-is either way, since a user may reasonably set this before
+    # flipping BYOK on. Default false: existing BYOK users get no automatic
+    # fallback until they opt in.
+    classification_fallback_local: bool
     # Whether the effective classifier backend ever reaches an LLM at all --
     # `classifier_backend != "heuristic"`. Gates the opt-in checkbox itself:
     # a heuristic-only deployment has no LLM path for the key to pay for.

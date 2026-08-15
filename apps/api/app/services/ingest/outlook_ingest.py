@@ -312,6 +312,11 @@ def _upsert_page_messages(
     threads_upserted = 0
     messages_upserted = 0
     classified = 0
+    # Phase 2 (D-C/D-I): a failed BYOK call the user hasn't opted into local
+    # fallback for leaves the message unclassified rather than downgrading to
+    # the keyword heuristic -- counted here so a sync toast can name it. No
+    # automatic recovery; the user has to run a backfill (D-I).
+    left_unclassified = 0
     # Tells the caller whether this page put anything in usage_acc, since it
     # can't see usage_acc's internal buffer state from out there.
     usage_recorded = False
@@ -394,11 +399,13 @@ def _upsert_page_messages(
                 attempt = classify_with_usage(
                     text_for_classification, routing=routing
                 )
-                label, confidence, rationale, model_version = attempt.verdict
                 # Only the user's own key gets recorded -- v1 tracks
                 # user-paid usage only (plan §1), same rule as Gmail's ingest.
                 # `routing.mode == "user"` is the single source of truth for
-                # who pays; the operator-paid server path never shows up here.
+                # who pays; the operator-paid server path never shows up
+                # here. Recorded regardless of verdict -- a failed call can
+                # still have reached (and billed) the provider before coming
+                # up empty (D3).
                 if routing.mode == "user" and routing.credential is not None:
                     usage_acc.record(
                         "classification",
@@ -407,15 +414,23 @@ def _upsert_page_messages(
                         provider_call_succeeded=attempt.provider_call_succeeded,
                     )
                     usage_recorded = True
-                upsert_classification(
-                    db,
-                    message_id=new_message_id,
-                    label=label,
-                    confidence=confidence,
-                    rationale=rationale,
-                    model_version=model_version,
-                )
-                classified += 1
+                # Phase 2 (D-C): `verdict is None` means a failed BYOK call
+                # with no local fallback served -- never write a null-label
+                # row (it would strand the message, neither classified nor a
+                # backfill candidate again).
+                if attempt.verdict is None:
+                    left_unclassified += 1
+                else:
+                    label, confidence, rationale, model_version = attempt.verdict
+                    upsert_classification(
+                        db,
+                        message_id=new_message_id,
+                        label=label,
+                        confidence=confidence,
+                        rationale=rationale,
+                        model_version=model_version,
+                    )
+                    classified += 1
 
         if should_reopen:
             db.execute(update(MailThread).where(MailThread.id == thread_id).values(done_at=None))
@@ -424,6 +439,7 @@ def _upsert_page_messages(
         "threads_upserted": threads_upserted,
         "messages_upserted": messages_upserted,
         "classified": classified,
+        "left_unclassified": left_unclassified,
         "usage_recorded": usage_recorded,
     }
 
@@ -546,6 +562,7 @@ def ingest_outlook_messages(
         "threads_upserted": 0,
         "messages_upserted": 0,
         "classified": 0,
+        "left_unclassified": 0,
         "messages_removed": 0,
         "fetched": 0,
     }
@@ -705,6 +722,7 @@ def ingest_outlook_messages(
             stats["threads_upserted"] += upsert_stats["threads_upserted"]
             stats["messages_upserted"] += upsert_stats["messages_upserted"]
             stats["classified"] += upsert_stats["classified"]
+            stats["left_unclassified"] += upsert_stats["left_unclassified"]
             stats["messages_removed"] += removal_stats["deleted"]
             stats["fetched"] += len(messages)
 

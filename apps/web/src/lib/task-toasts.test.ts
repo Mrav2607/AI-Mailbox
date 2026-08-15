@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { backfillToastOutcome, extractionToastOutcome } from "./task-toasts";
+import { backfillToastOutcome, extractionToastOutcome, ingestToastOutcome } from "./task-toasts";
 
 describe("backfillToastOutcome", () => {
   it("keeps the site's own clean copy when nothing fell back", () => {
@@ -8,7 +8,7 @@ describe("backfillToastOutcome", () => {
       { created: 12, fell_back: 0 },
       "classified 12 · scanned 200",
     );
-    expect(outcome).toEqual({ message: "classified 12 · scanned 200", warn: false });
+    expect(outcome).toEqual({ message: "classified 12 · scanned 200", level: "success" });
   });
 
   it("warns and shows the fallback ratio on partial degradation", () => {
@@ -16,7 +16,7 @@ describe("backfillToastOutcome", () => {
       { created: 12, fell_back: 38, failure_categories: { http_429: 38 } },
       "classified 12 · scanned 200",
     );
-    expect(outcome.warn).toBe(true);
+    expect(outcome.level).toBe("warning");
     expect(outcome.message).toBe(
       "classified 12 · 38 of those fell back to the built-in model — rate limited by your provider",
     );
@@ -29,7 +29,7 @@ describe("backfillToastOutcome", () => {
     );
     expect(outcome).toEqual({
       message: "classified 0 · 50 of those fell back to the built-in model — provider timed out",
-      warn: true,
+      level: "warning",
     });
   });
 
@@ -40,7 +40,7 @@ describe("backfillToastOutcome", () => {
     );
     expect(outcome).toEqual({
       message: "classified 5 · 10 of those fell back to the built-in model",
-      warn: true,
+      level: "warning",
     });
   });
 
@@ -48,7 +48,35 @@ describe("backfillToastOutcome", () => {
     // What an older API/worker result recorded before this feature shipped
     // looks like -- must not throw, must not warn.
     const outcome = backfillToastOutcome({}, "classified 12 · scanned 200");
-    expect(outcome).toEqual({ message: "classified 12 · scanned 200", warn: false });
+    expect(outcome).toEqual({ message: "classified 12 · scanned 200", level: "success" });
+  });
+
+  it("errors, names the category, and states the remedy when the run stopped for lack of a fallback", () => {
+    // Phase 2 (docs/plans/2026-08-14-llm-failure-visibility-plan.md): the
+    // user isn't opted into the local-model fallback, so the run stopped the
+    // moment the LLM failed instead of burning more of their own quota.
+    const outcome = backfillToastOutcome(
+      {
+        status: "llm_unavailable",
+        created: 7,
+        failure_categories: { http_429: 9 },
+      },
+      "classified 7 · scanned 50",
+    );
+    expect(outcome.level).toBe("error");
+    expect(outcome.message).toContain("7 classified so far");
+    expect(outcome.message).toContain("rate limited by your provider");
+    expect(outcome.message).toContain("run backfill again once your provider recovers");
+  });
+
+  it("still errors and states the remedy when llm_unavailable carries no dominant category", () => {
+    const outcome = backfillToastOutcome(
+      { status: "llm_unavailable", created: 0 },
+      "classified 0 · scanned 50",
+    );
+    expect(outcome.level).toBe("error");
+    expect(outcome.message).toContain("0 classified so far");
+    expect(outcome.message).toContain("run backfill again once your provider recovers");
   });
 });
 
@@ -57,7 +85,7 @@ describe("extractionToastOutcome", () => {
     const outcome = extractionToastOutcome({ extracted: 5, failed: 0 });
     expect(outcome).toEqual({
       message: "action extraction complete · 5 extracted",
-      warn: false,
+      level: "success",
     });
   });
 
@@ -67,7 +95,7 @@ describe("extractionToastOutcome", () => {
       failed: 2,
       failure_categories: { connection_failed: 2 },
     });
-    expect(outcome.warn).toBe(true);
+    expect(outcome.level).toBe("warning");
     expect(outcome.message).toBe(
       "action extraction · 3 extracted · 2 failed — could not reach your provider",
     );
@@ -81,7 +109,7 @@ describe("extractionToastOutcome", () => {
     });
     expect(outcome).toEqual({
       message: "action extraction · 0 extracted · 8 failed — rate limited by your provider",
-      warn: true,
+      level: "warning",
     });
   });
 
@@ -89,7 +117,7 @@ describe("extractionToastOutcome", () => {
     const outcome = extractionToastOutcome({});
     expect(outcome).toEqual({
       message: "action extraction complete · 0 extracted",
-      warn: false,
+      level: "success",
     });
   });
 
@@ -101,7 +129,30 @@ describe("extractionToastOutcome", () => {
     });
     expect(outcome).toEqual({
       message: "action extraction · 1 extracted · 4 failed",
-      warn: true,
+      level: "warning",
     });
+  });
+});
+
+describe("ingestToastOutcome", () => {
+  it("keeps the site's own clean copy when nothing was left unclassified", () => {
+    const outcome = ingestToastOutcome({ left_unclassified: 0 }, "ingest complete · 3 threads");
+    expect(outcome).toEqual({ message: "ingest complete · 3 threads", level: "success" });
+  });
+
+  it("warns and names the remedy when mail was left unclassified", () => {
+    const outcome = ingestToastOutcome({ left_unclassified: 4 }, "ingest complete · 3 threads");
+    expect(outcome).toEqual({
+      message:
+        "ingest complete · 3 threads · 4 left unclassified — run backfill when your provider recovers",
+      level: "warning",
+    });
+  });
+
+  it("treats a result missing left_unclassified as a clean run", () => {
+    // An older API (or an account not on BYOK classification) never sends
+    // this field at all -- must not throw, must not warn.
+    const outcome = ingestToastOutcome({}, "ingest complete · 3 threads");
+    expect(outcome).toEqual({ message: "ingest complete · 3 threads", level: "success" });
   });
 });

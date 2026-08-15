@@ -58,9 +58,18 @@ class ClassificationAttempt:
     `False` but a fallback still genuinely served. `failure_category` mirrors
     `LlmCallError.category`, or is `"invalid_response"` for a malformed body
     that isn't an `LlmCallError` at all.
+
+    `verdict` is `None` exactly once in this whole module (phase 2, D-C/D-H):
+    a `mode="user"` BYOK call failed, and either the user never opted into
+    `fallback_local` or the encoder couldn't serve either. `None` means NO
+    classification was produced and NONE must be written -- every caller
+    that destructures `verdict` has to check for `None` and skip its upsert
+    first (see `persistence.upsert_classification`'s callers). `fallback_used`
+    stays `False` in that case: nothing actually served a fallback verdict,
+    even though an LLM genuinely failed.
     """
 
-    verdict: tuple[str, float, str, str]
+    verdict: tuple[str, float, str, str] | None
     provider_call_succeeded: bool
     usage: LlmUsage | None
     llm_attempted: bool = False
@@ -152,10 +161,14 @@ def classify(
     text: str,
     backend: str | None = None,
     routing: ClassificationRouting | None = None,
-) -> tuple[str, float, str, str]:
+) -> tuple[str, float, str, str] | None:
     """
     Classify an email into the 6-label taxonomy.
-    Returns (label, confidence, rationale, model_version).
+    Returns (label, confidence, rationale, model_version), or `None` if no
+    classification could be produced -- see `ClassificationAttempt.verdict`'s
+    docstring for the one case that happens (a failed BYOK call the user
+    didn't opt into local fallback for). Every caller must check for `None`
+    before unpacking.
 
     Routed by `backend` (falling back to settings.classifier_backend when not
     given, so callers can override the global default per request):
@@ -193,11 +206,15 @@ def classify(
         `CLASSIFIER_BACKEND` default) still honors the opt-in instead of
         silently classifying opted-in mail for free on the encoder.
 
-    A failed BYOK call (`_classify_llm_user`) now falls back to the local
-    encoder before keyword rules, so a transient provider error doesn't hand
-    an opted-in user worse labels than someone who never opted in -- see
-    `_classify_attempt` and the `local_tried` plumbing through
-    `_classify_llm`/`_classify_llm_user`.
+    A failed BYOK call (`_classify_llm_user`) falls back to the local encoder
+    ONLY when `routing.fallback_local` opts in (plan phase 2, D-H) -- see
+    `_classify_attempt`, the `local_tried` plumbing through `_classify_llm`/
+    `_classify_llm_user`, and `_llm_user_failure_fallback`. Otherwise (or if
+    the encoder can't serve either), `classify()`/`classify_with_usage()`
+    return a `None` verdict rather than degrading to keyword rules -- the
+    keyword heuristic left this failure chain entirely; it never hands an
+    opted-in user a worse label than someone who never opted in, it just
+    leaves the message unclassified until a backfill.
 
     This is the compatibility wrapper -- see `_classify_attempt` for the
     actual implementation, which `classify_with_usage()` also wraps. Any
@@ -403,7 +420,9 @@ def _classify_llm(
             # opted in with their own key.
             logger.warning("ClassificationRouting mode='user' had no credential")
             return _heuristic_attempt(text)
-        return _classify_llm_user(text, routing.credential, local_tried)
+        return _classify_llm_user(
+            text, routing.credential, local_tried, fallback_local=routing.fallback_local
+        )
 
     return _classify_llm_server(text)
 
@@ -522,35 +541,38 @@ def _llm_user_failure_fallback(
     text: str,
     local_tried: bool,
     *,
+    fallback_local: bool,
     provider_call_succeeded: bool,
     usage: LlmUsage | None,
     failure_category: str,
 ) -> ClassificationAttempt:
     """
-    Shared by both `_classify_llm_user` failure paths (D2): try the local
-    encoder before keyword rules, unless it was already tried this call
-    (`local_tried`, D2a) or is unavailable, in which case fall back to
-    keyword rules like before.
+    Shared by both `_classify_llm_user` failure paths. Phase 2 (D-H): the
+    keyword heuristic is no longer reachable from here at all -- an opted-in
+    user (`fallback_local`) gets the local encoder if it can serve, else NO
+    verdict; a user who never opted in gets no verdict straight away. The
+    heuristic stays a selectable backend and stays on the server path
+    (`_classify_llm_server`); it just isn't a link in this chain anymore.
 
     `provider_call_succeeded`/`usage` describe whether the LLM call itself
     reached the provider, not what produced the verdict -- they're passed
-    through unchanged regardless of which fallback ends up serving (D3):
-    a malformed-but-received response still billed the user even if the
-    encoder, not the heuristic, ends up supplying the label.
+    through unchanged regardless of whether the encoder ends up serving or
+    the verdict ends up `None` (D3): a malformed-but-received response still
+    billed the user even when nothing downstream can classify it.
 
-    Both callers only reach here after an LLM call FAILED, so `fallback_used`
-    is always True -- something else genuinely served the verdict. But
-    "failed" isn't the same as "attempted": a destination-policy preflight
-    rejection (`failure_category == "blocked_by_policy"`) never issues a
-    request at all (`llm_client.request_was_issued`), so `llm_attempted`
-    tracks the category instead of being hardcoded. The encoder branch stamps
-    `+fallback` on its `model_version` (contract: plan's "Fallback
-    provenance"): without it, this row would be byte-identical to a healthy
-    local-backend run, which is the exact silent-degrade bug the plan exists
-    to fix. `heuristic-fallback` needs no suffix -- it's already unambiguous.
+    Both callers only reach here after an LLM call FAILED. "Failed" isn't the
+    same as "attempted": a destination-policy preflight rejection
+    (`failure_category == "blocked_by_policy"`) never issues a request at all
+    (`llm_client.request_was_issued`), so `llm_attempted` tracks the category
+    instead of being hardcoded. The encoder branch stamps `+fallback` on its
+    `model_version` (plan's "Fallback provenance"): without it, this row
+    would be byte-identical to a healthy local-backend run, which is the
+    exact silent-degrade bug the plan exists to fix. `fallback_used` is only
+    `True` on that branch -- a verdict of `None` means nothing served, so
+    there's no fallback to report (see `ClassificationAttempt`'s docstring).
     """
     llm_attempted = request_was_issued(failure_category)
-    if not local_tried:
+    if fallback_local and not local_tried:
         from app.services.nlp.local_model import try_predict
 
         result = try_predict(text)
@@ -565,19 +587,22 @@ def _llm_user_failure_fallback(
                 failure_category=failure_category,
             )
 
-    label, confidence, rationale, _ = _heuristic_classify(text)
     return ClassificationAttempt(
-        verdict=(label, confidence, rationale, "heuristic-fallback"),
+        verdict=None,
         provider_call_succeeded=provider_call_succeeded,
         usage=usage,
         llm_attempted=llm_attempted,
-        fallback_used=True,
+        fallback_used=False,
         failure_category=failure_category,
     )
 
 
 def _classify_llm_user(
-    text: str, credential: LlmCredential, local_tried: bool = False
+    text: str,
+    credential: LlmCredential,
+    local_tried: bool = False,
+    *,
+    fallback_local: bool = False,
 ) -> ClassificationAttempt:
     """
     BYOK classification path: the same prompt and the same strict parse as
@@ -587,9 +612,9 @@ def _classify_llm_user(
     name, since a BYOK verdict can come from any provider/model the user
     picked, not the operator's fixed Gemini deployment.
 
-    `local_tried` (D2/D2a): both failure paths below try the local encoder
-    before keyword rules, but only once per call -- see
-    `_llm_user_failure_fallback`.
+    `local_tried` (D2/D2a): the failure path below tries the local encoder
+    before giving up, but only once per call, and only when `fallback_local`
+    opts in -- see `_llm_user_failure_fallback`.
     """
     try:
         result = call_chat_completion(
@@ -604,7 +629,8 @@ def _classify_llm_user(
             "Classification call failed for provider %s: %s", credential.provider, exc.category
         )
         return _llm_user_failure_fallback(
-            text, local_tried, provider_call_succeeded=False, usage=None,
+            text, local_tried, fallback_local=fallback_local,
+            provider_call_succeeded=False, usage=None,
             failure_category=exc.category,
         )
 
@@ -619,7 +645,8 @@ def _classify_llm_user(
             credential.provider, type(exc).__name__,
         )
         return _llm_user_failure_fallback(
-            text, local_tried, provider_call_succeeded=True, usage=result.usage,
+            text, local_tried, fallback_local=fallback_local,
+            provider_call_succeeded=True, usage=result.usage,
             failure_category="invalid_response",
         )
 

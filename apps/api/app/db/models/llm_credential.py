@@ -64,6 +64,15 @@ class UserLlmCredential(Base):
     classification_byok: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false"
     )
+    # A true opt-in (default false, plan: 2026-08-14-llm-failure-visibility
+    # phase 2, D-A): only meaningful when classification_byok is also set --
+    # whether a failed BYOK classification call should serve the local
+    # encoder instead of leaving the message unclassified. Writable
+    # independently of classification_byok; it's simply inert until that's
+    # also true (see llm_settings.py).
+    classification_fallback_local: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()")
     )

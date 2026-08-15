@@ -22,6 +22,7 @@ export interface LlmPanelDeps {
     model: string;
     base_url?: string;
     classification_byok?: boolean;
+    classification_fallback_local?: boolean;
   }) => Promise<LlmSettings>;
   testLlmSettings: () => Promise<LlmTestResult>;
   deleteLlmSettings: () => Promise<void>;
@@ -291,6 +292,7 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
       model: string;
       base_url?: string;
       classification_byok?: boolean;
+      classification_fallback_local?: boolean;
     }) => {
       setLlmSaving(true);
       let saved = false;
