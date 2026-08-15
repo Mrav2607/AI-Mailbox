@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from datetime import datetime, time as dtime, timezone
 
 from app.core.logging import logger
-from app.services.nlp.llm_client import LlmCallError, LlmCallResult, LlmUsage, call_chat_completion
+from app.services.nlp.llm_client import (
+    LlmCallError,
+    LlmCallResult,
+    LlmUsage,
+    call_chat_completion,
+    request_was_issued,
+)
 from app.services.nlp.providers import LlmCredential
 
 # Kept as an alias so existing importers of the old name (tests included)
@@ -84,11 +90,13 @@ class ExtractionAttempt:
     `llm_attempted` / `fallback_used` / `failure_category` are the failure-
     visibility fields (plan: `docs/plans/2026-08-14-llm-failure-visibility-
     plan.md`), the same contract as `ClassificationAttempt`. Extraction has
-    no encoder/heuristic fallback -- `_extract_attempt` always issues exactly
-    one provider request -- so `llm_attempted` is always True and
-    `fallback_used` is always False here; only `failure_category` varies
-    (`LlmCallError.category`, or `"invalid_response"` for a malformed body
-    that isn't an `LlmCallError` at all).
+    no encoder/heuristic fallback, so `fallback_used` is always False here.
+    `llm_attempted` is True for every real attempt EXCEPT a destination-
+    policy preflight rejection (`failure_category == "blocked_by_policy"`),
+    which rejects before any request leaves the process -- see
+    `llm_client.request_was_issued`. `failure_category` mirrors
+    `LlmCallError.category`, or is `"invalid_response"` for a malformed body
+    that isn't an `LlmCallError` at all.
     """
 
     result: ExtractedAction | NoAction | None
@@ -305,7 +313,11 @@ def _extract_attempt(
             result=None,
             provider_call_succeeded=False,
             usage=None,
-            llm_attempted=True,
+            # A destination-policy rejection (blocked_by_policy) raises
+            # BEFORE the request ever leaves the process -- see
+            # llm_client.request_was_issued. Every other category implies a
+            # real request went out and failed.
+            llm_attempted=request_was_issued(exc.category),
             fallback_used=False,
             failure_category=exc.category,
         )

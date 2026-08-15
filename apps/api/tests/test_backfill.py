@@ -376,6 +376,45 @@ def test_run_backfill_llm_failure_falls_back_to_encoder_with_provenance_marker(m
     assert upserted_model_versions == ["local:test+fallback"]
 
 
+def test_run_backfill_preflight_rejection_reports_fell_back_without_llm_attempted(monkeypatch):
+    """Codex review finding: `llm_failed` must count only failures where a
+    request was actually issued -- a destination-policy PREFLIGHT rejection
+    (blocked_by_policy) never reaches the wire, so it must land in
+    fell_back/failure_categories only. Without this, `llm_failed=1,
+    llm_attempted=0` would be an incoherent shape (llm_failed <= llm_attempted
+    is the invariant). Drives the real call_chat_completion via a fake
+    pin_custom_destination, same pattern as the two tests above."""
+    from app.services.nlp import llm_client as llm_client_module
+    from app.services.nlp import local_model
+    from app.services.nlp.providers import DestinationRejected
+
+    monkeypatch.setattr(
+        local_model, "try_predict",
+        lambda text: ("fyi", 0.6, "local rationale", "local:test"),
+    )
+
+    def fake_pin(url):
+        raise DestinationRejected("destination_rejected", "nope")
+
+    monkeypatch.setattr(llm_client_module, "pin_custom_destination", fake_pin)
+
+    user_id = uuid4()
+    db = _single_message_db()
+    credential = LlmCredential(
+        provider="custom", base_url="https://ollama.example.com/v1", api_key="k", model="llama3"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
+
+    result = backfill.run_backfill(db, user_id, limit=10, backend="llm")
+
+    assert result["llm_attempted"] == 0
+    assert result["llm_failed"] == 0
+    assert result["fell_back"] == 1
+    assert result["failure_categories"] == {"blocked_by_policy": 1}
+
+
 # ---------------------------------------------------------------------------
 # run_backfill: usage recording (plan §5's flush/commit contract)
 # ---------------------------------------------------------------------------

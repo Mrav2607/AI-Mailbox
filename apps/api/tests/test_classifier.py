@@ -788,6 +788,39 @@ def test_classify_with_usage_user_mode_call_error_never_touched_provider(monkeyp
     assert attempt.usage is None
 
 
+def test_classify_with_usage_user_mode_real_preflight_rejection_never_attempted_llm(monkeypatch):
+    """A REAL destination-policy rejection (not a stubbed category), same
+    fix and same pattern as test_extractor.py's counterpart -- drives the
+    actual call_chat_completion (not classifier.call_chat_completion mocked
+    away) through a fake pin_custom_destination that raises
+    DestinationRejected. blocked_by_policy rejects BEFORE any request
+    leaves the process, so llm_attempted must be False even though a
+    fallback genuinely did serve the verdict (Codex review)."""
+    from app.services.nlp import classifier, local_model
+    from app.services.nlp import llm_client as llm_client_module
+    from app.services.nlp.providers import DestinationRejected
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
+
+    def fake_pin(url):
+        raise DestinationRejected("destination_rejected", "nope")
+
+    monkeypatch.setattr(llm_client_module, "pin_custom_destination", fake_pin)
+    credential = LlmCredential(
+        provider="custom", base_url="https://ollama.example.com/v1", api_key="k", model="llama3"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+
+    attempt = classify_with_usage("Security alert: new login detected", routing=routing)
+
+    assert attempt.verdict[3] == "heuristic-fallback"
+    assert attempt.provider_call_succeeded is False
+    assert attempt.llm_attempted is False
+    assert attempt.fallback_used is True
+    assert attempt.failure_category == "blocked_by_policy"
+
+
 def test_classify_with_usage_user_mode_success_carries_usage_through(monkeypatch):
     """The BYOK call succeeded and parsed cleanly -- the recorded call and
     the reported tokens both count."""

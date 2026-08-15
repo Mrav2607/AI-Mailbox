@@ -8,7 +8,7 @@ import httpx
 
 from app.core.config import settings
 from app.core.logging import logger
-from app.services.nlp.llm_client import LlmCallError, LlmUsage, call_chat_completion
+from app.services.nlp.llm_client import LlmCallError, LlmUsage, call_chat_completion, request_was_issued
 from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
 LABELS = (
@@ -49,12 +49,15 @@ class ClassificationAttempt:
     before any LLM call is even considered, and `provider_call_succeeded` is
     `False` for every heuristic/local verdict that never intended a call in
     the first place. `llm_attempted` means a provider request was actually
-    issued (not merely "an LLM path was reached" -- an SDK import failure
-    before any request is `False`). `fallback_used` means an LLM was
-    attempted, failed, and something else (encoder or heuristic) served the
-    verdict instead. `failure_category` mirrors `LlmCallError.category`, or
-    is `"invalid_response"` for a malformed body that isn't an `LlmCallError`
-    at all.
+    issued (not merely "an LLM path was reached" -- an SDK import failure or
+    a destination-policy preflight rejection, `failure_category ==
+    "blocked_by_policy"`, both leave it `False`; see
+    `llm_client.request_was_issued`). `fallback_used` means an LLM call
+    FAILED and something else (encoder or heuristic) served the verdict
+    instead -- true even for a preflight rejection, where `llm_attempted` is
+    `False` but a fallback still genuinely served. `failure_category` mirrors
+    `LlmCallError.category`, or is `"invalid_response"` for a malformed body
+    that isn't an `LlmCallError` at all.
     """
 
     verdict: tuple[str, float, str, str]
@@ -504,15 +507,18 @@ def _llm_user_failure_fallback(
     a malformed-but-received response still billed the user even if the
     encoder, not the heuristic, ends up supplying the label.
 
-    Both callers only reach here after an LLM call was actually attempted
-    and failed, so `llm_attempted`/`fallback_used` are always True -- only
-    `failure_category` varies by which failure got us here. The encoder
-    branch stamps `+fallback` on its `model_version` (contract: plan's
-    "Fallback provenance"): without it, this row would be byte-identical to
-    a healthy local-backend run, which is the exact silent-degrade bug the
-    plan exists to fix. `heuristic-fallback` needs no suffix -- it's already
-    unambiguous.
+    Both callers only reach here after an LLM call FAILED, so `fallback_used`
+    is always True -- something else genuinely served the verdict. But
+    "failed" isn't the same as "attempted": a destination-policy preflight
+    rejection (`failure_category == "blocked_by_policy"`) never issues a
+    request at all (`llm_client.request_was_issued`), so `llm_attempted`
+    tracks the category instead of being hardcoded. The encoder branch stamps
+    `+fallback` on its `model_version` (contract: plan's "Fallback
+    provenance"): without it, this row would be byte-identical to a healthy
+    local-backend run, which is the exact silent-degrade bug the plan exists
+    to fix. `heuristic-fallback` needs no suffix -- it's already unambiguous.
     """
+    llm_attempted = request_was_issued(failure_category)
     if not local_tried:
         from app.services.nlp.local_model import try_predict
 
@@ -523,7 +529,7 @@ def _llm_user_failure_fallback(
                 verdict=(label, confidence, rationale, f"{model_version}+fallback"),
                 provider_call_succeeded=provider_call_succeeded,
                 usage=usage,
-                llm_attempted=True,
+                llm_attempted=llm_attempted,
                 fallback_used=True,
                 failure_category=failure_category,
             )
@@ -533,7 +539,7 @@ def _llm_user_failure_fallback(
         verdict=(label, confidence, rationale, "heuristic-fallback"),
         provider_call_succeeded=provider_call_succeeded,
         usage=usage,
-        llm_attempted=True,
+        llm_attempted=llm_attempted,
         fallback_used=True,
         failure_category=failure_category,
     )

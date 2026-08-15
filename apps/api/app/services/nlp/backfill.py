@@ -282,8 +282,13 @@ def run_backfill(
         if attempt.llm_attempted:
             llm_attempted += 1
         if attempt.fallback_used:
-            llm_failed += 1
             fell_back += 1
+            # llm_failed <= llm_attempted must hold: a destination-policy
+            # preflight rejection (llm_attempted=False) still triggers a
+            # fallback, but no request was ever issued to "fail" -- it's
+            # counted in fell_back (and failure_categories) only, not here.
+            if attempt.llm_attempted:
+                llm_failed += 1
             if attempt.failure_category:
                 failure_categories[attempt.failure_category] = (
                     failure_categories.get(attempt.failure_category, 0) + 1
