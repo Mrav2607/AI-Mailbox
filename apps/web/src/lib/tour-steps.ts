@@ -162,7 +162,7 @@ export const TOUR_STEPS: TourStepDefinition[] = [
     slug: "ai-settings",
     title: "AI extraction & your key",
     body: "The agenda is powered by an AI model. Behind settings you can connect accounts, sync labels, and add your own key from OpenAI, Gemini, OpenRouter, Groq, or Mistral — see how much it gets used, and optionally let it sort incoming mail too.",
-    target: '[data-tour="llm-settings"]',
+    target: '[data-tour="settings"]',
     preconditions: ["open-accounts"],
     fallback: {
       kind: "target",

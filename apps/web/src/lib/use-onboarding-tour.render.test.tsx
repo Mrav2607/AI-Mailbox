@@ -24,7 +24,7 @@ const FIXTURE_SELECTORS = [
   "layout",
   "accounts",
   "accounts-panel",
-  "llm-settings",
+  "settings",
   "ingest-panel",
 ];
 

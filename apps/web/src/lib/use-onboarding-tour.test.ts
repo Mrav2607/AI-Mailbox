@@ -252,14 +252,14 @@ describe("resolveTourTarget", () => {
   describe("ai-settings fallback chain", () => {
     const aiSettings = TOUR_STEPS.find((step) => step.slug === "ai-settings")!;
 
-    it("targets the llm-settings button when present", () => {
+    it("targets the settings button when present", () => {
       expect(resolveTourTarget(aiSettings, () => true)).toEqual({
         kind: "target",
-        selector: '[data-tour="llm-settings"]',
+        selector: '[data-tour="settings"]',
       });
     });
 
-    it("falls back to the accounts panel when llm-settings is missing", () => {
+    it("falls back to the accounts panel when settings is missing", () => {
       expect(
         resolveTourTarget(
           aiSettings,
@@ -268,7 +268,7 @@ describe("resolveTourTarget", () => {
       ).toEqual({ kind: "target", selector: '[data-tour="accounts-panel"]' });
     });
 
-    it("centers when both llm-settings and the accounts panel are missing", () => {
+    it("centers when both settings and the accounts panel are missing", () => {
       expect(resolveTourTarget(aiSettings, () => false)).toEqual({ kind: "center" });
     });
   });
