@@ -106,6 +106,21 @@ describe("extractionToastOutcome", () => {
     );
   });
 
+  it("reports a deadline stop without blaming the provider", () => {
+    // The sweep ran out of its own time budget; its calls may all have
+    // succeeded. A provider diagnosis here would be a confident guess.
+    const outcome = extractionToastOutcome({
+      status: "timed_out",
+      extracted: 9,
+      failed: 0,
+    });
+    expect(outcome.level).toBe("error");
+    expect(outcome.message).toBe(
+      "action extraction stopped early · 9 extracted so far — run it again to continue",
+    );
+    expect(outcome.message).not.toMatch(/provider|rate limited/i);
+  });
+
   it("treats a missing status as a normal run", () => {
     // An older API/worker result predates the field; it must not read as a
     // stopped-early run.
@@ -120,7 +135,21 @@ describe("extractionToastOutcome", () => {
     });
     expect(outcome.level).toBe("warning");
     expect(outcome.message).toBe(
-      "action extraction · 3 extracted · 2 failed — could not reach your provider",
+      "action extraction · 3 extracted · 2 failed — lost the connection to your provider",
+    );
+  });
+
+  it("distinguishes a connection that was never established", () => {
+    // connect_failed and connection_failed are different facts: the first
+    // never reached the provider (nothing billed, safe to retry), the second
+    // dropped partway through a request that may have been processed.
+    const outcome = extractionToastOutcome({
+      extracted: 0,
+      failed: 4,
+      failure_categories: { connect_failed: 4 },
+    });
+    expect(outcome.message).toBe(
+      "action extraction · 0 extracted · 4 failed — could not reach your provider",
     );
   });
 

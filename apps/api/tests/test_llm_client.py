@@ -236,8 +236,41 @@ def test_call_chat_completion_survives_a_malformed_usage_block_and_still_returns
     assert result.usage is None
 
 
-def test_call_chat_completion_raises_connection_failed_on_network_error(monkeypatch):
-    _install_mock_transport(monkeypatch, _raising_handler(httpx.ConnectError("boom")))
+@pytest.mark.parametrize(
+    "exc", [httpx.ConnectError("boom"), httpx.ConnectTimeout("boom"), httpx.PoolTimeout("boom")],
+    ids=["ConnectError", "ConnectTimeout", "PoolTimeout"],
+)
+def test_call_chat_completion_raises_connect_failed_for_provably_pre_send_errors(monkeypatch, exc):
+    """CodeRabbit review (phase 3): these three, and only these three, fire
+    strictly before any byte of the request is written to a socket --
+    provably nothing was delivered or billed. They get their own category,
+    separate from the ambiguous connection_failed below."""
+    _install_mock_transport(monkeypatch, _raising_handler(exc))
+    with pytest.raises(LlmCallError) as exc_info:
+        call_chat_completion(_make_credential(), prompt="prompt", user_content="text", max_tokens=512)
+    assert exc_info.value.category == "connect_failed"
+    assert exc_info.value.status is None
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ReadError("boom"),
+        httpx.ReadTimeout("boom"),
+        httpx.WriteError("boom"),
+        httpx.WriteTimeout("boom"),
+        httpx.RemoteProtocolError("boom"),
+    ],
+    ids=["ReadError", "ReadTimeout", "WriteError", "WriteTimeout", "RemoteProtocolError"],
+)
+def test_call_chat_completion_raises_connection_failed_for_ambiguous_mid_flight_errors(monkeypatch, exc):
+    """CodeRabbit review (phase 3): these can all occur AFTER the request
+    (or part of it) already left the process -- a read failure only ever
+    happens once a request already went out awaiting a reply; a write
+    failure happens mid-transmission. Ambiguous, so this category stays
+    connection_failed and (per test_llm_client.py's retry-policy tests
+    below) is NOT retried."""
+    _install_mock_transport(monkeypatch, _raising_handler(exc))
     with pytest.raises(LlmCallError) as exc_info:
         call_chat_completion(_make_credential(), prompt="prompt", user_content="text", max_tokens=512)
     assert exc_info.value.category == "connection_failed"
@@ -659,8 +692,15 @@ def test_call_chat_completion_retries_a_retryable_http_category_and_succeeds(
     assert len(waits) == 1
 
 
-@pytest.mark.parametrize("exc", [httpx.ConnectError("boom"), httpx.ReadTimeout("boom")])
-def test_call_chat_completion_retries_a_connection_or_timeout_failure(monkeypatch, exc):
+@pytest.mark.parametrize(
+    "exc", [httpx.ConnectError("boom"), httpx.ConnectTimeout("boom"), httpx.PoolTimeout("boom")],
+    ids=["ConnectError", "ConnectTimeout", "PoolTimeout"],
+)
+def test_call_chat_completion_retries_a_pre_send_connect_failure(monkeypatch, exc):
+    """CodeRabbit review (phase 3): connect_failed is the one branch of the
+    old catch-all connection_failed that's actually safe to retry -- all
+    three fire before a single byte of the request is written to a socket,
+    so nothing was ever delivered or billed."""
     waits = _spy_sleep(monkeypatch)
     calls = {"n": 0}
 
@@ -680,6 +720,73 @@ def test_call_chat_completion_retries_a_connection_or_timeout_failure(monkeypatc
     assert result.content == VALID_CONTENT
     assert calls["n"] == 2
     assert len(waits) == 1
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ReadError("boom"),
+        httpx.ReadTimeout("boom"),
+        httpx.WriteError("boom"),
+        httpx.WriteTimeout("boom"),
+        httpx.RemoteProtocolError("boom"),
+    ],
+    ids=["ReadError", "ReadTimeout", "WriteError", "WriteTimeout", "RemoteProtocolError"],
+)
+def test_call_chat_completion_does_not_retry_an_ambiguous_mid_flight_failure(monkeypatch, exc):
+    """CodeRabbit review (phase 3): the bug this closes -- these used to be
+    lumped into the same retryable category as connect_failed even though
+    the request (or part of it) may already have reached the provider and
+    been billed. Exactly one wire attempt despite a policy that allows
+    many, so a regression here can't quietly restore the double-bill."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise exc
+
+    _install_mock_transport(monkeypatch, handler)
+    waits = _spy_sleep(monkeypatch)
+    policy = RetryPolicy(max_attempts=5, total_budget_s=10.0, per_wait_cap_s=10.0)
+
+    with pytest.raises(LlmCallError) as exc_info:
+        call_chat_completion(
+            _make_credential(), prompt="prompt", user_content="text", max_tokens=512, policy=policy
+        )
+
+    assert exc_info.value.category == "connection_failed"
+    assert calls["n"] == 1  # exactly one wire attempt -- never retried
+    assert waits == []
+
+
+def _raise_timed_out(*args, **kwargs):
+    raise LlmCallError("timed_out", None)
+
+
+def test_call_chat_completion_does_not_retry_a_timeout(monkeypatch):
+    """CodeRabbit review (phase 3): `timed_out` means the provider's
+    response headers had already arrived (see `_RETRYABLE_EXACT`'s own
+    comment) -- the WORST case to retry, not a plausible one. Monkeypatches
+    `_read_body_within_deadline` directly rather than re-deriving the
+    trickle/scripted-clock setup already covered by
+    test_call_chat_completion_aborts_a_body_that_trickles_past_the_deadline
+    -- this test is about the RETRY POLICY's treatment of the category, not
+    the deadline mechanic itself. Exactly one wire attempt despite a policy
+    that allows many."""
+    calls = []
+    _install_mock_transport(monkeypatch, _json_handler(200, _choice_payload(VALID_CONTENT), calls))
+    monkeypatch.setattr(llm_client, "_read_body_within_deadline", _raise_timed_out)
+    waits = _spy_sleep(monkeypatch)
+    policy = RetryPolicy(max_attempts=5, total_budget_s=10.0, per_wait_cap_s=10.0)
+
+    with pytest.raises(LlmCallError) as exc_info:
+        call_chat_completion(
+            _make_credential(), prompt="prompt", user_content="text", max_tokens=512, policy=policy
+        )
+
+    assert exc_info.value.category == "timed_out"
+    assert len(calls) == 1  # exactly one wire attempt -- never retried
+    assert waits == []
 
 
 @pytest.mark.parametrize(
