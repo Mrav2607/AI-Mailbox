@@ -192,3 +192,106 @@ describe("useAutoSync reattach path", () => {
     expect(toast.warning).not.toHaveBeenCalled();
   });
 });
+
+// CodeRabbit review on PR #53: Console keeps this hook mounted across
+// logout/login, so without a reset, an account whose session ended with the
+// streak ref already `warned: true` would silently suppress the NEXT
+// account's first real warning. `enabled` here mirrors App.tsx's own
+// `enabled: !!user && ...` gate -- a real logout always drops `enabled` to
+// false before a different login can raise it again, so this exercises the
+// exact same two-step transition the bug is about instead of a same-tick
+// prop swap that would leave React's own effect-dependency diffing doing
+// something less representative of the real app.
+describe("useAutoSync per-account warning reset", () => {
+  let root: Root;
+  let container: HTMLElement;
+
+  function Harness({ userId }: { userId: string | null }) {
+    useAutoSync({
+      intervalSec: 60,
+      enabled: !!userId,
+      busy: false,
+      userId,
+      onSessionExpired: vi.fn(),
+      onSynced: vi.fn(() => Promise.resolve()),
+    });
+    return null;
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.mocked(getActiveSync).mockReset();
+    vi.mocked(waitForSyncRuns).mockReset();
+    vi.mocked(getSyncHealth).mockResolvedValue({
+      last_succeeded_at: null,
+      stale: false,
+      sync_in_progress: false,
+      scheduler_alive: true,
+      threshold_seconds: 1800,
+      reason: null,
+      accounts: [],
+    });
+    vi.mocked(getTriage).mockResolvedValue({ bucket: "all", items: [] });
+    vi.mocked(ingestMail).mockResolvedValue([]);
+    vi.mocked(toast.warning).mockClear();
+    vi.mocked(toast.error).mockClear();
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
+    vi.unstubAllGlobals();
+  });
+
+  function flushPromises() {
+    return new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  async function renderAndFlush(userId: string | null) {
+    act(() => {
+      root.render(<Harness userId={userId} />);
+    });
+    await act(async () => {
+      await flushPromises();
+      await flushPromises();
+    });
+  }
+
+  it("warns for the next account even though the previous account's session already warned", async () => {
+    const userAFlight = run({ result: { status: "ok", left_unclassified: 4 } });
+    vi.mocked(getActiveSync).mockResolvedValueOnce([userAFlight]);
+    vi.mocked(waitForSyncRuns).mockResolvedValueOnce([{ status: "fulfilled", value: userAFlight }]);
+
+    await renderAndFlush("user-a");
+    expect(toast.warning).toHaveBeenCalledTimes(1);
+    expect(toast.warning).toHaveBeenNthCalledWith(
+      1,
+      "4 left unclassified — run backfill when your provider recovers",
+    );
+
+    // Logout -- `enabled` drops to false, same as Console's own gate. No
+    // reattach call happens here (the cadence effect's guard clause returns
+    // before ever reaching getActiveSync), so nothing needs mocking for
+    // this step.
+    await renderAndFlush(null);
+
+    // A different account logs in, and its own first sync also leaves mail
+    // unclassified. Without the reset, this would stay silent forever
+    // because the ref would still read `warned: true` from user A.
+    const userBFlight = run({ result: { status: "ok", left_unclassified: 6 } });
+    vi.mocked(getActiveSync).mockResolvedValueOnce([userBFlight]);
+    vi.mocked(waitForSyncRuns).mockResolvedValueOnce([{ status: "fulfilled", value: userBFlight }]);
+    await renderAndFlush("user-b");
+
+    expect(toast.warning).toHaveBeenCalledTimes(2);
+    expect(toast.warning).toHaveBeenNthCalledWith(
+      2,
+      "6 left unclassified — run backfill when your provider recovers",
+    );
+  });
+});

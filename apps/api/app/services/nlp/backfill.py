@@ -359,7 +359,17 @@ def run_backfill(
         pending.append((message_id, label, confidence, rationale, model_version))
         if len(pending) >= batch_size:
             flush_pending()
-    if pending:
+    # CodeRabbit finding: `usage_pending` is set for every recorded user-mode
+    # attempt REGARDLESS of verdict (a failed call can still have reached
+    # and billed the provider) -- but `pending` only grows when a verdict
+    # exists. An all-no-verdict run would set usage_pending=True and never
+    # append to pending, so gating this trailing flush on `pending` alone
+    # silently dropped that run's billed usage -- exactly when the user's
+    # provider is failing and their usage numbers matter most. flush_pending()
+    # handles an empty `pending` list fine (the upsert loop is a no-op, and
+    # the usage flush is gated on `usage_pending` separately), so there's no
+    # cost to calling it here whenever either is outstanding.
+    if pending or usage_pending:
         flush_pending()
 
     result = {

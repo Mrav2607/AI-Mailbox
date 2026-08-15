@@ -490,8 +490,11 @@ def ingest_outlook_messages(
     # Reply reconciliation START pass (plan §3.5): a level pass over this
     # account's reconciliation-eligible reply attempts, run BEFORE any
     # provider traversal begins -- own transactions, commits included. Never
-    # runs inside the per-page transactions below.
-    run_reconciliation_pass(
+    # runs inside the per-page transactions below. Its return is captured
+    # (Codex review, phase 2) and folded into `stats["left_unclassified"]`
+    # below -- previously discarded entirely, so a BYOK failure caught only
+    # by reconciliation (not the page loop) never reached the ingest toast.
+    start_reconciliation = run_reconciliation_pass(
         db,
         provider_account_id=provider.id,
         provider="outlook",
@@ -562,7 +565,9 @@ def ingest_outlook_messages(
         "threads_upserted": 0,
         "messages_upserted": 0,
         "classified": 0,
-        "left_unclassified": 0,
+        # The START pass's own no-verdict outcomes count here too -- see the
+        # END pass below for the rest of this run's total.
+        "left_unclassified": start_reconciliation["left_unclassified"],
         "messages_removed": 0,
         "fetched": 0,
     }
@@ -741,11 +746,12 @@ def ingest_outlook_messages(
     # final commit, catching both attempts created while the run was
     # ingesting AND messages the run itself just persisted (whose cursors
     # have advanced past them).
-    run_reconciliation_pass(
+    end_reconciliation = run_reconciliation_pass(
         db,
         provider_account_id=provider.id,
         provider="outlook",
         classify_messages=classify_messages,
     )
+    stats["left_unclassified"] += end_reconciliation["left_unclassified"]
 
     return stats

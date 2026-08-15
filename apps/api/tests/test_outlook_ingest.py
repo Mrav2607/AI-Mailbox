@@ -511,6 +511,39 @@ def test_classification_router_is_built_once_per_run_and_reused_across_pages(mon
     assert all(routing is SENTINEL_ROUTING for routing in classify_calls)
 
 
+def test_reconciliation_left_unclassified_reaches_ingest_stats(monkeypatch):
+    """Codex finding (D-C/D-I, plan: 2026-08-14-llm-failure-visibility phase
+    2): `run_reconciliation_pass`'s own no-verdict outcomes were previously
+    discarded entirely at both call sites here -- a message left
+    unclassified via reconciliation (as opposed to the page loop) never
+    reached `stats["left_unclassified"]`, the ONE thing the ingest toast/
+    auto-sync warning actually reads. Both the START and END passes'
+    left_unclassified counts must land in the final result."""
+    provider = _fake_provider()
+    db = _make_pipeline_db(provider)
+
+    reconciliation_calls = []
+
+    def fake_run_reconciliation_pass(db, *, provider_account_id, provider, classify_messages):
+        reconciliation_calls.append(provider_account_id)
+        # START pass (call 1) finds 1 no-verdict outcome; END pass (call 2,
+        # after the run's own page loop -- empty here) finds 2 more.
+        count = 1 if len(reconciliation_calls) == 1 else 2
+        return {
+            "attempts_checked": count, "completed": count,
+            "classified": 0, "left_unclassified": count,
+        }
+
+    monkeypatch.setattr(outlook_ingest, "run_reconciliation_pass", fake_run_reconciliation_pass)
+
+    result = outlook_ingest.ingest_outlook_messages(
+        db, _USER_ID, provider_account_id=str(provider.id), max_results=0, max_pages=20
+    )
+
+    assert len(reconciliation_calls) == 2  # START and END both ran
+    assert result["left_unclassified"] == 3  # 1 (START) + 2 (END)
+
+
 # ---------------------------------------------------------------------------
 # Per-user usage recording and its flush site (docs/plans/2026-08-02-llm-
 # usage-visibility-plan.md §5) -- classify_with_usage(), UsageAccumulator,

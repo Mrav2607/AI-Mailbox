@@ -650,6 +650,50 @@ def test_run_backfill_records_usage_only_for_user_mode_routing(monkeypatch):
     assert fake_acc.records == [("classification", "openai", usage, True)]
 
 
+def test_run_backfill_flushes_usage_even_when_every_message_is_no_verdict(monkeypatch):
+    """CodeRabbit finding (billing data loss): `usage_pending` is set for
+    every recorded user-mode attempt REGARDLESS of verdict -- a failed call
+    can still have reached and billed the provider (D3) -- but `pending`
+    (the classification-write batch) only grows when a verdict exists. The
+    OLD trailing flush was gated on `if pending:` alone, so an all-no-verdict
+    run recorded usage into the accumulator and then returned without ever
+    flushing it -- silently dropping billed usage exactly when the user's
+    provider is failing and their usage numbers matter most."""
+    user_id = uuid4()
+    db = _single_message_db()
+    routing = ClassificationRouting(mode="user", credential=_CRED)  # fallback_local=False
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+    usage = LlmUsage(prompt_tokens=1, completion_tokens=0, total_tokens=1)
+    monkeypatch.setattr(
+        backfill, "classify_with_usage",
+        lambda text, backend=None, routing=None: ClassificationAttempt(
+            verdict=None,
+            provider_call_succeeded=False,
+            usage=usage,
+            llm_attempted=True,
+            fallback_used=False,
+            failure_category="connection_failed",
+        ),
+    )
+    upserts = []
+    monkeypatch.setattr(
+        backfill, "upsert_classification",
+        lambda *a, **k: (upserts.append(k), "written")[1],
+    )
+    fake_acc = _FakeAcc(user_id)
+    monkeypatch.setattr(backfill, "UsageAccumulator", lambda uid: fake_acc)
+
+    result = backfill.run_backfill(db, user_id, limit=10)
+
+    assert upserts == []  # never a null-label row
+    assert fake_acc.records == [("classification", "openai", usage, False)]
+    # The bug: without the fix, flush_pending() (and therefore acc.flush()/
+    # acc.committed()) never runs at all on an all-no-verdict run.
+    assert "flush" in fake_acc.calls
+    assert "committed" in fake_acc.calls
+    assert result["left_unclassified"] == 1
+
+
 def test_run_backfill_server_mode_routing_records_nothing(monkeypatch):
     # The regression guard for the routing-mode gate: the operator's server
     # key must never get billed onto the user's readout.

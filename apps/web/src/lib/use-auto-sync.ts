@@ -310,6 +310,21 @@ export function useAutoSync({
     };
   }, [enabled, userId, checkNew]);
 
+  // Console keeps this hook mounted across logout/login, so without this a
+  // `warned: true` left over from the PREVIOUS account's session would
+  // silently suppress the next account's first real warning -- same class
+  // of per-account leak use-llm-panel.ts's own `[userId]` reset effect
+  // guards against for its state. No race with a late settle from the old
+  // account: the cadence effect below aborts anything it left in flight
+  // (its own cleanup, keyed on `enabled`) before a NEW instance starts for
+  // the next account -- this app never swaps directly from one logged-in
+  // user to another, always through a logged-out (`enabled: false`)
+  // moment in between, so that abort always lands before this reset could
+  // be clobbered by a stale continuation.
+  useEffect(() => {
+    leftUnclassifiedWarnedRef.current = false;
+  }, [userId]);
+
   // Thin wrapper around nextLeftUnclassifiedWarning that owns this hook's
   // streak ref -- shared by the normal completion path below AND the
   // reload/reattach path, so a tab reloaded mid-sync still gets told its
