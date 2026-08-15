@@ -369,9 +369,18 @@ export function ThreadDetailPane({
               aria-label={composerOpen ? "Hide reply composer" : "Reply"}
               aria-pressed={!!composerOpen}
               title={composerOpen ? "Hide reply ( Shift R )" : "Reply ( Shift R )"}
-              className="inline-flex items-center justify-center max-md:h-10 max-md:w-10 text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+              // Amber, unlike the muted utility icons around it -- reply is
+              // the pane's headline action, and five identical grey glyphs
+              // in a row made it invisible. Tinted fill while the composer
+              // is open so the toggle state reads at a glance.
+              className={[
+                "inline-flex items-center justify-center h-6 w-6 max-md:h-10 max-md:w-10 rounded cursor-pointer transition-colors",
+                composerOpen
+                  ? "bg-primary/15 text-primary-tint-foreground"
+                  : "text-primary-tint-foreground/75 hover:text-primary-tint-foreground hover:bg-primary/10",
+              ].join(" ")}
             >
-              <ReplyIcon className="h-3.5 w-3.5" />
+              <ReplyIcon className="h-4 w-4" />
             </button>
           )}
           {onSnooze && onUnsnooze && onSnoozePopoverOpenChange && (

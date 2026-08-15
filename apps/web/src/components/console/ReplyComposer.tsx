@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Loader2, Send, Sparkles } from "lucide-react";
+import { Loader2, Reply as ReplyIcon, Send, Sparkles } from "lucide-react";
 import { ApiError, draftReply, sendReply } from "@/lib/api";
 import { senderName } from "@/lib/sender";
 import type { ReplySent, ThreadMessage } from "@/lib/types";
@@ -316,13 +316,26 @@ export function ReplyComposer({
   }
 
   if (!open) {
+    // The pane's headline action, so it wears the primary tint (the
+    // backfill/run-ingest treatment) instead of the muted ghost styling the
+    // utility controls use -- solid primary stays reserved for the actual
+    // send button once the composer is open.
     return (
-      <div className="shrink-0 border-t border-border p-2 flex justify-end">
+      <div className="shrink-0 border-t border-border p-2 flex items-center justify-end gap-2.5">
+        <span
+          aria-hidden="true"
+          className="hidden md:inline-flex items-center gap-1 text-[10.5px] font-mono text-muted-foreground"
+        >
+          <span className="kbd">shift</span>
+          <span className="kbd">r</span>
+        </span>
         <button
           type="button"
           onClick={() => onOpenChange(true)}
-          className="h-8 px-3 rounded border border-border font-mono text-[12px] text-muted-foreground hover:text-foreground hover:border-foreground/30 cursor-pointer transition-colors"
+          title="Reply ( Shift R )"
+          className="inline-flex items-center gap-1.5 h-8 max-md:h-10 px-3.5 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground font-mono text-[12px] font-medium cursor-pointer transition-colors"
         >
+          <ReplyIcon className="h-3.5 w-3.5" />
           Reply
         </button>
       </div>
