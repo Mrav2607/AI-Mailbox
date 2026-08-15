@@ -48,6 +48,7 @@ from app.services.ingest.outlook_client import (
     OutlookClient,
 )
 from app.services.nlp.classifier import build_classification_text, classify_with_usage
+from app.services.nlp.llm_client import WORKER_RETRIES
 from app.services.nlp.persistence import upsert_classification
 from app.services.nlp.providers import ClassificationRouter
 from app.services.nlp.usage import UsageAccumulator
@@ -396,8 +397,10 @@ def _upsert_page_messages(
                     normalized.get("body_text"),
                 )
                 routing = classification_router.routing_for(db)
+                # Ingest only ever runs off a Celery task -- same reasoning
+                # as gmail_ingest.py.
                 attempt = classify_with_usage(
-                    text_for_classification, routing=routing
+                    text_for_classification, routing=routing, policy=WORKER_RETRIES
                 )
                 # Only the user's own key gets recorded -- v1 tracks
                 # user-paid usage only (plan §1), same rule as Gmail's ingest.

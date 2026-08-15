@@ -33,6 +33,7 @@ from app.services.mail_send.common import (
     stamp_verified,
 )
 from app.services.nlp.classifier import build_classification_text, classify_with_usage
+from app.services.nlp.llm_client import WORKER_RETRIES
 from app.services.nlp.persistence import upsert_classification
 from app.services.nlp.providers import ClassificationRouter
 from app.services.nlp.usage import UsageAccumulator
@@ -273,7 +274,13 @@ def _classify_and_stamp(
         )
         router = ClassificationRouter(user_id)
         routing = router.routing_for(db)
-        attempt_result = classify_with_usage(text_for_classification, routing=routing)
+        # This module only ever runs from ingest (worker) or the
+        # reconcile_reply_attempt Celery task -- never inline off a request
+        # (see this module's own docstring) -- so WORKER_RETRIES applies
+        # unconditionally, not threaded from a caller.
+        attempt_result = classify_with_usage(
+            text_for_classification, routing=routing, policy=WORKER_RETRIES
+        )
         if routing.mode == "user" and routing.credential is not None:
             acc = UsageAccumulator(user_id)
             acc.record(

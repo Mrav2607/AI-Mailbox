@@ -20,6 +20,7 @@ from app.services.nlp.extraction_run import (
     users_with_claimable_action_items,
     users_with_unclaimed_actionable_messages,
 )
+from app.services.nlp.llm_client import WORKER_RETRIES
 from app.services.nlp.persistence import upsert_classification
 from app.services.nlp.providers import extraction_feature_enabled, resolve_classification_routing
 from app.services.nlp.usage import UsageAccumulator
@@ -50,7 +51,8 @@ def classify_message(message_id: str) -> dict:
         # A single message, so no per-run router (and its memo) is needed --
         # resolve once, directly.
         routing = resolve_classification_routing(db, thread.user_id) if thread else None
-        attempt = classify_with_usage(text_for_classification, routing=routing)
+        # Celery task -- nobody's watching a spinner for this one.
+        attempt = classify_with_usage(text_for_classification, routing=routing, policy=WORKER_RETRIES)
         # Phase 2 (D-C): `verdict is None` means the BYOK call failed and the
         # user hasn't opted into local fallback (or the encoder couldn't
         # serve either) -- skip the write entirely so the message stays a
@@ -144,6 +146,8 @@ def backfill_threads_for_user(
     enqueues us for anything over its inline cap and returns 202; bucket and
     backend were already validated there."""
     with SessionLocal() as db:
+        # Celery task -- always the WORKER_RETRIES side of run_backfill's
+        # inline/worker split (the route handles the inline side directly).
         result = run_backfill(
             db,
             UUID(user_id),
@@ -151,6 +155,7 @@ def backfill_threads_for_user(
             force=force,
             bucket=bucket,
             backend=backend,
+            policy=WORKER_RETRIES,
         )
     return {"user_id": user_id, **result}
 
@@ -161,6 +166,7 @@ def classify_latest_threads(
 ) -> dict:
     """Classify the latest message in the user's most recent threads."""
     with SessionLocal() as db:
+        # Celery task -- same WORKER_RETRIES reasoning as backfill_threads_for_user.
         result = run_backfill(
             db,
             UUID(user_id),
@@ -168,6 +174,7 @@ def classify_latest_threads(
             force=force,
             bucket="all",
             include_task_counts=True,
+            policy=WORKER_RETRIES,
         )
     # user_id rides along because non-sync tasks don't have a durable ownership
     # row for the task-status endpoint to consult.

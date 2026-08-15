@@ -7,9 +7,12 @@ from datetime import datetime, time as dtime, timezone
 
 from app.core.logging import logger
 from app.services.nlp.llm_client import (
+    INLINE_RETRIES,
+    NO_RETRIES,
     LlmCallError,
     LlmCallResult,
     LlmUsage,
+    RetryPolicy,
     call_chat_completion,
     request_was_issued,
 )
@@ -262,7 +265,12 @@ def _parse_extraction(content: str, *, model_version: str) -> ExtractedAction | 
     )
 
 
-def _call_llm(credential: LlmCredential, prompt: str, message_text: str) -> LlmCallResult:
+def _call_llm(
+    credential: LlmCredential,
+    prompt: str,
+    message_text: str,
+    policy: RetryPolicy = NO_RETRIES,
+) -> LlmCallResult:
     """
     Thin wrapper around the shared wire call (`llm_client.call_chat_completion`)
     that adds extraction's own framing -- the "Email:" label and the 6000-char
@@ -275,7 +283,11 @@ def _call_llm(credential: LlmCredential, prompt: str, message_text: str) -> LlmC
     """
     user_content = f"Email:\n{message_text[:_MESSAGE_TEXT_MAX_LEN]}"
     return call_chat_completion(
-        credential, prompt=prompt, user_content=user_content, max_tokens=_MAX_TOKENS
+        credential,
+        prompt=prompt,
+        user_content=user_content,
+        max_tokens=_MAX_TOKENS,
+        policy=policy,
     )
 
 
@@ -287,6 +299,7 @@ def _extract_attempt(
     body_text: str | None,
     received_at: datetime | None,
     credential: LlmCredential,
+    policy: RetryPolicy = NO_RETRIES,
 ) -> ExtractionAttempt:
     """
     The one real implementation behind `extract_action` and
@@ -298,13 +311,17 @@ def _extract_attempt(
     before any parsing happens -- a BYOK credential is charged for the call
     whether or not its body turns out to be usable, so a parse failure must
     still count. Only `ExtractionCallError` (the call never came back at
-    all) leaves it `False`.
+    all) leaves it `False`. Any retries `policy` allows resolve entirely
+    inside `_call_llm` -- from here a call that failed twice and succeeded on
+    the third attempt is indistinguishable from a first-try success, so this
+    still records exactly one attempt's worth of usage either way (plan:
+    phase 3 of the LLM-failure work).
     """
     message_text = _build_message_text(subject, sender, snippet, body_text)
     prompt = _build_prompt(received_at)
 
     try:
-        call_result = _call_llm(credential, prompt, message_text)
+        call_result = _call_llm(credential, prompt, message_text, policy)
     except ExtractionCallError as exc:
         logger.warning(
             "Action extraction failed for provider %s: %s", credential.provider, exc.category
@@ -358,6 +375,7 @@ def extract_action(
     body_text: str | None,
     received_at: datetime | None,
     credential: LlmCredential,
+    policy: RetryPolicy = NO_RETRIES,
 ) -> ExtractedAction | NoAction | None:
     """
     Run the second-stage extraction call for one already-classified message,
@@ -378,7 +396,10 @@ def extract_action(
     Thin wrapper over `_extract_attempt` -- drops the usage/call-succeeded
     bookkeeping for callers that don't need it. Production callers that bill
     a user's key should use `extract_action_with_usage` instead so that
-    spend actually gets recorded.
+    spend actually gets recorded. `policy` defaults to `NO_RETRIES`, same as
+    `call_chat_completion` itself -- this function has no production caller
+    today (extraction always goes through `extract_action_with_usage`), so
+    there's no real context to pick a different default from.
     """
     return _extract_attempt(
         subject=subject,
@@ -387,6 +408,7 @@ def extract_action(
         body_text=body_text,
         received_at=received_at,
         credential=credential,
+        policy=policy,
     ).result
 
 
@@ -398,12 +420,20 @@ def extract_action_with_usage(
     body_text: str | None,
     received_at: datetime | None,
     credential: LlmCredential,
+    policy: RetryPolicy = NO_RETRIES,
 ) -> ExtractionAttempt:
     """
     Same call and args as `extract_action`, but returns the full
     `ExtractionAttempt` -- including `provider_call_succeeded` and `usage` --
     for callers that need to record background usage (Wave 2b wires the
     actual call sites; this wave only lands the contract).
+
+    `policy` (plan: phase 3 of the LLM-failure work) defaults to
+    `NO_RETRIES`. In practice this function is only ever reached through a
+    Celery task (`extraction_run.py`'s `_claim_extract_record`, called from
+    `run_extraction_for_message`/`run_extraction_sweep` -- both worker-only,
+    never inline off the request path), which passes `WORKER_RETRIES`
+    explicitly rather than relying on this default.
     """
     return _extract_attempt(
         subject=subject,
@@ -412,10 +442,13 @@ def extract_action_with_usage(
         body_text=body_text,
         received_at=received_at,
         credential=credential,
+        policy=policy,
     )
 
 
-def test_credential(credential: LlmCredential) -> tuple[bool, str | None, int]:
+def test_credential(
+    credential: LlmCredential, policy: RetryPolicy = INLINE_RETRIES
+) -> tuple[bool, str | None, int]:
     """
     The `/test` route's entry point: runs `_call_llm` + `_parse_extraction`
     against a fixed fixture message and reports `(ok, category, latency_ms)`.
@@ -428,11 +461,18 @@ def test_credential(credential: LlmCredential) -> tuple[bool, str | None, int]:
     is already rate-limited, user-initiated, and shows its result on screen
     immediately, unlike background classification/extraction. Don't wire
     usage in here later just because it's sitting right there.
+
+    `policy` defaults to `INLINE_RETRIES` (plan: phase 3) rather than
+    `NO_RETRIES` like the rest of this module's public functions -- this is
+    the one function here with exactly ONE production context (a human
+    watching the "Test connection" button), so there's no ambiguity to
+    thread a policy through from, and getting one transient retry for free
+    matches every other inline call site's treatment.
     """
     prompt = _build_prompt(None)
     start = time.monotonic()
     try:
-        call_result = _call_llm(credential, prompt, _TEST_CREDENTIAL_MESSAGE)
+        call_result = _call_llm(credential, prompt, _TEST_CREDENTIAL_MESSAGE, policy)
     except ExtractionCallError as exc:
         return False, exc.category, int((time.monotonic() - start) * 1000)
 

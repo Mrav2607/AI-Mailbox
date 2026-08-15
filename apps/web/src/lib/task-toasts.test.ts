@@ -89,6 +89,29 @@ describe("extractionToastOutcome", () => {
     });
   });
 
+  it("errors and names the remedy when the sweep gave up partway", () => {
+    // Phase 3: the sweep stops after a losing streak, so the candidates it
+    // never reached are invisible in the counts -- the toast has to say it
+    // stopped rather than imply the numbers are the whole story.
+    const outcome = extractionToastOutcome({
+      status: "llm_unavailable",
+      extracted: 2,
+      failed: 3,
+      failure_categories: { http_429: 3 },
+    });
+    expect(outcome.level).toBe("error");
+    expect(outcome.message).toBe(
+      "action extraction stopped early · 2 extracted so far — rate limited by your provider" +
+        " — run it again once your provider recovers",
+    );
+  });
+
+  it("treats a missing status as a normal run", () => {
+    // An older API/worker result predates the field; it must not read as a
+    // stopped-early run.
+    expect(extractionToastOutcome({ extracted: 4, failed: 0 }).level).toBe("success");
+  });
+
   it("warns and shows the extracted/failed ratio on partial degradation", () => {
     const outcome = extractionToastOutcome({
       extracted: 3,

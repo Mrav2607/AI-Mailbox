@@ -77,7 +77,7 @@ def _stub_returns(content, *, calls=None, usage=None):
     """A fake `call_chat_completion` that returns `content` wrapped in the
     real wire type, optionally carrying `usage`, and records the kwargs it
     was called with so tests can assert what extractor built."""
-    def fn(credential, *, prompt, user_content, max_tokens):
+    def fn(credential, *, prompt, user_content, max_tokens, policy=None):
         if calls is not None:
             calls.append(dict(credential=credential, prompt=prompt, user_content=user_content, max_tokens=max_tokens))
         return LlmCallResult(content=content, usage=usage)
@@ -85,7 +85,7 @@ def _stub_returns(content, *, calls=None, usage=None):
 
 
 def _stub_raises(category, status=None):
-    def fn(credential, *, prompt, user_content, max_tokens):
+    def fn(credential, *, prompt, user_content, max_tokens, policy=None):
         raise ExtractionCallError(category, status)
     return fn
 

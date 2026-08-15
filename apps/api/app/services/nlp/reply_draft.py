@@ -17,7 +17,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.core.logging import logger
-from app.services.nlp.llm_client import LlmCallError, LlmUsage, call_chat_completion
+from app.services.nlp.llm_client import INLINE_RETRIES, LlmCallError, LlmUsage, RetryPolicy, call_chat_completion
 from app.services.nlp.providers import (
     LlmCredential,
     ResolvedExtraction,
@@ -112,7 +112,11 @@ def _parse_draft(content: str) -> str:
 
 
 def generate_reply_draft(
-    *, credential: LlmCredential, subject: str | None, messages: list[Any]
+    *,
+    credential: LlmCredential,
+    subject: str | None,
+    messages: list[Any],
+    policy: RetryPolicy = INLINE_RETRIES,
 ) -> ReplyDraftAttempt:
     """Run the reply-draft call for one thread against the caller's
     resolved `credential`. Never raises -- mirrors extraction's
@@ -121,13 +125,20 @@ def generate_reply_draft(
     for the call whether or not its body turns out to be usable), and
     `draft_text` is `None` for any failure -- call failure or an
     unparseable response -- each logged as a warning.
+
+    `policy` (plan: phase 3 of the LLM-failure work) defaults to
+    `INLINE_RETRIES`, not `NO_RETRIES` -- this function has exactly ONE
+    production call site (`POST /mail/thread/{id}/reply-draft`), and a human
+    is always watching that request, so there's no ambiguous context to
+    thread a policy through from the way `classify_with_usage`/`run_backfill`
+    need to be.
     """
     context = _build_thread_context(subject, messages)
     prompt = _build_prompt()
 
     try:
         call_result = call_chat_completion(
-            credential, prompt=prompt, user_content=context, max_tokens=_MAX_TOKENS
+            credential, prompt=prompt, user_content=context, max_tokens=_MAX_TOKENS, policy=policy
         )
     except LlmCallError as exc:
         logger.warning(

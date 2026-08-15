@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.core.logging import logger
 from app.db.models import MailThread, MailMessage, Classification
 from app.services.nlp.classifier import classify_with_usage, build_classification_text
+from app.services.nlp.llm_client import NO_RETRIES, RetryPolicy
 from app.services.nlp.persistence import OPERATOR_MODEL_VERSION, upsert_classification
 from app.services.nlp.providers import ClassificationRouter
 from app.services.nlp.usage import UsageAccumulator
@@ -112,6 +113,7 @@ def run_backfill(
     bucket: str = "unclassified",
     backend: str | None = None,
     include_task_counts: bool = False,
+    policy: RetryPolicy = NO_RETRIES,
 ) -> dict:
     """Classify (or, with ``force``, re-classify) the latest message of up to
     ``limit`` of the user's threads currently in ``bucket``.
@@ -124,6 +126,16 @@ def run_backfill(
 
     Assumes bucket/backend were already validated -- the route checks both
     before running inline or enqueuing the worker task.
+
+    ``policy`` (plan: phase 3 of the LLM-failure work) is THE trap this
+    function exists to avoid: it serves both an inline request (the route
+    runs small backfills synchronously) and a Celery task (everything over
+    the inline cap gets queued) -- same function, two very different
+    contexts for "is a human waiting on this". It defaults to ``NO_RETRIES``
+    only so an old caller that predates this parameter keeps behaving
+    exactly as before; every real production caller MUST pass
+    ``INLINE_RETRIES`` or ``WORKER_RETRIES`` explicitly, chosen at the
+    entry point (the route or the task), never guessed in here.
     """
     query = select(MailThread).where(MailThread.user_id == user_id)
     if bucket == "unclassified":
@@ -299,7 +311,7 @@ def run_backfill(
     for idx, (message_id, text_for_classification) in enumerate(to_classify):
         routing = classification_router.routing_for(db)
         attempt = classify_with_usage(
-            text_for_classification, backend=backend, routing=routing
+            text_for_classification, backend=backend, routing=routing, policy=policy
         )
         attempted += 1
         if attempt.llm_attempted:

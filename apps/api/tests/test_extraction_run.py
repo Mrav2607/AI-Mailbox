@@ -576,6 +576,34 @@ def test_claim_extract_record_releases_transaction_before_llm_call(monkeypatch):
     assert commits_observed == [1]  # claim already committed before the call
 
 
+def test_claim_extract_record_always_passes_worker_retries(monkeypatch):
+    """Extraction has no inline HTTP entry point (plan: phase 3 of the
+    LLM-failure work) -- both _claim_extract_record's callers
+    (run_extraction_for_message, run_extraction_sweep) are Celery-task-only,
+    so this hardcodes WORKER_RETRIES rather than threading a policy from a
+    caller that has no other context to pick from."""
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(
+        message=message, thread=thread,
+        classification=_make_classification(), done_at_reads=[None],
+    )
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+    monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
+
+    captured = {}
+
+    def fake_extract(**kwargs):
+        captured["policy"] = kwargs.get("policy")
+        return _extraction_attempt(NoAction())
+
+    monkeypatch.setattr(extraction_run, "extract_action_with_usage", fake_extract)
+
+    extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+
+    assert captured["policy"] is extraction_run.WORKER_RETRIES
+
+
 def test_claim_extract_record_locks_classification_before_reading_label(monkeypatch):
     message = _make_message()
     thread = _make_thread(id=message.thread_id)
@@ -1292,6 +1320,109 @@ def test_run_extraction_sweep_isolates_one_bad_message_and_continues(monkeypatch
     assert result["failed"] == 1
     assert result["extracted"] == 1
     db.rollback.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# run_extraction_sweep: the _CONSECUTIVE_FAILURE_LIMIT early stop (plan:
+# phase 3 of the LLM-failure work) -- the extraction twin of backfill.py's
+# _CONSECUTIVE_NO_VERDICT_LIMIT tests above. A losing streak of "failed"
+# buckets stops the sweep early rather than grinding through every remaining
+# candidate; an isolated failure among successes must never trip it.
+# ---------------------------------------------------------------------------
+
+
+def test_run_extraction_sweep_stops_after_three_consecutive_failures_with_partial_counts(
+    monkeypatch,
+):
+    """Four candidates, every one a "failed" bucket -- the sweep stops after
+    the third and never even attempts the fourth."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4(), uuid4(), uuid4(), uuid4()]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    calls = []
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
+        calls.append(mid)
+        return "failed", uuid4()
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+
+    result = extraction_run.run_extraction_sweep(MagicMock(), uuid4())
+
+    assert calls == message_ids[:3]  # the fourth candidate was never attempted
+    # "ok" would be a half-truth: the counts describe only what was attempted
+    # and say nothing about the candidate never reached. Same status name
+    # run_backfill uses, so both jobs report giving up identically.
+    assert result["status"] == "llm_unavailable"
+    assert result["processed"] == 3
+    assert result["failed"] == 3
+
+
+def test_run_extraction_sweep_isolated_failures_among_successes_never_stop_and_counter_resets(
+    monkeypatch,
+):
+    """Pattern: failed, extracted, failed, failed, extracted -- 3 failures
+    total but the longest CONSECUTIVE run is 2, under the threshold, so all
+    5 candidates get attempted."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4() for _ in range(5)]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    buckets = iter(["failed", "extracted", "failed", "failed", "extracted"])
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
+        return next(buckets), uuid4()
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+
+    result = extraction_run.run_extraction_sweep(MagicMock(), uuid4())
+
+    assert result["processed"] == 5  # nothing stopped the sweep early
+    assert result["status"] == "ok"
+    assert result["failed"] == 3
+    assert result["extracted"] == 2
+
+
+def test_run_extraction_sweep_exception_path_counts_toward_the_streak(monkeypatch):
+    """A message that blows up _claim_extract_record entirely (fenced to
+    failed, containment already handled) counts the same as a "failed"
+    bucket toward the consecutive-failure streak -- not a separate, never-
+    counted failure mode."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4(), uuid4(), uuid4(), uuid4()]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    calls = []
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
+        calls.append(mid)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+    db = MagicMock()
+
+    result = extraction_run.run_extraction_sweep(db, uuid4())
+
+    assert calls == message_ids[:3]
+    assert result["processed"] == 3
+    assert result["failed"] == 3
+    assert db.rollback.call_count == 3
 
 
 def test_run_extraction_sweep_end_to_end_terminalizes_expired_at_cap_row(monkeypatch):

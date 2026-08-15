@@ -28,6 +28,7 @@ from app.core.logging import logger
 from app.db.base import SessionLocal
 from app.db.models import ActionItem, Classification, MailMessage, MailThread
 from app.services.nlp.extractor import ACTION_LABELS, NoAction, extract_action_with_usage
+from app.services.nlp.llm_client import WORKER_RETRIES
 from app.services.nlp.persistence import (
     MAX_ATTEMPTS,
     PENDING_LEASE,
@@ -44,6 +45,17 @@ from app.services.nlp.usage import UsageAccumulator
 
 _DEFAULT_SINCE_DAYS = 30
 _RESULT_BUCKETS = ("extracted", "no_action", "ineligible", "failed", "skipped")
+
+# The extraction-sweep twin of backfill.py's _CONSECUTIVE_NO_VERDICT_LIMIT
+# (plan: phase 3 of the LLM-failure work -- Phase 2 added the classification
+# side of this, this closes the same gap for run_extraction_sweep). Same
+# value, same reasoning: after this many CONSECUTIVE "failed" buckets in a
+# row, stop issuing more extraction calls for the rest of this sweep. Not
+# 1 -- a single odd message shouldn't abort an otherwise-healthy sweep --
+# and the counter resets to zero on any non-"failed" bucket, so only a
+# genuine losing streak trips it. Each attempt this stop prevents can be a
+# real BYOK-billed call very likely to fail the same way as the last few.
+_CONSECUTIVE_FAILURE_LIMIT = 3
 
 
 def _empty_counts() -> dict:
@@ -199,6 +211,12 @@ def _claim_extract_record(
         return "skipped", user_id
 
     try:
+        # WORKER_RETRIES unconditionally, not threaded from a caller: both
+        # entry points that ever reach this (run_extraction_for_message,
+        # run_extraction_sweep) are Celery-task-only -- extraction has no
+        # inline HTTP path (plan: phase 3 of the LLM-failure work) -- so
+        # there's no ambiguous context to thread a policy through from the
+        # way run_backfill's inline-vs-worker split needs.
         attempt = extract_action_with_usage(
             subject=subject,
             sender=sender,
@@ -206,6 +224,7 @@ def _claim_extract_record(
             body_text=body_text,
             received_at=received_at,
             credential=call_context.credential,
+            policy=WORKER_RETRIES,
         )
         result = attempt.result
         if failure_categories is not None and attempt.failure_category is not None:
@@ -487,6 +506,11 @@ def run_extraction_sweep(
         )
 
     counts = _empty_counts()
+    # _CONSECUTIVE_FAILURE_LIMIT's early stop (plan: phase 3 of the
+    # LLM-failure work, mirroring Phase 2's run_backfill treatment) -- reset
+    # on any bucket other than "failed", tripped after 3 in a row.
+    consecutive_failures = 0
+    stopped_early = False
     for message_id in message_ids:
         counts["processed"] += 1
         try:
@@ -506,10 +530,27 @@ def run_extraction_sweep(
             logger.exception(
                 "action extraction sweep failed for message %s", message_id
             )
+            bucket = "failed"
             counts["failed"] += 1
-            continue
-        counts[bucket] += 1
-    return {"status": "ok", **counts}
+        else:
+            counts[bucket] += 1
+
+        if bucket == "failed":
+            consecutive_failures += 1
+            if consecutive_failures >= _CONSECUTIVE_FAILURE_LIMIT:
+                # Every remaining candidate is very likely to fail the same
+                # way -- stop spending BYOK-billed attempts on it. The
+                # counts collected so far are still exactly right; the loop
+                # just never reaches the rest of message_ids.
+                stopped_early = True
+                break
+        else:
+            consecutive_failures = 0
+    # Reporting "ok" for a run that quit early would be the same lie this
+    # whole plan exists to remove: the counts would be truthful about what was
+    # attempted and silent about the candidates never reached. Mirrors
+    # run_backfill's status so both jobs say "I stopped" the same way.
+    return {"status": "llm_unavailable" if stopped_early else "ok", **counts}
 
 
 def users_with_claimable_action_items(db: Session) -> list[UUID]:

@@ -8,7 +8,14 @@ import httpx
 
 from app.core.config import settings
 from app.core.logging import logger
-from app.services.nlp.llm_client import LlmCallError, LlmUsage, call_chat_completion, request_was_issued
+from app.services.nlp.llm_client import (
+    NO_RETRIES,
+    LlmCallError,
+    LlmUsage,
+    RetryPolicy,
+    call_chat_completion,
+    request_was_issued,
+)
 from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
 LABELS = (
@@ -161,6 +168,7 @@ def classify(
     text: str,
     backend: str | None = None,
     routing: ClassificationRouting | None = None,
+    policy: RetryPolicy = NO_RETRIES,
 ) -> tuple[str, float, str, str] | None:
     """
     Classify an email into the 6-label taxonomy.
@@ -221,26 +229,36 @@ def classify(
     caller that can reach an LLM path (i.e. anywhere `routing` might resolve
     to `"user"`) MUST use `classify_with_usage()` instead, or its usage never
     gets recorded.
+
+    `policy` (plan: phase 3 of the LLM-failure work) only matters on the
+    `mode="user"` BYOK path -- it's ignored everywhere else, same as
+    `llm_client.call_chat_completion`'s own default. Defaults to
+    `NO_RETRIES` here too: a caller reaching an LLM path must pass
+    `WORKER_RETRIES` or `INLINE_RETRIES` explicitly based on whether a human
+    is waiting on it, rather than this function guessing from context it
+    doesn't have.
     """
-    return _classify_attempt(text, backend, routing).verdict
+    return _classify_attempt(text, backend, routing, policy).verdict
 
 
 def classify_with_usage(
     text: str,
     backend: str | None = None,
     routing: ClassificationRouting | None = None,
+    policy: RetryPolicy = NO_RETRIES,
 ) -> ClassificationAttempt:
     """Same inputs and behavior as `classify()`, but returns the full
     `ClassificationAttempt` so a paid call site can record what it spent.
     Every production call site that can reach an LLM must call this, not
-    the bare `classify()`."""
-    return _classify_attempt(text, backend, routing)
+    the bare `classify()`. See `classify()`'s docstring for `policy`."""
+    return _classify_attempt(text, backend, routing, policy)
 
 
 def _classify_attempt(
     text: str,
     backend: str | None = None,
     routing: ClassificationRouting | None = None,
+    policy: RetryPolicy = NO_RETRIES,
 ) -> ClassificationAttempt:
     """
     The one real implementation behind `classify()` and `classify_with_usage()`
@@ -283,7 +301,7 @@ def _classify_attempt(
         # verbatim instead (D1): the caller asked for the encoder, so the
         # encoder gets first shot even for an opted-in user.
         if not explicit and routing is not None and routing.mode == "user":
-            return _classify_llm(text, routing, local_tried=False)
+            return _classify_llm(text, routing, local_tried=False, policy=policy)
 
         result = try_predict(text)
         if result is not None:
@@ -304,9 +322,9 @@ def _classify_attempt(
         if explicit and effective == "local":
             return _heuristic_attempt(text)
 
-        return _classify_llm(text, routing, local_tried=True)
+        return _classify_llm(text, routing, local_tried=True, policy=policy)
 
-    return _classify_llm(text, routing, local_tried=False)
+    return _classify_llm(text, routing, local_tried=False, policy=policy)
 
 
 @lru_cache(maxsize=1)
@@ -387,6 +405,7 @@ def _classify_llm(
     text: str,
     routing: ClassificationRouting | None = None,
     local_tried: bool = False,
+    policy: RetryPolicy = NO_RETRIES,
 ) -> ClassificationAttempt:
     """
     Dispatch to the LLM path that pays for this call, per `routing`
@@ -405,6 +424,10 @@ def _classify_llm(
     NOT another torch import, since both the loaded model and the "can't
     load" verdict are memoized per process. Still worth skipping, but it's
     slot contention we're avoiding here, not a cold start.
+
+    `policy` only reaches `call_chat_completion` on the `mode="user"` path
+    (`_classify_llm_server`'s native genai call is explicitly out of scope
+    for retries, per the phase 3 contract) -- see `classify()`'s docstring.
     """
     if routing is not None and routing.mode == "off":
         return _heuristic_attempt(text)
@@ -421,7 +444,11 @@ def _classify_llm(
             logger.warning("ClassificationRouting mode='user' had no credential")
             return _heuristic_attempt(text)
         return _classify_llm_user(
-            text, routing.credential, local_tried, fallback_local=routing.fallback_local
+            text,
+            routing.credential,
+            local_tried,
+            fallback_local=routing.fallback_local,
+            policy=policy,
         )
 
     return _classify_llm_server(text)
@@ -603,6 +630,7 @@ def _classify_llm_user(
     local_tried: bool = False,
     *,
     fallback_local: bool = False,
+    policy: RetryPolicy = NO_RETRIES,
 ) -> ClassificationAttempt:
     """
     BYOK classification path: the same prompt and the same strict parse as
@@ -615,6 +643,12 @@ def _classify_llm_user(
     `local_tried` (D2/D2a): the failure path below tries the local encoder
     before giving up, but only once per call, and only when `fallback_local`
     opts in -- see `_llm_user_failure_fallback`.
+
+    `policy` reaches `call_chat_completion` unchanged -- ANY retries it does
+    resolve before this function ever sees a result or an exception, so a
+    call that fails twice and succeeds on the third attempt looks identical
+    here to a first-try success: one `LlmCallResult`, one `provider_call_
+    succeeded=True` below, one thing for the caller to record as usage.
     """
     try:
         result = call_chat_completion(
@@ -623,6 +657,7 @@ def _classify_llm_user(
             user_content=f"Email:\n{text[:6000]}",
             max_tokens=_CLASSIFICATION_MAX_TOKENS,
             timeout=_CLASSIFICATION_TIMEOUT_S,
+            policy=policy,
         )
     except LlmCallError as exc:
         logger.warning(

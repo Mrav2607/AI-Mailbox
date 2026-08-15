@@ -1656,7 +1656,7 @@ def test_classify_gmail_message_best_effort_skips_write_on_no_verdict(monkeypatc
     monkeypatch.setattr(reply_routes, "ClassificationRouter", _FixedRouter)
     monkeypatch.setattr(
         reply_routes, "classify_with_usage",
-        lambda text, routing=None: ClassificationAttempt(
+        lambda text, routing=None, policy=None: ClassificationAttempt(
             verdict=None,
             provider_call_succeeded=False,
             usage=None,

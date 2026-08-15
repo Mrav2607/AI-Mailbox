@@ -102,6 +102,7 @@ export function backfillToastOutcome(
 }
 
 export interface ExtractionToastInput {
+  status?: string;
   extracted?: number;
   failed?: number;
   failure_categories?: Record<string, number>;
@@ -116,6 +117,17 @@ export interface ExtractionToastInput {
 export function extractionToastOutcome(res: ExtractionToastInput): ToastOutcome {
   const failed = res.failed ?? 0;
   const extracted = res.extracted ?? 0;
+  // The sweep gave up partway (phase 3): saying only what it managed to
+  // attempt would hide the candidates it never reached, which is the same
+  // half-truth the old "N processed" toast told.
+  if (res.status === "llm_unavailable") {
+    const message =
+      appendDominantLabel(
+        `action extraction stopped early · ${extracted} extracted so far`,
+        res.failure_categories,
+      ) + ` — run it again once your provider recovers`;
+    return { message, level: "error" };
+  }
   if (failed <= 0) {
     return { message: `action extraction complete · ${extracted} extracted`, level: "success" };
   }

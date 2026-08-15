@@ -13,6 +13,8 @@ import json
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import NoReturn
 
 import httpx
@@ -56,11 +58,21 @@ class LlmCallError(Exception):
     result contract -- extraction's unchanged `None`, `/test`'s category set,
     classification's heuristic fallback -- none derives a category from a
     lossy `None`.
+
+    `retry_after_s` is the provider's `Retry-After` value, already resolved to
+    a seconds-from-now float (see `_parse_retry_after`) -- `None` when the
+    response carried no header, the header was unparseable, or this category
+    never had a response to read one from (`timed_out`, `connection_failed`).
+    Only the retry loop in `call_chat_completion` reads it; every other caller
+    can ignore the field entirely.
     """
 
-    def __init__(self, category: str, status: int | None) -> None:
+    def __init__(
+        self, category: str, status: int | None, *, retry_after_s: float | None = None
+    ) -> None:
         self.category = category
         self.status = status
+        self.retry_after_s = retry_after_s
         super().__init__(category)
 
 
@@ -86,6 +98,112 @@ def request_was_issued(category: str) -> bool:
     left the process -- see `PREFLIGHT_CATEGORIES` for why `blocked_by_policy`
     is the one exception."""
     return category not in PREFLIGHT_CATEGORIES
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """
+    Bounds one `call_chat_completion` call's retry behavior -- the single
+    retry owner, per this module's docstring (plan: phase 3 of the
+    LLM-failure work). Retries resolve entirely inside the call, before it
+    returns, so nothing new ever raises into Celery's `autoretry_for` and one
+    message still costs exactly one attempt against a caller's own attempt
+    cap (e.g. extraction's `MAX_ATTEMPTS`).
+
+    `max_attempts` counts the FIRST try too -- `1` means "never retry", not
+    "retry once". `total_budget_s` is a hard ceiling on cumulative WAIT time
+    only (never on the calls themselves, which have their own `timeout`).
+    `per_wait_cap_s` bounds any single wait, whether it comes from a
+    provider's `Retry-After` or our own backoff -- a provider asking for a
+    minute-long wait must never turn into a minute-long wait just because it
+    asked.
+    """
+
+    max_attempts: int
+    total_budget_s: float
+    per_wait_cap_s: float
+
+
+# The default for call_chat_completion -- no existing caller changes
+# behavior just because this module gained retries. A caller opts in by
+# passing one of the policies below explicitly.
+NO_RETRIES = RetryPolicy(max_attempts=1, total_budget_s=0.0, per_wait_cap_s=0.0)
+
+# Background sweeps/backfills, run in a Celery worker with nobody watching a
+# spinner -- this can afford a real wait. 60s total stays FAR below the
+# extraction claim lease (PENDING_LEASE, persistence.py -- 30 minutes): even
+# every attempt in this budget landing back-to-back with worst-case waits
+# leaves comfortable margin before another worker could steal the claim.
+# 4 attempts (the first try plus 3 retries) with a 20s per-wait cap means no
+# single Retry-After can burn more than a third of the budget in one sleep.
+WORKER_RETRIES = RetryPolicy(max_attempts=4, total_budget_s=60.0, per_wait_cap_s=20.0)
+
+# A human is waiting on the HTTP response. Roughly one quick retry: honoring
+# a large Retry-After inline would just turn a failed call into a multi-
+# second spinner, which is worse than failing fast and letting the user
+# retry (or the fallback/backfill path pick it up later).
+INLINE_RETRIES = RetryPolicy(max_attempts=2, total_budget_s=3.0, per_wait_cap_s=3.0)
+
+# Retryable: a rate limit, any 5xx, a timeout, or a connection failure -- all
+# plausibly transient. NOT retryable, each for its own reason:
+#   - blocked_by_policy: refused before dispatch: retrying just re-refuses.
+#   - invalid_response: the provider answered and the body was unusable; a
+#     retry bills the user again for what's likely the same bad answer.
+#   - any other http_4xx: a bad key or a bad request doesn't fix itself.
+_RETRYABLE_EXACT = frozenset({"http_429", "timed_out", "connection_failed"})
+
+
+def _is_retryable_category(category: str) -> bool:
+    if category in _RETRYABLE_EXACT:
+        return True
+    if category.startswith("http_"):
+        try:
+            status = int(category[len("http_"):])
+        except ValueError:
+            return False
+        return 500 <= status < 600
+    return False
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """
+    Resolve a `Retry-After` header to seconds-from-now, or `None` if it's
+    absent or unparseable.
+
+    RFC 9110 allows either an integer seconds count OR an HTTP-date -- an
+    intermediary can legally send the date form even when the origin always
+    sends seconds. Mirrors `outlook_client.py`'s `_get` idiom (~line 109):
+    try the cheap numeric parse first, and a value that fails BOTH forms
+    falls back to backoff in the caller rather than raising -- a malformed
+    header must never crash a run that would otherwise have succeeded on
+    retry.
+    """
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+
+
+# Seed for exponential backoff when a retryable failure carries no usable
+# Retry-After -- doubles each attempt (1s, 2s, 4s, ...), then gets clamped by
+# RetryPolicy.per_wait_cap_s same as a provider-supplied wait.
+_BACKOFF_BASE_S = 1.0
+
+
+# Patchable seam for tests: a real 60-second budget must never actually sleep
+# 60 seconds in a test run. Tests monkeypatch this name directly rather than
+# call_chat_completion needing a sleep_fn parameter every caller has to plumb.
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
 
 
 # A TCP connect slower than this is a dead host no matter how slow the model
@@ -212,20 +330,20 @@ def _parse_usage(payload: object) -> LlmUsage | None:
     )
 
 
-def call_chat_completion(
+def _call_once(
     credential: LlmCredential,
     *,
     prompt: str,
     user_content: str,
     max_tokens: int,
-    timeout: float = 30.0,
+    timeout: float,
 ) -> LlmCallResult:
     """
-    Perform the OpenAI-compatible chat-completions call and return an
-    `LlmCallResult` carrying the raw `choices[0].message.content` string plus
-    whatever usage telemetry the provider included. Raises `LlmCallError` on
-    every failure -- the single internal failure carrier. A malformed
-    `usage` block is never one of those failures; see `_parse_usage`.
+    One wire attempt -- the entire previous body of `call_chat_completion`,
+    unchanged, now wrapped by that function's retry loop. Raises
+    `LlmCallError` on every failure -- the single internal failure carrier. A
+    malformed `usage` block is never one of those failures; see
+    `_parse_usage`.
 
     `timeout` is a TOTAL WALL-CLOCK budget for the complete call -- DNS and
     destination pinning, connect, send, and reading the entire body -- not a
@@ -315,7 +433,8 @@ def call_chat_completion(
                         "LLM call failed for provider %s: http_%s",
                         credential.provider, status,
                     )
-                    raise LlmCallError(f"http_{status}", status)
+                    retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+                    raise LlmCallError(f"http_{status}", status, retry_after_s=retry_after)
                 raw = _read_body_within_deadline(response, deadline, credential.provider)
     except (httpx.HTTPError, httpx.StreamError) as exc:
         logger.warning(
@@ -348,3 +467,78 @@ def call_chat_completion(
         _raise_invalid_response(credential.provider, status)
 
     return LlmCallResult(content=content, usage=_parse_usage(payload))
+
+
+def call_chat_completion(
+    credential: LlmCredential,
+    *,
+    prompt: str,
+    user_content: str,
+    max_tokens: int,
+    timeout: float = 30.0,
+    policy: RetryPolicy = NO_RETRIES,
+) -> LlmCallResult:
+    """
+    The single wire point for every BYOK call (plan: phase 3 of the
+    LLM-failure work) -- retries live HERE and only here, so a caller opts in
+    by passing `policy` instead of writing its own loop. See `_call_once` for
+    the per-attempt call itself; `timeout` is unchanged from before this
+    wave and applies to EACH attempt independently, not to the retry
+    sequence as a whole.
+
+    Retries a failure only when `_is_retryable_category` says so
+    (`http_429`/`http_5xx`/`timed_out`/`connection_failed` -- see that
+    function's comment for why the rest aren't). The wait before each retry
+    is the failure's `Retry-After` when the provider sent a usable one,
+    otherwise exponential backoff (`_BACKOFF_BASE_S`); either way it's
+    clamped to `policy.per_wait_cap_s`. A wait that would push cumulative
+    waits past `policy.total_budget_s` means giving up NOW -- the exception
+    is re-raised without sleeping at all, rather than sleeping a clamped
+    amount and then failing anyway.
+
+    A call that fails on early attempts and succeeds on a later one returns
+    normally, exactly like a first-try success -- from every caller's (and
+    the usage recorder's) point of view this is ONE call, not several. Only
+    the attempt that actually reaches `_call_once`'s return matters; earlier
+    attempts that raised were never billable results to report (Phase 1's
+    `provider_call_succeeded` is set once, by the caller, off whatever this
+    function ultimately returns or raises -- see `ClassificationAttempt`'s
+    and `ExtractionAttempt`'s docstrings). If every attempt fails, the LAST
+    attempt's `LlmCallError` is what propagates, so a caller's
+    `failure_category` reflects what actually happened most recently.
+    """
+    budget_remaining = policy.total_budget_s
+    last_error: LlmCallError | None = None
+    for attempt in range(1, policy.max_attempts + 1):
+        try:
+            return _call_once(
+                credential,
+                prompt=prompt,
+                user_content=user_content,
+                max_tokens=max_tokens,
+                timeout=timeout,
+            )
+        except LlmCallError as exc:
+            last_error = exc
+            if attempt >= policy.max_attempts or not _is_retryable_category(exc.category):
+                raise
+            wait = exc.retry_after_s
+            if wait is None:
+                wait = _BACKOFF_BASE_S * (2 ** (attempt - 1))
+            wait = min(wait, policy.per_wait_cap_s)
+            if wait > budget_remaining:
+                # The remaining budget can't cover even this clamped wait --
+                # give up now rather than sleep a partial amount and fail
+                # anyway right after.
+                raise
+            logger.warning(
+                "LLM call failed for provider %s (%s), retrying in %.1fs (attempt %d/%d)",
+                credential.provider, exc.category, wait, attempt, policy.max_attempts,
+            )
+            _sleep(wait)
+            budget_remaining -= wait
+    # Unreachable -- the loop above always either returns or raises before
+    # exhausting its range. Kept for type-checkers and as a hard failsafe
+    # against a future edit breaking that invariant silently.
+    assert last_error is not None
+    raise last_error

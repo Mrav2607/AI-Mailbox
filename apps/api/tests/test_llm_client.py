@@ -17,12 +17,23 @@ import logging
 import socket
 import threading
 import time
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
 import httpx
 import pytest
 
 from app.services.nlp import llm_client
-from app.services.nlp.llm_client import LlmCallError, LlmCallResult, LlmUsage, call_chat_completion
+from app.services.nlp.llm_client import (
+    INLINE_RETRIES,
+    NO_RETRIES,
+    WORKER_RETRIES,
+    LlmCallError,
+    LlmCallResult,
+    LlmUsage,
+    RetryPolicy,
+    call_chat_completion,
+)
 from app.services.nlp.providers import DestinationRejected, LlmCredential
 from app.services.nlp import providers as providers_module
 
@@ -587,3 +598,310 @@ def test_call_chat_completion_never_logs_the_api_key(monkeypatch, caplog):
         with pytest.raises(LlmCallError):
             call_chat_completion(credential, prompt="prompt", user_content="text", max_tokens=512)
     assert SECRET_KEY not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# call_chat_completion / RetryPolicy -- phase 3 of the LLM-failure work.
+#
+# No test here ever sleeps for its budget: `_spy_sleep` replaces
+# `llm_client._sleep` with a recorder, so a 60-second WORKER_RETRIES budget
+# proves out in milliseconds, not minutes.
+# ---------------------------------------------------------------------------
+
+
+def _spy_sleep(monkeypatch):
+    """Patch llm_client._sleep to record every requested wait instead of
+    actually sleeping -- the seam the module exposes specifically so tests
+    never have to sleep through a real retry budget."""
+    waits = []
+    monkeypatch.setattr(llm_client, "_sleep", lambda seconds: waits.append(seconds))
+    return waits
+
+
+def _sequenced_handler(*responses):
+    """A MockTransport handler that returns `responses` in order, one per
+    request -- for tests where an early attempt fails and a later one
+    succeeds (or vice versa)."""
+    it = iter(responses)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return next(it)
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    "category, status, response",
+    [
+        ("http_429", 429, httpx.Response(429, json={})),
+        ("http_500", 500, httpx.Response(500, json={})),
+        ("http_503", 503, httpx.Response(503, json={})),
+    ],
+    ids=["429", "500", "503"],
+)
+def test_call_chat_completion_retries_a_retryable_http_category_and_succeeds(
+    monkeypatch, category, status, response
+):
+    waits = _spy_sleep(monkeypatch)
+    handler = _sequenced_handler(response, httpx.Response(200, json=_choice_payload(VALID_CONTENT)))
+    _install_mock_transport(monkeypatch, handler)
+    policy = RetryPolicy(max_attempts=2, total_budget_s=10.0, per_wait_cap_s=10.0)
+
+    result = call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512, policy=policy
+    )
+
+    # One retry, one wait -- and the caller sees a single successful result,
+    # not two. This is the "one billable success" contract Phase 1's
+    # provider_call_succeeded relies on: a caller that gets this LlmCallResult
+    # back records ONE usage entry, never one per wire attempt.
+    assert result.content == VALID_CONTENT
+    assert len(waits) == 1
+
+
+@pytest.mark.parametrize("exc", [httpx.ConnectError("boom"), httpx.ReadTimeout("boom")])
+def test_call_chat_completion_retries_a_connection_or_timeout_failure(monkeypatch, exc):
+    waits = _spy_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise exc
+        return httpx.Response(200, json=_choice_payload(VALID_CONTENT))
+
+    _install_mock_transport(monkeypatch, handler)
+    policy = RetryPolicy(max_attempts=2, total_budget_s=10.0, per_wait_cap_s=10.0)
+
+    result = call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512, policy=policy
+    )
+
+    assert result.content == VALID_CONTENT
+    assert calls["n"] == 2
+    assert len(waits) == 1
+
+
+@pytest.mark.parametrize(
+    "handler_factory",
+    [
+        lambda calls: _json_handler(400, {}, calls),
+        lambda calls: _json_handler(200, {"choices": []}, calls),  # invalid_response
+    ],
+    ids=["http_400", "invalid_response"],
+)
+def test_call_chat_completion_does_not_retry_a_non_retryable_category(monkeypatch, handler_factory):
+    calls = []
+    _install_mock_transport(monkeypatch, handler_factory(calls))
+    waits = _spy_sleep(monkeypatch)
+    policy = RetryPolicy(max_attempts=5, total_budget_s=10.0, per_wait_cap_s=10.0)
+
+    with pytest.raises(LlmCallError):
+        call_chat_completion(
+            _make_credential(), prompt="prompt", user_content="text", max_tokens=512, policy=policy
+        )
+
+    assert len(calls) == 1  # returned immediately -- no retry ever attempted
+    assert waits == []
+
+
+def test_call_chat_completion_does_not_retry_blocked_by_policy(monkeypatch):
+    calls = []
+    _install_mock_transport(monkeypatch, _json_handler(200, {}, calls))
+    waits = _spy_sleep(monkeypatch)
+
+    def fake_pin(url):
+        raise DestinationRejected("destination_rejected", "nope")
+
+    monkeypatch.setattr(llm_client, "pin_custom_destination", fake_pin)
+    credential = _make_credential(provider="custom", base_url="https://ollama.example.com/v1")
+    policy = RetryPolicy(max_attempts=5, total_budget_s=10.0, per_wait_cap_s=10.0)
+
+    with pytest.raises(LlmCallError) as exc_info:
+        call_chat_completion(credential, prompt="prompt", user_content="text", max_tokens=512, policy=policy)
+
+    assert exc_info.value.category == "blocked_by_policy"
+    assert not calls
+    assert waits == []
+
+
+def test_call_chat_completion_honors_retry_after_in_seconds(monkeypatch):
+    waits = _spy_sleep(monkeypatch)
+    handler = _sequenced_handler(
+        httpx.Response(429, json={}, headers={"Retry-After": "7"}),
+        httpx.Response(200, json=_choice_payload(VALID_CONTENT)),
+    )
+    _install_mock_transport(monkeypatch, handler)
+    policy = RetryPolicy(max_attempts=2, total_budget_s=30.0, per_wait_cap_s=30.0)
+
+    call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512, policy=policy
+    )
+
+    assert waits == [7.0]
+
+
+def test_call_chat_completion_honors_retry_after_as_an_http_date(monkeypatch):
+    waits = _spy_sleep(monkeypatch)
+    future = datetime.now(timezone.utc) + timedelta(seconds=5)
+    retry_after_date = format_datetime(future, usegmt=True)
+    handler = _sequenced_handler(
+        httpx.Response(429, json={}, headers={"Retry-After": retry_after_date}),
+        httpx.Response(200, json=_choice_payload(VALID_CONTENT)),
+    )
+    _install_mock_transport(monkeypatch, handler)
+    policy = RetryPolicy(max_attempts=2, total_budget_s=30.0, per_wait_cap_s=30.0)
+
+    call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512, policy=policy
+    )
+
+    assert len(waits) == 1
+    # Resolved relative to "now" at parse time, so allow a little slack rather
+    # than pin an exact float.
+    assert 4.0 <= waits[0] <= 6.0
+
+
+def test_call_chat_completion_garbage_retry_after_falls_back_to_backoff_not_a_crash(monkeypatch):
+    waits = _spy_sleep(monkeypatch)
+    handler = _sequenced_handler(
+        httpx.Response(429, json={}, headers={"Retry-After": "not-a-valid-value"}),
+        httpx.Response(200, json=_choice_payload(VALID_CONTENT)),
+    )
+    _install_mock_transport(monkeypatch, handler)
+    policy = RetryPolicy(max_attempts=2, total_budget_s=30.0, per_wait_cap_s=30.0)
+
+    result = call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512, policy=policy
+    )
+
+    assert result.content == VALID_CONTENT
+    assert waits == [1.0]  # _BACKOFF_BASE_S for the first retry, not a raise
+
+
+def test_call_chat_completion_clamps_a_single_wait_to_the_per_wait_cap(monkeypatch):
+    waits = _spy_sleep(monkeypatch)
+    handler = _sequenced_handler(
+        httpx.Response(429, json={}, headers={"Retry-After": "300"}),
+        httpx.Response(200, json=_choice_payload(VALID_CONTENT)),
+    )
+    _install_mock_transport(monkeypatch, handler)
+    policy = RetryPolicy(max_attempts=2, total_budget_s=100.0, per_wait_cap_s=5.0)
+
+    call_chat_completion(
+        _make_credential(), prompt="prompt", user_content="text", max_tokens=512, policy=policy
+    )
+
+    assert waits == [5.0]  # clamped, not the raw 300s Retry-After
+
+
+def test_call_chat_completion_cumulative_waits_never_exceed_the_total_budget(monkeypatch):
+    """Two retryable failures in a row, each wanting a 4s wait, against a 6s
+    total budget: the first wait (4s) fits, the second (would total 8s)
+    doesn't -- the run gives up on the SECOND failure without a third
+    attempt, and never sleeps past the budget."""
+    waits = _spy_sleep(monkeypatch)
+    handler = _sequenced_handler(
+        httpx.Response(429, json={}, headers={"Retry-After": "4"}),
+        httpx.Response(429, json={}, headers={"Retry-After": "4"}),
+        httpx.Response(200, json=_choice_payload(VALID_CONTENT)),
+    )
+    _install_mock_transport(monkeypatch, handler)
+    policy = RetryPolicy(max_attempts=5, total_budget_s=6.0, per_wait_cap_s=10.0)
+
+    with pytest.raises(LlmCallError) as exc_info:
+        call_chat_completion(
+            _make_credential(), prompt="prompt", user_content="text", max_tokens=512, policy=policy
+        )
+
+    assert exc_info.value.category == "http_429"
+    assert waits == [4.0]  # only the first wait ever happened
+    assert sum(waits) <= 6.0
+
+
+def test_call_chat_completion_retry_after_beyond_remaining_budget_gives_up_without_sleeping(
+    monkeypatch,
+):
+    """A single retryable failure whose Retry-After (10s) already exceeds the
+    ENTIRE budget (5s) must give up immediately -- zero sleeps, not a 5s
+    partial sleep followed by a failure anyway."""
+    waits = _spy_sleep(monkeypatch)
+    _install_mock_transport(
+        monkeypatch,
+        _sequenced_handler(httpx.Response(429, json={}, headers={"Retry-After": "10"})),
+    )
+    policy = RetryPolicy(max_attempts=3, total_budget_s=5.0, per_wait_cap_s=10.0)
+
+    with pytest.raises(LlmCallError) as exc_info:
+        call_chat_completion(
+            _make_credential(), prompt="prompt", user_content="text", max_tokens=512, policy=policy
+        )
+
+    assert exc_info.value.category == "http_429"
+    assert waits == []  # gave up before sleeping at all
+
+
+def test_inline_retries_cannot_produce_a_long_stall(monkeypatch):
+    """INLINE_RETRIES's own numbers, exercised end to end against a
+    provider that always asks for a full minute -- cumulative sleeping must
+    never exceed the policy's own tiny budget, proving a human waiting on
+    this request can never see a minute-long spinner."""
+    waits = _spy_sleep(monkeypatch)
+    _install_mock_transport(
+        monkeypatch,
+        lambda request: httpx.Response(429, json={}, headers={"Retry-After": "60"}),
+    )
+
+    with pytest.raises(LlmCallError):
+        call_chat_completion(
+            _make_credential(),
+            prompt="prompt",
+            user_content="text",
+            max_tokens=512,
+            policy=INLINE_RETRIES,
+        )
+
+    assert sum(waits) <= INLINE_RETRIES.total_budget_s
+    assert all(w <= INLINE_RETRIES.per_wait_cap_s for w in waits)
+
+
+def test_worker_retries_stays_far_under_the_extraction_claim_lease(monkeypatch):
+    """WORKER_RETRIES's own numbers, same end-to-end shape as the inline
+    test above, against the same always-asks-for-a-minute provider --
+    cumulative sleeping must stay within its own 60s budget, which is far
+    below the 30-minute PENDING_LEASE it's sized against."""
+    waits = _spy_sleep(monkeypatch)
+    _install_mock_transport(
+        monkeypatch,
+        lambda request: httpx.Response(429, json={}, headers={"Retry-After": "60"}),
+    )
+
+    with pytest.raises(LlmCallError):
+        call_chat_completion(
+            _make_credential(),
+            prompt="prompt",
+            user_content="text",
+            max_tokens=512,
+            policy=WORKER_RETRIES,
+        )
+
+    assert sum(waits) <= WORKER_RETRIES.total_budget_s
+    assert all(w <= WORKER_RETRIES.per_wait_cap_s for w in waits)
+
+
+def test_call_chat_completion_no_retries_default_is_unchanged_from_before_this_wave(monkeypatch):
+    """NO_RETRIES (the default) means a single retryable failure still
+    raises on the first attempt -- no existing caller's behavior changes
+    just because this module gained retries."""
+    calls = []
+    _install_mock_transport(monkeypatch, _json_handler(429, {}, calls))
+    waits = _spy_sleep(monkeypatch)
+
+    with pytest.raises(LlmCallError) as exc_info:
+        call_chat_completion(
+            _make_credential(), prompt="prompt", user_content="text", max_tokens=512, policy=NO_RETRIES
+        )
+
+    assert exc_info.value.category == "http_429"
+    assert len(calls) == 1
+    assert waits == []

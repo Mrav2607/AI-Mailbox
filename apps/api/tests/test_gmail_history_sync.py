@@ -405,7 +405,7 @@ def test_classification_router_is_built_once_per_run_not_once_per_message(monkey
             routing_calls.append(db)
             return SENTINEL_ROUTING
 
-    def fake_classify_with_usage(text, *, routing):
+    def fake_classify_with_usage(text, *, routing, policy=None):
         classify_calls.append(routing)
         return ClassificationAttempt(
             verdict=("other", 0.5, "stub", "test-model"),
@@ -469,7 +469,7 @@ def _fixed_router(routing):
 
 
 def _fake_classify_with_usage(usage):
-    def fake(text, *, routing):
+    def fake(text, *, routing, policy=None):
         return ClassificationAttempt(
             verdict=("fyi", 0.5, "stub", "test-model"),
             provider_call_succeeded=True,
@@ -591,7 +591,7 @@ def test_verdict_none_leaves_message_unclassified_and_reports_left_unclassified(
     records = []
     monkeypatch.setattr(gmail_ingest, "ClassificationRouter", _fixed_router(routing))
 
-    def fake_classify_with_usage(text, *, routing):
+    def fake_classify_with_usage(text, *, routing, policy=None):
         return ClassificationAttempt(
             verdict=None,
             provider_call_succeeded=False,

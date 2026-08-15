@@ -272,7 +272,7 @@ def _patch_classification(monkeypatch, *, raises=None, no_verdict=False):
     # written (not just inferred from outcome["classified"]).
     calls = {"classify": 0, "upsert": []}
 
-    def fake_classify(text, *, routing):
+    def fake_classify(text, *, routing, policy=None):
         calls["classify"] += 1
         if raises:
             raise raises

@@ -18,6 +18,7 @@ from app.core.logging import logger
 from app.services.ingest.gmail_client import GmailClient
 from app.services.ingest.normalizer import normalize_message
 from app.services.nlp.classifier import classify_with_usage, build_classification_text
+from app.services.nlp.llm_client import WORKER_RETRIES
 from app.services.nlp.persistence import upsert_classification
 from app.services.nlp.providers import ClassificationRouter
 from app.services.nlp.usage import UsageAccumulator
@@ -558,8 +559,10 @@ def ingest_gmail_messages(
                         normalized.get("body_text"),
                     )
                     routing = classification_router.routing_for(db)
+                    # Ingest only ever runs off a Celery task -- WORKER_RETRIES
+                    # unconditionally, nobody is waiting on a sync's response.
                     attempt = classify_with_usage(
-                        text_for_classification, routing=routing
+                        text_for_classification, routing=routing, policy=WORKER_RETRIES
                     )
                     # Only the user's own key gets recorded -- v1 tracks
                     # user-paid usage only (plan §1). `routing.mode == "user"`
