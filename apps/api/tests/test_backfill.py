@@ -692,7 +692,7 @@ def test_run_backfill_flushes_usage_even_when_every_message_is_no_verdict(monkey
     usage = LlmUsage(prompt_tokens=1, completion_tokens=0, total_tokens=1)
     monkeypatch.setattr(
         backfill, "classify_with_usage",
-        lambda text, backend=None, routing=None: ClassificationAttempt(
+        lambda text, backend=None, routing=None, policy=None: ClassificationAttempt(
             verdict=None,
             provider_call_succeeded=False,
             usage=usage,
