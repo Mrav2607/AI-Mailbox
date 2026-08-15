@@ -5,6 +5,7 @@ import {
   Download,
   Mail,
   MessagesSquare,
+  Settings,
   Sparkles,
   LogOut,
   Columns3,
@@ -495,7 +496,7 @@ function AccountsMenu({
       )}
       <button
         type="button"
-        data-tour="llm-settings"
+        data-tour="settings"
         disabled={actionsLocked}
         onClick={onOpenSettings}
         className="w-full h-7 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors"
@@ -716,6 +717,19 @@ export function TopBar({
           />
         </Popover>
       </div>
+      {/* Narrow viewports hide the accounts popover entirely, which used to
+          leave the command palette as the only way into settings on a phone.
+          This gear is the direct path instead; same dialog, accounts tab.
+          No data-tour here -- the tour anchors to the popover's settings
+          button, and duplicating the attribute would break its selector. */}
+      <button
+        onClick={onOpenSettings}
+        aria-label="Settings"
+        title="settings"
+        className="md:hidden h-10 w-10 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent flex items-center justify-center text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+      >
+        <Settings className="h-3 w-3" />
+      </button>
       <button
         onClick={onLogout}
         // "everywhere" because this revokes the session server-side, not just in
