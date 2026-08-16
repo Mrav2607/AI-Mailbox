@@ -303,6 +303,7 @@ def _upsert_page_messages(
     classification_router: ClassificationRouter,
     usage_acc: UsageAccumulator,
     breaker: ClassificationBreaker,
+    attempted_no_verdict_ids: set[str],
 ) -> dict[str, Any]:
     """Upsert one delta page's messages (and their threads) for one folder.
 
@@ -323,16 +324,14 @@ def _upsert_page_messages(
     # the keyword heuristic -- counted here so a sync toast can name it. No
     # automatic recovery; the user has to run a backfill (D-I).
     left_unclassified = 0
-    # Every provider_message_id this page ACTUALLY called classify_with_usage
-    # for and got no verdict back -- handed to the caller, which accumulates
-    # it across every page and threads the whole-run set into the END
-    # reconciliation pass (Codex review, phase 3 should-fix): without it,
-    # reconciliation has no way to know this exact attempt was already made
-    # and would start a SECOND WORKER_RETRIES chain on the same message.
-    # Deliberately NOT populated by a breaker-skip (see below) -- a message
-    # never even attempted needs no marker, since the breaker itself is
-    # still tripped for the rest of this run and covers it directly.
-    no_verdict_provider_message_ids: set[str] = set()
+    # ``attempted_no_verdict_ids`` is the RUN-shared no-verdict marker set
+    # (final Codex pass -- it used to be page-loop-local, which left a
+    # START-reconciliation failure invisible here): read to skip a message
+    # this run already attempted, fed with this page's own no-verdict
+    # attempts so the END reconciliation pass skips them too. Deliberately
+    # NOT fed by a breaker-skip -- a message never even attempted needs no
+    # marker, since the breaker itself stays tripped for the rest of the
+    # run and covers it directly.
     # Tells the caller whether this page put anything in usage_acc, since it
     # can't see usage_acc's internal buffer state from out there.
     usage_recorded = False
@@ -413,7 +412,14 @@ def _upsert_page_messages(
                 # it would otherwise), but a message that never even gets
                 # attempted is exactly as unclassified as one whose call
                 # failed, so it counts into left_unclassified the same way.
-                if not breaker.should_call:
+                if provider_message_id in attempted_no_verdict_ids:
+                    # Already attempted (and counted) by an earlier phase of
+                    # this run -- the START reconciliation pass, or an
+                    # earlier delta event for the same message. No second
+                    # wire call, and no second count (final Codex pass: the
+                    # first attempt already counted it wherever it ran).
+                    pass
+                elif not breaker.should_call:
                     left_unclassified += 1
                 else:
                     text_for_classification = build_classification_text(
@@ -449,13 +455,13 @@ def _upsert_page_messages(
                     # backfill candidate again).
                     if attempt.verdict is None:
                         left_unclassified += 1
-                        # Codex review, phase 3 should-fix: mark this exact
-                        # attempt as made THIS run so the END reconciliation
-                        # pass -- which may match this SAME message against
-                        # a correlated ReplyAttempt -- doesn't start a
+                        # Mark this exact attempt as made THIS run so no
+                        # later phase -- another delta event for the same
+                        # message, or the END reconciliation pass matching
+                        # it against a correlated ReplyAttempt -- starts a
                         # second WORKER_RETRIES chain on it (see
                         # reconcile.py's _classify_and_stamp docstring).
-                        no_verdict_provider_message_ids.add(provider_message_id)
+                        attempted_no_verdict_ids.add(provider_message_id)
                     else:
                         label, confidence, rationale, model_version = attempt.verdict
                         upsert_classification(
@@ -476,7 +482,6 @@ def _upsert_page_messages(
         "messages_upserted": messages_upserted,
         "classified": classified,
         "left_unclassified": left_unclassified,
-        "no_verdict_provider_message_ids": no_verdict_provider_message_ids,
         "usage_recorded": usage_recorded,
     }
 
@@ -533,6 +538,13 @@ def ingest_outlook_messages(
     # Tripping this NEVER stops ingest itself; see ClassificationBreaker's
     # own docstring.
     classification_breaker = ClassificationBreaker()
+    # RUN-shared no-verdict marker set (final Codex pass -- created before
+    # the START pass, not after it, so a Sent Items message the START pass
+    # fails on is skipped by the page loop and the END pass instead of
+    # getting a second WORKER_RETRIES chain when its delta update arrives
+    # this same run). Fed by every phase that makes a real no-verdict
+    # attempt; read by every later phase.
+    attempted_no_verdict_ids: set[str] = set()
 
     # Reply reconciliation START pass (plan §3.5): a level pass over this
     # account's reconciliation-eligible reply attempts, run BEFORE any
@@ -547,6 +559,7 @@ def ingest_outlook_messages(
         provider="outlook",
         classify_messages=classify_messages,
         breaker=classification_breaker,
+        attempted_no_verdict_ids=attempted_no_verdict_ids,
     )
 
     access_token = provider.access_token
@@ -619,12 +632,6 @@ def ingest_outlook_messages(
         "messages_removed": 0,
         "fetched": 0,
     }
-    # Accumulated across every page this run -- handed to the END
-    # reconciliation pass so it doesn't re-attempt a message the page loop
-    # already classified (and got no verdict for) earlier in this same run
-    # (Codex review, phase 3 should-fix; see _upsert_page_messages' own
-    # comment and reconcile.py's _classify_and_stamp docstring).
-    no_verdict_provider_message_ids: set[str] = set()
 
     for folder_key in _FOLDERS:
         if remaining <= 0 or pages_done >= max_pages:
@@ -706,10 +713,10 @@ def ingest_outlook_messages(
             upsert_stats = _upsert_page_messages(
                 db, user_id, provider, folder_key, messages, classify_messages,
                 classification_router, usage_acc, classification_breaker,
+                attempted_no_verdict_ids,
             )
             if upsert_stats["usage_recorded"]:
                 usage_pending = True
-            no_verdict_provider_message_ids.update(upsert_stats["no_verdict_provider_message_ids"])
             removal_stats = with_token_retry(
                 lambda deduped_removed=deduped_removed: _apply_removals(
                     db, client, provider.id, deduped_removed
@@ -803,16 +810,16 @@ def ingest_outlook_messages(
     # have advanced past them). Shares this run's classification_breaker
     # (Codex review, phase 3 blocker) -- a losing streak the page loop
     # already tripped must stop this pass from starting its own fresh
-    # retry chain too -- and no_verdict_provider_message_ids (should-fix)
-    # so it never re-attempts a message the page loop already classified
-    # (and got no verdict for) this run.
+    # retry chain too -- and attempted_no_verdict_ids (final Codex pass)
+    # so it never re-attempts (or re-counts) a message any earlier phase of
+    # this run already got a no-verdict outcome for.
     end_reconciliation = run_reconciliation_pass(
         db,
         provider_account_id=provider.id,
         provider="outlook",
         classify_messages=classify_messages,
         breaker=classification_breaker,
-        already_attempted_provider_message_ids=frozenset(no_verdict_provider_message_ids),
+        attempted_no_verdict_ids=attempted_no_verdict_ids,
     )
     stats["left_unclassified"] += end_reconciliation["left_unclassified"]
 

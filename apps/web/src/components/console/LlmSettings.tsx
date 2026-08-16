@@ -91,7 +91,7 @@ function testErrorMessage(error: string): string {
   // second one is worth distinguishing -- it usually means the endpoint is
   // reachable and something else went wrong mid-request.
   if (error === "connect_failed") return "Could not reach the provider.";
-  if (error === "connection_failed") return "Lost the connection to the provider.";
+  if (error === "connection_failed") return "The request to the provider didn't complete.";
   if (error === "timed_out") return "The provider took too long to reply.";
   if (error === "http_401" || error === "http_403") {
     return "The provider rejected this key.";

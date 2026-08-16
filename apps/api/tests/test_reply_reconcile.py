@@ -460,10 +460,14 @@ def test_classify_and_stamp_breaker_tripped_skips_the_call(monkeypatch):
 
 
 def test_classify_and_stamp_already_attempted_marker_skips_the_call(monkeypatch):
-    """Codex review should-fix (phase 3): the page loop already made THIS
-    exact attempt earlier in the same run and got no verdict -- the marker
-    set must stop the END pass from starting a second WORKER_RETRIES chain
-    on the same message, even when the breaker hasn't tripped at all."""
+    """Codex review should-fix (phase 3): an earlier phase of this run
+    already made THIS exact attempt and got no verdict -- the marker set
+    must stop this pass from starting a second WORKER_RETRIES chain on the
+    same message, even when the breaker hasn't tripped at all. Final Codex
+    pass: the outcome is the non-counting ALREADY_ATTEMPTED, not
+    NO_VERDICT -- the first attempt already counted this message into
+    left_unclassified, so counting the skip too made one unclassified
+    message read as two."""
     calls, stamp_calls = _patch_classification(monkeypatch)
     attempt = _attempt(provider="outlook", verified_at=None)
     message = _message(provider_message_id="already-tried-this-run")
@@ -472,14 +476,56 @@ def test_classify_and_stamp_already_attempted_marker_skips_the_call(monkeypatch)
     outcome = reconcile._classify_and_stamp(
         db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id,
         user_id=uuid4(),
-        already_attempted_provider_message_ids=frozenset({"already-tried-this-run"}),
+        attempted_no_verdict_ids={"already-tried-this-run"},
     )
 
-    assert outcome == reconcile._OUTCOME_NO_VERDICT
+    assert outcome == reconcile._OUTCOME_ALREADY_ATTEMPTED
     assert calls["classify"] == 0  # never called -- this is the fix
     assert calls["upsert"] == []
     assert len(stamp_calls) == 1
     assert db.commits == 1
+
+
+def test_classify_and_stamp_marker_wins_over_a_tripped_breaker(monkeypatch):
+    """Final Codex pass: the marker check must run BEFORE the breaker check
+    -- a marked message was already counted at its first attempt, and the
+    breaker branch reports a countable no-verdict, so the old order
+    double-counted every marked message once the breaker tripped."""
+    calls, stamp_calls = _patch_classification(monkeypatch)
+    breaker = reconcile.ClassificationBreaker()
+    breaker.tripped = True
+    attempt = _attempt(provider="outlook", verified_at=None)
+    message = _message(provider_message_id="already-tried-this-run")
+    db = _FakeDB(verified_at_reads=[None])
+
+    outcome = reconcile._classify_and_stamp(
+        db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id,
+        user_id=uuid4(), breaker=breaker,
+        attempted_no_verdict_ids={"already-tried-this-run"},
+    )
+
+    assert outcome == reconcile._OUTCOME_ALREADY_ATTEMPTED
+    assert calls["classify"] == 0
+    assert len(stamp_calls) == 1
+
+
+def test_classify_and_stamp_feeds_the_marker_set_on_no_verdict(monkeypatch):
+    """Final Codex pass: a START-pass no-verdict must land in the shared
+    marker set so the page loop and END pass skip that message for the rest
+    of the run instead of re-attempting it."""
+    _patch_classification(monkeypatch, no_verdict=True)
+    attempt = _attempt(provider="outlook", verified_at=None)
+    message = _message(provider_message_id="failed-in-start-pass")
+    db = _FakeDB(verified_at_reads=[None])
+    attempted: set[str] = set()
+
+    outcome = reconcile._classify_and_stamp(
+        db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id,
+        user_id=uuid4(), attempted_no_verdict_ids=attempted,
+    )
+
+    assert outcome == reconcile._OUTCOME_NO_VERDICT
+    assert attempted == {"failed-in-start-pass"}
 
 
 def test_classify_and_stamp_marker_is_scoped_to_its_own_provider_message_id(monkeypatch):
@@ -494,7 +540,7 @@ def test_classify_and_stamp_marker_is_scoped_to_its_own_provider_message_id(monk
     outcome = reconcile._classify_and_stamp(
         db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id,
         user_id=uuid4(),
-        already_attempted_provider_message_ids=frozenset({"some-other-message"}),
+        attempted_no_verdict_ids={"some-other-message"},
     )
 
     assert outcome == reconcile._OUTCOME_CLASSIFIED
@@ -855,7 +901,7 @@ def test_run_reconciliation_pass_snapshot_before_attempt_created_end_pass_comple
         reconcile,
         "_reconcile_one_attempt",
         lambda db, *, attempt_id, classify_messages, breaker=None,
-        already_attempted_provider_message_ids=frozenset(): reconciled.append(attempt_id)
+        attempted_no_verdict_ids=None: reconciled.append(attempt_id)
         or {"resolved_action_items": 1, "classified": False, "left_unclassified": False},
     )
 
@@ -877,7 +923,7 @@ def test_run_reconciliation_pass_isolates_a_failing_attempt(monkeypatch):
     ids = [uuid4(), uuid4(), uuid4()]
     monkeypatch.setattr(reconcile, "_eligible_attempt_ids", lambda db, **k: ids)
 
-    def fake_reconcile(db, *, attempt_id, classify_messages, breaker=None, already_attempted_provider_message_ids=frozenset()):
+    def fake_reconcile(db, *, attempt_id, classify_messages, breaker=None, attempted_no_verdict_ids=None):
         if attempt_id == ids[1]:
             raise RuntimeError("boom")
         return {
@@ -953,7 +999,7 @@ def test_run_reconciliation_pass_aggregates_left_unclassified_and_never_counts_f
     `_OUTCOME_NO_VERDICT` is a KNOWN "left unclassified" fact."""
     ids = [uuid4(), uuid4(), uuid4()]
 
-    def fake_reconcile(db, *, attempt_id, classify_messages, breaker=None, already_attempted_provider_message_ids=frozenset()):
+    def fake_reconcile(db, *, attempt_id, classify_messages, breaker=None, attempted_no_verdict_ids=None):
         if attempt_id == ids[0]:
             return {"resolved_action_items": 1, "classified": False, "left_unclassified": True}
         if attempt_id == ids[1]:
@@ -972,6 +1018,32 @@ def test_run_reconciliation_pass_aggregates_left_unclassified_and_never_counts_f
     assert result == {
         "attempts_checked": 3, "completed": 3, "classified": 1, "left_unclassified": 1,
     }
+
+
+def test_run_reconciliation_pass_propagates_soft_time_limit(monkeypatch):
+    """Final Codex pass: Celery's soft-limit signal is a plain Exception, so
+    both the per-attempt handler and the outer never-propagate handler used
+    to swallow it -- and the pass kept issuing paid retry chains until the
+    hard kill. It must propagate to the task instead."""
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    ids = [uuid4(), uuid4()]
+    monkeypatch.setattr(reconcile, "_eligible_attempt_ids", lambda db, **k: ids)
+
+    def fake_reconcile(db, *, attempt_id, classify_messages, breaker=None, attempted_no_verdict_ids=None):
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(reconcile, "_reconcile_one_attempt", fake_reconcile)
+
+    db = MagicMock()
+    try:
+        reconcile.run_reconciliation_pass(
+            db, provider_account_id=uuid4(), provider="outlook", classify_messages=True
+        )
+    except SoftTimeLimitExceeded:
+        pass
+    else:
+        raise AssertionError("SoftTimeLimitExceeded was swallowed by the pass")
 
 
 # ---------------------------------------------------------------------------

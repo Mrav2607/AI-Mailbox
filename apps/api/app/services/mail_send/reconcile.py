@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
@@ -55,17 +56,22 @@ _BLOCKING_STATUSES = ("preparing", "inflight", "unknown", "abandoned")
 # state, not a known "left unclassified" outcome, and `_OUTCOME_RACE_LOST`
 # didn't determine the message's status at all (someone else already did).
 #
-# `_OUTCOME_NO_VERDICT` also covers two SKIP cases now (Codex review, phase
-# 3): the run's `ClassificationBreaker` already tripped, or the ingest page
-# loop already made this exact attempt earlier in the same run (see
-# `_classify_and_stamp`'s own docstring for both) -- from the user's point
-# of view all three are identical ("this message needs a manual backfill"),
-# and none of them should start a fresh WORKER_RETRIES chain.
+# `_OUTCOME_NO_VERDICT` also covers one SKIP case (Codex review, phase 3):
+# the run's `ClassificationBreaker` already tripped -- a message skipped that
+# way was never counted anywhere else, so it still counts here. The OTHER
+# skip case (this run already attempted this exact message) has its own
+# non-counting outcome below.
 _OUTCOME_CLASSIFIED = "classified"
 _OUTCOME_ALREADY_CLASSIFIED = "already_classified"
 _OUTCOME_NO_VERDICT = "no_verdict"
 _OUTCOME_FAILED = "failed"
 _OUTCOME_RACE_LOST = "race_lost"
+# The message was already attempted (and got no verdict) earlier in this SAME
+# run -- it was counted into left_unclassified at that first attempt, so this
+# outcome stamps verified_at without a second wire call AND without a second
+# count (final Codex pass: reporting it as _OUTCOME_NO_VERDICT here made one
+# unclassified Outlook sent message read as "2 left unclassified").
+_OUTCOME_ALREADY_ATTEMPTED = "already_attempted"
 
 
 def _eligible_attempt_ids(
@@ -192,7 +198,13 @@ def _classify_and_stamp(
     thread_id: UUID,
     user_id: UUID,
     breaker: ClassificationBreaker | None = None,
-    already_attempted_provider_message_ids: frozenset[str] = frozenset(),
+    # Run-shared MUTABLE set of provider_message_ids already attempted (and
+    # left no-verdict) in this ingest run -- read to skip duplicate wire
+    # calls AND fed by this module's own no-verdict outcomes, so a
+    # START-pass failure protects the page loop and the END pass alike
+    # (final Codex pass). None = no ingest-run context (the standalone
+    # reconcile_reply_attempt task).
+    attempted_no_verdict_ids: set[str] | None = None,
 ) -> str:
     """Phase 2, ITS OWN transaction, isolated from phase 1: the
     classification claim (P8-2). Takes the shared serialization point
@@ -298,6 +310,22 @@ def _classify_and_stamp(
         db.commit()
         return _OUTCOME_ALREADY_CLASSIFIED
 
+    # Final Codex pass: the already-attempted check runs BEFORE the breaker
+    # check -- a message in the set was already counted into left_unclassified
+    # at its first attempt, and the breaker branch below reports a countable
+    # no-verdict, so the old order double-counted it whenever the breaker had
+    # tripped by the time reconciliation got here. This run already made this
+    # exact attempt and got no verdict (see this function's docstring's
+    # "Same-sync double call" section) -- same stamp treatment, no second wire
+    # call, and no second count.
+    if (
+        attempted_no_verdict_ids is not None
+        and message.provider_message_id in attempted_no_verdict_ids
+    ):
+        stamp_verified(db, attempt_id=attempt_id)
+        db.commit()
+        return _OUTCOME_ALREADY_ATTEMPTED
+
     # Phase 3 (Codex review, blocker): the run's breaker already tripped --
     # do NOT start a fresh WORKER_RETRIES chain against a provider already
     # known to be failing this run. Stamp verified for the same reason the
@@ -305,15 +333,6 @@ def _classify_and_stamp(
     # eligible forever), never write a Classification row, report it the
     # same way a real no-verdict call would.
     if breaker is not None and not breaker.should_call:
-        stamp_verified(db, attempt_id=attempt_id)
-        db.commit()
-        return _OUTCOME_NO_VERDICT
-
-    # Phase 3 (Codex review, should-fix): the page loop already made THIS
-    # exact attempt earlier in the same run and got no verdict -- see this
-    # function's own docstring's "Same-sync double call" section. Same
-    # stamp-and-report treatment, no second wire call.
-    if message.provider_message_id in already_attempted_provider_message_ids:
         stamp_verified(db, attempt_id=attempt_id)
         db.commit()
         return _OUTCOME_NO_VERDICT
@@ -362,6 +381,13 @@ def _classify_and_stamp(
         if attempt_result.verdict is None:
             if breaker is not None:
                 breaker.record(verdict_produced=False)
+            # Feed the run-shared set so a later phase of this SAME run (the
+            # page loop after a START-pass failure, or the END pass) skips
+            # this message instead of starting a fresh retry chain -- final
+            # Codex pass: the set used to be page-loop-fed only, leaving a
+            # START-pass failure re-attemptable by the page loop.
+            if attempted_no_verdict_ids is not None and message.provider_message_id:
+                attempted_no_verdict_ids.add(message.provider_message_id)
             stamp_verified(db, attempt_id=attempt_id)
             db.commit()
             return _OUTCOME_NO_VERDICT
@@ -379,6 +405,19 @@ def _classify_and_stamp(
         stamp_verified(db, attempt_id=attempt_id)
         db.commit()
         return _OUTCOME_CLASSIFIED
+    except SoftTimeLimitExceeded:
+        # Celery's soft-limit signal is a plain Exception, so the generic
+        # handler below WOULD swallow it and report an ordinary failure --
+        # and the pass loop would keep issuing paid calls until the hard
+        # kill (final Codex pass; same fix extraction_run.py already
+        # carries). Roll back best-effort and let the signal propagate.
+        try:
+            db.rollback()
+        except Exception:
+            logger.exception(
+                "rollback failed during soft-limit handling for attempt %s", attempt_id
+            )
+        raise
     except Exception:
         db.rollback()
         logger.exception(
@@ -400,12 +439,18 @@ def _reconcile_one_attempt(
     attempt_id: UUID,
     classify_messages: bool,
     breaker: ClassificationBreaker | None = None,
-    already_attempted_provider_message_ids: frozenset[str] = frozenset(),
+    # Run-shared MUTABLE set of provider_message_ids already attempted (and
+    # left no-verdict) in this ingest run -- read to skip duplicate wire
+    # calls AND fed by this module's own no-verdict outcomes, so a
+    # START-pass failure protects the page loop and the END pass alike
+    # (final Codex pass). None = no ingest-run context (the standalone
+    # reconcile_reply_attempt task).
+    attempted_no_verdict_ids: set[str] | None = None,
 ) -> dict | None:
     """One isolated reconciliation unit. Returns `None` if there's nothing
     to do yet (no persisted message matches), else a summary dict.
 
-    `breaker` and `already_attempted_provider_message_ids` pass straight
+    `breaker` and `attempted_no_verdict_ids` pass straight
     through to `_classify_and_stamp` -- see its docstring for what each one
     prevents (phase 3 of the LLM-failure work, Codex review)."""
     attempt = db.get(ReplyAttempt, attempt_id)
@@ -447,7 +492,7 @@ def _reconcile_one_attempt(
             thread_id=thread.id,
             user_id=thread.user_id,
             breaker=breaker,
-            already_attempted_provider_message_ids=already_attempted_provider_message_ids,
+            attempted_no_verdict_ids=attempted_no_verdict_ids,
         )
         classified = classify_outcome in (_OUTCOME_CLASSIFIED, _OUTCOME_ALREADY_CLASSIFIED)
         left_unclassified = classify_outcome == _OUTCOME_NO_VERDICT
@@ -473,7 +518,13 @@ def run_reconciliation_pass(
     provider: str,
     classify_messages: bool,
     breaker: ClassificationBreaker | None = None,
-    already_attempted_provider_message_ids: frozenset[str] = frozenset(),
+    # Run-shared MUTABLE set of provider_message_ids already attempted (and
+    # left no-verdict) in this ingest run -- read to skip duplicate wire
+    # calls AND fed by this module's own no-verdict outcomes, so a
+    # START-pass failure protects the page loop and the END pass alike
+    # (final Codex pass). None = no ingest-run context (the standalone
+    # reconcile_reply_attempt task).
+    attempted_no_verdict_ids: set[str] | None = None,
 ) -> dict:
     """One level pass for one account: fetch every reconciliation-eligible
     attempt, then reconcile each as its own isolated unit. Safe to call at
@@ -490,7 +541,7 @@ def run_reconciliation_pass(
     docstring promises never happens. Rolled back, logged, and reported as
     nothing-done instead of raised.
 
-    `breaker` and `already_attempted_provider_message_ids` (plan: phase 3 of
+    `breaker` and `attempted_no_verdict_ids` (plan: phase 3 of
     the LLM-failure work) pass straight through to `_reconcile_one_attempt`
     -> `_classify_and_stamp` -- see that function's docstring. Both default
     to "no context" so `reconcile_reply_attempt` (the standalone Celery task,
@@ -516,8 +567,16 @@ def run_reconciliation_pass(
                     attempt_id=attempt_id,
                     classify_messages=classify_messages,
                     breaker=breaker,
-                    already_attempted_provider_message_ids=already_attempted_provider_message_ids,
+                    attempted_no_verdict_ids=attempted_no_verdict_ids,
                 )
+            except SoftTimeLimitExceeded:
+                # Never swallowed as a per-attempt failure (final Codex
+                # pass): Celery is telling the whole TASK to stop, and
+                # grinding through the remaining attempts -- each a
+                # potential paid retry chain -- until the hard kill is the
+                # opposite of stopping. _classify_and_stamp already rolled
+                # back its own work before re-raising.
+                raise
             except Exception:
                 db.rollback()
                 logger.exception(
@@ -537,6 +596,18 @@ def run_reconciliation_pass(
             "classified": classified,
             "left_unclassified": left_unclassified,
         }
+    except SoftTimeLimitExceeded:
+        # The never-propagate contract above is about reconciliation-only
+        # concerns; the soft time limit is the TASK's own stop signal and
+        # must reach it (final Codex pass).
+        try:
+            db.rollback()
+        except Exception:
+            logger.exception(
+                "rollback failed during soft-limit handling for account %s",
+                provider_account_id,
+            )
+        raise
     except Exception:
         db.rollback()
         logger.exception(

@@ -47,14 +47,28 @@ _EXTRACT_ACTIONS_SOFT_TIME_LIMIT_S = 1740.0
 # sweep where every call keeps succeeding) -- gives the task time to finish
 # its current commit and return a clean partial result instead of racing an
 # asynchronously-delivered SoftTimeLimitExceeded that could land mid-write.
-_SWEEP_DEADLINE_MARGIN_S = 120.0
+# Sized to cover one COMPLETE worst-case WORKER_RETRIES claim (final Codex
+# pass -- 120s was smaller than one full retry sequence: 4 attempts x 30s
+# per-call timeout + 60s of waits = 180s, so a claim admitted just under the
+# old margin could be interrupted mid-wire and re-sent by the next sweep,
+# double-billing an ambiguously delivered call). The deadline check only
+# gates STARTING a claim, so the margin must cover a whole one, plus slack
+# for the record transaction's commit.
+_SWEEP_DEADLINE_MARGIN_S = (
+    WORKER_RETRIES.max_attempts * 30.0 + WORKER_RETRIES.total_budget_s + 15.0
+)
 
 # extraction_recovery_tick's own soft time limit and margin -- much smaller
 # than the dedicated sweep task's, since a tick shares its whole budget
 # across TWO sweep passes (row-driven and message-driven) plus its own
 # candidate-selection queries.
 _RECOVERY_TICK_SOFT_TIME_LIMIT_S = 270.0
-_RECOVERY_TICK_DEADLINE_MARGIN_S = 20.0
+# Same worst-case-claim sizing as _SWEEP_DEADLINE_MARGIN_S above (final
+# Codex pass -- 20s left a 160s window where a claim could straddle the soft
+# limit mid-wire). This leaves the tick only ~75s of claim-STARTING window
+# per pass, which is deliberate: it's a safety net that runs every 900s, so
+# doing less per tick beats re-sending an ambiguously delivered call.
+_RECOVERY_TICK_DEADLINE_MARGIN_S = _SWEEP_DEADLINE_MARGIN_S
 
 
 @celery_app.task

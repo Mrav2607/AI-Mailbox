@@ -156,8 +156,20 @@ def _rollback_discard_and_fence(
     THAT would look like success to Celery's autoretry and end the retry
     chain on a row nothing will ever reclaim until the recovery tick's
     lease expires.
+
+    The rollback itself is guarded (final Codex pass): a dead connection
+    makes `db.rollback()` raise too, and an unguarded one skipped both the
+    discard and the fence -- exactly the stuck-pending-for-a-full-lease
+    outcome this helper's docstring promises can't happen. The fence uses
+    its own fresh session (`_fence_claim_to_failed`), so it doesn't need
+    this session's rollback to have succeeded.
     """
-    db.rollback()
+    try:
+        db.rollback()
+    except Exception:
+        logger.exception(
+            "rollback failed while fencing extraction claim for message %s", message_id
+        )
     acc.discard()
     try:
         _fence_claim_to_failed(message_id, claim_token)

@@ -15,10 +15,12 @@ const FAILURE_CATEGORY_LABELS: Record<string, string> = {
   timed_out: "provider timed out",
   // Two different network failures, and the difference matters to whoever
   // reads this: connect_failed never reached the provider at all (so it was
-  // safe to retry, and nothing was billed), while connection_failed dropped
-  // partway through a request that may well have been processed.
+  // safe to retry, and nothing was billed), while connection_failed covers
+  // everything after that point -- dropped connections, but also read/write
+  // timeouts and protocol errors -- so its copy claims only what's certain:
+  // the request didn't complete, and it may have reached the provider.
   connect_failed: "could not reach your provider",
-  connection_failed: "lost the connection to your provider",
+  connection_failed: "the request to your provider didn't complete",
   invalid_response: "provider returned an unusable response",
   blocked_by_policy: "blocked by policy",
 };

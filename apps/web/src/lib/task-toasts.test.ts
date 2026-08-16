@@ -135,7 +135,7 @@ describe("extractionToastOutcome", () => {
     });
     expect(outcome.level).toBe("warning");
     expect(outcome.message).toBe(
-      "action extraction · 3 extracted · 2 failed — lost the connection to your provider",
+      "action extraction · 3 extracted · 2 failed — the request to your provider didn't complete",
     );
   });
 
