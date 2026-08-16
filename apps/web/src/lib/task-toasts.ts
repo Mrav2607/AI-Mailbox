@@ -13,7 +13,14 @@
 const FAILURE_CATEGORY_LABELS: Record<string, string> = {
   http_429: "rate limited by your provider",
   timed_out: "provider timed out",
-  connection_failed: "could not reach your provider",
+  // Two different network failures, and the difference matters to whoever
+  // reads this: connect_failed never reached the provider at all (so it was
+  // safe to retry, and nothing was billed), while connection_failed covers
+  // everything after that point -- dropped connections, but also read/write
+  // timeouts and protocol errors -- so its copy claims only what's certain:
+  // the request didn't complete, and it may have reached the provider.
+  connect_failed: "could not reach your provider",
+  connection_failed: "the request to your provider didn't complete",
   invalid_response: "provider returned an unusable response",
   blocked_by_policy: "blocked by policy",
 };
@@ -42,9 +49,9 @@ export interface ToastOutcome {
   message: string;
   // Which sonner toast function the caller should fire. "warning" covers
   // every degraded-but-completed run (unchanged from phase 1); "error" is
-  // new in phase 2 -- only backfillToastOutcome's llm_unavailable case
-  // reaches it, since that's the one outcome where the run stopped instead
-  // of degrading.
+  // for a run that STOPPED rather than degraded -- backfill's
+  // llm_unavailable, and either of extraction's two early stops
+  // (llm_unavailable, timed_out).
   level: "success" | "warning" | "error";
 }
 
@@ -102,6 +109,7 @@ export function backfillToastOutcome(
 }
 
 export interface ExtractionToastInput {
+  status?: string;
   extracted?: number;
   failed?: number;
   failure_categories?: Record<string, number>;
@@ -116,6 +124,27 @@ export interface ExtractionToastInput {
 export function extractionToastOutcome(res: ExtractionToastInput): ToastOutcome {
   const failed = res.failed ?? 0;
   const extracted = res.extracted ?? 0;
+  // The sweep gave up partway (phase 3): saying only what it managed to
+  // attempt would hide the candidates it never reached, which is the same
+  // half-truth the old "N processed" toast told.
+  if (res.status === "llm_unavailable") {
+    const message =
+      appendDominantLabel(
+        `action extraction stopped early · ${extracted} extracted so far`,
+        res.failure_categories,
+      ) + ` — run it again once your provider recovers`;
+    return { message, level: "error" };
+  }
+  // The sweep hit its own time budget rather than a failing provider, so it
+  // carries no diagnosis -- say what happened and nothing more. Blaming the
+  // provider here would be a confident guess about a run whose calls may all
+  // have SUCCEEDED; it simply ran out of time before reaching the rest.
+  if (res.status === "timed_out") {
+    return {
+      message: `action extraction stopped early · ${extracted} extracted so far — run it again to continue`,
+      level: "error",
+    };
+  }
   if (failed <= 0) {
     return { message: `action extraction complete · ${extracted} extracted`, level: "success" };
   }

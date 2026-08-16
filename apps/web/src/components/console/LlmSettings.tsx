@@ -86,7 +86,12 @@ const PRESET_PROVIDERS: LlmProvider[] = [
 // Maps the /test route's fixed category constants -- never a raw exception
 // string -- to plain copy anyone can follow, regardless of first language.
 function testErrorMessage(error: string): string {
-  if (error === "connection_failed") return "Could not reach the provider.";
+  // connect_failed never established a connection at all; connection_failed
+  // dropped partway through. Same remedy for someone testing a key, but the
+  // second one is worth distinguishing -- it usually means the endpoint is
+  // reachable and something else went wrong mid-request.
+  if (error === "connect_failed") return "Could not reach the provider.";
+  if (error === "connection_failed") return "The request to the provider didn't complete.";
   if (error === "timed_out") return "The provider took too long to reply.";
   if (error === "http_401" || error === "http_403") {
     return "The provider rejected this key.";

@@ -447,7 +447,7 @@ def test_classify_backend_gemini_is_an_alias_for_llm(monkeypatch):
 
     reached = []
 
-    def _spy(text, routing=None, local_tried=False):
+    def _spy(text, routing=None, local_tried=False, policy=None):
         reached.append(text)
         return ClassificationAttempt(
             verdict=("fyi", 0.9, "spy", "spy-v1"),
@@ -519,7 +519,7 @@ def test_classify_routing_user_mode_calls_openai_compat_with_credential(monkeypa
     )
     captured = {}
 
-    def fake_call(cred, *, prompt, user_content, max_tokens, timeout):
+    def fake_call(cred, *, prompt, user_content, max_tokens, timeout, policy=None):
         captured["credential"] = cred
         captured["timeout"] = timeout
         content = json.dumps({"label": "spam", "confidence": 0.9, "rationale": "scam"})
@@ -535,6 +535,35 @@ def test_classify_routing_user_mode_calls_openai_compat_with_credential(monkeypa
     assert captured["credential"] is credential
     # Classification uses its own tighter timeout, not extraction's 30s default.
     assert captured["timeout"] == classifier._CLASSIFICATION_TIMEOUT_S
+
+
+def test_classify_with_usage_threads_the_caller_supplied_policy_to_the_wire_call(monkeypatch):
+    """The entry-point-assignment contract (plan: phase 3 of the LLM-failure
+    work): whatever RetryPolicy the caller passes to classify_with_usage()
+    must reach call_chat_completion unchanged -- classifier.py never
+    substitutes its own guess."""
+    from app.services.nlp import classifier
+    from app.services.nlp.llm_client import WORKER_RETRIES
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+    monkeypatch.setattr(classifier, "_genai_client", _explode)
+
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="user-key", model="gpt-4o-mini"
+    )
+    captured = {}
+
+    def fake_call(cred, *, prompt, user_content, max_tokens, timeout, policy=None):
+        captured["policy"] = policy
+        content = json.dumps({"label": "fyi", "confidence": 0.5, "rationale": "r"})
+        return LlmCallResult(content=content, usage=None)
+
+    monkeypatch.setattr(classifier, "call_chat_completion", fake_call)
+
+    routing = ClassificationRouting(mode="user", credential=credential)
+    classifier.classify_with_usage("hi", routing=routing, policy=WORKER_RETRIES)
+
+    assert captured["policy"] is WORKER_RETRIES
 
 
 def test_classify_routing_off_mode_never_builds_genai_client_or_calls_llm(monkeypatch):
@@ -663,7 +692,7 @@ def test_classify_precedence_auto_backend_local_unavailable_falls_through_to_use
     )
     captured = {}
 
-    def fake_call(cred, *, prompt, user_content, max_tokens, timeout):
+    def fake_call(cred, *, prompt, user_content, max_tokens, timeout, policy=None):
         captured["credential"] = cred
         content = json.dumps({"label": "promotional", "confidence": 0.7, "rationale": "sale"})
         return LlmCallResult(content=content, usage=None)
@@ -1143,7 +1172,7 @@ def test_classify_explicit_auto_encoder_unavailable_user_mode_reaches_llm(monkey
     )
     captured = {}
 
-    def spy(text, routing=None, local_tried=False):
+    def spy(text, routing=None, local_tried=False, policy=None):
         captured["local_tried"] = local_tried
         captured["routing"] = routing
         return ClassificationAttempt(

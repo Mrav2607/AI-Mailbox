@@ -25,7 +25,7 @@ from app.db.models import MailMessage
 from app.services.nlp import backfill
 from app.services.nlp import classifier as classifier_module
 from app.services.nlp.classifier import ClassificationAttempt
-from app.services.nlp.llm_client import LlmCallError, LlmUsage
+from app.services.nlp.llm_client import INLINE_RETRIES, LlmCallError, LlmUsage
 from app.services.nlp.persistence import OPERATOR_MODEL_VERSION
 from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
@@ -249,7 +249,7 @@ def test_run_backfill_builds_one_router_per_run_and_calls_routing_for_per_messag
 
     classify_routings = []
 
-    def fake_classify_with_usage(text, backend=None, routing=None):
+    def fake_classify_with_usage(text, backend=None, routing=None, policy=None):
         classify_routings.append(routing)
         return ClassificationAttempt(
             verdict=("fyi", 0.5, "no cues", "heuristic-v1"),
@@ -300,6 +300,32 @@ def test_run_backfill_custom_opt_in_credential_routes_off_with_no_server_call(mo
     result = backfill.run_backfill(db, user_id, limit=10, backend="llm")
 
     assert result["created"] == 1
+
+
+def test_run_backfill_threads_the_caller_supplied_policy_to_classify_with_usage(monkeypatch):
+    """The `run_backfill` trap (plan: phase 3 of the LLM-failure work): it
+    serves both an inline request and a queued worker task, so it must never
+    guess a policy internally -- whatever the caller passes has to reach
+    classify_with_usage() unchanged."""
+    user_id = uuid4()
+    db = _n_message_db(1)
+    routing = ClassificationRouting(mode="user", credential=_CRED)
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+
+    captured = {}
+
+    def fake_classify_with_usage(text, backend=None, routing=None, policy=None):
+        captured["policy"] = policy
+        return ClassificationAttempt(
+            verdict=("fyi", 0.5, "r", "m"), provider_call_succeeded=False, usage=None,
+        )
+
+    monkeypatch.setattr(backfill, "classify_with_usage", fake_classify_with_usage)
+    monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
+
+    backfill.run_backfill(db, user_id, limit=10, policy=INLINE_RETRIES)
+
+    assert captured["policy"] is INLINE_RETRIES
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +539,7 @@ def test_run_backfill_stops_after_three_consecutive_no_verdicts_with_partial_cou
 
     calls = []
 
-    def fake_classify_with_usage(text, backend=None, routing=None):
+    def fake_classify_with_usage(text, backend=None, routing=None, policy=None):
         calls.append(text)
         return _no_verdict_attempt()
 
@@ -550,7 +576,7 @@ def test_run_backfill_opted_in_encoder_down_stops_after_threshold_not_immediatel
 
     calls = []
 
-    def fake_classify_with_usage(text, backend=None, routing=None):
+    def fake_classify_with_usage(text, backend=None, routing=None, policy=None):
         calls.append(text)
         return _no_verdict_attempt()
 
@@ -587,7 +613,7 @@ def test_run_backfill_isolated_no_verdicts_among_successes_never_stop_and_counte
     ]
     calls = []
 
-    def fake_classify_with_usage(text, backend=None, routing=None):
+    def fake_classify_with_usage(text, backend=None, routing=None, policy=None):
         calls.append(text)
         return outcomes[len(calls) - 1]
 
@@ -613,7 +639,7 @@ def test_run_backfill_two_consecutive_no_verdicts_stay_under_the_stop_threshold(
 
     calls = []
 
-    def fake_classify_with_usage(text, backend=None, routing=None):
+    def fake_classify_with_usage(text, backend=None, routing=None, policy=None):
         calls.append(text)
         return _no_verdict_attempt()
 
@@ -635,7 +661,7 @@ def test_run_backfill_records_usage_only_for_user_mode_routing(monkeypatch):
     usage = LlmUsage(prompt_tokens=1, completion_tokens=2, total_tokens=3)
     monkeypatch.setattr(
         backfill, "classify_with_usage",
-        lambda text, backend=None, routing=None: ClassificationAttempt(
+        lambda text, backend=None, routing=None, policy=None: ClassificationAttempt(
             verdict=("fyi", 0.5, "r", "openai:gpt-4o-mini"),
             provider_call_succeeded=True,
             usage=usage,
@@ -666,7 +692,7 @@ def test_run_backfill_flushes_usage_even_when_every_message_is_no_verdict(monkey
     usage = LlmUsage(prompt_tokens=1, completion_tokens=0, total_tokens=1)
     monkeypatch.setattr(
         backfill, "classify_with_usage",
-        lambda text, backend=None, routing=None: ClassificationAttempt(
+        lambda text, backend=None, routing=None, policy=None: ClassificationAttempt(
             verdict=None,
             provider_call_succeeded=False,
             usage=usage,
@@ -703,7 +729,7 @@ def test_run_backfill_server_mode_routing_records_nothing(monkeypatch):
     monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
     monkeypatch.setattr(
         backfill, "classify_with_usage",
-        lambda text, backend=None, routing=None: ClassificationAttempt(
+        lambda text, backend=None, routing=None, policy=None: ClassificationAttempt(
             verdict=("fyi", 0.5, "r", "gemini-x"),
             provider_call_succeeded=True,
             usage=LlmUsage(prompt_tokens=1, completion_tokens=2, total_tokens=3),
@@ -728,7 +754,7 @@ def test_run_backfill_flush_happens_before_commit_and_committed_after(monkeypatc
     monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
     monkeypatch.setattr(
         backfill, "classify_with_usage",
-        lambda text, backend=None, routing=None: ClassificationAttempt(
+        lambda text, backend=None, routing=None, policy=None: ClassificationAttempt(
             verdict=("fyi", 0.5, "r", "openai:gpt-4o-mini"),
             provider_call_succeeded=True,
             usage=None,
@@ -754,7 +780,7 @@ def test_run_backfill_failing_usage_flush_does_not_block_business_commit(monkeyp
     monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
     monkeypatch.setattr(
         backfill, "classify_with_usage",
-        lambda text, backend=None, routing=None: ClassificationAttempt(
+        lambda text, backend=None, routing=None, policy=None: ClassificationAttempt(
             verdict=("fyi", 0.5, "r", "openai:gpt-4o-mini"),
             provider_call_succeeded=True,
             usage=None,
@@ -801,7 +827,7 @@ def test_run_backfill_force_skips_user_override_rows_at_candidate_selection(monk
     monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
     monkeypatch.setattr(
         backfill, "classify_with_usage",
-        lambda text, backend=None, routing=None: ClassificationAttempt(
+        lambda text, backend=None, routing=None, policy=None: ClassificationAttempt(
             verdict=("fyi", 0.5, "no cues", "heuristic-v1"),
             provider_call_succeeded=False,
             usage=None,
@@ -834,7 +860,7 @@ def test_run_backfill_protected_upsert_outcome_counts_as_skipped_not_created(mon
     monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
     monkeypatch.setattr(
         backfill, "classify_with_usage",
-        lambda text, backend=None, routing=None: ClassificationAttempt(
+        lambda text, backend=None, routing=None, policy=None: ClassificationAttempt(
             verdict=("fyi", 0.5, "r", "heuristic-v1"),
             provider_call_succeeded=False,
             usage=None,

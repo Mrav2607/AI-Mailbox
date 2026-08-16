@@ -64,6 +64,7 @@ from app.services.mail_send.outlook_send import (
 )
 from app.services.nlp.backfill import latest_message_ordering
 from app.services.nlp.classifier import build_classification_text, classify_with_usage
+from app.services.nlp.llm_client import INLINE_RETRIES
 from app.services.nlp.persistence import upsert_classification
 from app.services.nlp.providers import ClassificationRouter
 from app.services.nlp.reply_draft import generate_reply_draft, resolve_reply_draft_credential
@@ -410,7 +411,11 @@ def _classify_gmail_message_best_effort(
         )
         router = ClassificationRouter(user_id)
         routing = router.routing_for(db)
-        attempt_result = classify_with_usage(text_for_classification, routing=routing)
+        # Inline -- this runs synchronously inside send_reply's own request,
+        # before the response goes back to the caller.
+        attempt_result = classify_with_usage(
+            text_for_classification, routing=routing, policy=INLINE_RETRIES
+        )
         if routing.mode == "user" and routing.credential is not None:
             acc = UsageAccumulator(user_id)
             acc.record(

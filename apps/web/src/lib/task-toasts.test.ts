@@ -89,6 +89,44 @@ describe("extractionToastOutcome", () => {
     });
   });
 
+  it("errors and names the remedy when the sweep gave up partway", () => {
+    // Phase 3: the sweep stops after a losing streak, so the candidates it
+    // never reached are invisible in the counts -- the toast has to say it
+    // stopped rather than imply the numbers are the whole story.
+    const outcome = extractionToastOutcome({
+      status: "llm_unavailable",
+      extracted: 2,
+      failed: 3,
+      failure_categories: { http_429: 3 },
+    });
+    expect(outcome.level).toBe("error");
+    expect(outcome.message).toBe(
+      "action extraction stopped early · 2 extracted so far — rate limited by your provider" +
+        " — run it again once your provider recovers",
+    );
+  });
+
+  it("reports a deadline stop without blaming the provider", () => {
+    // The sweep ran out of its own time budget; its calls may all have
+    // succeeded. A provider diagnosis here would be a confident guess.
+    const outcome = extractionToastOutcome({
+      status: "timed_out",
+      extracted: 9,
+      failed: 0,
+    });
+    expect(outcome.level).toBe("error");
+    expect(outcome.message).toBe(
+      "action extraction stopped early · 9 extracted so far — run it again to continue",
+    );
+    expect(outcome.message).not.toMatch(/provider|rate limited/i);
+  });
+
+  it("treats a missing status as a normal run", () => {
+    // An older API/worker result predates the field; it must not read as a
+    // stopped-early run.
+    expect(extractionToastOutcome({ extracted: 4, failed: 0 }).level).toBe("success");
+  });
+
   it("warns and shows the extracted/failed ratio on partial degradation", () => {
     const outcome = extractionToastOutcome({
       extracted: 3,
@@ -97,7 +135,21 @@ describe("extractionToastOutcome", () => {
     });
     expect(outcome.level).toBe("warning");
     expect(outcome.message).toBe(
-      "action extraction · 3 extracted · 2 failed — could not reach your provider",
+      "action extraction · 3 extracted · 2 failed — the request to your provider didn't complete",
+    );
+  });
+
+  it("distinguishes a connection that was never established", () => {
+    // connect_failed and connection_failed are different facts: the first
+    // never reached the provider (nothing billed, safe to retry), the second
+    // dropped partway through a request that may have been processed.
+    const outcome = extractionToastOutcome({
+      extracted: 0,
+      failed: 4,
+      failure_categories: { connect_failed: 4 },
+    });
+    expect(outcome.message).toBe(
+      "action extraction · 0 extracted · 4 failed — could not reach your provider",
     );
   });
 

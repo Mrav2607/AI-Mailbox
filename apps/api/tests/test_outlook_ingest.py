@@ -1,3 +1,4 @@
+import time
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -51,7 +52,13 @@ def _no_op_removals(*_args, **_kwargs):
     return {"verified": 0, "deleted": 0, "kept": 0}
 
 
-def _upsert_stub(threads=0, messages=0, classified=0, left_unclassified=0, usage_recorded=False):
+def _upsert_stub(
+    threads=0,
+    messages=0,
+    classified=0,
+    left_unclassified=0,
+    usage_recorded=False,
+):
     return {
         "threads_upserted": threads,
         "messages_upserted": messages,
@@ -104,7 +111,7 @@ def _fixed_router(routing):
 
 
 def _fake_classify_with_usage(usage):
-    def fake(text, *, routing):
+    def fake(text, *, routing, policy=None):
         return ClassificationAttempt(
             verdict=("fyi", 0.5, "stub", "test-model"),
             provider_call_succeeded=True,
@@ -459,7 +466,7 @@ def test_classification_router_is_built_once_per_run_and_reused_across_pages(mon
             routed_selves.append(self)
             return SENTINEL_ROUTING
 
-    def fake_classify_with_usage(text, *, routing):
+    def fake_classify_with_usage(text, *, routing, policy=None):
         classify_calls.append(routing)
         return ClassificationAttempt(
             verdict=("other", 0.5, "stub", "test-model"),
@@ -511,6 +518,69 @@ def test_classification_router_is_built_once_per_run_and_reused_across_pages(mon
     assert all(routing is SENTINEL_ROUTING for routing in classify_calls)
 
 
+def test_more_than_30_rate_limited_messages_trips_the_breaker_not_a_retry_storm(monkeypatch):
+    """Codex review regression (blocker, phase 3 of the LLM-failure work) --
+    the Outlook twin of gmail_history_sync's own version of this test. See
+    that test's docstring for the full storm mechanics; the only difference
+    here is proving the DELTA CURSOR (not a Gmail history id) still
+    advances exactly as it would without the breaker.
+    """
+    message_count = 35
+    SENTINEL_ROUTING = ClassificationRouting(mode="off", credential=None)
+
+    call_log = []
+
+    def counting_classify(text, *, routing, policy=None):
+        call_log.append(1)
+        return ClassificationAttempt(verdict=None, provider_call_succeeded=False, usage=None)
+
+    monkeypatch.setattr(outlook_ingest, "ClassificationRouter", _fixed_router(SENTINEL_ROUTING))
+    monkeypatch.setattr(outlook_ingest, "classify_with_usage", counting_classify)
+
+    provider = _fake_provider()
+    db = _make_pipeline_db(provider)
+
+    page = {
+        "messages": [
+            {"id": f"m{i}", "conversationId": "t1", "subject": f"s{i}"}
+            for i in range(message_count)
+        ],
+        "removed_ids": [],
+        "next_url": None,
+        "delta_url": "https://delta-final",
+    }
+    client = MagicMock()
+    client.delta_page = MagicMock(return_value=page)
+    monkeypatch.setattr(outlook_ingest, "OutlookClient", lambda token: client)
+
+    start = time.monotonic()
+    result = outlook_ingest.ingest_outlook_messages(
+        db, _USER_ID, provider_account_id=str(provider.id),
+        max_results=message_count, max_pages=20,
+    )
+    elapsed = time.monotonic() - start
+
+    # The breaker: exactly 3 real classify calls, never message_count of them.
+    assert len(call_log) == 3
+
+    # Ingest itself never aborted -- every message still got upserted...
+    assert result["messages_upserted"] == message_count
+    # ...and the delta cursor still advanced exactly as it would without the
+    # breaker (single page, delta_url present -> baseline complete, cursor
+    # saved onto the account).
+    assert "https://delta-final" in provider.outlook_delta_cursors
+
+    # Every message the breaker skipped (message_count - 3 never attempted,
+    # plus the 3 real attempts that all came back no-verdict) is reported --
+    # the user must be told, not silently shorted.
+    assert result["left_unclassified"] == message_count
+
+    # Reaching this line at all proves ingest_outlook_messages never raised
+    # -- what keeps Celery's autoretry_for from ever seeing a failure and
+    # replaying the whole run.
+    assert elapsed < 1.0  # nothing in this test actually sleeps
+
+
 def test_reconciliation_left_unclassified_reaches_ingest_stats(monkeypatch):
     """Codex finding (D-C/D-I, plan: 2026-08-14-llm-failure-visibility phase
     2): `run_reconciliation_pass`'s own no-verdict outcomes were previously
@@ -524,7 +594,10 @@ def test_reconciliation_left_unclassified_reaches_ingest_stats(monkeypatch):
 
     reconciliation_calls = []
 
-    def fake_run_reconciliation_pass(db, *, provider_account_id, provider, classify_messages):
+    def fake_run_reconciliation_pass(
+        db, *, provider_account_id, provider, classify_messages, breaker=None,
+        left_unclassified_ids=None,
+    ):
         reconciliation_calls.append(provider_account_id)
         # START pass (call 1) finds 1 no-verdict outcome; END pass (call 2,
         # after the run's own page loop -- empty here) finds 2 more.
@@ -542,6 +615,66 @@ def test_reconciliation_left_unclassified_reaches_ingest_stats(monkeypatch):
 
     assert len(reconciliation_calls) == 2  # START and END both ran
     assert result["left_unclassified"] == 3  # 1 (START) + 2 (END)
+
+
+def test_page_loop_no_verdict_provider_message_ids_reach_the_end_reconciliation_pass(monkeypatch):
+    """Codex review should-fix (phase 3): the page loop's no-verdict
+    provider_message_ids must actually reach the END reconciliation pass'
+    `left_unclassified_ids` -- proving the WIRING, not just
+    reconcile.py's own already-tested behavior given that set. Two messages
+    classified this run: one succeeds, one comes back no-verdict -- only the
+    no-verdict one's id should be in what the END pass receives."""
+    SENTINEL_ROUTING = ClassificationRouting(mode="off", credential=None)
+    monkeypatch.setattr(outlook_ingest, "ClassificationRouter", _fixed_router(SENTINEL_ROUTING))
+
+    def fake_classify(text, *, routing, policy=None):
+        # "m-ok" classifies fine; "m-429" comes back no-verdict, mirroring a
+        # rate-limited message.
+        if "m-429" in text:
+            return ClassificationAttempt(verdict=None, provider_call_succeeded=False, usage=None)
+        return ClassificationAttempt(
+            verdict=("fyi", 0.5, "stub", "test-model"), provider_call_succeeded=True, usage=None,
+        )
+
+    monkeypatch.setattr(outlook_ingest, "classify_with_usage", fake_classify)
+
+    provider = _fake_provider()
+    db = _make_pipeline_db(provider)
+
+    page = {
+        "messages": [
+            {"id": "m-ok", "conversationId": "t1", "subject": "m-ok"},
+            {"id": "m-429", "conversationId": "t1", "subject": "m-429"},
+        ],
+        "removed_ids": [],
+        "next_url": None,
+        "delta_url": "https://delta-final",
+    }
+    client = MagicMock()
+    client.delta_page = MagicMock(return_value=page)
+    monkeypatch.setattr(outlook_ingest, "OutlookClient", lambda token: client)
+
+    captured = {}
+
+    def fake_run_reconciliation_pass(
+        db, *, provider_account_id, provider, classify_messages, breaker=None,
+        left_unclassified_ids=None,
+    ):
+        # The set is run-shared and MUTABLE now (final Codex pass) -- both
+        # passes get the same object, so capture a snapshot per call: the
+        # START pass sees it empty, the END pass sees the page loop's
+        # no-verdict ids.
+        captured.setdefault("snapshots", []).append(set(left_unclassified_ids or set()))
+        return {"attempts_checked": 0, "completed": 0, "classified": 0, "left_unclassified": 0}
+
+    monkeypatch.setattr(outlook_ingest, "run_reconciliation_pass", fake_run_reconciliation_pass)
+
+    outlook_ingest.ingest_outlook_messages(
+        db, _USER_ID, provider_account_id=str(provider.id), max_results=2, max_pages=20
+    )
+
+    assert captured["snapshots"][0] == set()  # START pass: nothing attempted yet
+    assert captured["snapshots"][-1] == {"m-429"}  # END pass: page loop's no-verdict
 
 
 # ---------------------------------------------------------------------------

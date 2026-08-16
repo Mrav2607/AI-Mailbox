@@ -22,6 +22,7 @@ ordering from plan §5).
 
 from __future__ import annotations
 
+import time
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
+from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -576,6 +578,34 @@ def test_claim_extract_record_releases_transaction_before_llm_call(monkeypatch):
     assert commits_observed == [1]  # claim already committed before the call
 
 
+def test_claim_extract_record_always_passes_worker_retries(monkeypatch):
+    """Extraction has no inline HTTP entry point (plan: phase 3 of the
+    LLM-failure work) -- both _claim_extract_record's callers
+    (run_extraction_for_message, run_extraction_sweep) are Celery-task-only,
+    so this hardcodes WORKER_RETRIES rather than threading a policy from a
+    caller that has no other context to pick from."""
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(
+        message=message, thread=thread,
+        classification=_make_classification(), done_at_reads=[None],
+    )
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+    monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
+
+    captured = {}
+
+    def fake_extract(**kwargs):
+        captured["policy"] = kwargs.get("policy")
+        return _extraction_attempt(NoAction())
+
+    monkeypatch.setattr(extraction_run, "extract_action_with_usage", fake_extract)
+
+    extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+
+    assert captured["policy"] is extraction_run.WORKER_RETRIES
+
+
 def test_claim_extract_record_locks_classification_before_reading_label(monkeypatch):
     message = _make_message()
     thread = _make_thread(id=message.thread_id)
@@ -877,6 +907,65 @@ def test_claim_extract_record_containment_commit_failure_reraises_original(monke
     monkeypatch.setattr(extraction_run, "SessionLocal", lambda: nullcontext(fresh_session))
 
     with pytest.raises(RuntimeError, match="original failure"):
+        extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+
+
+def test_claim_extract_record_soft_time_limit_still_fences_but_propagates(monkeypatch):
+    """BLOCKER (Codex review, phase 3): SoftTimeLimitExceeded is a plain
+    Exception, so without a dedicated branch it would be swallowed the same
+    way an ordinary RuntimeError is -- fenced, converted to a "failed"
+    bucket, and never seen by the caller. It must still be fenced (a live
+    pending row must never survive a soft-limit kill unclaimed for the full
+    PENDING_LEASE), but it must PROPAGATE, not return a bucket."""
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(message=message, thread=thread)
+    token = uuid4()
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: token)
+
+    def _boom(**kwargs):
+        raise SoftTimeLimitExceeded
+
+    monkeypatch.setattr(extraction_run, "extract_action_with_usage", _boom)
+
+    fresh_session = MagicMock()
+    monkeypatch.setattr(extraction_run, "SessionLocal", lambda: nullcontext(fresh_session))
+
+    with pytest.raises(SoftTimeLimitExceeded):
+        extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+
+    # Fenced exactly like the ordinary-exception path above -- a retry's
+    # sweep must still be able to reclaim this row.
+    assert session.rollbacks == 1
+    fresh_session.execute.assert_called_once()
+    fence_stmt = fresh_session.execute.call_args[0][0]
+    fence_params = _compiled_params(fence_stmt)
+    assert fence_params["outcome"] == "failed"
+    assert fence_params["claim_token"] is None
+    assert fence_params["claim_token_1"] == token
+    fresh_session.commit.assert_called_once()
+
+
+def test_claim_extract_record_soft_time_limit_fencing_failure_reraises_the_soft_limit(monkeypatch):
+    """Mirrors test_claim_extract_record_containment_commit_failure_reraises_original
+    for the SoftTimeLimitExceeded branch: if even the fence can't commit,
+    the ORIGINAL SoftTimeLimitExceeded must still be what propagates (not
+    the fencing failure) -- it's still the signal Celery needs to see."""
+    message = _make_message()
+    thread = _make_thread(id=message.thread_id)
+    session = _FakeSession(message=message, thread=thread)
+    monkeypatch.setattr(extraction_run, "claim_action_item", lambda *a, **k: uuid4())
+
+    def _boom(**kwargs):
+        raise SoftTimeLimitExceeded
+
+    monkeypatch.setattr(extraction_run, "extract_action_with_usage", _boom)
+
+    fresh_session = MagicMock()
+    fresh_session.commit.side_effect = RuntimeError("fencing commit also failed")
+    monkeypatch.setattr(extraction_run, "SessionLocal", lambda: nullcontext(fresh_session))
+
+    with pytest.raises(SoftTimeLimitExceeded):
         extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
 
@@ -1207,7 +1296,7 @@ def test_run_extraction_sweep_counts_a_bucket_per_message(monkeypatch):
     buckets = iter(["extracted", "no_action", "failed"])
     monkeypatch.setattr(
         extraction_run, "_claim_extract_record",
-        lambda db, mid, force=False, call_context=None, acc=None, failure_categories=None: (
+        lambda db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None: (
             next(buckets), uuid4()
         ),
     )
@@ -1278,7 +1367,7 @@ def test_run_extraction_sweep_isolates_one_bad_message_and_continues(monkeypatch
         lambda *a, **k: [bad_message, good_message],
     )
 
-    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         if mid == bad_message:
             raise RuntimeError("boom")
         return "extracted", uuid4()
@@ -1292,6 +1381,238 @@ def test_run_extraction_sweep_isolates_one_bad_message_and_continues(monkeypatch
     assert result["failed"] == 1
     assert result["extracted"] == 1
     db.rollback.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# run_extraction_sweep: the _CONSECUTIVE_FAILURE_LIMIT early stop (plan:
+# phase 3 of the LLM-failure work) -- the extraction twin of backfill.py's
+# _CONSECUTIVE_NO_VERDICT_LIMIT tests above. A losing streak of "failed"
+# buckets stops the sweep early rather than grinding through every remaining
+# candidate; an isolated failure among successes must never trip it.
+# ---------------------------------------------------------------------------
+
+
+def test_run_extraction_sweep_stops_after_three_consecutive_failures_with_partial_counts(
+    monkeypatch,
+):
+    """Four candidates, every one a "failed" bucket -- the sweep stops after
+    the third and never even attempts the fourth."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4(), uuid4(), uuid4(), uuid4()]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    calls = []
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
+        calls.append(mid)
+        return "failed", uuid4()
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+
+    result = extraction_run.run_extraction_sweep(MagicMock(), uuid4())
+
+    assert calls == message_ids[:3]  # the fourth candidate was never attempted
+    # "ok" would be a half-truth: the counts describe only what was attempted
+    # and say nothing about the candidate never reached. Same status name
+    # run_backfill uses, so both jobs report giving up identically.
+    assert result["status"] == "llm_unavailable"
+    assert result["processed"] == 3
+    assert result["failed"] == 3
+
+
+def test_run_extraction_sweep_isolated_failures_among_successes_never_stop_and_counter_resets(
+    monkeypatch,
+):
+    """Pattern: failed, extracted, failed, failed, extracted -- 3 failures
+    total but the longest CONSECUTIVE run is 2, under the threshold, so all
+    5 candidates get attempted."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4() for _ in range(5)]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    buckets = iter(["failed", "extracted", "failed", "failed", "extracted"])
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
+        return next(buckets), uuid4()
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+
+    result = extraction_run.run_extraction_sweep(MagicMock(), uuid4())
+
+    assert result["processed"] == 5  # nothing stopped the sweep early
+    assert result["status"] == "ok"
+    assert result["failed"] == 3
+    assert result["extracted"] == 2
+
+
+def test_run_extraction_sweep_containment_failure_does_not_trigger_llm_unavailable(monkeypatch):
+    """SHOULD-FIX (Codex review, phase 3): a message that blows up
+    _claim_extract_record entirely (a DB error, or anything even its own
+    containment couldn't fence) is NOT an LLM result -- it carries no
+    failure_category and must never feed the consecutive-failure streak, or
+    a Postgres hiccup would misreport as "the user's LLM provider is
+    rate-limited". Four containment failures in a row -- well past
+    _CONSECUTIVE_FAILURE_LIMIT -- must still process every candidate and
+    report "ok", not "llm_unavailable"."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4(), uuid4(), uuid4(), uuid4()]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    calls = []
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
+        calls.append(mid)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+    db = MagicMock()
+
+    result = extraction_run.run_extraction_sweep(db, uuid4())
+
+    assert calls == message_ids  # never stopped early -- all 4 attempted
+    assert result["processed"] == 4
+    assert result["failed"] == 4
+    assert result["status"] == "ok"  # NOT llm_unavailable -- this was never an LLM failure
+    assert db.rollback.call_count == 4
+
+
+def test_run_extraction_sweep_soft_time_limit_propagates_and_stops_the_sweep(monkeypatch):
+    """BLOCKER (Codex review, phase 3): SoftTimeLimitExceeded is a plain
+    Exception, so it must be special-cased ahead of the generic containment
+    handler -- otherwise it's counted as an ordinary per-message failure and
+    the sweep grinds on instead of stopping cleanly. Raised on the second of
+    four candidates: it must propagate OUT of run_extraction_sweep itself
+    (not be swallowed), the third and fourth candidates must never be
+    attempted, and it must not be counted into `failed`."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4(), uuid4(), uuid4(), uuid4()]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    calls = []
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
+        calls.append(mid)
+        if len(calls) == 2:
+            raise SoftTimeLimitExceeded
+        return "extracted", uuid4()
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+    db = MagicMock()
+
+    with pytest.raises(SoftTimeLimitExceeded):
+        extraction_run.run_extraction_sweep(db, uuid4())
+
+    assert calls == message_ids[:2]  # the third and fourth were never attempted
+    db.rollback.assert_called_once()
+
+
+def test_run_extraction_sweep_deadline_exceeded_before_any_candidate_stops_immediately(monkeypatch):
+    """A deadline already in the past (plan: phase 3, Codex review blocker
+    -- per-message retry budgets alone don't bound a sweep of all-successful
+    calls) stops the sweep before it ever claims a single candidate."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4(), uuid4()]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    calls = []
+    monkeypatch.setattr(
+        extraction_run, "_claim_extract_record",
+        lambda *a, **k: (calls.append(1), ("extracted", uuid4()))[1],
+    )
+
+    result = extraction_run.run_extraction_sweep(
+        MagicMock(), uuid4(), deadline=time.monotonic() - 1.0
+    )
+
+    assert calls == []
+    assert result["processed"] == 0
+    assert result["status"] == "timed_out"
+
+
+def test_run_extraction_sweep_inner_deadline_on_last_candidate_reports_timed_out(monkeypatch):
+    """Verify pass 3: when the INNER (post-claim, pre-wire) deadline check
+    trips on the sweep's LAST candidate, there is no next iteration for the
+    loop's own check to catch -- the run must still report "timed_out", not
+    "ok", and the fenced candidate must not count as processed."""
+    message_ids = [uuid4()]
+    monkeypatch.setattr(extraction_run, "extraction_feature_enabled", lambda: True)
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda db, **k: None)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, user_id: SimpleNamespace(credential=object(), source="user"),
+    )
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
+        return "deadline", uuid4()
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+
+    result = extraction_run.run_extraction_sweep(
+        MagicMock(), uuid4(), deadline=time.monotonic() + 3600
+    )
+
+    assert result["status"] == "timed_out"
+    assert result["processed"] == 0
+
+
+def test_run_extraction_sweep_deadline_exceeded_mid_sweep_reports_partial_counts(monkeypatch):
+    """A deadline that expires between the second and third candidate stops
+    the sweep there -- partial counts, status "timed_out", not conflated
+    with an LLM-failure diagnosis. Scripted clock, no real sleeping: the
+    deadline check runs once per loop iteration, and the third scripted
+    reading is past the fixed deadline."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4(), uuid4(), uuid4()]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    deadline = 100.0
+    ticks = iter([0.0, 50.0, 200.0])  # first two under the deadline, the third past it
+    monkeypatch.setattr(extraction_run.time, "monotonic", lambda: next(ticks))
+
+    calls = []
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
+        calls.append(mid)
+        return "extracted", uuid4()
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+
+    result = extraction_run.run_extraction_sweep(MagicMock(), uuid4(), deadline=deadline)
+
+    assert calls == message_ids[:2]  # the third candidate's deadline check stopped it first
+    assert result["status"] == "timed_out"
+    assert result["processed"] == 2
 
 
 def test_run_extraction_sweep_end_to_end_terminalizes_expired_at_cap_row(monkeypatch):
@@ -1364,7 +1685,7 @@ def test_run_extraction_sweep_resolves_credential_once_and_threads_it(monkeypatc
     captured_call_contexts = []
     captured_accs = []
 
-    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         captured_call_contexts.append(call_context)
         captured_accs.append(acc)
         return "extracted", uuid4()
@@ -1490,6 +1811,27 @@ def test_extract_actions_for_user_delegates_and_includes_user_id(monkeypatch):
     assert captured["limit"] == 50
     assert captured["force"] is True
     assert result["user_id"] == str(user_id)
+
+
+def test_extract_actions_for_user_threads_a_deadline_under_its_own_soft_time_limit(monkeypatch):
+    """Codex review blocker (phase 3): run_extraction_sweep never guesses a
+    deadline, so this task must compute one FROM its own soft time limit and
+    thread it through -- not rely on the default (unbounded)."""
+    captured = {}
+
+    def fake_sweep(db, uid, **kwargs):
+        captured.update(kwargs)
+        return {"status": "ok", "processed": 0}
+
+    monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(MagicMock()))
+    monkeypatch.setattr(tasks_nlp, "run_extraction_sweep", fake_sweep)
+
+    before = time.monotonic()
+    tasks_nlp.extract_actions_for_user.run(str(uuid4()))
+    after = time.monotonic()
+
+    budget = tasks_nlp._EXTRACT_ACTIONS_SOFT_TIME_LIMIT_S - tasks_nlp._SWEEP_DEADLINE_MARGIN_S
+    assert before + budget <= captured["deadline"] <= after + budget
 
 
 def test_extraction_recovery_tick_no_op_when_disabled(monkeypatch):
@@ -1625,6 +1967,35 @@ def test_extraction_recovery_tick_returns_partial_counts_on_soft_time_limit(monk
     result = tasks_nlp.extraction_recovery_tick.run()
 
     assert result == {"status": "timed_out", "row_driven_users": 1, "message_driven_users": 0}
+
+
+def test_extraction_recovery_tick_shares_one_deadline_across_both_sweep_passes(monkeypatch):
+    """Codex review blocker (phase 3): a per-call deadline would let the
+    row-driven pass alone burn the tick's entire budget and leave nothing
+    for the message-driven pass -- both calls must receive the SAME
+    deadline, computed once."""
+    row_user, message_user = uuid4(), uuid4()
+    deadlines = []
+
+    monkeypatch.setattr(tasks_nlp, "extraction_feature_enabled", lambda: True)
+    monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(MagicMock()))
+    monkeypatch.setattr(tasks_nlp, "terminalize_expired_pending", lambda db: None)
+    monkeypatch.setattr(tasks_nlp, "users_with_claimable_action_items", lambda db: [row_user])
+    monkeypatch.setattr(
+        tasks_nlp, "users_with_unclaimed_actionable_messages", lambda db: [message_user]
+    )
+
+    def fake_sweep(db, user_id, *, limit, recovery=False, deadline=None, **kwargs):
+        deadlines.append(deadline)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(tasks_nlp, "run_extraction_sweep", fake_sweep)
+
+    tasks_nlp.extraction_recovery_tick.run()
+
+    assert len(deadlines) == 2
+    assert deadlines[0] is not None
+    assert deadlines[0] == deadlines[1]  # one shared budget, not one per pass
 
 
 # ---------------------------------------------------------------------------

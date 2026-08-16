@@ -137,7 +137,7 @@ def test_classify_message_resolves_routing_once_after_loading_thread(monkeypatch
 
     classify_calls = []
 
-    def fake_classify_with_usage(text, backend=None, routing=None):
+    def fake_classify_with_usage(text, backend=None, routing=None, policy=None):
         classify_calls.append(routing)
         return _classification_attempt(("fyi", 0.5, "no cues", "heuristic-v1"))
 
@@ -169,7 +169,7 @@ def test_classify_message_missing_thread_routes_to_none_without_resolving(monkey
 
     classify_calls = []
 
-    def fake_classify_with_usage(text, backend=None, routing=None):
+    def fake_classify_with_usage(text, backend=None, routing=None, policy=None):
         classify_calls.append(routing)
         return _classification_attempt(("fyi", 0.4, "no cues", "heuristic-v1"))
 
@@ -197,7 +197,7 @@ def test_classify_message_reports_skipped_marker_when_upsert_protects_a_user_ove
     monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(db))
     monkeypatch.setattr(
         tasks_nlp, "classify_with_usage",
-        lambda text, backend=None, routing=None: _classification_attempt(
+        lambda text, backend=None, routing=None, policy=None: _classification_attempt(
             ("fyi", 0.4, "no cues", "heuristic-v1")
         ),
     )
@@ -269,7 +269,7 @@ def test_classify_message_records_usage_only_for_user_mode_routing(monkeypatch):
     usage = LlmUsage(prompt_tokens=1, completion_tokens=2, total_tokens=3)
     monkeypatch.setattr(
         tasks_nlp, "classify_with_usage",
-        lambda text, backend=None, routing=None: _classification_attempt(
+        lambda text, backend=None, routing=None, policy=None: _classification_attempt(
             ("fyi", 0.5, "r", "openai:gpt-4o-mini"), provider_call_succeeded=True, usage=usage
         ),
     )
@@ -295,7 +295,7 @@ def test_classify_message_server_mode_routing_records_nothing(monkeypatch):
     )
     monkeypatch.setattr(
         tasks_nlp, "classify_with_usage",
-        lambda text, backend=None, routing=None: _classification_attempt(
+        lambda text, backend=None, routing=None, policy=None: _classification_attempt(
             ("fyi", 0.5, "r", "gemini-x"),
             provider_call_succeeded=True,
             usage=LlmUsage(prompt_tokens=1, completion_tokens=2, total_tokens=3),
@@ -326,7 +326,7 @@ def test_classify_message_flush_happens_before_commit_and_committed_after(monkey
     )
     monkeypatch.setattr(
         tasks_nlp, "classify_with_usage",
-        lambda text, backend=None, routing=None: _classification_attempt(
+        lambda text, backend=None, routing=None, policy=None: _classification_attempt(
             ("fyi", 0.5, "r", "openai:gpt-4o-mini"), provider_call_succeeded=True
         ),
     )
@@ -351,7 +351,7 @@ def test_classify_message_failing_usage_flush_does_not_block_business_commit(mon
     )
     monkeypatch.setattr(
         tasks_nlp, "classify_with_usage",
-        lambda text, backend=None, routing=None: _classification_attempt(
+        lambda text, backend=None, routing=None, policy=None: _classification_attempt(
             ("fyi", 0.5, "r", "openai:gpt-4o-mini"), provider_call_succeeded=True
         ),
     )

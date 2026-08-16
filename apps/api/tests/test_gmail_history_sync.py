@@ -1,3 +1,4 @@
+import time
 from unittest.mock import MagicMock
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
@@ -405,7 +406,7 @@ def test_classification_router_is_built_once_per_run_not_once_per_message(monkey
             routing_calls.append(db)
             return SENTINEL_ROUTING
 
-    def fake_classify_with_usage(text, *, routing):
+    def fake_classify_with_usage(text, *, routing, policy=None):
         classify_calls.append(routing)
         return ClassificationAttempt(
             verdict=("other", 0.5, "stub", "test-model"),
@@ -446,6 +447,87 @@ def test_classification_router_is_built_once_per_run_not_once_per_message(monkey
     assert all(routing is SENTINEL_ROUTING for routing in classify_calls)
 
 
+def test_more_than_30_rate_limited_messages_trips_the_breaker_not_a_retry_storm(monkeypatch):
+    """Codex review regression (blocker, phase 3 of the LLM-failure work):
+    before the per-run ClassificationBreaker, a sustained 429 storm across
+    30+ messages in one ingest run would burn up to N * WORKER_RETRIES'
+    ~60s wait budget -- comfortably past the ingest task's own 1740s soft
+    time limit. The task would then hit its hard limit, get replayed by
+    Celery's `autoretry_for`, and reprocess the same messages again (a
+    no-verdict outcome never writes a Classification row) -- the exact
+    retry storm this phase exists to prevent.
+
+    The breaker caps the number of REAL classify_with_usage calls at 3
+    regardless of how many messages need classifying, so even accounting
+    for WORKER_RETRIES' own per-call bound (exhaustively tested in
+    test_llm_client.py: max_attempts=4, total_budget_s=60.0), a run like
+    this costs at most 3 * (60s waits + call time) -- a small fraction of
+    the soft limit, not 35 times that.
+
+    No real sleeping anywhere: classify_with_usage is mocked to return
+    immediately (its own retry-budget behavior is proven elsewhere), so the
+    wall-clock assertion below is really proving this TEST doesn't block --
+    the production time-budget claim above follows from that plus the
+    already-proven WORKER_RETRIES bound.
+    """
+    message_count = 35
+    SENTINEL_ROUTING = ClassificationRouting(mode="off", credential=None)
+
+    class FixedRouter:
+        def __init__(self, user_id):
+            pass
+
+        def routing_for(self, db):
+            return SENTINEL_ROUTING
+
+    call_log = []
+
+    def counting_classify(text, *, routing, policy=None):
+        call_log.append(1)
+        # Every call "fails" the same way a sustained 429 storm would --
+        # this is precisely the scenario the breaker exists for.
+        return ClassificationAttempt(verdict=None, provider_call_succeeded=False, usage=None)
+
+    monkeypatch.setattr(gmail_ingest, "ClassificationRouter", FixedRouter)
+    monkeypatch.setattr(gmail_ingest, "classify_with_usage", counting_classify)
+
+    provider = MagicMock(access_token="tok", token_expiry=None, gmail_history_id="4242")
+    db = _make_pipeline_db(provider)
+
+    client = MagicMock()
+    client.list_history.return_value = _history_page(["t1"])
+    client.get_thread.return_value = {
+        "messages": [
+            {"id": f"m{i}", "threadId": "t1", "payload": {"headers": []}, "snippet": f"hi {i}"}
+            for i in range(message_count)
+        ]
+    }
+    monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
+
+    start = time.monotonic()
+    result = ingest_gmail_messages(db, _USER_ID, new_only=True)
+    elapsed = time.monotonic() - start
+
+    # The breaker: exactly 3 real classify calls, never message_count of them.
+    assert len(call_log) == 3
+
+    # Ingest itself never aborted -- every message still got upserted...
+    assert result["messages_upserted"] == message_count
+    # ...and the history cursor still advanced exactly as it would without
+    # the breaker (_history_page's own historyId).
+    assert provider.gmail_history_id == "9999"
+
+    # Every message the breaker skipped (message_count - 3 never attempted,
+    # plus the 3 real attempts that all came back no-verdict) is reported --
+    # the user must be told, not silently shorted.
+    assert result["left_unclassified"] == message_count
+
+    # Reaching this line at all proves ingest_gmail_messages never raised --
+    # which is what keeps Celery's autoretry_for from ever seeing a failure
+    # and replaying the whole run (reprocessing these same messages again).
+    assert elapsed < 1.0  # nothing in this test actually sleeps
+
+
 # ---------------------------------------------------------------------------
 # Per-user usage recording and its flush sites (docs/plans/2026-08-02-llm-
 # usage-visibility-plan.md §5) -- classify_with_usage(), UsageAccumulator,
@@ -469,7 +551,7 @@ def _fixed_router(routing):
 
 
 def _fake_classify_with_usage(usage):
-    def fake(text, *, routing):
+    def fake(text, *, routing, policy=None):
         return ClassificationAttempt(
             verdict=("fyi", 0.5, "stub", "test-model"),
             provider_call_succeeded=True,
@@ -591,7 +673,7 @@ def test_verdict_none_leaves_message_unclassified_and_reports_left_unclassified(
     records = []
     monkeypatch.setattr(gmail_ingest, "ClassificationRouter", _fixed_router(routing))
 
-    def fake_classify_with_usage(text, *, routing):
+    def fake_classify_with_usage(text, *, routing, policy=None):
         return ClassificationAttempt(
             verdict=None,
             provider_call_succeeded=False,

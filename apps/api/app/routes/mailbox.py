@@ -54,6 +54,7 @@ from app.services.nlp.backfill import (
 )
 from app.services.nlp.classifier import LABELS, build_classification_text
 from app.services.nlp.extractor import ACTION_LABELS
+from app.services.nlp.llm_client import INLINE_RETRIES
 from app.services.nlp.providers import extraction_available
 from app.services.nlp.persistence import (
     FEEDBACK_TEXT_MAX,
@@ -1302,6 +1303,7 @@ def backfill_classifications(
         response.status_code = 202
         return {"status": "queued", "task_id": task.id}
 
+    # Inline -- this request's caller is waiting on the response right now.
     return run_backfill(
         db,
         current_user.id,
@@ -1309,6 +1311,7 @@ def backfill_classifications(
         force=force,
         bucket=bucket,
         backend=normalized_backend,
+        policy=INLINE_RETRIES,
     )
 
 
