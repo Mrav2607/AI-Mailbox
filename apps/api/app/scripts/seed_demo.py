@@ -3,8 +3,10 @@ Seed a user's mailbox with sample threads so the app has something to show.
 
 Without this, a fresh `docker compose up` ends at an empty console: no mail is
 connected, so every bucket reads zero and there's nothing to evaluate. The
-demo-login route calls `seed_demo_data` for brand-new users (dev only), and
-this module doubles as a CLI for seeding an existing account:
+demo-login route calls `seed_demo_data` on every demo login (dev only) --
+it's idempotent, so an already-seeded user is a no-op and one that a prior
+best-effort attempt left empty gets healed on the next login. This module
+also doubles as a CLI for seeding an existing account:
 
     python -m app.scripts.seed_demo you@example.com
 """
@@ -25,8 +27,22 @@ from app.db.models import AppUser, Classification, MailMessage, MailThread, Prov
 # The fake connection that owns the sample threads. mail_thread.provider_account_id
 # is NOT NULL, so seeded mail needs an account row to hang off.
 DEMO_ACCOUNT_EMAIL = "demo@cortexmail.local"
-DEMO_EXTERNAL_ID = "demo-seed-account"
+# Every demo account shared this one literal before it was scoped per user.
+# provider_account has TWO unique constraints (models/provider.py): one keyed
+# on (user_id, provider, external_user_id), but the other on just (provider,
+# external_user_id) -- NOT scoped by user. A shared literal means the SECOND
+# demo user to sign in always violates that second constraint. Kept around
+# (rather than deleted) so accounts seeded before this fix are still found by
+# _demo_account's lookup instead of getting a second, colliding row.
+LEGACY_DEMO_EXTERNAL_ID = "demo-seed-account"
 DEMO_MODEL_VERSION = "demo-seed"
+
+
+def _demo_external_id(user_id: uuid.UUID) -> str:
+    """The external id a NEW demo account gets: unique per user, so two demo
+    users can never collide on provider_account's (provider, external_user_id)
+    constraint the way the old shared literal did."""
+    return f"demo-seed-account-{user_id}"
 
 # (subject, sender, snippet, label, confidence, hours_ago). Confidences span the
 # whole range on purpose: the confidence bar's low tier only paints at 35% or
@@ -176,20 +192,35 @@ def _demo_account(db: Session, user: AppUser) -> ProviderAccount:
     up accounts where refresh_token IS NOT NULL, so the scheduler skips this one
     instead of hammering Gmail with a fake credential. Leaving sync_paused_at
     null keeps the UI from flagging it as needing reconnection.
+
+    The lookup matches either this user's new per-user external id or the old
+    shared LEGACY_DEMO_EXTERNAL_ID -- a user seeded before that id was scoped
+    per user still has a row under the legacy literal, and returning that row
+    (rather than missing it and inserting a second one) both avoids a second
+    hit on the (provider, external_user_id) constraint and keeps
+    seed_demo_data's idempotency guard, which is scoped to whichever account
+    this returns, pointed at the same account every time.
     """
-    account = db.execute(
-        select(ProviderAccount).where(
-            ProviderAccount.user_id == user.id,
-            ProviderAccount.external_user_id == DEMO_EXTERNAL_ID,
+    external_id = _demo_external_id(user.id)
+    account = (
+        db.execute(
+            select(ProviderAccount)
+            .where(
+                ProviderAccount.user_id == user.id,
+                ProviderAccount.external_user_id.in_((external_id, LEGACY_DEMO_EXTERNAL_ID)),
+            )
+            .limit(1)
         )
-    ).scalar_one_or_none()
+        .scalars()
+        .first()
+    )
     if account:
         return account
 
     account = ProviderAccount(
         user_id=user.id,
         provider="gmail",
-        external_user_id=DEMO_EXTERNAL_ID,
+        external_user_id=external_id,
         access_token="demo-seed-no-token",
         refresh_token=None,
         display_email=DEMO_ACCOUNT_EMAIL,

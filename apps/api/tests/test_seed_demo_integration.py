@@ -18,7 +18,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
 from app.db.models import AppUser, Classification, MailMessage, MailThread, ProviderAccount
-from app.scripts.seed_demo import DEMO_EXTERNAL_ID, seed_demo_data
+from app.scripts.seed_demo import LEGACY_DEMO_EXTERNAL_ID, seed_demo_data
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
@@ -128,7 +128,67 @@ def test_demo_account_is_invisible_to_the_sync_scheduler(db_session, user):
     seed_demo_data(db_session, user)
 
     account = db_session.execute(
-        select(ProviderAccount).where(ProviderAccount.external_user_id == DEMO_EXTERNAL_ID)
+        select(ProviderAccount).where(ProviderAccount.user_id == user.id)
     ).scalar_one()
     assert account.refresh_token is None
     assert account.sync_paused_at is None
+
+
+def test_seeding_two_different_users_does_not_collide(db_session, user):
+    """provider_account has a (provider, external_user_id) unique constraint
+    that ISN'T scoped by user_id (models/provider.py) -- a shared literal
+    external id used to make the SECOND demo user's insert violate it. Two
+    users seeding back to back must not raise, and each must get their own,
+    differently-identified account.
+    """
+    other = AppUser(email="seeded-2@example.com", display_name="Seeded Two")
+    db_session.add(other)
+    db_session.commit()
+    db_session.refresh(other)
+
+    created_first = seed_demo_data(db_session, user)
+    created_second = seed_demo_data(db_session, other)
+
+    assert created_first > 0
+    assert created_second > 0
+
+    account_first = db_session.execute(
+        select(ProviderAccount).where(ProviderAccount.user_id == user.id)
+    ).scalar_one()
+    account_second = db_session.execute(
+        select(ProviderAccount).where(ProviderAccount.user_id == other.id)
+    ).scalar_one()
+    assert account_first.external_user_id != account_second.external_user_id
+
+
+def test_legacy_external_id_account_is_found_not_duplicated(db_session, user):
+    """A user seeded before the external id was scoped per-user has a
+    provider_account row under the old shared literal. Seeding again must
+    find that row (and hang new threads off it) instead of inserting a
+    second placeholder account -- which would double-hit the (provider,
+    external_user_id) constraint problem this fix exists to close.
+    """
+    legacy_account = ProviderAccount(
+        user_id=user.id,
+        provider="gmail",
+        external_user_id=LEGACY_DEMO_EXTERNAL_ID,
+        access_token="demo-seed-no-token",
+        refresh_token=None,
+    )
+    db_session.add(legacy_account)
+    db_session.commit()
+
+    created = seed_demo_data(db_session, user)
+
+    assert created > 0
+    accounts = db_session.execute(
+        select(ProviderAccount).where(ProviderAccount.user_id == user.id)
+    ).scalars().all()
+    assert len(accounts) == 1
+    assert accounts[0].external_user_id == LEGACY_DEMO_EXTERNAL_ID
+    threads = db_session.execute(
+        select(func.count())
+        .select_from(MailThread)
+        .where(MailThread.provider_account_id == accounts[0].id)
+    ).scalar_one()
+    assert threads == created

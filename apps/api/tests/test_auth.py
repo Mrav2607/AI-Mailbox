@@ -120,6 +120,41 @@ def test_demo_login_is_hidden_in_production(monkeypatch, env):
     assert resp.status_code == 404
 
 
+@pytest.fixture
+def demo_login_client():
+    db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: db
+    yield TestClient(app), db
+    app.dependency_overrides.clear()
+
+
+def test_demo_login_reseeds_an_existing_user_on_every_login(demo_login_client, monkeypatch):
+    """seed_demo_data used to only run for brand-new users, so a user whose
+    FIRST seed attempt failed partway stayed stuck with an empty console
+    forever. seed_demo_data is idempotent, so calling it on every login
+    (even for an already-existing user) is what actually heals that.
+    """
+    api_client, db = demo_login_client
+    existing_user = SimpleNamespace(
+        id=uuid4(), email="stuck@example.com", display_name=None, token_version=0
+    )
+    db.query.return_value.filter.return_value.first.return_value = existing_user
+
+    seeded_for = []
+    monkeypatch.setattr(
+        auth_routes,
+        "seed_demo_data",
+        lambda db_arg, user_arg: seeded_for.append(user_arg.id) or 15,
+    )
+
+    resp = api_client.post("/api/v1/auth/demo-login", json={"email": "stuck@example.com"})
+
+    assert resp.status_code == 200
+    assert seeded_for == [existing_user.id]
+    # The existing-user path never re-creates the AppUser row.
+    db.add.assert_not_called()
+
+
 USER_ID = uuid4()
 CONNECTIONS_URL = "/api/v1/auth/connections"
 

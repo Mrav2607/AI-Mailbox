@@ -105,14 +105,17 @@ def demo_login(payload: DemoLoginRequest, db: Session = Depends(get_db)) -> dict
         db.add(user)
         db.commit()
         db.refresh(user)
-        # A brand-new demo user has no mail, so the console would open empty
-        # and there'd be nothing to try. Seeding is best-effort: if it fails,
-        # the operator still gets a usable session rather than a 500.
-        try:
-            seed_demo_data(db, user)
-        except Exception:
-            logger.exception("demo seed failed for %s", email)
-            db.rollback()
+    # Seed on EVERY demo login, not just first-time user creation --
+    # seed_demo_data is idempotent (a no-op once the demo account already
+    # owns threads), so this is cheap for the common case, and it's what
+    # actually heals a user whose earlier seed attempt failed partway and
+    # left them with an empty console. Best-effort: a failure here still
+    # returns a usable session rather than a 500.
+    try:
+        seed_demo_data(db, user)
+    except Exception:
+        logger.exception("demo seed failed for %s", email)
+        db.rollback()
     return {
         "access_token": create_access_token(str(user.id), user.token_version),
         "token_type": "bearer",

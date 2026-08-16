@@ -158,20 +158,29 @@ A browser frontend must be served from an origin listed in `CORS_ORIGINS`
 `http://localhost:5173`). Other origins are blocked by the browser.
 
 ### Triage demo data (local only)
-Signing in through the demo login on a non-production deployment seeds a new
-user with sample threads automatically, so there's nothing to run by hand.
+Signing in through the demo login on a dev deployment seeds a new user with
+sample threads automatically, so there's nothing to run by hand.
 
 To seed an account that already exists (or to top up after clearing the
 database):
 
 ```bash
+# Docker stack (the quick start above)
 docker compose exec api python -m app.scripts.seed_demo you@example.com
+
+# Host API (the "Daily startup" flow, where only db and redis run in Docker).
+# Needs the venv active and DATABASE_URL set, same as running the API.
+cd apps/api && python -m app.scripts.seed_demo you@example.com
 ```
 
 It's idempotent — running it twice won't duplicate the sample inbox. The
-threads hang off a placeholder connection with no refresh token, so the
-background sync skips them and never tries to reach Gmail. The demo login is
-disabled entirely when `APP_ENV` is not a dev environment.
+threads hang off a placeholder connection with no refresh token, so both the
+scheduled sync and a manual one skip it and never reach Gmail.
+
+The demo login only works when `APP_ENV` is one of `dev`, `development`,
+`local`, `test`, `testing`, or `ci`. Every other value — including `staging` —
+counts as production, where the route 404s and the sign-in screen hides the
+button.
 
 ### Gmail OAuth (dev)
 1. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URI` in `.env`.
