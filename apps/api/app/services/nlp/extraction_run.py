@@ -185,6 +185,7 @@ def _claim_extract_record(
     call_context: CallContext | None = None,
     acc: UsageAccumulator | None = None,
     failure_categories: dict[str, int] | None = None,
+    deadline: float | None = None,
 ) -> tuple[str, UUID | None]:
     """One claim -> extract -> record cycle for ``message_id``.
 
@@ -261,6 +262,16 @@ def _claim_extract_record(
         return "skipped", user_id
 
     try:
+        # Final verify pass: the sweep's pre-claim deadline check can't see
+        # time spent WAITING on the claim's own locks -- re-check here,
+        # after the claim committed but before anything touches the wire.
+        # Nothing ambiguous has been sent yet, so raising into the generic
+        # handler below fences the claim to a cleanly retryable `failed`
+        # row for a later sweep; the one spurious consecutive-failure
+        # strike this costs is bounded (the sweep's own deadline check
+        # breaks the loop on the very next candidate).
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("extraction deadline exhausted before the wire call")
         # WORKER_RETRIES unconditionally, not threaded from a caller: both
         # entry points that ever reach this (run_extraction_for_message,
         # run_extraction_sweep) are Celery-task-only -- extraction has no
@@ -595,7 +606,7 @@ def run_extraction_sweep(
         try:
             bucket, _user_id = _claim_extract_record(
                 db, message_id, force=force, call_context=call_context, acc=acc,
-                failure_categories=counts["failure_categories"],
+                failure_categories=counts["failure_categories"], deadline=deadline,
             )
         except SoftTimeLimitExceeded:
             # Already fenced by _claim_extract_record -- propagate

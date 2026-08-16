@@ -596,7 +596,7 @@ def test_reconciliation_left_unclassified_reaches_ingest_stats(monkeypatch):
 
     def fake_run_reconciliation_pass(
         db, *, provider_account_id, provider, classify_messages, breaker=None,
-        attempted_no_verdict_ids=None,
+        left_unclassified_ids=None,
     ):
         reconciliation_calls.append(provider_account_id)
         # START pass (call 1) finds 1 no-verdict outcome; END pass (call 2,
@@ -620,7 +620,7 @@ def test_reconciliation_left_unclassified_reaches_ingest_stats(monkeypatch):
 def test_page_loop_no_verdict_provider_message_ids_reach_the_end_reconciliation_pass(monkeypatch):
     """Codex review should-fix (phase 3): the page loop's no-verdict
     provider_message_ids must actually reach the END reconciliation pass'
-    `attempted_no_verdict_ids` -- proving the WIRING, not just
+    `left_unclassified_ids` -- proving the WIRING, not just
     reconcile.py's own already-tested behavior given that set. Two messages
     classified this run: one succeeds, one comes back no-verdict -- only the
     no-verdict one's id should be in what the END pass receives."""
@@ -658,13 +658,13 @@ def test_page_loop_no_verdict_provider_message_ids_reach_the_end_reconciliation_
 
     def fake_run_reconciliation_pass(
         db, *, provider_account_id, provider, classify_messages, breaker=None,
-        attempted_no_verdict_ids=None,
+        left_unclassified_ids=None,
     ):
         # The set is run-shared and MUTABLE now (final Codex pass) -- both
         # passes get the same object, so capture a snapshot per call: the
         # START pass sees it empty, the END pass sees the page loop's
         # no-verdict ids.
-        captured.setdefault("snapshots", []).append(set(attempted_no_verdict_ids or set()))
+        captured.setdefault("snapshots", []).append(set(left_unclassified_ids or set()))
         return {"attempts_checked": 0, "completed": 0, "classified": 0, "left_unclassified": 0}
 
     monkeypatch.setattr(outlook_ingest, "run_reconciliation_pass", fake_run_reconciliation_pass)

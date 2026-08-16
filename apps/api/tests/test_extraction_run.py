@@ -1296,7 +1296,7 @@ def test_run_extraction_sweep_counts_a_bucket_per_message(monkeypatch):
     buckets = iter(["extracted", "no_action", "failed"])
     monkeypatch.setattr(
         extraction_run, "_claim_extract_record",
-        lambda db, mid, force=False, call_context=None, acc=None, failure_categories=None: (
+        lambda db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None: (
             next(buckets), uuid4()
         ),
     )
@@ -1367,7 +1367,7 @@ def test_run_extraction_sweep_isolates_one_bad_message_and_continues(monkeypatch
         lambda *a, **k: [bad_message, good_message],
     )
 
-    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         if mid == bad_message:
             raise RuntimeError("boom")
         return "extracted", uuid4()
@@ -1408,7 +1408,7 @@ def test_run_extraction_sweep_stops_after_three_consecutive_failures_with_partia
 
     calls = []
 
-    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         calls.append(mid)
         return "failed", uuid4()
 
@@ -1442,7 +1442,7 @@ def test_run_extraction_sweep_isolated_failures_among_successes_never_stop_and_c
 
     buckets = iter(["failed", "extracted", "failed", "failed", "extracted"])
 
-    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         return next(buckets), uuid4()
 
     monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
@@ -1475,7 +1475,7 @@ def test_run_extraction_sweep_containment_failure_does_not_trigger_llm_unavailab
 
     calls = []
 
-    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         calls.append(mid)
         raise RuntimeError("boom")
 
@@ -1510,7 +1510,7 @@ def test_run_extraction_sweep_soft_time_limit_propagates_and_stops_the_sweep(mon
 
     calls = []
 
-    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         calls.append(mid)
         if len(calls) == 2:
             raise SoftTimeLimitExceeded
@@ -1575,7 +1575,7 @@ def test_run_extraction_sweep_deadline_exceeded_mid_sweep_reports_partial_counts
 
     calls = []
 
-    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         calls.append(mid)
         return "extracted", uuid4()
 
@@ -1658,7 +1658,7 @@ def test_run_extraction_sweep_resolves_credential_once_and_threads_it(monkeypatc
     captured_call_contexts = []
     captured_accs = []
 
-    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None):
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         captured_call_contexts.append(call_context)
         captured_accs.append(acc)
         return "extracted", uuid4()
