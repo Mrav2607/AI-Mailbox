@@ -1554,6 +1554,33 @@ def test_run_extraction_sweep_deadline_exceeded_before_any_candidate_stops_immed
     assert result["status"] == "timed_out"
 
 
+def test_run_extraction_sweep_inner_deadline_on_last_candidate_reports_timed_out(monkeypatch):
+    """Verify pass 3: when the INNER (post-claim, pre-wire) deadline check
+    trips on the sweep's LAST candidate, there is no next iteration for the
+    loop's own check to catch -- the run must still report "timed_out", not
+    "ok", and the fenced candidate must not count as processed."""
+    message_ids = [uuid4()]
+    monkeypatch.setattr(extraction_run, "extraction_feature_enabled", lambda: True)
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda db, **k: None)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, user_id: SimpleNamespace(credential=object(), source="user"),
+    )
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
+        return "deadline", uuid4()
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+
+    result = extraction_run.run_extraction_sweep(
+        MagicMock(), uuid4(), deadline=time.monotonic() + 3600
+    )
+
+    assert result["status"] == "timed_out"
+    assert result["processed"] == 0
+
+
 def test_run_extraction_sweep_deadline_exceeded_mid_sweep_reports_partial_counts(monkeypatch):
     """A deadline that expires between the second and third candidate stops
     the sweep there -- partial counts, status "timed_out", not conflated

@@ -410,14 +410,23 @@ def _classify_and_stamp(
             left_unclassified_ids.add(message.provider_message_id)
         if routing.mode == "user" and routing.credential is not None:
             try:
-                acc = UsageAccumulator(user_id)
-                acc.record(
-                    "classification",
-                    routing.credential.provider,
-                    attempt_result.usage,
-                    provider_call_succeeded=attempt_result.provider_call_succeeded,
-                )
-                acc.flush(db)
+                # SAVEPOINT, not a plain try/rollback (verify pass 3): a
+                # full rollback here would release the MailThread/attempt
+                # locks taken at the top of this function and then keep
+                # writing OUTSIDE the serialization fence -- a concurrent
+                # reconciliation could take the locks, see no verified_at,
+                # and issue a second paid call. A failed savepoint rolls
+                # back only the usage writes; the outer transaction and its
+                # locks stay held.
+                with db.begin_nested():
+                    acc = UsageAccumulator(user_id)
+                    acc.record(
+                        "classification",
+                        routing.credential.provider,
+                        attempt_result.usage,
+                        provider_call_succeeded=attempt_result.provider_call_succeeded,
+                    )
+                    acc.flush(db)
             except SoftTimeLimitExceeded:
                 _rollback_quietly(db, attempt_id)
                 raise
@@ -425,8 +434,11 @@ def _classify_and_stamp(
                 # Usage is telemetry -- losing one row beats returning
                 # FAILED here, which would erase this attempt's countable
                 # outcome and (marker set above) undercount the toast
-                # (verify pass).
-                _rollback_quietly(db, attempt_id)
+                # (verify pass). If the CONNECTION itself died, the next
+                # statement below fails too and the generic handler takes
+                # over -- that residual (marker set, FAILED returned, one
+                # toast unit undercounted) is the honest "unknown state"
+                # case, not this branch's.
                 logger.exception(
                     "usage flush failed during reply reconciliation for attempt %s",
                     attempt_id,

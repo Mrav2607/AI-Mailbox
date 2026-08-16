@@ -70,6 +70,19 @@ _RESULT_BUCKETS = ("extracted", "no_action", "ineligible", "failed", "skipped")
 _CONSECUTIVE_FAILURE_LIMIT = 3
 
 
+class _DeadlineExhausted(Exception):
+    """Raised inside `_claim_extract_record` when the caller's deadline
+    expired between the sweep's pre-claim check and the wire call
+    (claim-lock waits are invisible to that outer check). Never escapes
+    this module -- `_claim_extract_record` catches it, fences the claim
+    (nothing was sent, so the row is cleanly retryable), and returns the
+    distinct "deadline" bucket so the sweep stops immediately with status
+    "timed_out" instead of reporting an "ok" run that silently quit
+    (verify pass 3: with the stop disguised as "failed", a sweep stopping
+    on its LAST candidate never hit the loop's next-iteration deadline
+    check and reported "ok")."""
+
+
 def _empty_counts() -> dict:
     # failure_categories rides alongside the buckets rather than replacing
     # `failed` -- it's a breakdown (plan: 2026-08-14-llm-failure-visibility),
@@ -265,13 +278,11 @@ def _claim_extract_record(
         # Final verify pass: the sweep's pre-claim deadline check can't see
         # time spent WAITING on the claim's own locks -- re-check here,
         # after the claim committed but before anything touches the wire.
-        # Nothing ambiguous has been sent yet, so raising into the generic
-        # handler below fences the claim to a cleanly retryable `failed`
-        # row for a later sweep; the one spurious consecutive-failure
-        # strike this costs is bounded (the sweep's own deadline check
-        # breaks the loop on the very next candidate).
+        # Nothing ambiguous has been sent yet; the dedicated handler below
+        # fences the claim to a cleanly retryable `failed` row and reports
+        # the distinct "deadline" bucket.
         if deadline is not None and time.monotonic() >= deadline:
-            raise TimeoutError("extraction deadline exhausted before the wire call")
+            raise _DeadlineExhausted()
         # WORKER_RETRIES unconditionally, not threaded from a caller: both
         # entry points that ever reach this (run_extraction_for_message,
         # run_extraction_sweep) are Celery-task-only -- extraction has no
@@ -367,6 +378,12 @@ def _claim_extract_record(
                 acc.discard()
         db.commit()
         acc.committed()
+    except _DeadlineExhausted as exc:
+        # Fence exactly like any other mid-claim failure -- the row stays
+        # reclaimable -- but report the stop distinctly so the sweep can
+        # end with status "timed_out" instead of "ok" (verify pass 3).
+        _rollback_discard_and_fence(db, acc, message.id, claim_token, exc)
+        return "deadline", user_id
     except SoftTimeLimitExceeded as exc:
         # Celery's soft time limit is a plain Exception, so the generic
         # `except Exception` below WOULD otherwise catch it -- and
@@ -639,6 +656,17 @@ def run_extraction_sweep(
             )
             counts["failed"] += 1
             continue
+
+        if bucket == "deadline":
+            # The inner pre-wire check fenced the claim without calling the
+            # provider (verify pass 3) -- stop NOW with the truthful status,
+            # not "ok": on the sweep's last candidate there is no next
+            # iteration for the loop's own deadline check to catch. The
+            # candidate wasn't processed (claimed and fenced only), so the
+            # optimistic increment above is undone.
+            counts["processed"] -= 1
+            stop_reason = "timed_out"
+            break
 
         counts[bucket] += 1
         if bucket == "failed":
