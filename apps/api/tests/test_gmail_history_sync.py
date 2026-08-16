@@ -571,6 +571,61 @@ def test_server_paid_classification_records_nothing(monkeypatch):
     assert records == []
 
 
+def test_verdict_none_leaves_message_unclassified_and_reports_left_unclassified(monkeypatch):
+    """Phase 2 (D-C, plan: 2026-08-14-llm-failure-visibility): a failed BYOK
+    call the user hasn't opted into local fallback for produces verdict=None.
+    Ingest must never write a null-label row (it would strand the message,
+    neither classified nor a backfill candidate again) and must report it via
+    left_unclassified instead of classified -- but usage still gets recorded,
+    since the call may have genuinely billed the user even though it
+    produced nothing to classify with (D3). The run otherwise completes
+    successfully -- unlike run_backfill, ingest has no BYOK-spend reason to
+    stop early on a single message."""
+    routing = ClassificationRouting(
+        mode="user",
+        credential=LlmCredential(
+            provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+        ),
+    )  # fallback_local=False
+    usage = LlmUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    records = []
+    monkeypatch.setattr(gmail_ingest, "ClassificationRouter", _fixed_router(routing))
+
+    def fake_classify_with_usage(text, *, routing):
+        return ClassificationAttempt(
+            verdict=None,
+            provider_call_succeeded=False,
+            usage=usage,
+            llm_attempted=True,
+            fallback_used=False,
+            failure_category="connection_failed",
+        )
+
+    monkeypatch.setattr(gmail_ingest, "classify_with_usage", fake_classify_with_usage)
+    monkeypatch.setattr(
+        gmail_ingest, "UsageAccumulator", _tracing_accumulator_class([], records)
+    )
+    upsert_calls = []
+    monkeypatch.setattr(
+        gmail_ingest, "upsert_classification",
+        lambda *a, **k: (upsert_calls.append(k), "written")[1],
+    )
+
+    provider = MagicMock(access_token="tok", token_expiry=None, gmail_history_id="4242", id=uuid4())
+    db = _make_pipeline_db(provider)
+    client = MagicMock()
+    client.list_history.return_value = _history_page(["t1"])
+    client.get_thread.side_effect = [_raw_thread("t1", "m1")]
+    monkeypatch.setattr(gmail_ingest, "GmailClient", lambda _token: client)
+
+    result = ingest_gmail_messages(db, _USER_ID, new_only=True)
+
+    assert upsert_calls == []  # never wrote a null-label row
+    assert result["classified"] == 0
+    assert result["left_unclassified"] == 1
+    assert records == [("classification", "openai", usage, False)]
+
+
 def test_periodic_commit_flushes_usage_before_it_in_order_and_committed_runs_last(monkeypatch):
     routing = ClassificationRouting(
         mode="user",

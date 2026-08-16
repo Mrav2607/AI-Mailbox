@@ -266,13 +266,28 @@ def _patch_settle(monkeypatch, *, mark_sent_result=True, resolved=1):
     return calls
 
 
-def _patch_classification(monkeypatch, *, raises=None):
-    calls = {"classify": 0}
+def _patch_classification(monkeypatch, *, raises=None, no_verdict=False):
+    # calls["upsert"] tracks every upsert_classification invocation -- used
+    # by the phase 2 no-verdict tests to assert directly that NO row is ever
+    # written (not just inferred from outcome["classified"]).
+    calls = {"classify": 0, "upsert": []}
 
     def fake_classify(text, *, routing):
         calls["classify"] += 1
         if raises:
             raise raises
+        if no_verdict:
+            # Phase 2 (D-C): a failed BYOK call with no local fallback
+            # served -- see classifier.ClassificationAttempt's own docstring
+            # for why this is the one case `verdict` is None.
+            return SimpleNamespace(
+                verdict=None,
+                provider_call_succeeded=False,
+                usage=None,
+                llm_attempted=True,
+                fallback_used=False,
+                failure_category="connection_failed",
+            )
         return SimpleNamespace(
             verdict=("needs_reply", 0.9, "why", "heuristic-fallback"),
             provider_call_succeeded=False,
@@ -295,7 +310,10 @@ def _patch_classification(monkeypatch, *, raises=None):
     monkeypatch.setattr(reconcile, "build_classification_text", lambda *a: "text")
     monkeypatch.setattr(reconcile, "ClassificationRouter", _FakeRouter)
     monkeypatch.setattr(reconcile, "classify_with_usage", fake_classify)
-    monkeypatch.setattr(reconcile, "upsert_classification", lambda db, **k: "written")
+    monkeypatch.setattr(
+        reconcile, "upsert_classification",
+        lambda db, **k: calls["upsert"].append(k) or "written",
+    )
     monkeypatch.setattr(
         reconcile, "stamp_verified", lambda db, **kwargs: stamp_calls.append(kwargs)
     )
@@ -385,11 +403,78 @@ def test_classify_and_stamp_null_winner_classifies_and_stamps(monkeypatch):
         db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id, user_id=uuid4()
     )
 
-    assert won is True
+    assert won == reconcile._OUTCOME_CLASSIFIED
     assert calls["classify"] == 1
     assert len(stamp_calls) == 1
     assert db.commits == 1
     assert db.rollbacks == 0
+
+
+def test_classify_and_stamp_no_verdict_stamps_verified_without_classifying(monkeypatch):
+    """Codex-caught bug fix (phase 2): `verdict is None` (a failed BYOK call
+    with no local fallback served) must still stamp_verified and commit --
+    the SEND itself is genuinely verified, that's a separate fact from
+    classification succeeding (see _classify_and_stamp's own docstring).
+    Skipping the stamp here left the attempt permanently eligible, which
+    would re-issue the same already-known-to-fail BYOK call on every future
+    sync forever. No Classification row is ever written either -- the
+    message stays a genuine backfill candidate."""
+    calls, stamp_calls = _patch_classification(monkeypatch, no_verdict=True)
+    attempt = _attempt(provider="outlook", verified_at=None)
+    message = _message()
+    db = _FakeDB(verified_at_reads=[None])
+
+    won = reconcile._classify_and_stamp(
+        db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id, user_id=uuid4()
+    )
+
+    assert won == reconcile._OUTCOME_NO_VERDICT  # not classified, but a KNOWN outcome
+    assert calls["classify"] == 1
+    assert calls["upsert"] == []  # never a null-label row
+    assert len(stamp_calls) == 1  # but the send IS verified
+    assert db.commits == 1
+    assert db.rollbacks == 0
+
+
+def test_classify_and_stamp_no_verdict_then_a_later_sync_never_reclassifies(monkeypatch):
+    """The bounded-cost guarantee Codex asked us to document (phase 2): a
+    no-verdict pass stamps verified_at (see the test above), so the NEXT
+    reconciliation pass -- representing a later sync, whether that's the END
+    pass right behind a page-loop's own already-failed classification, or a
+    wholly separate later sync's START/END pass -- sees a non-null
+    verified_at and skips straight to the loser-of-race early return without
+    ever calling the classifier again. Total real-world cost for one message
+    is bounded at "however many calls happened before the first stamp",
+    never unbounded."""
+    calls, stamp_calls = _patch_classification(monkeypatch, no_verdict=True)
+    attempt = _attempt(provider="outlook", verified_at=None)
+    message = _message()
+
+    # Pass 1: verified_at is still NULL -- this is the first call reconcile.py
+    # itself ever sees for this attempt (a page-loop classification that
+    # already failed and left no Classification row looks IDENTICAL to this
+    # state; reconcile.py can't and needn't distinguish the two).
+    db_pass_1 = _FakeDB(verified_at_reads=[None])
+    outcome_1 = reconcile._classify_and_stamp(
+        db_pass_1, attempt_id=attempt.id, message=message,
+        thread_id=attempt.thread_id, user_id=uuid4(),
+    )
+    assert outcome_1 == reconcile._OUTCOME_NO_VERDICT
+    assert calls["classify"] == 1
+    assert len(stamp_calls) == 1
+
+    # Pass 2 (a later sync's own reconciliation pass): verified_at is now
+    # non-null, stamped by pass 1 above.
+    db_pass_2 = _FakeDB(verified_at_reads=[datetime.now(timezone.utc)])
+    outcome_2 = reconcile._classify_and_stamp(
+        db_pass_2, attempt_id=attempt.id, message=message,
+        thread_id=attempt.thread_id, user_id=uuid4(),
+    )
+    assert outcome_2 == reconcile._OUTCOME_RACE_LOST
+    assert calls["classify"] == 1  # no new call
+    assert calls["upsert"] == []  # still no Classification row, ever
+    assert len(stamp_calls) == 1  # no new stamp either
+    assert db_pass_2.rollbacks == 1
 
 
 def test_classify_and_stamp_two_workers_racing_classify_exactly_once(monkeypatch):
@@ -411,8 +496,8 @@ def test_classify_and_stamp_two_workers_racing_classify_exactly_once(monkeypatch
         db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id, user_id=uuid4()
     )
 
-    assert first is True
-    assert second is False
+    assert first == reconcile._OUTCOME_CLASSIFIED
+    assert second == reconcile._OUTCOME_RACE_LOST
     assert calls["classify"] == 1
     assert len(stamp_calls) == 1
     assert db.rollbacks == 1  # the loser's rollback
@@ -431,7 +516,7 @@ def test_classify_and_stamp_classification_failure_leaves_unverified(monkeypatch
         db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id, user_id=uuid4()
     )
 
-    assert won is False
+    assert won == reconcile._OUTCOME_FAILED  # unknown state, NOT the same as no_verdict
     assert calls["classify"] == 1
     assert stamp_calls == []
     assert db.rollbacks == 1
@@ -452,7 +537,7 @@ def test_classify_and_stamp_existing_classification_stamps_without_classifying(m
         db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id, user_id=uuid4()
     )
 
-    assert won is True
+    assert won == reconcile._OUTCOME_ALREADY_CLASSIFIED
     assert calls["classify"] == 0
     assert len(stamp_calls) == 1
     assert db.commits == 1
@@ -471,7 +556,7 @@ def test_classify_and_stamp_user_override_stamps_without_overwriting(monkeypatch
         db, attempt_id=attempt.id, message=message, thread_id=attempt.thread_id, user_id=uuid4()
     )
 
-    assert won is True
+    assert won == reconcile._OUTCOME_ALREADY_CLASSIFIED
     assert calls["classify"] == 0
 
 
@@ -504,7 +589,11 @@ def test_classify_and_stamp_passes_subject_from_stored_headers(monkeypatch):
 def test_reconcile_one_attempt_settles_first_even_when_classification_fails(monkeypatch):
     """A provably delivered attempt must never stay blocking because
     classification later fails -- settle (mark_sent/fence) commits
-    independently of the classify phase's outcome."""
+    independently of the classify phase's outcome. Codex finding (D-C/D-I):
+    a genuine exception is an UNKNOWN state, not a known "left unclassified"
+    outcome, so it must NOT count toward `left_unclassified` either -- only
+    `test_reconcile_one_attempt_no_verdict_reports_left_unclassified` below
+    (a clean no-verdict) should."""
     settle_calls = _patch_settle(monkeypatch)
     _patch_classification(monkeypatch, raises=RuntimeError("boom"))
     thread = _thread()
@@ -518,7 +607,33 @@ def test_reconcile_one_attempt_settles_first_even_when_classification_fails(monk
 
     assert outcome["resolved_action_items"] == 1
     assert outcome["classified"] is False
+    assert outcome["left_unclassified"] is False  # unknown state, not a known miss
     assert len(settle_calls["mark_sent"]) == 1
+
+
+def test_reconcile_one_attempt_no_verdict_reports_left_unclassified(monkeypatch):
+    """Codex finding (D-C/D-I): a clean no-verdict outcome (a failed BYOK
+    call with no local fallback served) must surface as
+    `outcome["left_unclassified"] is True` -- this is what
+    `run_reconciliation_pass` aggregates and both `outlook_ingest.py` call
+    sites fold into `stats["left_unclassified"]`, the ONE thing the ingest
+    toast/auto-sync warning actually reads. Before this fix, a message left
+    unclassified via reconciliation (as opposed to the page loop) was
+    invisible end to end."""
+    settle_calls = _patch_settle(monkeypatch)
+    _patch_classification(monkeypatch, no_verdict=True)
+    thread = _thread()
+    attempt = _attempt(provider="outlook", thread_id=thread.id, status="inflight", verified_at=None)
+    message = _message(thread_id=thread.id, provider_message_id="draft-1")
+    attempt.provider_message_id = "draft-1"
+    monkeypatch.setattr(reconcile, "_match_message", lambda db, **k: message)
+    db = _FakeDB(attempts=[attempt], threads=[thread], verified_at_reads=[None])
+
+    outcome = reconcile._reconcile_one_attempt(db, attempt_id=attempt.id, classify_messages=True)
+
+    assert outcome["classified"] is False
+    assert outcome["left_unclassified"] is True
+    assert len(settle_calls["mark_sent"]) == 1  # the send is still settled/verified
 
 
 def test_reconcile_one_attempt_classify_false_skips_classification_entirely(monkeypatch):
@@ -625,7 +740,9 @@ def test_run_reconciliation_pass_snapshot_before_attempt_created_end_pass_comple
     start_result = reconcile.run_reconciliation_pass(
         _StartDB(), provider_account_id=uuid4(), provider="gmail", classify_messages=True
     )
-    assert start_result == {"attempts_checked": 0, "completed": 0, "classified": 0}
+    assert start_result == {
+        "attempts_checked": 0, "completed": 0, "classified": 0, "left_unclassified": 0,
+    }
 
     attempt_id = uuid4()
     reconciled = []
@@ -633,7 +750,7 @@ def test_run_reconciliation_pass_snapshot_before_attempt_created_end_pass_comple
         reconcile,
         "_reconcile_one_attempt",
         lambda db, *, attempt_id, classify_messages: reconciled.append(attempt_id)
-        or {"resolved_action_items": 1, "classified": False},
+        or {"resolved_action_items": 1, "classified": False, "left_unclassified": False},
     )
 
     class _EndDB:
@@ -642,7 +759,9 @@ def test_run_reconciliation_pass_snapshot_before_attempt_created_end_pass_comple
     end_result = reconcile.run_reconciliation_pass(
         _EndDB(), provider_account_id=uuid4(), provider="gmail", classify_messages=True
     )
-    assert end_result == {"attempts_checked": 1, "completed": 1, "classified": 0}
+    assert end_result == {
+        "attempts_checked": 1, "completed": 1, "classified": 0, "left_unclassified": 0,
+    }
     assert reconciled == [attempt_id]
 
 
@@ -655,7 +774,11 @@ def test_run_reconciliation_pass_isolates_a_failing_attempt(monkeypatch):
     def fake_reconcile(db, *, attempt_id, classify_messages):
         if attempt_id == ids[1]:
             raise RuntimeError("boom")
-        return {"resolved_action_items": 1, "classified": attempt_id == ids[2]}
+        return {
+            "resolved_action_items": 1,
+            "classified": attempt_id == ids[2],
+            "left_unclassified": False,
+        }
 
     monkeypatch.setattr(reconcile, "_reconcile_one_attempt", fake_reconcile)
 
@@ -668,7 +791,9 @@ def test_run_reconciliation_pass_isolates_a_failing_attempt(monkeypatch):
         db, provider_account_id=uuid4(), provider="gmail", classify_messages=True
     )
 
-    assert result == {"attempts_checked": 3, "completed": 2, "classified": 1}
+    assert result == {
+        "attempts_checked": 3, "completed": 2, "classified": 1, "left_unclassified": 0,
+    }
     assert db.rolled_back is True
 
 
@@ -693,7 +818,9 @@ def test_run_reconciliation_pass_eligible_query_failure_never_raises(monkeypatch
         db, provider_account_id=uuid4(), provider="gmail", classify_messages=True
     )
 
-    assert result == {"attempts_checked": 0, "completed": 0, "classified": 0}
+    assert result == {
+        "attempts_checked": 0, "completed": 0, "classified": 0, "left_unclassified": 0,
+    }
     assert db.rolled_back is True
 
 
@@ -706,7 +833,39 @@ def test_run_reconciliation_pass_counts_matches_with_nothing_yet_as_incomplete(m
         MagicMock(), provider_account_id=uuid4(), provider="outlook", classify_messages=True
     )
 
-    assert result == {"attempts_checked": 2, "completed": 0, "classified": 0}
+    assert result == {
+        "attempts_checked": 2, "completed": 0, "classified": 0, "left_unclassified": 0,
+    }
+
+
+def test_run_reconciliation_pass_aggregates_left_unclassified_and_never_counts_failures(
+    monkeypatch,
+):
+    """Codex finding (D-C/D-I): a no-verdict outcome must reach the pass's
+    own return dict as `left_unclassified`, and a genuinely failed/unknown
+    outcome (or a race-lost no-op) must NOT be counted there -- only
+    `_OUTCOME_NO_VERDICT` is a KNOWN "left unclassified" fact."""
+    ids = [uuid4(), uuid4(), uuid4()]
+
+    def fake_reconcile(db, *, attempt_id, classify_messages):
+        if attempt_id == ids[0]:
+            return {"resolved_action_items": 1, "classified": False, "left_unclassified": True}
+        if attempt_id == ids[1]:
+            return {"resolved_action_items": 1, "classified": True, "left_unclassified": False}
+        # ids[2]: a race-lost/gmail-branch outcome -- neither classified nor
+        # left_unclassified, same shape _reconcile_one_attempt always emits.
+        return {"resolved_action_items": 1, "classified": False, "left_unclassified": False}
+
+    monkeypatch.setattr(reconcile, "_eligible_attempt_ids", lambda db, **k: ids)
+    monkeypatch.setattr(reconcile, "_reconcile_one_attempt", fake_reconcile)
+
+    result = reconcile.run_reconciliation_pass(
+        MagicMock(), provider_account_id=uuid4(), provider="outlook", classify_messages=True
+    )
+
+    assert result == {
+        "attempts_checked": 3, "completed": 3, "classified": 1, "left_unclassified": 1,
+    }
 
 
 # ---------------------------------------------------------------------------

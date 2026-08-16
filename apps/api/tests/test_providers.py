@@ -587,25 +587,38 @@ class _FakeClassificationDB:
     def execute(self, stmt):
         self.statements.append(stmt)
         cols = [c.key for c in stmt.selected_columns]
-        if cols == ["provider", "classification_byok"]:
+        if cols == ["provider", "classification_byok", "classification_fallback_local"]:
             item = self._queue.pop(0)
             self._pending = item
             if item is None:
                 return _RoutingResult(None)
             provider, byok, _full = item
-            return _RoutingResult(SimpleNamespace(provider=provider, classification_byok=byok))
+            # Not branched on at step 1 -- only mode="user" cares about
+            # fallback_local, and step 2 re-reads it fresh (same freshness
+            # reasoning as the credential fields), so this value is never
+            # read by the resolver.
+            return _RoutingResult(
+                SimpleNamespace(
+                    provider=provider,
+                    classification_byok=byok,
+                    classification_fallback_local=False,
+                )
+            )
         # The second (re-asserted) read -- only reached when the pending
         # projection said opted-in + preset.
         _provider, _byok, full = self._pending
         return _RoutingResult(full)
 
 
-def _make_classification_row(provider="openai", api_key="user-key-1234", model="gpt-4o-mini"):
+def _make_classification_row(
+    provider="openai", api_key="user-key-1234", model="gpt-4o-mini", fallback_local=False
+):
     return SimpleNamespace(
         provider=provider,
         base_url=PROVIDER_PRESETS.get(provider, "https://example.com/v1"),
         api_key=api_key,
         model=model,
+        classification_fallback_local=fallback_local,
     )
 
 
@@ -643,7 +656,22 @@ def test_resolve_classification_routing_opt_in_true_preset_returns_user():
         api_key="user-key-1234",
         model="gpt-4o-mini",
     )
+    assert routing.fallback_local is False  # _make_classification_row's default
     assert len(db.statements) == 2  # the re-asserted second read did fire
+
+
+def test_resolve_classification_routing_carries_fallback_local_from_second_read():
+    """Phase 2 (2026-08-14-llm-failure-visibility): fallback_local is read
+    from the SECOND (re-asserted) query, same freshness guarantee as the
+    credential fields -- not from step 1's projection, which never sees a
+    varying value in this fake (see _FakeClassificationDB)."""
+    full = _make_classification_row(
+        provider="openai", api_key="user-key-1234", model="gpt-4o-mini", fallback_local=True
+    )
+    db = _FakeClassificationDB(("openai", True, full))
+    routing = resolve_classification_routing(db, uuid4())
+    assert routing.mode == "user"
+    assert routing.fallback_local is True
 
 
 def test_resolve_classification_routing_second_read_empty_resolves_off():
@@ -656,13 +684,14 @@ def test_resolve_classification_routing_second_read_empty_resolves_off():
 
 
 def test_resolve_classification_routing_projection_never_selects_api_key():
-    """The step-1 read must project only (provider, classification_byok) --
-    never the whole entity, or `api_key` (EncryptedText) gets decrypted just
-    to read a boolean, for every extraction-only user, once a minute."""
+    """The step-1 read must project only (provider, classification_byok,
+    classification_fallback_local) -- never the whole entity, or `api_key`
+    (EncryptedText) gets decrypted just to read two booleans, for every
+    extraction-only user, once a minute."""
     db = _FakeClassificationDB(("openai", False, None))
     resolve_classification_routing(db, uuid4())
     cols = [c.key for c in db.statements[0].selected_columns]
-    assert cols == ["provider", "classification_byok"]
+    assert cols == ["provider", "classification_byok", "classification_fallback_local"]
     assert "api_key" not in cols
 
 
@@ -686,9 +715,17 @@ def test_resolve_classification_routing_second_read_uses_columns_not_stale_entit
         def execute(self, stmt):
             self.statements.append(stmt)
             cols = [c.key for c in stmt.selected_columns]
-            if cols == ["provider", "classification_byok"]:
-                return _RoutingResult(SimpleNamespace(provider="openai", classification_byok=True))
-            if set(cols) == {"provider", "base_url", "api_key", "model"}:
+            if cols == ["provider", "classification_byok", "classification_fallback_local"]:
+                return _RoutingResult(
+                    SimpleNamespace(
+                        provider="openai",
+                        classification_byok=True,
+                        classification_fallback_local=False,
+                    )
+                )
+            if set(cols) == {
+                "provider", "base_url", "api_key", "model", "classification_fallback_local",
+            }:
                 return _RoutingResult(fresh)
             # Any other shape (e.g. the old `select(UserLlmCredential)`)
             # simulates the identity map handing back the stale instance.
@@ -702,7 +739,9 @@ def test_resolve_classification_routing_second_read_uses_columns_not_stale_entit
     assert routing.credential.model == "gpt-4o-mini"
 
     second_read_cols = [c.key for c in db.statements[1].selected_columns]
-    assert set(second_read_cols) == {"provider", "base_url", "api_key", "model"}
+    assert set(second_read_cols) == {
+        "provider", "base_url", "api_key", "model", "classification_fallback_local",
+    }
     # The full mapped entity carries `id` (among others); a column select
     # doesn't -- confirms this isn't just a same-length coincidence.
     assert "id" not in second_read_cols

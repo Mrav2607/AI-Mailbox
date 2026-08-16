@@ -43,6 +43,21 @@ from app.services.nlp.usage import UsageAccumulator
 # not just a comment (plan §3.5, P6-5).
 _BLOCKING_STATUSES = ("preparing", "inflight", "unknown", "abandoned")
 
+# `_classify_and_stamp`'s outcome kinds (Codex review, phase 2 correction):
+# named constants rather than bare strings so a typo can't silently produce
+# an outcome nobody's comparison recognizes. `_OUTCOME_NO_VERDICT` and
+# `_OUTCOME_FAILED` both leave `classified=False` at the call site but are
+# DELIBERATELY distinct -- a no-verdict pass genuinely completed (stamped,
+# just nothing to classify with), so it's the only one of the five that
+# should ever count toward `left_unclassified`. An exception is an unknown
+# state, not a known "left unclassified" outcome, and `_OUTCOME_RACE_LOST`
+# didn't determine the message's status at all (someone else already did).
+_OUTCOME_CLASSIFIED = "classified"
+_OUTCOME_ALREADY_CLASSIFIED = "already_classified"
+_OUTCOME_NO_VERDICT = "no_verdict"
+_OUTCOME_FAILED = "failed"
+_OUTCOME_RACE_LOST = "race_lost"
+
 
 def _eligible_attempt_ids(
     db: Session, *, provider_account_id: UUID, provider: str
@@ -162,15 +177,61 @@ def _settle_match(
 
 def _classify_and_stamp(
     db: Session, *, attempt_id: UUID, message: MailMessage, thread_id: UUID, user_id: UUID
-) -> bool:
+) -> str:
     """Phase 2, ITS OWN transaction, isolated from phase 1: the
     classification claim (P8-2). Takes the shared serialization point
     (`MailThread` -> `ReplyAttempt` lock order, the same one used by every
     reconciliation path), re-reads `verified_at`, and only the null-winner
     classifies and stamps -- guaranteeing exactly one classifier invocation
-    even when two workers race this same attempt. A classification failure
-    rolls back only this attempt's work and leaves `verified_at` NULL for a
-    later pass; it never touches phase 1's already-committed settlement.
+    even when two workers race this same attempt.
+
+    Returns one of the `_OUTCOME_*` constants (Codex review: the caller
+    needs to tell `no_verdict` and `failed` apart to report
+    `left_unclassified` correctly, and a bare bool couldn't say which of
+    five different states produced it) -- see those constants' own comment
+    for what each one means and why they're kept distinct.
+
+    `verified_at` and "classification succeeded" are DELIBERATELY
+    independent facts (Codex review, phase 2 correction): `verified_at`
+    means the authoritative provider copy was confirmed (`reply_attempt.py`'s
+    own docstring) -- for Outlook, that's THIS reconciliation pass finding
+    the sentitems row, which genuinely happened whether or not classification
+    did. `_settle_match` already stamps/settles unconditionally on a match,
+    regardless of whether classification later succeeds -- this is the same
+    principle applied to the classification phase's own outcomes:
+
+    - `verdict is None` (D-C: a BYOK failure with no local fallback opted
+      into): the send is still genuinely verified, so `stamp_verified` runs
+      and commits same as a normal success -- just with no Classification
+      row (`_OUTCOME_NO_VERDICT`). Leaving `verified_at` NULL here would
+      make this attempt eligible forever (`_eligible_attempt_ids`'s Outlook
+      `verified_at IS NULL` predicate), and with no row ever written to trip
+      the duplicate-call guard above, EVERY future sync's reconciliation
+      pass would re-issue the same already-known-to-fail BYOK call -- an
+      unbounded retry loop that keeps billing the user and directly
+      violates D-I (unclassified mail waits for a MANUAL backfill, nothing
+      retries it automatically).
+    - A genuine exception below (`except Exception`, `_OUTCOME_FAILED`) is a
+      DIFFERENT, unknown state -- not a clean "the call ran and produced
+      nothing" like the `verdict is None` case above, but "something broke
+      and we don't know what state this left things in". Retrying a
+      genuinely-unknown failure is defensible, so it still leaves
+      `verified_at` NULL for a later pass; it never touches phase 1's
+      already-committed settlement. These two paths look similar but are a
+      DELIBERATE divergence, not an oversight -- do not "simplify" them
+      back to matching each other, and do not count `_OUTCOME_FAILED`
+      toward `left_unclassified` (it isn't a KNOWN "left unclassified"
+      outcome the way `_OUTCOME_NO_VERDICT` is).
+
+    Same-sync double call (Codex review): a `classify_messages=True` sync's
+    own page loop can already have made one failed BYOK call for this
+    message before the END reconciliation pass reaches here -- with no
+    Classification row written (D-C), the duplicate-call guard above can't
+    see that first attempt, so this can issue a second one. Left as-is
+    rather than contorting the design for it: the stamp fix above bounds it
+    at exactly 2 calls total, ever, for a given message (after this pass
+    stamps `verified_at`, `_eligible_attempt_ids` never selects it again) --
+    a one-time, bounded cost, not a loop.
     """
     db.execute(select(MailThread).where(MailThread.id == thread_id).with_for_update())
     current_verified_at = db.execute(
@@ -178,9 +239,11 @@ def _classify_and_stamp(
     ).scalar_one_or_none()
     if current_verified_at is not None:
         # Someone else already won this race (or a prior pass already
-        # verified it) -- nothing to do.
+        # verified it) -- nothing to do, and this call didn't determine the
+        # message's classification status, so it's neither "classified" nor
+        # "left unclassified" -- just a no-op.
         db.rollback()
-        return False
+        return _OUTCOME_RACE_LOST
 
     # R-3 (final review): a classification-enabled sync classifies the
     # persisted Sent Items message in its OWN page loop; the claim above
@@ -196,7 +259,7 @@ def _classify_and_stamp(
     if existing_classification is not None:
         stamp_verified(db, attempt_id=attempt_id)
         db.commit()
-        return True
+        return _OUTCOME_ALREADY_CLASSIFIED
 
     try:
         # R-7 (final review): the Subject header, read case-insensitively
@@ -211,7 +274,6 @@ def _classify_and_stamp(
         router = ClassificationRouter(user_id)
         routing = router.routing_for(db)
         attempt_result = classify_with_usage(text_for_classification, routing=routing)
-        label, confidence, rationale, model_version = attempt_result.verdict
         if routing.mode == "user" and routing.credential is not None:
             acc = UsageAccumulator(user_id)
             acc.record(
@@ -221,6 +283,24 @@ def _classify_and_stamp(
                 provider_call_succeeded=attempt_result.provider_call_succeeded,
             )
             acc.flush(db)
+        # Phase 2 correction (Codex review, D-C/D-I): `verdict is None` means
+        # a failed BYOK call with no local fallback served -- but the SEND
+        # itself is still genuinely verified (see this function's own
+        # docstring for why that's a separate fact from classification
+        # succeeding), so stamp_verified runs and commits here same as a
+        # normal success. Skipping the stamp was the bug Codex caught: with
+        # no Classification row ever written to trip the duplicate-call
+        # guard above, and this attempt staying eligible forever, every
+        # future sync's reconciliation pass would re-issue the same
+        # already-known-to-fail BYOK call forever. Never write a null-label
+        # row regardless (it would strand the message); usage above still
+        # commits either way -- the call may have genuinely billed the user
+        # even though it produced nothing to classify with.
+        if attempt_result.verdict is None:
+            stamp_verified(db, attempt_id=attempt_id)
+            db.commit()
+            return _OUTCOME_NO_VERDICT
+        label, confidence, rationale, model_version = attempt_result.verdict
         upsert_classification(
             db,
             message_id=message.id,
@@ -231,14 +311,14 @@ def _classify_and_stamp(
         )
         stamp_verified(db, attempt_id=attempt_id)
         db.commit()
-        return True
+        return _OUTCOME_CLASSIFIED
     except Exception:
         db.rollback()
         logger.exception(
             "reply reconciliation: classification failed for attempt %s (sent but unverified)",
             attempt_id,
         )
-        return False
+        return _OUTCOME_FAILED
 
 
 def _reconcile_one_attempt(
@@ -266,18 +346,27 @@ def _reconcile_one_attempt(
         return None
 
     classified = False
+    # Phase 2 (Codex review): distinct from `classified` -- only
+    # `_OUTCOME_NO_VERDICT` counts here (see `_classify_and_stamp`'s own
+    # docstring for why `_OUTCOME_FAILED`/`_OUTCOME_RACE_LOST` deliberately
+    # don't). This is the ONE place a BYOK-failure-left-unclassified message
+    # from the reconciliation path becomes visible to the ingest stats the
+    # frontend actually reads.
+    left_unclassified = False
     if (
         attempt.provider == "outlook"
         and classify_messages
         and attempt.verified_at is None
     ):
-        classified = _classify_and_stamp(
+        classify_outcome = _classify_and_stamp(
             db,
             attempt_id=attempt.id,
             message=message,
             thread_id=thread.id,
             user_id=thread.user_id,
         )
+        classified = classify_outcome in (_OUTCOME_CLASSIFIED, _OUTCOME_ALREADY_CLASSIFIED)
+        left_unclassified = classify_outcome == _OUTCOME_NO_VERDICT
     elif attempt.provider == "gmail" and attempt.verified_at is None:
         # Gmail normally stamps verified_at in the send completion
         # transaction (our assembled MIME IS what sync later normalizes,
@@ -289,6 +378,7 @@ def _reconcile_one_attempt(
         db.commit()
 
     outcome["classified"] = classified
+    outcome["left_unclassified"] = left_unclassified
     return outcome
 
 
@@ -316,6 +406,13 @@ def run_reconciliation_pass(
         )
         completed = 0
         classified = 0
+        # Phase 2 (Codex review, D-C/D-I): forwarded into ingest's own
+        # `stats["left_unclassified"]` at both outlook_ingest.py call sites
+        # -- previously this pass's own no-verdict outcomes were silently
+        # dropped, invisible to the ingest toast/auto-sync warning even
+        # though the page-loop's own `_upsert_page_messages` counter already
+        # reported the analogous case.
+        left_unclassified = 0
         for attempt_id in attempt_ids:
             try:
                 outcome = _reconcile_one_attempt(
@@ -332,14 +429,17 @@ def run_reconciliation_pass(
             completed += 1
             if outcome.get("classified"):
                 classified += 1
+            if outcome.get("left_unclassified"):
+                left_unclassified += 1
         return {
             "attempts_checked": len(attempt_ids),
             "completed": completed,
             "classified": classified,
+            "left_unclassified": left_unclassified,
         }
     except Exception:
         db.rollback()
         logger.exception(
             "reply reconciliation pass failed for account %s", provider_account_id
         )
-        return {"attempts_checked": 0, "completed": 0, "classified": 0}
+        return {"attempts_checked": 0, "completed": 0, "classified": 0, "left_unclassified": 0}

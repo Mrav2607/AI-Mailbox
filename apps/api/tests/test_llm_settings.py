@@ -56,6 +56,7 @@ def _make_row(
     revision=1,
     last_verified_at=None,
     classification_byok=False,
+    classification_fallback_local=False,
 ):
     return SimpleNamespace(
         id=id or uuid4(),
@@ -67,6 +68,7 @@ def _make_row(
         revision=revision,
         last_verified_at=last_verified_at,
         classification_byok=classification_byok,
+        classification_fallback_local=classification_fallback_local,
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
     )
@@ -235,6 +237,7 @@ def test_get_unconfigured_returns_nulls_and_flags(monkeypatch, user):
         "private_endpoints_enabled": False,
         "custom_blocked": False,
         "classification_byok": False,
+        "classification_fallback_local": False,
         "classifier_uses_llm": True,
         "classifier_backend": "local",
         "classification_eligible": False,
@@ -470,6 +473,52 @@ def test_get_classifier_backend_fields_use_the_normalized_expression(
     body = resp.json()
     assert body["classifier_backend"] == expected_backend
     assert body["classifier_uses_llm"] is expected_uses_llm
+
+
+# ---------------------------------------------------------------------------
+# GET -- classification_fallback_local (Phase 2: LLM failure opt-in)
+# ---------------------------------------------------------------------------
+
+
+def test_get_classification_fallback_local_defaults_false_on_a_stored_row(monkeypatch, user):
+    row = _make_row(user_id=user.id, provider="openai")  # default classification_fallback_local=False
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=True, source="user"),
+    )
+    body = TestClient(app).get("/api/v1/settings/llm").json()
+    assert body["classification_fallback_local"] is False
+
+
+def test_get_classification_fallback_local_reflects_the_stored_row(monkeypatch, user):
+    row = _make_row(user_id=user.id, provider="openai", classification_fallback_local=True)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=True, source="user"),
+    )
+    body = TestClient(app).get("/api/v1/settings/llm").json()
+    assert body["classification_fallback_local"] is True
+
+
+def test_get_classification_fallback_local_true_even_when_byok_is_off(monkeypatch, user):
+    # Inert but not clobbered -- a user can set this before flipping BYOK on.
+    row = _make_row(
+        user_id=user.id, provider="openai",
+        classification_byok=False, classification_fallback_local=True,
+    )
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=True, source="user"),
+    )
+    body = TestClient(app).get("/api/v1/settings/llm").json()
+    assert body["classification_byok"] is False
+    assert body["classification_fallback_local"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1213,6 +1262,156 @@ def test_put_response_carries_every_new_field_on_update(monkeypatch, user):
     assert body["classifier_backend"] == "auto"
     assert body["classification_eligible"] is True
     assert row.classification_byok is True
+
+
+# ---------------------------------------------------------------------------
+# PUT -- classification_fallback_local (Phase 2: LLM failure opt-in)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_value", [1, 0, "true", "false", ["true"], {"on": True}],
+    ids=["one", "zero", "str-true", "str-false", "list", "dict"],
+)
+def test_put_classification_fallback_local_non_bool_is_422(user, bad_value):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "api_key": "sk-abcdefgh",
+            "model": "m",
+            "classification_fallback_local": bad_value,
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "classification_fallback_local must be a boolean"}
+    assert db.commits == 0
+
+
+def test_put_classification_fallback_local_absent_defaults_false_on_create(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": "sk-abcdefgh", "model": "m"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["classification_fallback_local"] is False
+    assert db.added[0].classification_fallback_local is False
+
+
+def test_put_classification_fallback_local_true_persists_on_create(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "api_key": "sk-abcdefgh",
+            "model": "m",
+            "classification_fallback_local": True,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["classification_fallback_local"] is True
+    assert db.added[0].classification_fallback_local is True
+
+
+def test_put_classification_fallback_local_absent_is_unchanged_on_update(user):
+    row = _make_row(user_id=user.id, provider="openai", classification_fallback_local=True)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": "sk-new-key-1234", "model": "new-model"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["classification_fallback_local"] is True
+    assert row.classification_fallback_local is True
+
+
+def test_put_classification_fallback_local_true_persists_even_when_byok_is_false(user):
+    # D-C in the frozen contract: setting this while classification_byok is
+    # false is allowed but inert -- it must be stored as given, never
+    # coerced to False or silently rejected just because BYOK isn't on.
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "api_key": "sk-abcdefgh",
+            "model": "m",
+            "classification_byok": False,
+            "classification_fallback_local": True,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["classification_byok"] is False
+    assert body["classification_fallback_local"] is True
+    assert db.added[0].classification_byok is False
+    assert db.added[0].classification_fallback_local is True
+
+
+def test_put_classification_fallback_local_true_persists_with_custom_provider(monkeypatch, user):
+    # classification_byok force-clears to False for `custom` (presets-only
+    # in v1), but classification_fallback_local carries no such restriction
+    # -- it's independent of provider, only meaningful once BYOK is back on
+    # a preset.
+    db = _CredentialDB()
+    _override(user, db)
+    monkeypatch.setattr(settings, "llm_custom_endpoints_enabled", True)
+
+    async def _normalize(url):
+        return "https://llm.example/v1"
+
+    monkeypatch.setattr(llm_settings, "validate_custom_base_url_async", _normalize)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "custom",
+            "api_key": "sk-abcdefgh",
+            "model": "m",
+            "base_url": "https://llm.example/v1",
+            "classification_fallback_local": True,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["classification_byok"] is False
+    assert body["classification_fallback_local"] is True
+    assert db.added[0].classification_fallback_local is True
+
+
+def test_put_classification_fallback_local_flag_only_edit_leaves_last_verified_at_untouched(user):
+    verified_at = datetime.now(timezone.utc)
+    row = _make_row(
+        user_id=user.id,
+        provider="openai",
+        model="gpt-4o-mini",
+        revision=3,
+        last_verified_at=verified_at,
+        classification_fallback_local=False,
+    )
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "classification_fallback_local": True,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["classification_fallback_local"] is True
+    assert body["last_verified_at"] is not None
+    assert row.last_verified_at == verified_at
+    assert row.revision == 4
 
 
 # ---------------------------------------------------------------------------

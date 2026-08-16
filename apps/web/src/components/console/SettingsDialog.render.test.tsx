@@ -3,7 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SettingsDialog, type SettingsTab } from "./SettingsDialog";
-import type { Connection, LlmSettings, LlmUsage } from "@/lib/types";
+import type { Connection, LlmProvider, LlmSettings, LlmUsage } from "@/lib/types";
 import type { SyncHealth } from "@/lib/api";
 
 function makeConnection(overrides: Partial<Connection> = {}): Connection {
@@ -33,6 +33,7 @@ function makeSettings(overrides: Partial<LlmSettings> = {}): LlmSettings {
     private_endpoints_enabled: true,
     custom_blocked: false,
     classification_byok: false,
+    classification_fallback_local: false,
     classifier_uses_llm: true,
     classifier_backend: "heuristic",
     classification_eligible: true,
@@ -86,6 +87,16 @@ function findButton(text: string): HTMLButtonElement {
   return btn as HTMLButtonElement;
 }
 
+function findCheckboxByLabelText(text: string): HTMLInputElement {
+  const label = Array.from(document.body.querySelectorAll("label")).find((l) =>
+    l.textContent?.includes(text),
+  );
+  if (!label) throw new Error(`checkbox label containing "${text}" not found`);
+  const input = label.querySelector('input[type="checkbox"]');
+  if (!input) throw new Error(`no checkbox inside label containing "${text}"`);
+  return input as HTMLInputElement;
+}
+
 function Harness({
   initialTab = "accounts",
   connections = [],
@@ -97,6 +108,7 @@ function Harness({
   onDisconnect = vi.fn(),
   onConnectionUpdated = vi.fn(),
   onRetrySettings = vi.fn(),
+  onSave = vi.fn(),
 }: {
   initialTab?: SettingsTab;
   connections?: Connection[];
@@ -108,6 +120,14 @@ function Harness({
   onDisconnect?: (id: string) => void;
   onConnectionUpdated?: (c: Connection) => void;
   onRetrySettings?: () => void;
+  onSave?: (input: {
+    provider: LlmProvider;
+    api_key?: string;
+    model: string;
+    base_url?: string;
+    classification_byok?: boolean;
+    classification_fallback_local?: boolean;
+  }) => void;
 }) {
   const [open, setOpen] = useState(true);
   const [tab, setTab] = useState<SettingsTab>(initialTab);
@@ -126,7 +146,7 @@ function Harness({
       settings={settings}
       settingsError={settingsError}
       onRetrySettings={onRetrySettings}
-      onSave={vi.fn()}
+      onSave={onSave}
       saving={false}
       onTest={vi.fn()}
       testing={false}
@@ -271,6 +291,102 @@ describe("SettingsDialog ai tab", () => {
     expect(usageTabBtn.getAttribute("aria-pressed")).toBe("true");
     const usageMarker = document.body.querySelector('[role="group"][aria-label="usage window"]')!;
     expect(isHiddenByAncestry(usageMarker)).toBe(false);
+  });
+});
+
+describe("SettingsDialog ai tab LLM-failure fallback toggle", () => {
+  it("does not render the fallback toggle when classification_byok is off", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings({ classification_byok: false })}
+          usage={makeUsage()}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).not.toContain(
+      "If your LLM fails, classify with the built-in model instead",
+    );
+  });
+
+  it("renders the fallback toggle, and its two-sentence copy, once classification_byok is on", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings({
+            classification_byok: true,
+            classification_fallback_local: false,
+          })}
+          usage={makeUsage()}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain(
+      "If your LLM fails, classify with the built-in model instead",
+    );
+    expect(document.body.textContent).toContain(
+      "Off means affected mail stays unclassified until you run a backfill.",
+    );
+    expect(findCheckboxByLabelText("If your LLM fails").checked).toBe(false);
+  });
+
+  it("saves the toggled value through onSave", async () => {
+    const onSave = vi.fn();
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings({
+            classification_byok: true,
+            classification_fallback_local: false,
+          })}
+          usage={makeUsage()}
+          onSave={onSave}
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    const toggle = findCheckboxByLabelText("If your LLM fails");
+    act(() => {
+      toggle.click();
+    });
+    expect(toggle.checked).toBe(true);
+
+    act(() => {
+      findButton("save").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(onSave.mock.calls[0][0]).toMatchObject({ classification_fallback_local: true });
+  });
+
+  it("hides the toggle again if classification_byok gets unchecked before saving", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings({
+            classification_byok: true,
+            classification_fallback_local: true,
+          })}
+          usage={makeUsage()}
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    const byokToggle = findCheckboxByLabelText("Also use my key to sort incoming mail");
+    act(() => {
+      byokToggle.click();
+    });
+    expect(document.body.textContent).not.toContain(
+      "If your LLM fails, classify with the built-in model instead",
+    );
   });
 });
 

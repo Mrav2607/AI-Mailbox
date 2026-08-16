@@ -458,10 +458,17 @@ class ClassificationRouting:
     "use the operator's server key", so an optional type would silently bill
     the operator for a user whose credential just became blocked or
     ineligible. `credential` is set if and only if `mode == "user"`.
+
+    `fallback_local` (plan: 2026-08-14-llm-failure-visibility phase 2, D-A/
+    D-H) is the user's opt-in to serve the local encoder when their own LLM
+    call fails. Only meaningful for `mode == "user"`; stays at its default
+    `False` for `server`/`off` -- there's no BYOK failure to fall back from
+    on either of those.
     """
 
     mode: str  # "user" | "server" | "off"
     credential: LlmCredential | None
+    fallback_local: bool = False
 
 
 def resolve_classification_routing(db: Session, user_id: UUID) -> ClassificationRouting:
@@ -473,11 +480,15 @@ def resolve_classification_routing(db: Session, user_id: UUID) -> Classification
     Two-step read, and the ORDER is a security requirement, not an
     optimization:
 
-    1. Project ONLY `(provider, classification_byok)` -- never select the
-       whole entity here. `api_key` is `EncryptedText`, which transparently
-       DECRYPTS on row materialization; selecting the entity just to read a
-       boolean would decrypt the plaintext key of every extraction-only user,
-       in every active ingest worker, once a minute.
+    1. Project ONLY `(provider, classification_byok, classification_
+       fallback_local)` -- never select the whole entity here. `api_key` is
+       `EncryptedText`, which transparently DECRYPTS on row materialization;
+       selecting the entity just to read two booleans would decrypt the
+       plaintext key of every extraction-only user, in every active ingest
+       worker, once a minute. `classification_fallback_local` rides along in
+       this projection but isn't branched on here -- only `mode == "user"`
+       cares about it, and step 2 re-reads it fresh for that case anyway
+       (see below), same reasoning as the credential fields.
     2. Only when step 1 says opted-in AND the provider is a preset, issue a
        SECOND read that re-asserts every condition in its OWN WHERE clause
        (`user_id` AND `classification_byok IS true` AND `provider IN
@@ -514,9 +525,11 @@ def resolve_classification_routing(db: Session, user_id: UUID) -> Classification
     a silent wrong-payer decision.
     """
     projection = db.execute(
-        select(UserLlmCredential.provider, UserLlmCredential.classification_byok).where(
-            UserLlmCredential.user_id == user_id
-        )
+        select(
+            UserLlmCredential.provider,
+            UserLlmCredential.classification_byok,
+            UserLlmCredential.classification_fallback_local,
+        ).where(UserLlmCredential.user_id == user_id)
     ).first()
 
     if projection is None or not projection.classification_byok:
@@ -531,6 +544,7 @@ def resolve_classification_routing(db: Session, user_id: UUID) -> Classification
             UserLlmCredential.base_url,
             UserLlmCredential.api_key,
             UserLlmCredential.model,
+            UserLlmCredential.classification_fallback_local,
         ).where(
             UserLlmCredential.user_id == user_id,
             UserLlmCredential.classification_byok.is_(True),
@@ -544,7 +558,9 @@ def resolve_classification_routing(db: Session, user_id: UUID) -> Classification
     credential = LlmCredential(
         provider=row.provider, base_url=row.base_url, api_key=row.api_key, model=row.model
     )
-    return ClassificationRouting(mode="user", credential=credential)
+    return ClassificationRouting(
+        mode="user", credential=credential, fallback_local=row.classification_fallback_local
+    )
 
 
 class ClassificationRouter:

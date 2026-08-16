@@ -74,7 +74,12 @@ import { ALL_LABELS } from "@/lib/types";
 import { toast } from "sonner";
 import { createLiveSearch, type LiveSearchController } from "@/lib/live-search";
 import { emailLocalPart } from "@/lib/sender";
-import { backfillToastOutcome, extractionToastOutcome } from "@/lib/task-toasts";
+import {
+  backfillToastOutcome,
+  extractionToastOutcome,
+  ingestToastOutcome,
+  type ToastOutcome,
+} from "@/lib/task-toasts";
 
 import { LandingPage } from "@/components/landing/LandingPage";
 import { AgendaList } from "@/components/console/AgendaList";
@@ -182,6 +187,19 @@ function formatSyncTime(iso: string | null): string {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}h ago`;
   return `${Math.floor(hours / 24)}d ago`;
+}
+
+// Maps a task-toasts ToastOutcome level to the matching sonner call --
+// centralized here so every result-summarizing call site (trackTask,
+// doBackfill, doIngest) picks the right toast function the same way.
+function fireToast(
+  level: ToastOutcome["level"],
+  message: string,
+  opts?: Parameters<typeof toast.success>[1],
+) {
+  if (level === "error") return toast.error(message, opts);
+  if (level === "warning") return toast.warning(message, opts);
+  return toast.success(message, opts);
 }
 
 export default function Console() {
@@ -2211,10 +2229,11 @@ export default function Console() {
     async (
       taskId: string,
       label: string,
-      // A plain string is always a clean success; return { warn: true } to
-      // route through toast.warning instead when the result carries any LLM
-      // degradation (docs/plans/2026-08-14-llm-failure-visibility-plan.md).
-      summarize: (res: TaskResult) => string | { message: string; warn: boolean },
+      // A plain string is always a clean success; return a ToastOutcome to
+      // route through toast.warning/toast.error instead when the result
+      // carries LLM degradation or (phase 2) an outright stop
+      // (docs/plans/2026-08-14-llm-failure-visibility-plan.md).
+      summarize: (res: TaskResult) => string | ToastOutcome,
     ) => {
       const t = toast.loading(`${label} running…`);
       const final = await waitForTask(taskId, {
@@ -2233,9 +2252,11 @@ export default function Console() {
         toast.message(`${label} still running — showing what's landed so far`, { id: t });
       } else {
         const summary = summarize(res ?? {});
-        const { message, warn } =
-          typeof summary === "string" ? { message: summary, warn: false } : summary;
-        (warn ? toast.warning : toast.success)(message, { id: t });
+        const { message, level } =
+          typeof summary === "string"
+            ? { message: summary, level: "success" as const }
+            : summary;
+        fireToast(level, message, { id: t });
       }
       await refreshAll();
     },
@@ -2292,8 +2313,12 @@ export default function Console() {
           await refreshAll({ quiet: true });
           return;
         }
-        const { threads, messages } = sumIngestResults(finals);
-        toast.success(`ingest complete · ${threads} threads · ${messages} msgs`);
+        const { threads, messages, leftUnclassified } = sumIngestResults(finals);
+        const { message, level } = ingestToastOutcome(
+          { left_unclassified: leftUnclassified },
+          `ingest complete · ${threads} threads · ${messages} msgs`,
+        );
+        fireToast(level, message);
         await refreshAll();
         if (user) broadcastSyncComplete(user.id);
         // A deliberate pull acknowledges everything it just surfaced.
@@ -2323,11 +2348,11 @@ export default function Console() {
           );
           return;
         }
-        const { message, warn } = backfillToastOutcome(
+        const { message, level } = backfillToastOutcome(
           r,
           `classified ${r.created} · scanned ${r.scanned}`,
         );
-        (warn ? toast.warning : toast.success)(message);
+        fireToast(level, message);
         await refreshAll();
       } catch (e) {
         toast.error((e as Error).message ?? "backfill failed");

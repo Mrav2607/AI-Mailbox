@@ -161,10 +161,14 @@ export interface BackfillOptions {
 // llm_attempted/llm_failed/fell_back/failure_categories are always present
 // on a current API (0 / {} when nothing applies) but stay optional here so a
 // stale/older API response still parses instead of breaking the toast --
-// same convention as skipped_user_overrides above.
+// same convention as skipped_user_overrides above. left_unclassified is the
+// same deal, added in phase 2 (docs/plans/2026-08-14-llm-failure-visibility-
+// plan.md): "ok" is unchanged, "llm_unavailable" is new -- the run stopped
+// early because the LLM kept failing and this user has no fallback, so
+// created/scanned only cover what happened before it gave up.
 export type BackfillResult =
   | {
-      status: "ok";
+      status: "ok" | "llm_unavailable";
       created: number;
       scanned: number;
       skipped_user_overrides: number;
@@ -172,6 +176,7 @@ export type BackfillResult =
       llm_failed?: number;
       fell_back?: number;
       failure_categories?: Record<string, number>;
+      left_unclassified?: number;
     }
   | { status: "queued"; task_id: string };
 
@@ -313,6 +318,13 @@ export interface LlmSettings {
   // Per-credential opt-in: does this user's key also pay for classification
   // (every ingested message), not just extraction? False when unconfigured.
   classification_byok: boolean;
+  // When a user-mode classification call to this user's LLM fails, fall back
+  // to the built-in local encoder instead of leaving the message
+  // unclassified (docs/plans/2026-08-14-llm-failure-visibility-plan.md
+  // phase 2). Only meaningful while classification_byok is on -- the UI
+  // only offers this toggle then. A true opt-in: false by default, and
+  // false when unconfigured.
+  classification_fallback_local: boolean;
   // Whether the effective classifier backend ever reaches an LLM at all --
   // gates the opt-in checkbox itself, since a heuristic-only deployment has
   // no LLM path for the key to pay for.

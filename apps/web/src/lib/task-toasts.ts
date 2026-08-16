@@ -40,11 +40,20 @@ function appendDominantLabel(message: string, categories?: Record<string, number
 
 export interface ToastOutcome {
   message: string;
-  // true routes the caller to toast.warning instead of toast.success.
-  warn: boolean;
+  // Which sonner toast function the caller should fire. "warning" covers
+  // every degraded-but-completed run (unchanged from phase 1); "error" is
+  // new in phase 2 -- only backfillToastOutcome's llm_unavailable case
+  // reaches it, since that's the one outcome where the run stopped instead
+  // of degrading.
+  level: "success" | "warning" | "error";
 }
 
 export interface BackfillToastInput {
+  // New in phase 2 (docs/plans/2026-08-14-llm-failure-visibility-plan.md):
+  // "llm_unavailable" means the run stopped early because the LLM kept
+  // failing and this user has no local-model fallback configured. Absent/
+  // "ok" reads as today's behaviour.
+  status?: string;
   created?: number;
   fell_back?: number;
   failure_categories?: Record<string, number>;
@@ -54,18 +63,32 @@ export interface BackfillToastInput {
  * Builds the backfill result toast. `cleanMessage` is the site's own
  * unchanged success copy (the queued and inline backfill call sites use
  * slightly different wording) -- this function only decides whether that
- * copy still applies or the degraded ratio replaces it.
+ * copy still applies, the degraded ratio replaces it, or (phase 2) the run
+ * stopped outright and this becomes an error.
  *
  * Missing fields (an older API/worker result recorded before this change)
- * all default to 0, which reads as a clean run -- exactly today's behaviour.
+ * all default to 0/"ok", which reads as a clean run -- exactly today's
+ * behaviour.
  */
 export function backfillToastOutcome(
   res: BackfillToastInput,
   cleanMessage: string,
 ): ToastOutcome {
-  const fellBack = res.fell_back ?? 0;
-  if (fellBack <= 0) return { message: cleanMessage, warn: false };
   const created = res.created ?? 0;
+  // D-C: no fallback configured, so the run stopped the moment the LLM
+  // failed rather than keep spending a BYOK user's own quota on calls that
+  // would just fail again. The partial count still says what DID land.
+  if (res.status === "llm_unavailable") {
+    const label = dominantFailureLabel(res.failure_categories);
+    const why = label ? ` — ${label}` : "";
+    const message =
+      `backfill stopped early · ${created} classified so far${why} — turn on the ` +
+      `built-in-model fallback in AI settings, or run backfill again once your ` +
+      `provider recovers`;
+    return { message, level: "error" };
+  }
+  const fellBack = res.fell_back ?? 0;
+  if (fellBack <= 0) return { message: cleanMessage, level: "success" };
   // "N of those" rather than "N of M": fell_back is a SUBSET of what was
   // classified, and reading it as a separate total would double the apparent
   // work. A literal `${fellBack} of ${created}` would be worse -- a user
@@ -75,7 +98,7 @@ export function backfillToastOutcome(
     `classified ${created} · ${fellBack} of those fell back to the built-in model`,
     res.failure_categories,
   );
-  return { message, warn: true };
+  return { message, level: "warning" };
 }
 
 export interface ExtractionToastInput {
@@ -94,11 +117,37 @@ export function extractionToastOutcome(res: ExtractionToastInput): ToastOutcome 
   const failed = res.failed ?? 0;
   const extracted = res.extracted ?? 0;
   if (failed <= 0) {
-    return { message: `action extraction complete · ${extracted} extracted`, warn: false };
+    return { message: `action extraction complete · ${extracted} extracted`, level: "success" };
   }
   const message = appendDominantLabel(
     `action extraction · ${extracted} extracted · ${failed} failed`,
     res.failure_categories,
   );
-  return { message, warn: true };
+  return { message, level: "warning" };
+}
+
+// Plain-words remedy for the ingest/sync toast (phase 2, same plan). Shared
+// by the manual ingest button and the background auto-sync loop so the
+// wording can't drift between the two call sites.
+export function leftUnclassifiedMessage(count: number): string {
+  return `${count} left unclassified — run backfill when your provider recovers`;
+}
+
+export interface IngestToastInput {
+  left_unclassified?: number;
+}
+
+/**
+ * Builds the ingest/sync result toast. `cleanMessage` is the call site's own
+ * unchanged success copy -- this only decides whether it still applies or a
+ * "left unclassified" warning gets appended.
+ *
+ * Missing/zero left_unclassified (an older API, or an account that isn't on
+ * BYOK classification at all) reads as a clean run, same convention as
+ * backfillToastOutcome/extractionToastOutcome above.
+ */
+export function ingestToastOutcome(res: IngestToastInput, cleanMessage: string): ToastOutcome {
+  const left = res.left_unclassified ?? 0;
+  if (left <= 0) return { message: cleanMessage, level: "success" };
+  return { message: `${cleanMessage} · ${leftUnclassifiedMessage(left)}`, level: "warning" };
 }

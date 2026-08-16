@@ -51,15 +51,23 @@ def classify_message(message_id: str) -> dict:
         # resolve once, directly.
         routing = resolve_classification_routing(db, thread.user_id) if thread else None
         attempt = classify_with_usage(text_for_classification, routing=routing)
-        label, confidence, rationale, model_version = attempt.verdict
-        outcome = upsert_classification(
-            db,
-            message_id=message.id,
-            label=label,
-            confidence=confidence,
-            rationale=rationale,
-            model_version=model_version,
-        )
+        # Phase 2 (D-C): `verdict is None` means the BYOK call failed and the
+        # user hasn't opted into local fallback (or the encoder couldn't
+        # serve either) -- skip the write entirely so the message stays a
+        # backfill candidate, never a stranded null-label row.
+        verdict = attempt.verdict
+        outcome = None
+        label = confidence = None
+        if verdict is not None:
+            label, confidence, rationale, model_version = verdict
+            outcome = upsert_classification(
+                db,
+                message_id=message.id,
+                label=label,
+                confidence=confidence,
+                rationale=rationale,
+                model_version=model_version,
+            )
 
         # Only a resolved "user" payer gets recorded -- operator-paid usage
         # is an explicit v1 non-goal (plan §1), and a threadless message has
@@ -108,6 +116,8 @@ def classify_message(message_id: str) -> dict:
         # happen.
         if outcome == "protected":
             return {"message_id": message_id, "status": "skipped_user_override"}
+        if verdict is None:
+            return {"message_id": message_id, "status": "left_unclassified"}
         return {"message_id": message_id, "label": label, "confidence": confidence}
 
 
@@ -175,6 +185,7 @@ def classify_latest_threads(
         "llm_failed": result["llm_failed"],
         "fell_back": result["fell_back"],
         "failure_categories": result["failure_categories"],
+        "left_unclassified": result["left_unclassified"],
     }
 
 

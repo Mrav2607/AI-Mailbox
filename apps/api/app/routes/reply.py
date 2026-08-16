@@ -411,7 +411,6 @@ def _classify_gmail_message_best_effort(
         router = ClassificationRouter(user_id)
         routing = router.routing_for(db)
         attempt_result = classify_with_usage(text_for_classification, routing=routing)
-        label, confidence, rationale, model_version = attempt_result.verdict
         if routing.mode == "user" and routing.credential is not None:
             acc = UsageAccumulator(user_id)
             acc.record(
@@ -421,14 +420,21 @@ def _classify_gmail_message_best_effort(
                 provider_call_succeeded=attempt_result.provider_call_succeeded,
             )
             acc.flush(db)
-        upsert_classification(
-            db,
-            message_id=message.id,
-            label=label,
-            confidence=confidence,
-            rationale=rationale,
-            model_version=model_version,
-        )
+        # Phase 2 (D-C): `verdict is None` means a failed BYOK call with no
+        # local fallback served -- skip the write so the message stays a
+        # backfill candidate instead of a stranded null-label row. Usage
+        # above still records/commits: the call may have genuinely billed
+        # the user even though it produced nothing to classify with.
+        if attempt_result.verdict is not None:
+            label, confidence, rationale, model_version = attempt_result.verdict
+            upsert_classification(
+                db,
+                message_id=message.id,
+                label=label,
+                confidence=confidence,
+                rationale=rationale,
+                model_version=model_version,
+            )
         db.commit()
     except Exception:
         db.rollback()

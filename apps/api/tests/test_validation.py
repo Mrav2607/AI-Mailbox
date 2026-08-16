@@ -131,6 +131,7 @@ def test_backfill_valid_params_pass_validation(client):
         "llm_failed": 0,
         "fell_back": 0,
         "failure_categories": {},
+        "left_unclassified": 0,
     }
 
 

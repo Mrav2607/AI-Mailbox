@@ -208,6 +208,11 @@ class BackfillDone(Response):
     llm_failed: int = 0
     fell_back: int = 0
     failure_categories: dict[str, int] = {}
+    # Phase 2 (plan: 2026-08-14-llm-failure-visibility, D-C/D-I) -- messages
+    # this run left unclassified rather than downgrading to the keyword
+    # heuristic. Defaulted the same way as the fields above, so an old
+    # Celery result recorded before this change still parses.
+    left_unclassified: int = 0
 
 
 class Queued(Response):

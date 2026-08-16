@@ -693,6 +693,10 @@ export interface TaskResult {
   extracted?: number;
   failed?: number;
   failure_categories?: Record<string, number>;
+  // Phase 2 of the same plan: mail a run left unclassified because the LLM
+  // failed and this user has no fallback configured. Backfill and ingest
+  // both report it; optional so an older API/worker result still parses.
+  left_unclassified?: number;
 }
 
 export interface SyncRunStatus {
@@ -781,13 +785,15 @@ export function allRunsDeduplicated(runs: SyncRunStatus[]): boolean {
 export function sumIngestResults(finals: SyncRunStatus[]): {
   threads: number;
   messages: number;
+  leftUnclassified: number;
 } {
   return finals.reduce(
     (acc, f) => ({
       threads: acc.threads + (f.result?.threads_upserted ?? f.result?.new_threads ?? 0),
       messages: acc.messages + (f.result?.messages_upserted ?? 0),
+      leftUnclassified: acc.leftUnclassified + (f.result?.left_unclassified ?? 0),
     }),
-    { threads: 0, messages: 0 },
+    { threads: 0, messages: 0, leftUnclassified: 0 },
   );
 }
 
@@ -1029,6 +1035,11 @@ export async function putLlmSettings(input: {
   // unchecked it, so an update to an unrelated field never silently revokes
   // a standing opt-in.
   classification_byok?: boolean;
+  // Same absent-means-unchanged rule as classification_byok above. The
+  // server accepts this even when classification_byok is false -- it's just
+  // inert until byok is on (docs/plans/2026-08-14-llm-failure-visibility-
+  // plan.md phase 2).
+  classification_fallback_local?: boolean;
 }): Promise<LlmSettings> {
   if (USE_MOCK) {
     await new Promise((r) => setTimeout(r, 150));

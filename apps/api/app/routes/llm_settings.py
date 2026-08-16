@@ -142,6 +142,9 @@ def _settings_payload(
         "private_endpoints_enabled": bool(settings.llm_private_endpoints_enabled),
         "custom_blocked": resolved.blocked_reason is not None,
         "classification_byok": bool(row.classification_byok) if row is not None else False,
+        "classification_fallback_local": (
+            bool(row.classification_fallback_local) if row is not None else False
+        ),
         "classifier_uses_llm": classifier_uses_llm,
         "classifier_backend": backend,
         "classification_eligible": classification_eligible,
@@ -431,6 +434,7 @@ async def put_llm_settings(
     model = payload.get("model")
     base_url_input = payload.get("base_url")
     classification_byok_input = payload.get("classification_byok")
+    classification_fallback_local_input = payload.get("classification_fallback_local")
 
     if not isinstance(provider, str):
         raise HTTPException(status_code=422, detail="provider must be a string")
@@ -438,6 +442,12 @@ async def put_llm_settings(
         raise HTTPException(status_code=422, detail="model must be a string")
     if classification_byok_input is not None and not isinstance(classification_byok_input, bool):
         raise HTTPException(status_code=422, detail="classification_byok must be a boolean")
+    if classification_fallback_local_input is not None and not isinstance(
+        classification_fallback_local_input, bool
+    ):
+        raise HTTPException(
+            status_code=422, detail="classification_fallback_local must be a boolean"
+        )
 
     # Absent OR explicit null api_key both mean "keep the stored one" -- the
     # server never echoes the raw key back, so that's the ONLY way to edit
@@ -503,6 +513,21 @@ async def put_llm_settings(
             value = False
         return False if provider == "custom" else value
 
+    def _resolve_classification_fallback_local(existing: UserLlmCredential | None) -> bool:
+        """Same absent-preserves convention as `_resolve_classification_byok`:
+        absent means false on create, unchanged on update. Unlike that flag,
+        this one is never forced by provider or by `classification_byok`
+        itself -- it's simply inert until `classification_byok` is also true
+        (see the model's own docstring), so writing it while BYOK is off (or
+        while the provider is `custom`) is allowed and persisted exactly as
+        given, never coerced or reset.
+        """
+        if classification_fallback_local_input is not None:
+            return classification_fallback_local_input
+        if existing is not None:
+            return bool(existing.classification_fallback_local)
+        return False
+
     # FOR UPDATE before the read-then-branch: two concurrent PUTs for the
     # same user otherwise both read the same revision and bump it only
     # once, weakening the id+revision guard /test relies on. The lock
@@ -526,9 +551,9 @@ async def put_llm_settings(
         raise HTTPException(status_code=422, detail="api_key must be a string")
 
     def _apply_update(target: UserLlmCredential) -> None:
-        # Read BEFORE mutating -- both `_resolve_classification_byok` and
-        # `material_changed` need `target`'s state as it stood before this
-        # write. A flag-only edit (no new key, same provider/base_url/model)
+        # Read BEFORE mutating -- both flag resolvers and `material_changed`
+        # need `target`'s state as it stood before this write. A flag-only
+        # edit (no new key, same provider/base_url/model)
         # must NOT clear last_verified_at -- that'd be a confusing "your
         # verified key just went unverified" regression for a save that
         # didn't touch the credential itself.
@@ -539,6 +564,7 @@ async def put_llm_settings(
             or target.model != model
         )
         target.classification_byok = _resolve_classification_byok(target)
+        target.classification_fallback_local = _resolve_classification_fallback_local(target)
         target.provider = provider
         target.base_url = base_url
         target.api_key = effective_api_key
@@ -564,6 +590,7 @@ async def put_llm_settings(
             api_key=effective_api_key,
             model=model,
             classification_byok=_resolve_classification_byok(None),
+            classification_fallback_local=_resolve_classification_fallback_local(None),
             revision=1,
         )
         row.updated_at = now
@@ -627,6 +654,7 @@ async def put_llm_settings(
         "private_endpoints_enabled": bool(settings.llm_private_endpoints_enabled),
         "custom_blocked": False,
         "classification_byok": bool(row.classification_byok),
+        "classification_fallback_local": bool(row.classification_fallback_local),
         "classifier_uses_llm": classifier_uses_llm,
         "classifier_backend": backend,
         "classification_eligible": eligible,

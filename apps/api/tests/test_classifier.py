@@ -573,9 +573,11 @@ def test_classify_routing_user_mode_with_no_credential_falls_back_to_heuristic(m
     assert model_version == "heuristic-v1"  # direct heuristic, not "-fallback"
 
 
-def test_classify_routing_user_mode_falls_back_to_heuristic_on_call_error(monkeypatch):
+def test_classify_routing_user_mode_no_opt_in_yields_no_verdict_on_call_error(monkeypatch):
     # Forces the encoder unavailable so this pins the "nothing can serve"
     # tail of D2's fallback chain -- case 9 covers the encoder-available half.
+    # Updated for phase 2 (D-H): the heuristic no longer serves this at all;
+    # with fallback_local at its default False, classify() returns None.
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
@@ -588,17 +590,18 @@ def test_classify_routing_user_mode_falls_back_to_heuristic_on_call_error(monkey
         raise LlmCallError("connection_failed", None)
 
     monkeypatch.setattr(classifier, "call_chat_completion", failing_call)
-    routing = ClassificationRouting(mode="user", credential=credential)
-    label, confidence, rationale, model_version = classify(
-        "Security alert: new login detected", routing=routing
-    )
-    assert label == "security_alert"
-    assert model_version == "heuristic-fallback"
+    routing = ClassificationRouting(mode="user", credential=credential)  # fallback_local=False
+    result = classify("Security alert: new login detected", routing=routing)
+    assert result is None
 
 
-def test_classify_routing_user_mode_falls_back_to_heuristic_on_unparseable_response(monkeypatch):
+def test_classify_routing_user_mode_no_opt_in_yields_no_verdict_on_unparseable_response(
+    monkeypatch,
+):
     # Forces the encoder unavailable so this pins the "nothing can serve"
     # tail of D2's fallback chain -- case 10 covers the encoder-available half.
+    # Updated for phase 2 (D-H): the heuristic no longer serves this at all;
+    # with fallback_local at its default False, classify() returns None.
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
@@ -612,12 +615,9 @@ def test_classify_routing_user_mode_falls_back_to_heuristic_on_unparseable_respo
         classifier, "call_chat_completion",
         lambda *a, **k: LlmCallResult(content="not json at all", usage=None),
     )
-    routing = ClassificationRouting(mode="user", credential=credential)
-    label, confidence, rationale, model_version = classify(
-        "Invoice #1842 is due Friday", routing=routing
-    )
-    assert label == "action_required"
-    assert model_version == "heuristic-fallback"
+    routing = ClassificationRouting(mode="user", credential=credential)  # fallback_local=False
+    result = classify("Invoice #1842 is due Friday", routing=routing)
+    assert result is None
 
 
 def test_classify_precedence_heuristic_backend_ignores_user_routing(monkeypatch):
@@ -795,8 +795,12 @@ def test_classify_with_usage_user_mode_real_preflight_rejection_never_attempted_
     actual call_chat_completion (not classifier.call_chat_completion mocked
     away) through a fake pin_custom_destination that raises
     DestinationRejected. blocked_by_policy rejects BEFORE any request
-    leaves the process, so llm_attempted must be False even though a
-    fallback genuinely did serve the verdict (Codex review)."""
+    leaves the process, so llm_attempted must be False.
+
+    Updated for phase 2 (D-H): the encoder is forced unavailable and the
+    user hasn't opted into local fallback, so nothing serves this failure
+    anymore -- verdict is None and fallback_used is False, unlike the old
+    "heuristic-fallback" this used to land on (Codex review, pre-phase-2)."""
     from app.services.nlp import classifier, local_model
     from app.services.nlp import llm_client as llm_client_module
     from app.services.nlp.providers import DestinationRejected
@@ -811,14 +815,14 @@ def test_classify_with_usage_user_mode_real_preflight_rejection_never_attempted_
     credential = LlmCredential(
         provider="custom", base_url="https://ollama.example.com/v1", api_key="k", model="llama3"
     )
-    routing = ClassificationRouting(mode="user", credential=credential)
+    routing = ClassificationRouting(mode="user", credential=credential)  # fallback_local=False
 
     attempt = classify_with_usage("Security alert: new login detected", routing=routing)
 
-    assert attempt.verdict[3] == "heuristic-fallback"
+    assert attempt.verdict is None
     assert attempt.provider_call_succeeded is False
     assert attempt.llm_attempted is False
-    assert attempt.fallback_used is True
+    assert attempt.fallback_used is False
     assert attempt.failure_category == "blocked_by_policy"
 
 
@@ -850,7 +854,9 @@ def test_classify_with_usage_user_mode_counts_the_call_even_when_content_is_unpa
     answered (and billed the user) even though its content didn't parse, so
     the provider-reported usage still has to survive on `attempt.usage` --
     regardless of whether the fallback verdict ends up served by the local
-    encoder or (forced unavailable here) keyword rules, per D3."""
+    encoder or (forced unavailable here, no opt-in either) nothing at all,
+    per D3. Updated for phase 2 (D-H): with no verdict produced, `verdict` is
+    None rather than the old "heuristic-fallback" -- usage still counts."""
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
@@ -863,12 +869,12 @@ def test_classify_with_usage_user_mode_counts_the_call_even_when_content_is_unpa
         classifier, "call_chat_completion",
         lambda *a, **k: LlmCallResult(content="not json at all", usage=usage),
     )
-    routing = ClassificationRouting(mode="user", credential=credential)
+    routing = ClassificationRouting(mode="user", credential=credential)  # fallback_local=False
     attempt = classify_with_usage("Invoice #1842 is due Friday", routing=routing)
 
     assert attempt.provider_call_succeeded is True
     assert attempt.usage is usage
-    assert attempt.verdict[3] == "heuristic-fallback"
+    assert attempt.verdict is None
 
 
 def test_classify_with_usage_server_path_success_reports_call_but_no_usage(monkeypatch):
@@ -1184,7 +1190,9 @@ def test_classify_user_key_call_error_falls_back_to_encoder_not_heuristic(monkey
     with a flaky provider shouldn't get worse labels than someone who never
     opted in. The encoder's model_version carries the `+fallback` provenance
     marker (plan: 2026-08-14-llm-failure-visibility) -- without it this row
-    would be byte-identical to a healthy local-backend run."""
+    would be byte-identical to a healthy local-backend run. Requires
+    fallback_local=True (phase 2, D-A/D-H): this test's whole point is "the
+    encoder serves as fallback", which now requires the opt-in."""
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(
@@ -1198,7 +1206,7 @@ def test_classify_user_key_call_error_falls_back_to_encoder_not_heuristic(monkey
     credential = LlmCredential(
         provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
     )
-    routing = ClassificationRouting(mode="user", credential=credential)
+    routing = ClassificationRouting(mode="user", credential=credential, fallback_local=True)
     attempt = classify_with_usage(
         "Security alert: new login detected", backend="llm", routing=routing
     )
@@ -1216,7 +1224,9 @@ def test_classify_user_key_malformed_response_falls_back_to_encoder(monkeypatch)
     reflect that the provider answered and billed the user (D3) -- only the
     verdict's source changes. The encoder's model_version carries the
     `+fallback` provenance marker, and the failure is categorized as
-    `invalid_response` even though it never raised an `LlmCallError`."""
+    `invalid_response` even though it never raised an `LlmCallError`.
+    Requires fallback_local=True (phase 2, D-A/D-H): this test's whole point
+    is "the encoder serves as fallback", which now requires the opt-in."""
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(
@@ -1231,7 +1241,7 @@ def test_classify_user_key_malformed_response_falls_back_to_encoder(monkeypatch)
     credential = LlmCredential(
         provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
     )
-    routing = ClassificationRouting(mode="user", credential=credential)
+    routing = ClassificationRouting(mode="user", credential=credential, fallback_local=True)
     attempt = classify_with_usage("Invoice #1842 is due Friday", backend="llm", routing=routing)
     assert attempt.verdict == ("action_required", 0.6, "local rationale", "local:test+fallback")
     assert attempt.provider_call_succeeded is True
@@ -1241,11 +1251,15 @@ def test_classify_user_key_malformed_response_falls_back_to_encoder(monkeypatch)
     assert attempt.failure_category == "invalid_response"
 
 
-def test_classify_user_key_failure_with_encoder_unavailable_uses_heuristic_fallback(monkeypatch):
-    """Case 11 (regression guard, already holds today): when the encoder
-    can't serve either, the failure paths land on keyword rules exactly as
-    before, stamped "heuristic-fallback" -- the encoder attempt happened but
-    came up empty, unlike case 6's "never even attempted" heuristic-v1."""
+def test_classify_user_key_failure_with_encoder_unavailable_and_no_opt_in_yields_no_verdict(
+    monkeypatch,
+):
+    """Case 11, rewritten for phase 2 (D-H, plan: 2026-08-14-llm-failure-
+    visibility): the keyword heuristic left this failure chain entirely.
+    With the encoder unavailable AND `fallback_local` at its default False,
+    `classify()` returns None -- nothing is written, and the message stays
+    a backfill candidate rather than landing on "heuristic-fallback" like it
+    used to."""
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(local_model, "try_predict", lambda text: None)
@@ -1257,20 +1271,22 @@ def test_classify_user_key_failure_with_encoder_unavailable_uses_heuristic_fallb
     credential = LlmCredential(
         provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
     )
-    routing = ClassificationRouting(mode="user", credential=credential)
-    label, confidence, rationale, model_version = classify(
+    routing = ClassificationRouting(mode="user", credential=credential)  # fallback_local=False
+    result = classify(
         "Security alert: new login detected", backend="llm", routing=routing
     )
-    assert label == "security_alert"
-    assert model_version == "heuristic-fallback"
+    assert result is None
 
 
-def test_classify_explicit_auto_failure_path_tries_local_encoder_at_most_once(monkeypatch):
-    """Case 12 (D2a): under explicit backend="auto" the encoder is already
-    attempted once before the LLM call. If the LLM call then also fails, the
-    failure handler must NOT attempt the encoder a second time -- its load
-    path is expensive (unbounded torch/transformers import + model load) and
-    D2a says never twice per call."""
+def test_classify_explicit_auto_failure_path_with_no_opt_in_never_retries_encoder(monkeypatch):
+    """Case 12, rewritten for phase 2 (D2a + D-H): under explicit
+    backend="auto" the encoder is already attempted once before the LLM
+    call. If the LLM call then also fails and `fallback_local` is at its
+    default False, the failure handler returns verdict=None without ever
+    attempting the encoder a second time -- its load path is expensive
+    (unbounded torch/transformers import + model load) and D2a says never
+    twice per call, regardless of whether the opt-in would have let it try
+    again."""
     from app.services.nlp import classifier, local_model
 
     calls = []
@@ -1289,10 +1305,10 @@ def test_classify_explicit_auto_failure_path_tries_local_encoder_at_most_once(mo
         provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
     )
     routing = ClassificationRouting(mode="user", credential=credential)
-    label, confidence, rationale, model_version = classify(
+    result = classify(
         "Security alert: new login detected", backend="auto", routing=routing
     )
-    assert model_version == "heuristic-fallback"
+    assert result is None
     assert len(calls) == 1
 
 
@@ -1301,15 +1317,20 @@ def test_classify_with_usage_provider_call_succeeded_matches_whether_provider_an
     whether the LLM call reached the provider, not what ultimately produced
     the verdict. usage.py returns early when provider_call_succeeded is
     False, so an LlmCallError never emits a usage row while a malformed
-    response does -- unaffected by whether the encoder or keyword rules
-    served the fallback label."""
+    response does.
+
+    Both subcases here are default-fallback_local (False) + encoder
+    unavailable, so under D-H neither the encoder nor the keyword heuristic
+    serves a fallback anymore -- `verdict` is `None` in both (Codex review:
+    this must be asserted explicitly, not left to fall out as a side effect
+    of the usage assertions, so the matrix records every changed outcome)."""
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(local_model, "try_predict", lambda text: None)
     credential = LlmCredential(
         provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
     )
-    routing = ClassificationRouting(mode="user", credential=credential)
+    routing = ClassificationRouting(mode="user", credential=credential)  # fallback_local=False
 
     def failing_call(*args, **kwargs):
         raise LlmCallError("connection_failed", None)
@@ -1318,6 +1339,7 @@ def test_classify_with_usage_provider_call_succeeded_matches_whether_provider_an
     attempt = classify_with_usage(
         "Security alert: new login detected", backend="llm", routing=routing
     )
+    assert attempt.verdict is None
     assert attempt.provider_call_succeeded is False
     assert attempt.usage is None
 
@@ -1327,6 +1349,7 @@ def test_classify_with_usage_provider_call_succeeded_matches_whether_provider_an
         lambda *a, **k: LlmCallResult(content="not json at all", usage=usage),
     )
     attempt = classify_with_usage("Invoice #1842 is due Friday", backend="llm", routing=routing)
+    assert attempt.verdict is None
     assert attempt.provider_call_succeeded is True
     assert attempt.usage is usage
 
@@ -1351,3 +1374,109 @@ def test_classify_explicit_auto_user_mode_encoder_available_wins_over_key(monkey
     routing = ClassificationRouting(mode="user", credential=credential)
     label, confidence, rationale, model_version = classify("hi", backend="auto", routing=routing)
     assert model_version == "local:test"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (2026-08-14-llm-failure-visibility, D-A/D-C/D-H): the fallback_local
+# opt-in dimension layered on top of the precedence matrix above. Only
+# meaningful for mode="user" -- server/off must never look at it.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_fallback_local_opted_in_encoder_available_serves_with_marker(monkeypatch):
+    """Opted in + encoder available: the encoder's verdict serves, stamped
+    +fallback -- unchanged provenance marker from phase 1."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(
+        local_model, "try_predict", lambda text: ("fyi", 0.6, "local rationale", "local:test")
+    )
+
+    def failing_call(*args, **kwargs):
+        raise LlmCallError("connection_failed", None)
+
+    monkeypatch.setattr(classifier, "call_chat_completion", failing_call)
+    credential = LlmCredential(
+        provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential, fallback_local=True)
+    attempt = classify_with_usage(
+        "Security alert: new login detected", backend="llm", routing=routing
+    )
+    assert attempt.verdict == ("fyi", 0.6, "local rationale", "local:test+fallback")
+    assert attempt.fallback_used is True
+    assert attempt.llm_attempted is True
+    assert attempt.failure_category == "connection_failed"
+
+
+def test_classify_fallback_local_opted_in_encoder_unavailable_yields_no_verdict(monkeypatch):
+    """Opted in + encoder unavailable: verdict is None, NOT the heuristic
+    (D-H) -- the encoder attempt happened but came up empty, so nothing
+    fell back and `fallback_used` stays False."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
+
+    def failing_call(*args, **kwargs):
+        raise LlmCallError("connection_failed", None)
+
+    monkeypatch.setattr(classifier, "call_chat_completion", failing_call)
+    credential = LlmCredential(
+        provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential, fallback_local=True)
+    attempt = classify_with_usage(
+        "Security alert: new login detected", backend="llm", routing=routing
+    )
+    assert attempt.verdict is None
+    assert attempt.fallback_used is False
+    assert attempt.llm_attempted is True
+    assert attempt.failure_category == "connection_failed"
+
+
+def test_classify_not_opted_in_llm_failure_yields_no_verdict_even_with_healthy_encoder(
+    monkeypatch,
+):
+    """Not opted in (D-C): verdict is None even though the encoder is
+    healthy and could have served -- the opt-in gate blocks the fallback
+    outright, it isn't just about encoder availability."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(
+        local_model, "try_predict", lambda text: ("fyi", 0.6, "local rationale", "local:test")
+    )
+
+    def failing_call(*args, **kwargs):
+        raise LlmCallError("connection_failed", None)
+
+    monkeypatch.setattr(classifier, "call_chat_completion", failing_call)
+    credential = LlmCredential(
+        provider="groq", base_url="https://api.groq.com/openai/v1", api_key="k", model="llama"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)  # fallback_local=False
+    attempt = classify_with_usage(
+        "Security alert: new login detected", backend="llm", routing=routing
+    )
+    assert attempt.verdict is None
+    assert attempt.fallback_used is False
+    assert attempt.llm_attempted is True
+    assert attempt.failure_category == "connection_failed"
+
+
+def test_classify_fallback_local_has_no_effect_on_server_or_off_mode(monkeypatch):
+    """`fallback_local` is only meaningful for mode="user" (Classification
+    Routing's own docstring) -- server and off must be byte-identical
+    whether it's True or False."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+    monkeypatch.setattr(classifier, "call_chat_completion", _explode)
+    monkeypatch.setattr(classifier, "_genai_client", _explode)
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", None)
+
+    for mode in ("server", "off"):
+        opted_out = ClassificationRouting(mode=mode, credential=None, fallback_local=False)
+        opted_in = ClassificationRouting(mode=mode, credential=None, fallback_local=True)
+        assert classify("Can you help?", routing=opted_out) == classify(
+            "Can you help?", routing=opted_in
+        )

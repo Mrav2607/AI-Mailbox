@@ -37,6 +37,7 @@ def test_classify_latest_threads_delegates_to_the_shared_backfill(monkeypatch):
             "llm_failed": 0,
             "fell_back": 0,
             "failure_categories": {},
+            "left_unclassified": 0,
         }
 
     monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(MagicMock()))
@@ -59,6 +60,7 @@ def test_classify_latest_threads_delegates_to_the_shared_backfill(monkeypatch):
         "llm_failed": 0,
         "fell_back": 0,
         "failure_categories": {},
+        "left_unclassified": 0,
     }
 
 
@@ -81,6 +83,7 @@ def test_classify_latest_threads_forwards_failure_visibility_counters(monkeypatc
             "llm_failed": 2,
             "fell_back": 2,
             "failure_categories": {"http_429": 2},
+            "left_unclassified": 1,
         }
 
     monkeypatch.setattr(tasks_nlp, "SessionLocal", lambda: nullcontext(MagicMock()))
@@ -92,6 +95,7 @@ def test_classify_latest_threads_forwards_failure_visibility_counters(monkeypatc
     assert result["llm_failed"] == 2
     assert result["fell_back"] == 2
     assert result["failure_categories"] == {"http_429": 2}
+    assert result["left_unclassified"] == 1
 
 
 # ---------------------------------------------------------------------------

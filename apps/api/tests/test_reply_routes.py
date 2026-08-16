@@ -39,8 +39,9 @@ from app.deps import get_current_user, get_db
 from app.main import app
 from app.routes import reply as reply_routes
 from app.services.mail_send.common import SendError
+from app.services.nlp.classifier import ClassificationAttempt
 from app.services.nlp.reply_draft import ReplyDraftAttempt
-from app.services.nlp.providers import LlmCredential, ResolvedExtraction
+from app.services.nlp.providers import ClassificationRouting, LlmCredential, ResolvedExtraction
 
 _SELF = "me@example.com"
 _OTHER = "alice@example.com"
@@ -1624,3 +1625,73 @@ def test_reply_draft_success_returns_text_provider_and_model(monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body == {"draft_text": "Sounds good, thanks!", "provider": "openai", "model": "gpt-x"}
+
+
+# ---------------------------------------------------------------------------
+# _classify_gmail_message_best_effort: the "no verdict" state (phase 2, D-C
+# -- plan: 2026-08-14-llm-failure-visibility)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_gmail_message_best_effort_skips_write_on_no_verdict(monkeypatch):
+    """A failed BYOK call the user hasn't opted into local fallback for
+    produces verdict=None -- the best-effort classify pass must skip
+    upsert_classification entirely (never write a null-label row, which
+    would strand the message) but still record usage and commit, since the
+    call may have genuinely billed the user even though it produced nothing
+    to classify with (D3)."""
+    user_id = uuid4()
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)  # fallback_local=False
+
+    class _FixedRouter:
+        def __init__(self, uid):
+            pass
+
+        def routing_for(self, db_arg):
+            return routing
+
+    monkeypatch.setattr(reply_routes, "ClassificationRouter", _FixedRouter)
+    monkeypatch.setattr(
+        reply_routes, "classify_with_usage",
+        lambda text, routing=None: ClassificationAttempt(
+            verdict=None,
+            provider_call_succeeded=False,
+            usage=None,
+            llm_attempted=True,
+            fallback_used=False,
+            failure_category="connection_failed",
+        ),
+    )
+    records = []
+
+    class _FakeAcc:
+        def __init__(self, uid):
+            pass
+
+        def record(self, stage, provider, usage, *, provider_call_succeeded):
+            records.append((stage, provider, usage, provider_call_succeeded))
+
+        def flush(self, db):
+            pass
+
+    monkeypatch.setattr(reply_routes, "UsageAccumulator", _FakeAcc)
+    upsert_calls = []
+    monkeypatch.setattr(
+        reply_routes, "upsert_classification",
+        lambda *a, **k: upsert_calls.append(k),
+    )
+
+    db = MagicMock()
+    message = SimpleNamespace(id=uuid4(), snippet="hi", body_text="there")
+
+    reply_routes._classify_gmail_message_best_effort(
+        db, message=message, subject="subj", user_id=user_id
+    )
+
+    assert upsert_calls == []
+    assert records == [("classification", "openai", None, False)]
+    db.commit.assert_called_once()
+    db.rollback.assert_not_called()
