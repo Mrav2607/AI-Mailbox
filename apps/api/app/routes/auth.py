@@ -22,6 +22,7 @@ from app.db.schemas.auth import (
     UpdateConnectionRequest,
     UserOut,
 )
+from app.scripts.seed_demo import seed_demo_data
 from app.services.label_sync import (
     CLAIM_LEASE,
     GMAIL_MODIFY_SCOPE,
@@ -62,7 +63,7 @@ def list_providers() -> dict:
     providers = ["gmail"]
     if settings.microsoft_oauth_enabled:
         providers.append("outlook")
-    return {"providers": providers}
+    return {"providers": providers, "demo_login": not settings.is_production}
 
 
 @router.get("/me", response_model=UserOut)
@@ -104,6 +105,17 @@ def demo_login(payload: DemoLoginRequest, db: Session = Depends(get_db)) -> dict
         db.add(user)
         db.commit()
         db.refresh(user)
+    # Seed on EVERY demo login, not just first-time user creation --
+    # seed_demo_data is idempotent (a no-op once the demo account already
+    # owns threads), so this is cheap for the common case, and it's what
+    # actually heals a user whose earlier seed attempt failed partway and
+    # left them with an empty console. Best-effort: a failure here still
+    # returns a usable session rather than a 500.
+    try:
+        seed_demo_data(db, user)
+    except Exception:
+        logger.exception("demo seed failed for %s", email)
+        db.rollback()
     return {
         "access_token": create_access_token(str(user.id), user.token_version),
         "token_type": "bearer",

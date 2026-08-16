@@ -6,7 +6,7 @@ taxonomy (`needs_reply`, `action_required`, `fyi`, `promotional`,
 triage buckets over a FastAPI service.
 
 - API path: `apps/api`
-- Web path: `apps/web` (placeholder)
+- Web path: `apps/web` (React + Vite console and landing page)
 - Model training: `ml/` (see [Email classification](#email-classification))
 
 ## Quick start (Docker)
@@ -15,13 +15,19 @@ The fastest way to run the whole app — API, Celery worker, Postgres (pgvector)
 Redis, and the web UI — is Docker Compose. From the repo root:
 
 ```bash
-cp deploy/.env.example deploy/.env    # once; defaults are enough to boot
+cp deploy/local.env.example deploy/.env    # once; ready to boot as-is
 docker compose up --build
 ```
 
-Then open **http://localhost:8080** and click **demo login** (email only, no
-Google account needed). Everything is served from one origin — nginx serves the
-SPA and proxies `/api` to the API, so there's no CORS to configure.
+Then open **http://localhost:8080**, click **Sign in**, and use the **demo
+login** box (email only, no Google account needed). A new demo user starts with
+a handful of sample threads across every bucket, so the console has something in
+it before you connect real mail. Everything is served from one origin — nginx
+serves the SPA and proxies `/api` to the API, so there's no CORS to configure.
+
+> Use `deploy/local.env.example`, not `deploy/.env.example`. The latter is the
+> production template: it sets `APP_ENV=production`, which makes the API refuse
+> to start until you supply real secrets, and disables the demo login.
 
 What comes up:
 
@@ -49,8 +55,8 @@ the `model-v2` GitHub Release. Fetch it (needs the [GitHub CLI](https://cli.gith
 INSTALL_LOCAL_CLASSIFIER=true CLASSIFIER_BACKEND=local docker compose up --build
 ```
 
-No repo access to the release? Set `GEMINI_API_KEY` and `CLASSIFIER_BACKEND=llm`
-for real LLM classification without any download.
+Prefer not to download 256MB? Set `GEMINI_API_KEY` and `CLASSIFIER_BACKEND=llm`
+for real LLM classification instead.
 
 **Gmail (optional):** to ingest real mail, fill `GOOGLE_CLIENT_ID` /
 `GOOGLE_CLIENT_SECRET` in `deploy/.env` and register
@@ -61,7 +67,8 @@ for real LLM classification without any download.
 > quick start above is all you need.
 
 > **Local-only paths:** `models/`, `data/`, and `scripts/` are git-ignored. The
-> trained model (~1 GB), the training/eval datasets (real email content), and the
+> trained model (~250MB to download), the training/eval datasets (real email
+> content), and the
 > one-off data-prep scripts live on your machine, not in the repo. None of them
 > are required to *run* the API — the model is loaded at serve time if present,
 > and the classifier falls back gracefully when it isn't.
@@ -150,13 +157,30 @@ A browser frontend must be served from an origin listed in `CORS_ORIGINS`
 (comma-separated; defaults cover `http://localhost:3000` and
 `http://localhost:5173`). Other origins are blocked by the browser.
 
-### Triage demo data (optional, local only)
-- The demo-data seed scripts live under `scripts/` (git-ignored) and are **not**
-  required to run the app — the primary data path is Gmail ingest (below).
-- If you have a seed script locally, run it to create a demo user and messages,
-  then `POST /api/v1/auth/demo-login` with that user's email to get a token.
-- Call `GET /api/v1/mail/triage` (with the bearer token) to see the seeded
-  threads and classifications.
+### Triage demo data (local only)
+Signing in through the demo login on a dev deployment seeds a new user with
+sample threads automatically, so there's nothing to run by hand.
+
+To seed an account that already exists (or to top up after clearing the
+database):
+
+```bash
+# Docker stack (the quick start above)
+docker compose exec api python -m app.scripts.seed_demo you@example.com
+
+# Host API (the "Daily startup" flow, where only db and redis run in Docker).
+# Needs the venv active and DATABASE_URL set, same as running the API.
+cd apps/api && python -m app.scripts.seed_demo you@example.com
+```
+
+It's idempotent — running it twice won't duplicate the sample inbox. The
+threads hang off a placeholder connection with no refresh token, so both the
+scheduled sync and a manual one skip it and never reach Gmail.
+
+The demo login only works when `APP_ENV` is one of `dev`, `development`,
+`local`, `test`, `testing`, or `ci`. Every other value — including `staging` —
+counts as production, where the route 404s and the sign-in screen hides the
+button.
 
 ### Gmail OAuth (dev)
 1. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URI` in `.env`.

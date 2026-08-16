@@ -997,21 +997,25 @@ def ingest_mail(
     A full ingest is up to 500 serial fetches plus classification -- way too
     slow to hold a request open for, so we hand each account to Celery and
     return 202 with one run per account. Every non-paused connected account
-    is fanned out to, whatever its provider -- start_sync_run picks the right
-    ingest task per account. Paused accounts (a dead refresh token) are
-    skipped -- nothing but a reconnect fixes those, so queuing them just
-    burns quota. Zero connected/eligible accounts isn't an error; it just
+    with a refresh token is fanned out to, whatever its provider --
+    start_sync_run picks the right ingest task per account. Paused accounts
+    (a dead refresh token) are skipped -- nothing but a reconnect fixes
+    those, so queuing them just burns quota. Accounts with no refresh token
+    at all (e.g. the seeded demo account) are skipped too, same as the
+    scheduler in tasks_ingest.py -- they can never refresh, so a pull can
+    only fail. Zero connected/eligible accounts isn't an error; it just
     means nothing to sync yet.
 
     ``provider_account_ids``, when given, narrows the fan-out to just those
-    accounts -- still filtered through the same user-owned, not-paused
-    predicates, so an unknown or another user's id is silently dropped rather
-    than erroring, and a paused account in the list stays skipped. Omit it to
-    get today's all-accounts behavior.
+    accounts -- still filtered through the same user-owned, not-paused,
+    has-a-refresh-token predicates, so an unknown or another user's id is
+    silently dropped rather than erroring, and a paused or tokenless account
+    in the list stays skipped. Omit it to get today's all-accounts behavior.
     """
     predicates = [
         ProviderAccount.user_id == current_user.id,
         ProviderAccount.sync_paused_at.is_(None),
+        ProviderAccount.refresh_token.is_not(None),
     ]
     if provider_account_ids is not None:
         predicates.append(ProviderAccount.id.in_(provider_account_ids))

@@ -7,6 +7,7 @@ must be able to tell whether the "Sign in with Microsoft" flow is usable
 before offering it.
 """
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import settings
@@ -47,3 +48,19 @@ def test_providers_requires_all_three_microsoft_credentials(monkeypatch):
     body = client.get(PROVIDERS_URL).json()
 
     assert body["providers"] == ["gmail"]
+
+def test_providers_advertises_demo_login_in_dev(monkeypatch):
+    """The sign-in screen renders its demo box off this flag, so dev must
+    advertise the route it actually serves."""
+    monkeypatch.setattr(settings, "app_env", "dev")
+
+    assert client.get(PROVIDERS_URL).json()["demo_login"] is True
+
+
+@pytest.mark.parametrize("env", ["prod", "production", "staging"])
+def test_providers_hides_demo_login_outside_dev(monkeypatch, env):
+    """demo-login 404s in production, so the flag must not offer it there --
+    otherwise the UI shows a control that can only fail."""
+    monkeypatch.setattr(settings, "app_env", env)
+
+    assert client.get(PROVIDERS_URL).json()["demo_login"] is False

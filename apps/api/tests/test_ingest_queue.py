@@ -21,11 +21,12 @@ from app.workers import tasks_nlp
 USER_ID = uuid4()
 
 
-def _account(*, paused=False, provider="gmail"):
+def _account(*, paused=False, provider="gmail", refresh_token="rt"):
     return SimpleNamespace(
         id=uuid4(),
         provider=provider,
         sync_paused_at=datetime.now(timezone.utc) if paused else None,
+        refresh_token=refresh_token,
     )
 
 
@@ -113,6 +114,44 @@ def test_ingest_query_excludes_paused_accounts_in_sql(fanout):
     statement = db.execute.call_args[0][0]
     compiled = str(statement.compile(compile_kwargs={"literal_binds": True}))
     assert "sync_paused_at IS NULL" in compiled
+
+
+def test_ingest_query_excludes_tokenless_accounts_in_sql(fanout):
+    # A ProviderAccount can never have refresh_token=None AND be paused at
+    # the same time in real data (pausing needs a refresh attempt to fail
+    # first), but the seeded demo account has no refresh token and is never
+    # paused -- start_sync_run/the ingest tasks would just fail against it,
+    # same reasoning as the scheduler's own filter in tasks_ingest.py.
+    client, db = fanout
+    db.execute.return_value.scalars.return_value.all.return_value = []
+    client.post("/api/v1/mail/ingest")
+    statement = db.execute.call_args[0][0]
+    compiled = str(statement.compile(compile_kwargs={"literal_binds": True}))
+    assert "refresh_token IS NOT NULL" in compiled
+
+
+def test_ingest_skips_accounts_with_no_refresh_token(fanout, monkeypatch):
+    # Regression test: the manual route used to fan out to every non-paused
+    # account regardless of refresh_token, which let a tokenless account
+    # (e.g. the seeded demo account) reach start_sync_run with a bearer
+    # token that can never actually authenticate.
+    client, db = fanout
+    # A real tokenless account never comes back from the SQL query above
+    # (see test_ingest_query_excludes_tokenless_accounts_in_sql); mirror that
+    # by returning nothing, same idiom as test_ingest_skips_paused_accounts.
+    db.execute.return_value.scalars.return_value.all.return_value = []
+    calls = []
+
+    def fake_start_sync_run(db_arg, user_id, account_id, *, mode, options, provider="gmail"):
+        calls.append(account_id)
+        return _run(account_id, mode), False
+
+    monkeypatch.setattr(mailbox_routes, "start_sync_run", fake_start_sync_run)
+
+    resp = client.post("/api/v1/mail/ingest")
+    assert resp.status_code == 202
+    assert calls == []
+    assert resp.json() == {"runs": []}
 
 
 def test_ingest_fans_out_to_every_eligible_account(fanout, monkeypatch):

@@ -237,6 +237,26 @@ describe("listAuthProviders", () => {
     expect(providers).toEqual(["gmail", "outlook"]);
     expect(requestedUrl(fetchMock).pathname).toBe("/api/v1/auth/providers");
   });
+
+  it("reports the demo-login flag alongside the providers", async () => {
+    const api = await importLiveApi();
+    stubFetch({ providers: ["gmail"], demo_login: true });
+    await expect(api.listAuthOptions()).resolves.toEqual({
+      providers: ["gmail"],
+      demoLogin: true,
+    });
+  });
+
+  // An older API that predates the flag must not light up a control it can't
+  // serve, so a missing field reads as "no demo login", not undefined.
+  it("treats a missing demo_login as disabled", async () => {
+    const api = await importLiveApi();
+    stubFetch({ providers: ["gmail"] });
+    await expect(api.listAuthOptions()).resolves.toEqual({
+      providers: ["gmail"],
+      demoLogin: false,
+    });
+  });
 });
 
 describe("ingestMail", () => {

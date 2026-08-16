@@ -3,7 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Full mock, per the test harness rules -- mounting the signed-out branch
-// pulls in LoginScreen (listAuthProviders) and, once a token resolves, the
+// pulls in LoginScreen (listAuthOptions) and, once a token resolves, the
 // whole authenticated console's post-auth fetch effect. Most of those calls
 // reject harmlessly (their callers already swallow non-401 errors); only
 // getMe/getToken/setToken/revokeAllTokens are individually controlled below.
@@ -24,6 +24,9 @@ const mockApi = vi.hoisted(() => {
     getMe: vi.fn<() => Promise<unknown>>(() => Promise.reject(new ApiError(401, "no token"))),
     revokeAllTokens: vi.fn<() => Promise<void>>(() => Promise.resolve()),
     listAuthProviders: vi.fn<() => Promise<string[]>>(() => Promise.resolve([])),
+    listAuthOptions: vi.fn<() => Promise<{ providers: string[]; demoLogin: boolean }>>(
+      () => Promise.resolve({ providers: [], demoLogin: false }),
+    ),
     getOverview: vi.fn(notImplemented),
     getCounts: vi.fn(notImplemented),
     listConnections: vi.fn(notImplemented),
@@ -177,6 +180,10 @@ beforeEach(() => {
   mockApi.revokeAllTokens.mockImplementation(() => Promise.resolve());
   mockApi.listAuthProviders.mockClear();
   mockApi.listAuthProviders.mockImplementation(() => Promise.resolve([]));
+  mockApi.listAuthOptions.mockClear();
+  mockApi.listAuthOptions.mockImplementation(() =>
+    Promise.resolve({ providers: [], demoLogin: false }),
+  );
   // Console's post-auth fetch effect -- reject everything by default; each
   // caller already swallows non-401 errors, so this just keeps the
   // authenticated branch from crashing on an unimplemented call.

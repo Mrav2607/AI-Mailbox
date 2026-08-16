@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { LoginScreen } from "./LoginScreen";
 
-// Mounting LoginScreen fires listAuthProviders on mount -- stub the whole
+// Mounting LoginScreen fires listAuthOptions on mount -- stub the whole
 // module so that resolves instantly and none of the real auth calls fire.
 vi.mock("@/lib/api", () => ({
   ApiError: class ApiError extends Error {
@@ -15,7 +15,7 @@ vi.mock("@/lib/api", () => ({
     }
   },
   USE_MOCK: true,
-  listAuthProviders: vi.fn(() => Promise.resolve([])),
+  listAuthOptions: vi.fn(() => Promise.resolve({ providers: [], demoLogin: false })),
   login: vi.fn(),
   signup: vi.fn(),
   forgotPassword: vi.fn(),
@@ -32,7 +32,7 @@ let root: Root;
 async function renderLoginScreen(onBack?: () => void) {
   await act(async () => {
     root.render(<LoginScreen onAuthed={vi.fn()} onBack={onBack} />);
-    // Flushes the listAuthProviders microtask so its state update lands
+    // Flushes the listAuthOptions microtask so its state update lands
     // inside act, not after -- the back control itself doesn't depend on
     // this, but an unflushed effect here would log an act warning.
     await Promise.resolve();

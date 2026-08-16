@@ -16,9 +16,12 @@ def test_health_ok():
 def test_list_providers():
     resp = client.get("/api/v1/auth/providers")
     assert resp.status_code == 200
-    # Gmail is the only provider that actually works; we used to also advertise
-    # Outlook, which is implemented nowhere.
-    assert resp.json() == {"providers": ["gmail"]}
+    body = resp.json()
+    # Outlook is implemented but only advertised once its MICROSOFT_* creds are
+    # configured, which they aren't here.
+    assert body["providers"] == ["gmail"]
+    # Env-dependent; test_auth_providers_outlook.py pins both sides of it.
+    assert isinstance(body["demo_login"], bool)
 
 
 def test_bare_prefix_is_404():
