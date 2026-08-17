@@ -44,9 +44,14 @@ The `migrate` service runs first and the app waits on health checks, so a single
 `docker compose up` comes up clean with no ordering races.
 
 **Classifier:** fetch the fine-tuned local model first — it's a one-time
-download, costs nothing per message, works offline, and no mail content
-leaves the machine. It's git-ignored (~256MB, trained on private data), so it
-ships as chunked assets on the `model-v2` GitHub Release. Fetch it (needs the
+download, costs nothing per message, and works offline. With no LLM key
+configured (`GEMINI_API_KEY` unset, nobody opted into BYOK), no mail content
+leaves the machine. Add a key and that stops being true: under `auto` an
+opted-in user's key is tried *before* the encoder, and the operator's key is
+used when the encoder can't serve.
+
+The model is git-ignored (~256MB, trained on private data), so it ships as
+chunked assets on the `model-v2` GitHub Release. Fetch it (needs the
 [GitHub CLI](https://cli.github.com), `gh auth login`), then build with the
 torch deps:
 
@@ -339,7 +344,7 @@ Two things to know:
 If your key ever stops being usable for sorting, the settings panel says so
 — and, unless you've also checked **"If your LLM fails, classify with the
 built-in model instead"**, that mail is left **unclassified**, not
-heuristically labelled. It never quietly falls back to the server's key.
+heuristically labeled. It never quietly falls back to the server's key.
 
 Two settings control the rest:
 

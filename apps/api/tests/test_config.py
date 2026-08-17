@@ -157,6 +157,30 @@ def test_classifier_backend_blank_defaults_to_auto():
     assert s.classifier_backend == "auto"
 
 
+@pytest.mark.parametrize("raw", ["auto ", " auto", "\tauto\n", " AUTO "])
+def test_classifier_backend_tolerates_surrounding_whitespace(raw):
+    # A .env or compose line picks up a trailing space very easily. Without
+    # the strip that boots to a hard ValueError on a value the operator would
+    # swear is correct, which is a miserable way to find out.
+    s = Settings(_env_file=None, CLASSIFIER_BACKEND=raw)
+    assert s.classifier_backend == "auto"
+
+
+@pytest.mark.parametrize("raw", ["   ", "\t", "\n"])
+def test_classifier_backend_whitespace_only_defaults_to_auto(raw):
+    # Same fallback a truly blank value gets -- whitespace-only is blank as
+    # far as an operator is concerned, so it must not raise.
+    s = Settings(_env_file=None, CLASSIFIER_BACKEND=raw)
+    assert s.classifier_backend == "auto"
+
+
+def test_classifier_backend_strips_before_mapping_a_legacy_alias():
+    # The strip has to happen before the alias lookup, not after, or a padded
+    # legacy value misses the map and falls through to the reject branch.
+    s = Settings(_env_file=None, CLASSIFIER_BACKEND=" local ")
+    assert s.classifier_backend == "auto"
+
+
 @pytest.mark.parametrize("raw", ["HEURISTIC", "Auto", "LLM"])
 def test_classifier_backend_case_insensitive_for_canonical_values(raw):
     s = Settings(_env_file=None, CLASSIFIER_BACKEND=raw)

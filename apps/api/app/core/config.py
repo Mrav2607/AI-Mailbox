@@ -189,7 +189,12 @@ class Settings(BaseSettings):
         configuration error, not a rename -- and is rejected below along
         with any other unrecognized value.
         """
-        normalized = (value or "auto").lower()
+        # .strip() before anything else: a .env or compose value picks up
+        # trailing whitespace easily (`CLASSIFIER_BACKEND=auto `), and without
+        # this that boots to a hard ValueError on a value the operator would
+        # swear is correct. Stripping first also makes a whitespace-only value
+        # fall back to "auto" like a blank one, instead of raising.
+        normalized = (value or "").strip().lower() or "auto"
         mapped = _LEGACY_CLASSIFIER_BACKENDS.get(normalized, normalized)
         if mapped != normalized:
             _logger.warning(
