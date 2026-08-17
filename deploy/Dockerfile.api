@@ -13,7 +13,7 @@ COPY apps/api/alembic.ini ./alembic.ini
 
 # The in-process torch classifier is optional -- off by default so the image
 # stays small and the build stays fast (torch pulls ~1.5GB). Flip to true to
-# install it; otherwise CLASSIFIER_BACKEND=local degrades to the heuristic
+# install it; otherwise CLASSIFIER_BACKEND=auto degrades to the heuristic
 # backend, which needs no extra deps. torch is CPU-only (the default PyPI wheel
 # bundles CUDA and is multi-GB).
 ARG INSTALL_LOCAL_CLASSIFIER=false

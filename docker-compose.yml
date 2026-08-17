@@ -16,7 +16,7 @@
 # The in-process torch classifier is OFF by default so the image stays small and
 # the build stays fast; the app falls back to the keyword heuristic. To serve the
 # fine-tuned model instead: drop it in ./models/email-classifier, set
-# CLASSIFIER_BACKEND=local in deploy/.env, and build with
+# CLASSIFIER_BACKEND=auto in deploy/.env, and build with
 # INSTALL_LOCAL_CLASSIFIER=true docker compose up --build
 name: cortexmail
 
@@ -71,7 +71,7 @@ services:
     build: *api-build
     image: cortexmail-api:local
     env_file: ./deploy/.env
-    # Mount a fine-tuned classifier (if you have one) so CLASSIFIER_BACKEND=local
+    # Mount a fine-tuned classifier (if you have one) so CLASSIFIER_BACKEND=auto
     # can serve it without rebuilding. Harmless when the dir is absent/empty.
     volumes:
       - ./models:/app/models:ro
