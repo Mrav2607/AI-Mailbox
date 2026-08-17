@@ -73,10 +73,14 @@ _MAX_MODEL_LEN = 200
 
 def _effective_backend() -> str:
     """The SAME normalized expression `classifier.classify` dispatches on --
-    `(settings.classifier_backend or "auto").lower()`. The config value is an
-    unconstrained string, so comparing it raw would misreport e.g.
-    `CLASSIFIER_BACKEND=HEURISTIC` or an empty value as LLM-backed, showing a
-    consent toggle that can never fire.
+    `(settings.classifier_backend or "auto").lower()`.
+
+    Settings' own field validator now normalizes, maps the legacy spellings
+    and rejects anything unrecognized at boot, so by the time this runs the
+    value is already canonical and this expression is a no-op. Kept anyway:
+    it costs nothing, and it means this function and `classify()` still read
+    identically, which is what stops them drifting if either side's
+    normalization ever moves again.
     """
     return (settings.classifier_backend or "auto").lower()
 
@@ -309,6 +313,21 @@ def _classifier_mix_kind(model_version: str | None) -> ClassifierMixKind:
         return "heuristic"
     if model_version == "user-override":
         return "manual"
+    # DEFERRED, deliberately: the demo-seed stamps ("demo-seed", "demo-1",
+    # "seeded") should map to "demo" here, and the kind already exists in
+    # ClassifierMixKind and in the web label map. Emitting it is held back one
+    # release because a browser tab that is already open is still running the
+    # PREVIOUS bundle, whose summary interpolates its label map blindly and
+    # would render "undefined 15" for a kind it has never heard of. This
+    # release ships the tolerant renderer; once clients have picked it up, the
+    # mapping below is a two-line change with nothing left to break.
+    #
+    #   if model_version in ("demo-seed", "demo-1", "seeded"):
+    #       return "demo"
+    #
+    # Until then these fall to the operator_key catch-all, which is wrong but
+    # is exactly as wrong as it already was -- no regression, just not yet
+    # fixed.
     preset, sep, _rest = model_version.partition(":")
     if sep and preset in PROVIDER_PRESETS:
         return "user_key"
@@ -418,6 +437,19 @@ async def put_llm_settings(
     mean a user who's forgotten it can't touch anything else -- including
     turning off the classification opt-in they came here to revoke. A
     create still needs one, since there's nothing stored to fall back on.
+
+    ``classification_byok: true`` is accepted here regardless of the
+    deployment's ``CLASSIFIER_BACKEND`` -- including while it's
+    ``heuristic``, which never even reads routing (plan:
+    2026-08-16-classifier-default-honesty §1). That is deliberate, not an
+    oversight: rejecting the opt-in would punish "use my key when you can"
+    for a deployment-level setting the caller doesn't control. The flag can
+    therefore sit **dormant** -- saved and reported as
+    ``classification_eligible: false`` -- and be activated LATER, with no
+    further action from this caller, purely by an administrator changing
+    ``CLASSIFIER_BACKEND`` away from ``heuristic``. This is the one place
+    that dormancy is documented for an API-only caller, since the console
+    hides the opt-in checkbox entirely under a heuristic backend.
     """
     raw_body = await _read_bounded_body(request)
 

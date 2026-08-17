@@ -94,14 +94,22 @@ _BACKFILL_BUCKETS = _TRIAGE_BUCKETS - {"done", "snoozed"}
 _SNOOZE_MIN_LEAD_SECONDS = 60
 _SNOOZE_MAX_LEAD_DAYS = 366
 # Classifier backends a caller may request per run (see services.nlp.classify).
-# "gemini" is the old name for "llm" -- still accepted so existing deployments
-# and saved requests don't break, but it's no longer the name we document. The
-# LLM path hasn't been Gemini-only since BYOK landed: it routes to whatever
-# provider the user's credential names.
-_CLASSIFIER_BACKENDS = frozenset({"local", "llm", "gemini", "heuristic", "auto"})
-# What we tell callers about on a bad value -- the alias is accepted but not
-# advertised, so nobody learns the deprecated spelling from an error message.
-_DOCUMENTED_BACKENDS = _CLASSIFIER_BACKENDS - {"gemini"}
+# "gemini" is the old name for "llm" and "auto" is the old name for
+# "local_then_llm" -- both still accepted so existing deployments and saved
+# requests don't break, but neither is the name we document any more. The LLM
+# path hasn't been Gemini-only since BYOK landed: it routes to whatever
+# provider the user's credential names. "local_then_llm" is the canonical
+# name for what per-run "auto" always did -- try the local encoder, then an
+# LLM, then the heuristic (plan: 2026-08-16-classifier-default-honesty §2) --
+# renamed because "auto" means something different as the GLOBAL default
+# (an opted-in BYOK key first, not the encoder).
+_CLASSIFIER_BACKENDS = frozenset(
+    {"local", "llm", "heuristic", "local_then_llm", "gemini", "auto"}
+)
+# What we tell callers about on a bad value -- both aliases are accepted but
+# not advertised, so nobody learns a deprecated spelling from an error
+# message, and the canonical "local_then_llm" is the one they DO learn.
+_DOCUMENTED_BACKENDS = _CLASSIFIER_BACKENDS - {"gemini", "auto"}
 # _OPERATOR_MODEL_VERSION is persistence.OPERATOR_MODEL_VERSION under its old
 # local name (see the import above) -- marks a label set by a human in the
 # console rather than a model, so it's distinguishable from a real prediction
@@ -1286,7 +1294,11 @@ def backfill_classifications(
         )
     # classify() lowercases its backend anyway, but normalize here so one
     # canonical value flows into task kwargs and logs -- including folding the
-    # "gemini" alias to "llm", so logs never show two names for one path.
+    # "gemini" alias to "llm" and the "local_then_llm" canonical name to
+    # "auto" (its `_classify_attempt` spelling), so logs never show two names
+    # for one path. `_classify_attempt` folds "local_then_llm" right back to
+    # "auto" itself too (plan §2) -- this isn't the only place it's handled,
+    # it's just what keeps task kwargs and logs canonical.
     normalized_backend = backend.lower() if backend is not None else None
     if normalized_backend is not None and normalized_backend not in _CLASSIFIER_BACKENDS:
         raise HTTPException(
@@ -1295,6 +1307,8 @@ def backfill_classifications(
         )
     if normalized_backend == "gemini":
         normalized_backend = "llm"
+    elif normalized_backend == "local_then_llm":
+        normalized_backend = "auto"
 
     if limit > _MAX_INLINE_BACKFILL:
         task = cast(Any, backfill_threads_for_user).delay(

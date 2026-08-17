@@ -212,7 +212,10 @@ def test_get_unconfigured_returns_nulls_and_flags(monkeypatch, user):
     monkeypatch.setattr(settings, "action_extraction_enabled", True)
     monkeypatch.setattr(settings, "llm_custom_endpoints_enabled", False)
     monkeypatch.setattr(settings, "llm_private_endpoints_enabled", False)
-    monkeypatch.setattr(settings, "classifier_backend", "local")
+    # "auto" is the canonical global default (plan §2/§3; "local" is now a
+    # deprecated alias for the same value) -- this only needs a non-heuristic
+    # backend, so any value in that bucket proves the same thing.
+    monkeypatch.setattr(settings, "classifier_backend", "auto")
     # Pinned, not assumed: classification_llm_usable falls back to the operator
     # key, so a developer with GEMINI_API_KEY in their environment would flip
     # this expectation without touching the code under test.
@@ -239,7 +242,7 @@ def test_get_unconfigured_returns_nulls_and_flags(monkeypatch, user):
         "classification_byok": False,
         "classification_fallback_local": False,
         "classifier_uses_llm": True,
-        "classifier_backend": "local",
+        "classifier_backend": "auto",
         "classification_eligible": False,
         "classification_llm_usable": False,
     }
@@ -351,6 +354,40 @@ def test_get_classification_eligible_true_when_routing_says_user(monkeypatch, us
     assert body["classification_eligible"] is True
 
 
+def test_get_classification_eligible_flips_false_to_true_when_backend_leaves_heuristic(
+    monkeypatch, user,
+):
+    """§1's required "flip" assertion: an opted-in row's `classification_
+    eligible` is false while the deployment's backend is "heuristic" and
+    becomes true the moment an administrator changes CLASSIFIER_BACKEND --
+    with NOTHING else about the row or the request changing. This is the
+    observable a client would actually see (llm_settings.py:636); it does
+    NOT go through resolve_classification_routing to prove it (routing
+    never reads CLASSIFIER_BACKEND at all -- see classifier.py's dispatch
+    and this file's other routing-mode tests)."""
+    row = _make_row(user_id=user.id, provider="openai", classification_byok=True)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=True, source="user"),
+    )
+    monkeypatch.setattr(
+        llm_settings, "resolve_classification_routing",
+        lambda db_, uid: ClassificationRouting(mode="user", credential=None),
+    )
+
+    monkeypatch.setattr(settings, "classifier_backend", "heuristic")
+    dormant = TestClient(app).get("/api/v1/settings/llm").json()
+    assert dormant["classification_byok"] is True
+    assert dormant["classification_eligible"] is False
+
+    monkeypatch.setattr(settings, "classifier_backend", "auto")
+    active = TestClient(app).get("/api/v1/settings/llm").json()
+    assert active["classification_byok"] is True
+    assert active["classification_eligible"] is True
+
+
 def test_get_llm_usable_true_on_operator_key_even_when_user_is_not_eligible(monkeypatch, user):
     """The whole reason this field exists apart from classification_eligible.
     Not eligible means "your key won't be used" -- but with an operator key
@@ -453,15 +490,23 @@ def test_get_llm_usable_false_for_off_routing_even_with_an_operator_key(monkeypa
         ("HEURISTIC", "heuristic", False),
         ("", "auto", True),
         ("Auto", "auto", True),
-        ("gemini", "gemini", True),
+        ("llm", "llm", True),
     ],
-    ids=["uppercase-heuristic", "empty", "mixed-case-auto", "gemini"],
+    ids=["uppercase-heuristic", "empty", "mixed-case-auto", "llm"],
 )
 def test_get_classifier_backend_fields_use_the_normalized_expression(
     monkeypatch, user, raw_backend, expected_backend, expected_uses_llm,
 ):
     # Must be the SAME normalization `classify()` applies -- comparing the
-    # raw config string would misreport an uppercase or empty value.
+    # raw config string would misreport an uppercase or empty value. This is
+    # deliberately NOT the place that covers "gemini"/"local" input any more
+    # (plan §3): `Settings`' own validator maps both to their canonical
+    # spelling AT CONSTRUCTION, so `settings.classifier_backend` can never
+    # observably BE "gemini" once a real app has booted -- see
+    # test_get_classifier_backend_field_reflects_the_legacy_mapping below,
+    # which builds a real `Settings` object to prove that, rather than
+    # monkeypatching this singleton's attribute directly (which bypasses the
+    # validator and would prove the mapping runs when it doesn't).
     db = _CredentialDB()
     _override(user, db)
     monkeypatch.setattr(settings, "classifier_backend", raw_backend)
@@ -473,6 +518,37 @@ def test_get_classifier_backend_fields_use_the_normalized_expression(
     body = resp.json()
     assert body["classifier_backend"] == expected_backend
     assert body["classifier_uses_llm"] is expected_uses_llm
+
+
+@pytest.mark.parametrize(
+    "legacy_value, mapped_value",
+    [("gemini", "llm"), ("local", "auto")],
+    ids=["gemini-to-llm", "local-to-auto"],
+)
+def test_get_classifier_backend_field_reflects_the_legacy_mapping(
+    monkeypatch, user, legacy_value, mapped_value,
+):
+    """§3: both legacy globals change what GET /settings/llm reports, because
+    the mapping happens once at `Settings` construction and this endpoint
+    just echoes `settings.classifier_backend` -- a real deployment that sets
+    CLASSIFIER_BACKEND=gemini (or =local) will show "llm" (or "auto") here,
+    never the raw legacy spelling. Builds a real `Settings` object (like
+    test_config.py) rather than monkeypatching a raw string directly, so
+    this actually exercises the mapping instead of assuming it."""
+    from app.core.config import Settings
+
+    mapped_settings = Settings(_env_file=None, CLASSIFIER_BACKEND=legacy_value)
+    assert mapped_settings.classifier_backend == mapped_value
+
+    db = _CredentialDB()
+    _override(user, db)
+    monkeypatch.setattr(settings, "classifier_backend", mapped_settings.classifier_backend)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=False),
+    )
+    resp = TestClient(app).get("/api/v1/settings/llm")
+    assert resp.json()["classifier_backend"] == mapped_value
 
 
 # ---------------------------------------------------------------------------
@@ -1170,6 +1246,48 @@ def test_put_classification_byok_true_on_create_with_preset_provider(user):
     assert resp.json()["classification_byok"] is True
     assert resp.json()["classification_eligible"] is True
     assert db.added[0].classification_byok is True
+
+
+def test_put_classification_byok_true_under_heuristic_stays_dormant_then_activates(
+    monkeypatch, user,
+):
+    """§1/decision 4: the PUT accepts `classification_byok: true` regardless
+    of CLASSIFIER_BACKEND -- no 422 for saving it under "heuristic" -- and
+    its OWN docstring now says so explicitly. This is the reported
+    inactive -> active transition that documentation names: the same saved
+    row reports `classification_eligible: false` while the deployment is
+    "heuristic" and `true` once an administrator changes CLASSIFIER_BACKEND,
+    with no further action from this caller."""
+    db = _CredentialDB()
+    _override(user, db)
+
+    monkeypatch.setattr(settings, "classifier_backend", "heuristic")
+    dormant = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "api_key": "sk-abcdefgh",
+            "model": "m",
+            "classification_byok": True,
+        },
+    )
+    assert dormant.status_code == 200  # accepted, no 422, per decision 4
+    assert dormant.json()["classification_byok"] is True
+    assert dormant.json()["classification_eligible"] is False
+
+    # A second PUT rather than a GET: PUT derives `routing_is_user` straight
+    # from the row it just wrote (llm_settings.py), never from
+    # resolve_classification_routing -- unlike GET, which this suite's
+    # autouse `_default_classification_routing` fixture pins to mode="server"
+    # unless a test overrides it. Omitting `api_key` here is itself part of
+    # the contract under test (P2 fix): a caller with nothing new to say
+    # about the credential must still be able to observe the flip.
+    monkeypatch.setattr(settings, "classifier_backend", "auto")
+    active = TestClient(app).put(
+        "/api/v1/settings/llm", json={"provider": "openai", "model": "m"},
+    )
+    assert active.json()["classification_byok"] is True
+    assert active.json()["classification_eligible"] is True
 
 
 def test_put_classification_byok_absent_is_unchanged_on_update(user):
@@ -2103,6 +2221,32 @@ def test_classifier_mix_null_model_version_maps_to_unknown(user):
     _override(user, db)
     resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
     assert resp.json() == {"classifier_mix": [{"kind": "unknown", "count": 2}]}
+
+
+@pytest.mark.parametrize(
+    "seed_model_version",
+    ["demo-seed", "demo-1", "seeded"],
+    ids=["committed-seed_demo.py", "gitignored-seed_demo_data.py", "gitignored-seed_fake_threads.py"],
+)
+def test_classifier_mix_demo_seeds_still_await_the_demo_kind(user, seed_model_version):
+    """Pins the DEFERRED state, not the desired one.
+
+    None of the three historic seed stamps matches a real prefix, so they
+    fall through the catch-all and are reported as `operator_key` -- 100%
+    paid usage on a mailbox that never made a call. The `demo` kind that
+    fixes this exists in the schema and in the web label map already, but
+    emitting it is held back one release: a browser tab open across the
+    deploy is still running the previous bundle, which would interpolate
+    `undefined` for a kind it has never seen.
+
+    When the follow-up lands, this test flips to asserting `demo`. Do not
+    "fix" it by mapping only some of the three -- all three seeders exist,
+    and a partial mapping leaves the others mislabeled.
+    """
+    db = _mix_db([(seed_model_version, 7)])
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
+    assert resp.json() == {"classifier_mix": [{"kind": "operator_key", "count": 7}]}
 
 
 def test_classifier_mix_sums_distinct_versions_of_one_kind_into_a_single_row(user):

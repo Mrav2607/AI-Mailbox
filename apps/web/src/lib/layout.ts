@@ -98,10 +98,16 @@ export type UiState = {
   tourVersion: number; // 0 = never completed; N = completed tour version N
   density: Density; // wide ThreadList row spacing
   fontScale: number; // CSS zoom applied to the console root; 1 = today's size
+  // Dismissal of the "keyword rules are sorting your mail" notice (plan §4):
+  // 0 = never dismissed, N = dismissed at notice version N. Browser-global,
+  // same as every other field here -- deliberately NOT tourVersion, which
+  // controls onboarding.
+  classifierHeuristicNoticeVersion: number;
 };
 
 export const UI_KEY = "cortexmail_ui";
 export const TOUR_VERSION = 3;
+export const CLASSIFIER_HEURISTIC_NOTICE_VERSION = 1;
 
 export const DEFAULT_UI: UiState = {
   sidebar: true,
@@ -114,6 +120,7 @@ export const DEFAULT_UI: UiState = {
   tourVersion: 0,
   density: "comfortable",
   fontScale: 1,
+  classifierHeuristicNoticeVersion: 0,
 };
 
 function isPaneLayout(v: unknown): v is PaneLayout {
@@ -190,5 +197,11 @@ export function loadUi(): UiState {
       o.fontScale <= 1.5
         ? o.fontScale
         : DEFAULT_UI.fontScale,
+    classifierHeuristicNoticeVersion:
+      typeof o.classifierHeuristicNoticeVersion === "number" &&
+      Number.isFinite(o.classifierHeuristicNoticeVersion) &&
+      o.classifierHeuristicNoticeVersion >= 0
+        ? o.classifierHeuristicNoticeVersion
+        : DEFAULT_UI.classifierHeuristicNoticeVersion,
   };
 }

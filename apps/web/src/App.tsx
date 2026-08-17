@@ -108,7 +108,12 @@ import {
 import { Toaster } from "@/components/ui/sonner";
 import { ConsoleLayout } from "@/components/console/ConsoleLayout";
 import { NarrowShell } from "@/components/console/NarrowShell";
-import { TOUR_VERSION, UI_KEY, loadUi } from "@/lib/layout";
+import {
+  CLASSIFIER_HEURISTIC_NOTICE_VERSION,
+  TOUR_VERSION,
+  UI_KEY,
+  loadUi,
+} from "@/lib/layout";
 import type { Arrangement, Density, PaneLayout, PaneSizes } from "@/lib/layout";
 import { isUnseen, loadSeen, markSeen, unmarkSeen } from "@/lib/seen";
 import {
@@ -332,6 +337,11 @@ export default function Console() {
   const [tourVersion, setTourVersion] = useState<number>(INITIAL_UI.tourVersion);
   const [density, setDensity] = useState<Density>(INITIAL_UI.density);
   const [fontScale, setFontScale] = useState<number>(INITIAL_UI.fontScale);
+  // Dismissal of the "keyword rules are sorting your mail" settings notice
+  // (classifier-default-honesty plan §4) -- deliberately its own field, not
+  // tourVersion, which controls onboarding.
+  const [classifierHeuristicNoticeVersion, setClassifierHeuristicNoticeVersion] =
+    useState<number>(INITIAL_UI.classifierHeuristicNoticeVersion);
   // Resolved dark/light, tracked as state so theme-aware children (the
   // toaster) re-render when a "system" preference follows an OS flip.
   const [resolvedTheme, setResolvedTheme] = useState<"dark" | "light">(() =>
@@ -417,12 +427,23 @@ export default function Console() {
           tourVersion,
           density,
           fontScale,
+          classifierHeuristicNoticeVersion,
         }),
       );
     } catch {
       /* storage unavailable; layout just won't persist */
     }
-  }, [panels, arrangement, paneSizes, theme, autoSync, tourVersion, density, fontScale]);
+  }, [
+    panels,
+    arrangement,
+    paneSizes,
+    theme,
+    autoSync,
+    tourVersion,
+    density,
+    fontScale,
+    classifierHeuristicNoticeVersion,
+  ]);
 
   const togglePanel = useCallback((key: keyof Panels) => {
     setPanels((p) => ({ ...p, [key]: !p[key] }));
@@ -3656,6 +3677,12 @@ export default function Console() {
           removing={llmRemoving}
           classifierMix={classifierMix}
           classifierMixError={classifierMixError}
+          heuristicNoticeDismissed={
+            classifierHeuristicNoticeVersion >= CLASSIFIER_HEURISTIC_NOTICE_VERSION
+          }
+          onDismissHeuristicNotice={() =>
+            setClassifierHeuristicNoticeVersion(CLASSIFIER_HEURISTIC_NOTICE_VERSION)
+          }
           usage={llmUsage}
           usageError={llmUsageError}
           days={llmUsageDays}

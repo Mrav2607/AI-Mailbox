@@ -35,7 +35,9 @@ async def lifespan(app: FastAPI):
     # to load lazily on the first classify call, stalling every early request
     # behind it. A daemon thread keeps startup and readiness unblocked, and a
     # missing model degrades exactly as before (try_predict just returns None).
-    if (settings.classifier_backend or "auto").lower() in ("local", "auto"):
+    # Just "auto" -- Settings' validator maps the legacy "local" spelling onto
+    # it at construction, so the literal can't reach this line any more.
+    if settings.classifier_backend == "auto":
         from .services.nlp import local_model
 
         threading.Thread(target=local_model.warmup, name="classifier-warmup", daemon=True).start()

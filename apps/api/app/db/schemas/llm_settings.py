@@ -170,7 +170,17 @@ class LlmUsageOut(Response):
 # plan §7. `custom` deliberately has no kind of its own: a `custom`
 # credential can never route classification (presets-only, see
 # providers.py), so no row can ever be stamped with one.
-ClassifierMixKind = Literal["local", "user_key", "operator_key", "heuristic", "manual", "unknown"]
+#
+# `demo` (plan: 2026-08-16-classifier-default-honesty §5) is every seed
+# script's stamped model_version (`demo-seed`, `demo-1`, `seeded`) -- none of
+# which match a known prefix, so they used to fall through the catch-all and
+# get reported as `operator_key`: 100% paid usage on a mailbox that never
+# made a call. Do NOT delete `operator_key`'s catch-all to fix this; it's
+# also what buckets the retained bare-model-name operator path (see the
+# route's `_classifier_mix_kind`).
+ClassifierMixKind = Literal[
+    "local", "user_key", "operator_key", "heuristic", "manual", "demo", "unknown"
+]
 
 
 class ClassifierMixEntry(Response):

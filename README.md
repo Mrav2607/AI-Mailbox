@@ -43,20 +43,30 @@ What comes up:
 The `migrate` service runs first and the app waits on health checks, so a single
 `docker compose up` comes up clean with no ordering races.
 
-**Classifier:** the default build is lean and uses the keyword `heuristic`
-backend — no model or API keys required, which is enough to test the app end to
-end. To serve the actual fine-tuned encoder, you need the model artifact. It's
-git-ignored (~256MB, trained on private data), so it ships as chunked assets on
-the `model-v2` GitHub Release. Fetch it (needs the [GitHub CLI](https://cli.github.com),
-`gh auth login`), then build with the torch deps:
+**Classifier:** fetch the fine-tuned local model first — it's a one-time
+download, costs nothing per message, and works offline. With no LLM key
+configured (`GEMINI_API_KEY` unset, nobody opted into BYOK), no mail content
+leaves the machine. Add a key and that stops being true: under `auto` an
+opted-in user's key is tried *before* the encoder, and the operator's key is
+used when the encoder can't serve.
+
+The model is git-ignored (~256MB, trained on private data), so it ships as
+chunked assets on the `model-v2` GitHub Release. Fetch it (needs the
+[GitHub CLI](https://cli.github.com), `gh auth login`), then build with the
+torch deps:
 
 ```bash
 ./fetch-model.sh    # downloads + unpacks into ./models/email-classifier
-INSTALL_LOCAL_CLASSIFIER=true CLASSIFIER_BACKEND=local docker compose up --build
+INSTALL_LOCAL_CLASSIFIER=true CLASSIFIER_BACKEND=auto docker compose up --build
 ```
 
-Prefer not to download 256MB? Set `GEMINI_API_KEY` and `CLASSIFIER_BACKEND=llm`
-for real LLM classification instead.
+Without a model installed, the shipped default (`CLASSIFIER_BACKEND=auto`,
+no torch, no keys) degrades to the keyword `heuristic` backend — no deps
+required, which is enough to test the app end to end but gives worse results.
+
+Prefer an LLM over downloading 256MB? Set `GEMINI_API_KEY` and
+`CLASSIFIER_BACKEND=llm` instead — that's an ongoing per-message cost, so the
+local model is the better default for most self-hosters.
 
 **Gmail (optional):** to ingest real mail, fill `GOOGLE_CLIENT_ID` /
 `GOOGLE_CLIENT_SECRET` in `deploy/.env` and register
@@ -67,7 +77,7 @@ for real LLM classification instead.
 > quick start above is all you need.
 
 > **Local-only paths:** `models/`, `data/`, and `scripts/` are git-ignored. The
-> trained model (~250MB to download), the training/eval datasets (real email
+> trained model (~256MB to download), the training/eval datasets (real email
 > content), and the
 > one-off data-prep scripts live on your machine, not in the repo. None of them
 > are required to *run* the API — the model is loaded at serve time if present,
@@ -96,7 +106,7 @@ pip install -e .
 cd ../..
 ```
 
-   To use the local encoder classifier (`CLASSIFIER_BACKEND=local`), also install
+   To use the local encoder classifier (`CLASSIFIER_BACKEND=auto`), also install
    the optional ML dependencies (torch + transformers):
 
 ```bash
@@ -205,24 +215,41 @@ All calls below require the `Authorization: Bearer <token>` header.
 ## Email classification
 
 Each ingested message is classified into one of six labels: `needs_reply`,
-`action_required`, `fyi`, `promotional`, `security_alert`, `spam`. The backend is
-chosen by `CLASSIFIER_BACKEND` in `.env`:
+`action_required`, `fyi`, `promotional`, `security_alert`, `spam`. The
+deployment-wide backend is chosen by `CLASSIFIER_BACKEND` in `.env` (both
+deploy templates and the code default ship `auto`). The canonical values:
 
-- `local` (the code default, though both deploy templates set `heuristic`, so
-  copying one to `deploy/.env` selects the no-model backend) — a fine-tuned
-  encoder loaded from `CLASSIFIER_MODEL_PATH`
-  (default `models/email-classifier`). Needs the `local-classifier` extra. If
-  torch or the model files are missing, it falls back to the heuristic, so the
-  API still runs without a trained model. If the model directory contains a
-  `calibration.json`, the encoder applies that confidence calibration at load
-  time (absent file = raw confidences; a dir whose `config.json` marks
-  `"calibration_required": true` refuses to serve uncalibrated).
-- `llm` — an LLM classifies each message. Users who saved their own provider
-  key and opted in are served on their key; otherwise the operator's
-  `GEMINI_API_KEY` is used, with a keyword-heuristic fallback.
-- `heuristic` — keyword rules only, no extra dependencies.
-- `auto` — the local encoder when it can serve, else the LLM path, else the
-  heuristic. (Opted-in users with their own key are served on it first.)
+- `auto` — an opted-in user's own saved key is tried **first**, before the
+  local encoder is even attempted. Everyone else gets the local encoder
+  (loaded from `CLASSIFIER_MODEL_PATH`, default `models/email-classifier`;
+  needs the `local-classifier` extra) if it can serve; if torch or the model
+  files are missing, or the encoder can't produce a verdict, it falls through
+  to an LLM — the operator's `GEMINI_API_KEY` if one is set (keyword-heuristic
+  fallback on failure), otherwise the heuristic directly. If the model
+  directory contains a `calibration.json`, the encoder applies that confidence
+  calibration at load time (absent file = raw confidences; a dir whose
+  `config.json` marks `"calibration_required": true` refuses to serve
+  uncalibrated).
+- `llm` — the same routing as `auto` minus the local-encoder step: an
+  opted-in user's own key first, else the operator's `GEMINI_API_KEY` with a
+  keyword-heuristic fallback.
+- `heuristic` — keyword rules only, no extra dependencies, no LLM calls at
+  all. This is the one value that **doesn't** honor a saved key: it returns
+  before an opted-in user's routing is even read.
+
+`local` and `gemini` are deprecated aliases for `auto` and `llm` (still
+accepted, mapped at startup with a deprecation warning, scheduled for
+removal — move off them when you touch this file). Per-run overrides (the
+console's backfill picker, or `backend=` on the classify endpoints) accept a
+different, stricter `local`: only an *explicit* per-run `backend="local"` is
+guaranteed to never reach an LLM even when the encoder can't serve (it ends
+at the heuristic instead) — the global default *may* reach one instead. It
+does not always: a user whose credential resolves to "off", or a deployment
+with no `GEMINI_API_KEY` and nobody opted in, ends at the heuristic too. The
+difference is the guarantee, not the usual outcome.
+Per-run also has `local_then_llm` ("local encoder,
+LLM on failure"), the per-run analogue of `auto`'s non-opted-in path; it
+isn't a valid value for `CLASSIFIER_BACKEND` itself.
 
 The trained model is **not** committed (`models/` is git-ignored) — fetch it
 from the `model-v2` release with `./fetch-model.sh`, or train your own with the
@@ -310,14 +337,17 @@ Two things to know:
 - **Preset providers only.** Custom endpoints aren't offered here yet — the
   safety check that runs before every request to a custom URL costs a DNS
   lookup, which is fine once per action but not once per email.
-- **The built-in model goes first.** If this deployment has the local
-  classifier (`CLASSIFIER_BACKEND=local` or `auto`), it handles most mail for
-  free and your key is only used when it can't. The checkbox is hidden
-  entirely on a `heuristic` deployment, where no LLM is used at all.
+- **Your key goes first, not the built-in model.** On any deployment set to
+  `CLASSIFIER_BACKEND=auto` or `llm`, checking this box means your key is
+  tried *before* the local encoder is ever attempted — not "only used when
+  the encoder can't". Every email you receive is sent to your provider. The
+  checkbox is only inert (and hidden) on a `heuristic` deployment, where no
+  LLM is used at all.
 
 If your key ever stops being usable for sorting, the settings panel says so
-and mail falls back to the built-in rules — it never quietly switches to the
-server's key.
+— and, unless you've also checked **"If your LLM fails, classify with the
+built-in model instead"**, that mail is left **unclassified**, not
+heuristically labeled. It never quietly falls back to the server's key.
 
 Two settings control the rest:
 

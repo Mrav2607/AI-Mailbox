@@ -107,6 +107,46 @@ describe("loadUi density", () => {
   });
 });
 
+describe("loadUi classifierHeuristicNoticeVersion", () => {
+  beforeEach(() => window.localStorage.clear());
+
+  it("accepts finite non-negative numbers", () => {
+    window.localStorage.setItem(
+      UI_KEY,
+      JSON.stringify({ ...DEFAULT_UI, classifierHeuristicNoticeVersion: 1 }),
+    );
+    expect(loadUi().classifierHeuristicNoticeVersion).toBe(1);
+  });
+
+  it.each([-1, "1", null, Number.NaN, Number.POSITIVE_INFINITY])(
+    "falls back for an invalid value (%s) without poisoning other fields",
+    (value) => {
+      window.localStorage.setItem(
+        UI_KEY,
+        JSON.stringify({
+          ...DEFAULT_UI,
+          classifierHeuristicNoticeVersion: value,
+          autoSync: 60,
+        }),
+      );
+      const ui = loadUi();
+      expect(ui.classifierHeuristicNoticeVersion).toBe(
+        DEFAULT_UI.classifierHeuristicNoticeVersion,
+      );
+      expect(ui.autoSync).toBe(60);
+    },
+  );
+
+  it("falls back when an older blob has no classifierHeuristicNoticeVersion", () => {
+    const { classifierHeuristicNoticeVersion: _v, ...oldUi } = DEFAULT_UI;
+    window.localStorage.setItem(UI_KEY, JSON.stringify(oldUi));
+
+    expect(loadUi().classifierHeuristicNoticeVersion).toBe(
+      DEFAULT_UI.classifierHeuristicNoticeVersion,
+    );
+  });
+});
+
 describe("loadUi fontScale", () => {
   beforeEach(() => window.localStorage.clear());
 

@@ -62,6 +62,14 @@ export interface LlmSettingsSectionProps {
   // the render site below for why it can't live behind the BYOK gate.
   classifierMix: ClassifierMixEntry[] | null;
   classifierMixError: boolean;
+  // Whether this browser has already dismissed the "keyword rules are
+  // sorting your mail" notice below (classifier-default-honesty plan §4).
+  // App owns the underlying classifierHeuristicNoticeVersion and gates it
+  // against CLASSIFIER_HEURISTIC_NOTICE_VERSION (lib/layout.ts) -- this
+  // component only ever sees the already-computed boolean, same as the rest
+  // of this section's settings-derived flags.
+  heuristicNoticeDismissed: boolean;
+  onDismissHeuristicNotice: () => void;
 }
 
 // Hints only, shown as the model field's placeholder -- never submitted on
@@ -121,6 +129,7 @@ const CLASSIFIER_MIX_LABELS: Record<ClassifierMixKind, string> = {
   operator_key: "shared key",
   heuristic: "keyword rules",
   manual: "you",
+  demo: "demo data",
   unknown: "",
 };
 
@@ -130,9 +139,18 @@ const CLASSIFIER_MIX_LABELS: Record<ClassifierMixKind, string> = {
 // way would hide it from exactly the people it's for: anyone with no
 // credential at all, anyone on `server`/`off` routing, and any heuristic-
 // only deployment that still has local/manual/heuristic history.
+//
+// Drops any entry whose label is missing or empty, rather than trusting
+// every `kind` the API sends to exist in CLASSIFIER_MIX_LABELS -- a browser
+// tab that's already loaded runs an old bundle regardless of deployment
+// order, so it can be handed a kind (e.g. a future addition to the union)
+// its own map has never heard of. Without this, that renders literal
+// "undefined 12" instead of just omitting the row. This also covers
+// `unknown` for free, since its label is `""`, so no separate kind check is
+// needed (classifier-default-honesty plan, wave plan section).
 function classifierMixSummary(mix: ClassifierMixEntry[]): string {
   const parts = mix
-    .filter((entry) => entry.kind !== "unknown" && entry.count > 0)
+    .filter((entry) => CLASSIFIER_MIX_LABELS[entry.kind] && entry.count > 0)
     .map((entry) => `${CLASSIFIER_MIX_LABELS[entry.kind]} ${entry.count.toLocaleString()}`);
   return parts.length > 0 ? `Sorting your mail: ${parts.join(", ")}` : "nothing sorted yet";
 }
@@ -180,6 +198,8 @@ export function LlmSettingsSection({
   onOpenUsage,
   classifierMix,
   classifierMixError,
+  heuristicNoticeDismissed,
+  onDismissHeuristicNotice,
 }: LlmSettingsSectionProps) {
   const [provider, setProvider] = useState<LlmProvider>("openai");
   const [model, setModel] = useState("");
@@ -255,6 +275,31 @@ export function LlmSettingsSection({
             ? "checking how your mail is sorted…"
             : classifierMixSummary(classifierMix)}
       </p>
+
+      {/* This deployment's global backend, not this user's key -- fetching a
+          model or saving a key below changes nothing while it's heuristic,
+          since that path returns before either is read (classifier-default-
+          honesty plan §4). Dismissal is a single browser-global flag (see
+          layout.ts's classifierHeuristicNoticeVersion), so the copy is
+          addressed to "this deployment's administrator", never the reader --
+          it must stay true regardless of which account dismissed it. */}
+      {settings.classifier_backend === "heuristic" && !heuristicNoticeDismissed && (
+        <div className="rounded border border-primary/40 bg-primary/10 px-2.5 py-2 text-[11.5px] font-mono text-primary-tint-foreground leading-snug flex items-start gap-2">
+          <span className="flex-1">
+            Keyword rules are sorting your mail. Ask this deployment&apos;s
+            administrator to set <code>CLASSIFIER_BACKEND=auto</code> to use
+            the built-in model or an LLM key.
+          </span>
+          <button
+            type="button"
+            onClick={onDismissHeuristicNotice}
+            title="dismiss"
+            className="shrink-0 h-5 px-1.5 rounded border border-border/60 text-[10px] font-mono cursor-pointer transition-colors hover:bg-accent"
+          >
+            dismiss
+          </button>
+        </div>
+      )}
 
       {settings.custom_blocked && (
         <div className="rounded border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[11.5px] font-mono text-destructive leading-snug">

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Download the fine-tuned email classifier and unpack it into
-# ./models/email-classifier, so `CLASSIFIER_BACKEND=local` has something to
-# serve. The model is git-ignored (~1GB, trained on private email data), so it
-# ships as chunked assets on the `model-v2` GitHub Release instead.
+# ./models/email-classifier, so `CLASSIFIER_BACKEND=auto` has something to
+# serve. The model is git-ignored (~256MB, trained on private email data), so
+# it ships as chunked assets on the `model-v2` GitHub Release instead.
 #
 # Usage:
 #   ./fetch-model.sh
-#   INSTALL_LOCAL_CLASSIFIER=true CLASSIFIER_BACKEND=local docker compose up --build
+#   INSTALL_LOCAL_CLASSIFIER=true CLASSIFIER_BACKEND=auto docker compose up --build
 #
 # Needs the GitHub CLI, authenticated and with read access to this repo:
 #   gh auth login
@@ -45,4 +45,4 @@ if [ ! -f "$SENTINEL" ]; then
 fi
 
 echo "Done. Model is at $DEST."
-echo "Run: INSTALL_LOCAL_CLASSIFIER=true CLASSIFIER_BACKEND=local docker compose up --build"
+echo "Run: INSTALL_LOCAL_CLASSIFIER=true CLASSIFIER_BACKEND=auto docker compose up --build"

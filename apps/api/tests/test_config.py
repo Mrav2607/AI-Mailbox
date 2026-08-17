@@ -116,3 +116,87 @@ def test_scheduling_can_still_be_disabled_with_zero():
     # 0 is the documented off switch and must stay valid.
     s = Settings(_env_file=None, SCHEDULED_SYNC_INTERVAL_SECONDS=0)
     assert s.scheduled_sync_interval_seconds == 0
+
+
+# ---------------------------------------------------------------------------
+# CLASSIFIER_BACKEND normalization/legacy-mapping/rejection (plan:
+# 2026-08-16-classifier-default-honesty §3).
+#
+# Constructs real `Settings` objects rather than monkeypatching the
+# already-booted singleton's attribute -- a singleton patch bypasses this
+# validator entirely (it only runs at construction), which is exactly the
+# code path these tests exist to prove.
+# ---------------------------------------------------------------------------
+
+
+def test_classifier_backend_defaults_to_auto():
+    s = Settings(_env_file=None)
+    assert s.classifier_backend == "auto"
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("local", "auto"),
+        ("gemini", "llm"),
+        ("LOCAL", "auto"),
+        ("Gemini", "llm"),
+    ],
+    ids=["local-to-auto", "gemini-to-llm", "uppercase-local", "mixed-case-gemini"],
+)
+def test_classifier_backend_maps_legacy_spellings(raw, expected):
+    # Behaviour-preserving renames (plan §2/§3). The docs moved to `auto` in
+    # this branch, but every .env already copied from them says `local`, and
+    # those deployments have to keep booting -- not just keep classifying
+    # correctly.
+    s = Settings(_env_file=None, CLASSIFIER_BACKEND=raw)
+    assert s.classifier_backend == expected
+
+
+def test_classifier_backend_blank_defaults_to_auto():
+    s = Settings(_env_file=None, CLASSIFIER_BACKEND="")
+    assert s.classifier_backend == "auto"
+
+
+@pytest.mark.parametrize("raw", ["auto ", " auto", "\tauto\n", " AUTO "])
+def test_classifier_backend_tolerates_surrounding_whitespace(raw):
+    # A .env or compose line picks up a trailing space very easily. Without
+    # the strip that boots to a hard ValueError on a value the operator would
+    # swear is correct, which is a miserable way to find out.
+    s = Settings(_env_file=None, CLASSIFIER_BACKEND=raw)
+    assert s.classifier_backend == "auto"
+
+
+@pytest.mark.parametrize("raw", ["   ", "\t", "\n"])
+def test_classifier_backend_whitespace_only_defaults_to_auto(raw):
+    # Same fallback a truly blank value gets -- whitespace-only is blank as
+    # far as an operator is concerned, so it must not raise.
+    s = Settings(_env_file=None, CLASSIFIER_BACKEND=raw)
+    assert s.classifier_backend == "auto"
+
+
+def test_classifier_backend_strips_before_mapping_a_legacy_alias():
+    # The strip has to happen before the alias lookup, not after, or a padded
+    # legacy value misses the map and falls through to the reject branch.
+    s = Settings(_env_file=None, CLASSIFIER_BACKEND=" local ")
+    assert s.classifier_backend == "auto"
+
+
+@pytest.mark.parametrize("raw", ["HEURISTIC", "Auto", "LLM"])
+def test_classifier_backend_case_insensitive_for_canonical_values(raw):
+    s = Settings(_env_file=None, CLASSIFIER_BACKEND=raw)
+    assert s.classifier_backend == raw.lower()
+
+
+def test_classifier_backend_rejects_unknown_value():
+    with pytest.raises(ValidationError, match="CLASSIFIER_BACKEND"):
+        Settings(_env_file=None, CLASSIFIER_BACKEND="banana")
+
+
+def test_classifier_backend_rejects_local_then_llm_as_a_global_value():
+    # local_then_llm is per-run only (a `backend=` override on a single
+    # request/backfill) -- never a deployment default. Accepting it here
+    # would mean every classify() call silently loses the global-default
+    # opt-in-wins-first semantics "auto" carries (plan's Wave plan section).
+    with pytest.raises(ValidationError, match="CLASSIFIER_BACKEND"):
+        Settings(_env_file=None, CLASSIFIER_BACKEND="local_then_llm")
