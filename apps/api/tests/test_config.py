@@ -145,9 +145,10 @@ def test_classifier_backend_defaults_to_auto():
     ids=["local-to-auto", "gemini-to-llm", "uppercase-local", "mixed-case-gemini"],
 )
 def test_classifier_backend_maps_legacy_spellings(raw, expected):
-    # Behaviour-preserving renames (plan §2/§3): docker-compose.yml,
-    # fetch-model.sh, and README.md all still say CLASSIFIER_BACKEND=local,
-    # so this has to keep booting, not just keep classifying correctly.
+    # Behaviour-preserving renames (plan §2/§3). The docs moved to `auto` in
+    # this branch, but every .env already copied from them says `local`, and
+    # those deployments have to keep booting -- not just keep classifying
+    # correctly.
     s = Settings(_env_file=None, CLASSIFIER_BACKEND=raw)
     assert s.classifier_backend == expected
 

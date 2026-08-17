@@ -199,11 +199,10 @@ def classify(
                      `mode="user"`, see below). Folded onto "auto" right at
                      the top of `_classify_attempt`, so a direct
                      `classify(backend="local_then_llm")` call and the
-                     mailbox.py route both resolve identically. Left as the
-                     global default it follows the same opt-in rule as
-                     "local" below, so an opted-in caller reaches the LLM
-                     BEFORE the encoder. The two are not interchangeable for
-                     `mode="user"`.
+                     mailbox.py route both resolve identically. Per-run
+                     only: Settings' validator rejects it as a global
+                     CLASSIFIER_BACKEND value, because it names an ordering
+                     for one request rather than a deployment default.
 
     `routing` (see `providers.ClassificationRouting`) decides WHO PAYS if and
     only if the LLM path is actually reached. `None` and `mode="server"` are

@@ -243,8 +243,11 @@ removal — move off them when you touch this file). Per-run overrides (the
 console's backfill picker, or `backend=` on the classify endpoints) accept a
 different, stricter `local`: only an *explicit* per-run `backend="local"` is
 guaranteed to never reach an LLM even when the encoder can't serve (it ends
-at the heuristic instead) — the global default, in every other routing
-state, does reach an LLM. Per-run also has `local_then_llm` ("local encoder,
+at the heuristic instead) — the global default *may* reach one instead. It
+does not always: a user whose credential resolves to "off", or a deployment
+with no `GEMINI_API_KEY` and nobody opted in, ends at the heuristic too. The
+difference is the guarantee, not the usual outcome.
+Per-run also has `local_then_llm` ("local encoder,
 LLM on failure"), the per-run analogue of `auto`'s non-opted-in path; it
 isn't a valid value for `CLASSIFIER_BACKEND` itself.
 

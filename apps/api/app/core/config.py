@@ -28,8 +28,9 @@ _logger = logging.getLogger("cortexmail")
 
 # Legacy CLASSIFIER_BACKEND spellings, mapped onto their canonical
 # replacement at boot rather than rejected -- docker-compose.yml,
-# fetch-model.sh, and README.md all currently tell people to set
-# CLASSIFIER_BACKEND=local, and "gemini" predates BYOK. Both mappings are
+# fetch-model.sh and README.md said CLASSIFIER_BACKEND=local for a long time
+# (this branch moved them to auto, but every .env copied from them before
+# that still says local), and "gemini" predates BYOK. Both mappings are
 # behaviour-preserving (see classifier.py's dispatch), so this is a rename,
 # not a functional change. Kept for at least one release (plan:
 # docs/plans/2026-08-16-classifier-default-honesty-plan.md §3).
