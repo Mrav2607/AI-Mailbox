@@ -73,10 +73,14 @@ _MAX_MODEL_LEN = 200
 
 def _effective_backend() -> str:
     """The SAME normalized expression `classifier.classify` dispatches on --
-    `(settings.classifier_backend or "auto").lower()`. The config value is an
-    unconstrained string, so comparing it raw would misreport e.g.
-    `CLASSIFIER_BACKEND=HEURISTIC` or an empty value as LLM-backed, showing a
-    consent toggle that can never fire.
+    `(settings.classifier_backend or "auto").lower()`.
+
+    Settings' own field validator now normalizes, maps the legacy spellings
+    and rejects anything unrecognized at boot, so by the time this runs the
+    value is already canonical and this expression is a no-op. Kept anyway:
+    it costs nothing, and it means this function and `classify()` still read
+    identically, which is what stops them drifting if either side's
+    normalization ever moves again.
     """
     return (settings.classifier_backend or "auto").lower()
 

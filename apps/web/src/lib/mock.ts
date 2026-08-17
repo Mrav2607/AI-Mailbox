@@ -1119,6 +1119,10 @@ export function mockGetClassifierMix(): ClassifierMix {
     { kind: "local", count: 809 },
     { kind: "user_key", count: 86 },
     { kind: "heuristic", count: 11 },
+    // Seeded demo rows get their own kind rather than falling to the
+    // operator-key catch-all. Carried here so preview exercises the label
+    // too -- otherwise the only place it renders is a real seeded mailbox.
+    { kind: "demo", count: 15 },
     { kind: "manual", count: 1 },
   ];
   return { classifier_mix };
