@@ -3,7 +3,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SettingsDialog, type SettingsTab } from "./SettingsDialog";
-import type { Connection, LlmProvider, LlmSettings, LlmUsage } from "@/lib/types";
+import type {
+  ClassifierMixEntry,
+  Connection,
+  LlmProvider,
+  LlmSettings,
+  LlmUsage,
+} from "@/lib/types";
 import type { SyncHealth } from "@/lib/api";
 
 function makeConnection(overrides: Partial<Connection> = {}): Connection {
@@ -109,6 +115,9 @@ function Harness({
   onConnectionUpdated = vi.fn(),
   onRetrySettings = vi.fn(),
   onSave = vi.fn(),
+  heuristicNoticeDismissed = false,
+  onDismissHeuristicNotice = vi.fn(),
+  classifierMix = null,
 }: {
   initialTab?: SettingsTab;
   connections?: Connection[];
@@ -128,6 +137,9 @@ function Harness({
     classification_byok?: boolean;
     classification_fallback_local?: boolean;
   }) => void;
+  heuristicNoticeDismissed?: boolean;
+  onDismissHeuristicNotice?: () => void;
+  classifierMix?: ClassifierMixEntry[] | null;
 }) {
   const [open, setOpen] = useState(true);
   const [tab, setTab] = useState<SettingsTab>(initialTab);
@@ -153,8 +165,10 @@ function Harness({
       testResult={null}
       onRemove={vi.fn()}
       removing={false}
-      classifierMix={null}
+      classifierMix={classifierMix}
       classifierMixError={false}
+      heuristicNoticeDismissed={heuristicNoticeDismissed}
+      onDismissHeuristicNotice={onDismissHeuristicNotice}
       usage={usage}
       usageError={usageError}
       days={30}
@@ -387,6 +401,102 @@ describe("SettingsDialog ai tab LLM-failure fallback toggle", () => {
     expect(document.body.textContent).not.toContain(
       "If your LLM fails, classify with the built-in model instead",
     );
+  });
+});
+
+describe("SettingsDialog ai tab heuristic-backend notice", () => {
+  it("renders when the backend is heuristic and not dismissed", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings({ classifier_backend: "heuristic" })}
+          usage={makeUsage()}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain(
+      "Keyword rules are sorting your mail.",
+    );
+  });
+
+  it("does not render when the backend isn't heuristic", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings({ classifier_backend: "auto" })}
+          usage={makeUsage()}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).not.toContain(
+      "Keyword rules are sorting your mail.",
+    );
+  });
+
+  it("hides once dismissed", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings({ classifier_backend: "heuristic" })}
+          usage={makeUsage()}
+          heuristicNoticeDismissed={true}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).not.toContain(
+      "Keyword rules are sorting your mail.",
+    );
+  });
+
+  it("fires the dismiss callback", async () => {
+    const onDismissHeuristicNotice = vi.fn();
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings({ classifier_backend: "heuristic" })}
+          usage={makeUsage()}
+          onDismissHeuristicNotice={onDismissHeuristicNotice}
+        />,
+      );
+      await Promise.resolve();
+    });
+    act(() => {
+      findButton("dismiss").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onDismissHeuristicNotice).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("SettingsDialog ai tab classifier-mix summary forward compatibility", () => {
+  it("omits an entry whose kind the label map doesn't recognize, instead of rendering it broken", async () => {
+    // Casts past the union on purpose -- simulating an already-open tab
+    // running an old bundle that receives a `kind` its build has never heard
+    // of (classifier-default-honesty plan, wave plan section).
+    const mix: ClassifierMixEntry[] = [
+      { kind: "local", count: 3 },
+      { kind: "a-future-kind" as ClassifierMixEntry["kind"], count: 12 },
+    ];
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings({ classifier_backend: "auto" })}
+          usage={makeUsage()}
+          classifierMix={mix}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("Sorting your mail: built-in model 3");
+    expect(document.body.textContent).not.toContain("undefined");
+    expect(document.body.textContent).not.toContain("12");
   });
 });
 

@@ -2,6 +2,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Connection } from "@/lib/types";
+import { CLASSIFIER_HEURISTIC_NOTICE_VERSION, UI_KEY } from "@/lib/layout";
 
 // The fenced merge (settings-card plan §3.2/P1-1) lives entirely inside
 // App's own closures (connectionsGenRef, userIdRef, handleConnectionUpdated),
@@ -350,6 +351,34 @@ describe("App's fenced connection-update merge", () => {
     // Still u2's own row, untouched -- u1's stale update never got merged in.
     expect(findConnection("conn-1")?.email_address).toBe("bob@outlook.com");
     expect(findConnection("conn-1")?.label_sync_enabled).toBe(false);
+  });
+});
+
+describe("the heuristic-notice dismissal write", () => {
+  // Proves ONLY the write side of persistence -- App.tsx's own
+  // `INITIAL_UI = loadUi()` module-scope read (App.tsx:151-152) means a
+  // fresh render/remount of this same module instance reuses that stale
+  // object, so it can't prove a reload picks the write back up. The read
+  // side is proven separately in layout.test.ts's loadUi() suite, which
+  // exercises the exact same field the write below produces (classifier-
+  // default-honesty plan §4).
+  it("persists the dismissal to localStorage when the callback fires", async () => {
+    window.localStorage.removeItem(UI_KEY);
+    mockApi.listConnections.mockImplementation(() => Promise.resolve([]));
+    await renderApp();
+
+    expect(settingsCapture.current.heuristicNoticeDismissed).toBe(false);
+
+    await act(async () => {
+      settingsCapture.current.onDismissHeuristicNotice();
+      await Promise.resolve();
+    });
+
+    const stored = JSON.parse(window.localStorage.getItem(UI_KEY) ?? "{}");
+    expect(stored.classifierHeuristicNoticeVersion).toBe(
+      CLASSIFIER_HEURISTIC_NOTICE_VERSION,
+    );
+    expect(settingsCapture.current.heuristicNoticeDismissed).toBe(true);
   });
 });
 

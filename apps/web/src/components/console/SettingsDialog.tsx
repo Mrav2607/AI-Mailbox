@@ -215,6 +215,8 @@ export interface SettingsDialogProps {
   removing: LlmSettingsSectionProps["removing"];
   classifierMix: LlmSettingsSectionProps["classifierMix"];
   classifierMixError: LlmSettingsSectionProps["classifierMixError"];
+  heuristicNoticeDismissed: LlmSettingsSectionProps["heuristicNoticeDismissed"];
+  onDismissHeuristicNotice: LlmSettingsSectionProps["onDismissHeuristicNotice"];
 
   // usage tab -- same field names LlmUsageSection takes. `usage`/`usageError`
   // double as the ai tab's one-line usage summary, same as the field names
@@ -266,6 +268,8 @@ export function SettingsDialog({
   removing,
   classifierMix,
   classifierMixError,
+  heuristicNoticeDismissed,
+  onDismissHeuristicNotice,
   usage,
   usageError,
   days,
@@ -351,6 +355,8 @@ export function SettingsDialog({
               onOpenUsage={() => onTabChange("usage")}
               classifierMix={classifierMix}
               classifierMixError={classifierMixError}
+              heuristicNoticeDismissed={heuristicNoticeDismissed}
+              onDismissHeuristicNotice={onDismissHeuristicNotice}
             />
           </div>
           <div hidden={tab !== "usage"} className="h-full overflow-y-auto pr-0.5">

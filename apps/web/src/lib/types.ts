@@ -400,13 +400,16 @@ export interface LlmUsage {
 // The closed set `Classification.model_version` maps onto, server-side (plan
 // §7). `custom` deliberately has no kind of its own -- a `custom` credential
 // can never route classification (presets-only), so no row can ever be
-// stamped with one.
+// stamped with one. `demo` covers the seed scripts' model_version stand-ins
+// (classifier-default-honesty plan §5) -- without it, demo rows fell into
+// the operator_key catch-all and misreported free seed data as paid usage.
 export type ClassifierMixKind =
   | "local"
   | "user_key"
   | "operator_key"
   | "heuristic"
   | "manual"
+  | "demo"
   | "unknown";
 
 // One row of GET /settings/llm/classifier-mix -- a `kind` summed across
