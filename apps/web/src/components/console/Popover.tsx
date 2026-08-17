@@ -49,7 +49,10 @@ export function Popover({
   }, [open, onOpenChange, lockOpen]);
 
   return (
-    <div ref={ref} className="relative">
+    // flex (not block) so an inline-flex trigger doesn't sit on a text
+    // baseline and pick up descender space -- that pushed the detail pane's
+    // snooze icon a few px above its neighbors.
+    <div ref={ref} className="relative flex">
       {trigger}
       {open && (
         // No ARIA role on purpose: this is a disclosure (trigger sets
