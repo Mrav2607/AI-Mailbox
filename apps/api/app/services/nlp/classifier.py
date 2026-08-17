@@ -190,11 +190,20 @@ def classify(
                      called "gemini" before BYOK, which read as though it
                      pinned the provider. "gemini" still works as an alias.
       - "heuristic": keyword rules only.
-      - "auto":      try local, then LLM, then heuristic -- but only when
-                     passed explicitly. Left as the global default it follows
-                     the same opt-in rule as "local" below, so an opted-in
-                     caller reaches the LLM BEFORE the encoder. The two are
-                     not interchangeable for `mode="user"`.
+      - "local_then_llm": try local, then LLM, then heuristic -- but only
+                     when passed explicitly. This is the canonical per-run
+                     name for what used to be (and still is, as a deprecated
+                     alias) per-run "auto" -- named for what it does rather
+                     than overloading "auto", which means something
+                     different as the GLOBAL default (key-first under
+                     `mode="user"`, see below). Folded onto "auto" right at
+                     the top of `_classify_attempt`, so a direct
+                     `classify(backend="local_then_llm")` call and the
+                     mailbox.py route both resolve identically. Left as the
+                     global default it follows the same opt-in rule as
+                     "local" below, so an opted-in caller reaches the LLM
+                     BEFORE the encoder. The two are not interchangeable for
+                     `mode="user"`.
 
     `routing` (see `providers.ClassificationRouting`) decides WHO PAYS if and
     only if the LLM path is actually reached. `None` and `mode="server"` are
@@ -272,6 +281,7 @@ def _classify_attempt(
 
         explicit = backend is not None
         effective = (backend or settings.classifier_backend or "auto").lower()
+        if effective == "local_then_llm":       -> effective = "auto"
 
         if effective == "heuristic":            -> keyword rules
         if effective in ("local", "auto"):
@@ -286,6 +296,18 @@ def _classify_attempt(
     """
     explicit = backend is not None
     effective = (backend or settings.classifier_backend or "auto").lower()
+    # "local_then_llm" is the canonical PER-RUN name for this branch (plan
+    # §2) -- folded onto "auto" here, at the library boundary, rather than
+    # only in mailbox.py's route: a caller reaching this function directly
+    # (classify(backend="local_then_llm")) must resolve the same way a
+    # backfill request does, regardless of whether it went through the
+    # route's own normalization first. `explicit` is computed above from the
+    # ORIGINAL `backend` argument, so an explicit "local_then_llm" call still
+    # counts as explicit after this fold -- it just adopts "auto"'s dispatch
+    # rules (local first, LLM on failure) rather than "auto"'s different
+    # meaning as an unset global default (BYOK key first under `mode="user"`).
+    if effective == "local_then_llm":
+        effective = "auto"
 
     if effective == "heuristic":
         return _heuristic_attempt(text)

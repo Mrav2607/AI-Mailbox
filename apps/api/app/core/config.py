@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -18,6 +19,26 @@ _DEV_ENVS = {"dev", "development", "local", "test", "testing", "ci"}
 # so asymmetric algorithms (RS*/ES*) can't work here, and "none" would disable
 # signature checks entirely -- reject anything outside this set at boot.
 _ALLOWED_JWT_ALGORITHMS = {"HS256", "HS384", "HS512"}
+
+# Named "cortexmail" to match the logger `app.core.logging.configure_logging`
+# sets up -- config.py can't import that module (it imports `settings` from
+# here, which would be circular), so this grabs the same named logger
+# directly instead.
+_logger = logging.getLogger("cortexmail")
+
+# Legacy CLASSIFIER_BACKEND spellings, mapped onto their canonical
+# replacement at boot rather than rejected -- docker-compose.yml,
+# fetch-model.sh, and README.md all currently tell people to set
+# CLASSIFIER_BACKEND=local, and "gemini" predates BYOK. Both mappings are
+# behaviour-preserving (see classifier.py's dispatch), so this is a rename,
+# not a functional change. Kept for at least one release (plan:
+# docs/plans/2026-08-16-classifier-default-honesty-plan.md §3).
+_LEGACY_CLASSIFIER_BACKENDS = {"local": "auto", "gemini": "llm"}
+# The only values `classify()` understands as a GLOBAL default. Deliberately
+# excludes "local_then_llm" -- that ordering is per-run only (a `backend=`
+# override on a request), never a deployment default; see the plan's Wave
+# plan section for why global local_then_llm must be rejected here.
+_VALID_CLASSIFIER_BACKENDS = {"auto", "heuristic", "llm"}
 
 
 _CONFIG_PATH = Path(__file__).resolve()
@@ -52,10 +73,14 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
-    # Email classifier backend: "local" (fine-tuned encoder in models/), "gemini"
-    # (LLM), "heuristic" (keyword rules), or "auto" (local, else gemini, else
-    # heuristic). Local/gemini both fall back gracefully if unavailable.
-    classifier_backend: str = Field(default="local", alias="CLASSIFIER_BACKEND")
+    # Email classifier backend -- canonical global values are "auto" (an
+    # opted-in BYOK key first, else the local encoder, else an LLM),
+    # "heuristic" (keyword rules only), or "llm" (LLM-backed, heuristic on
+    # failure). "local" and "gemini" are deprecated aliases for "auto"/"llm",
+    # mapped below with a startup warning; "local_then_llm" is a per-run-only
+    # value (services/nlp/classifier.py, routes/mailbox.py) and is rejected
+    # here. See docs/plans/2026-08-16-classifier-default-honesty-plan.md §2-3.
+    classifier_backend: str = Field(default="auto", alias="CLASSIFIER_BACKEND")
     classifier_model_path: str = Field(default="models/email-classifier", alias="CLASSIFIER_MODEL_PATH")
     # Opt-in switch for the second-stage LLM action extraction. Off by default:
     # existing deployments already carry GEMINI_API_KEY for classification and
@@ -146,6 +171,40 @@ class Settings(BaseSettings):
     @classmethod
     def _strip_frontend_base_url_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
+
+    @field_validator("classifier_backend")
+    @classmethod
+    def _normalize_classifier_backend(cls, value: str) -> str:
+        """Normalize, map legacy spellings, and reject anything else at boot.
+
+        Blank/case handling matches the SAME expression `classify()` uses at
+        dispatch time (`(value or "auto").lower()`), so the value stored here
+        is already what every other reader can just echo. `local` and
+        `gemini` map to `auto`/`llm` with a deprecation warning rather than
+        failing -- a hard reject would strand every deployment still
+        following docker-compose.yml/fetch-model.sh/README.md's
+        `CLASSIFIER_BACKEND=local` instructions. `local_then_llm` is
+        deliberately NOT in the legacy map: it's a per-run override, never a
+        deployment default, so a global value of it is a genuine
+        configuration error, not a rename -- and is rejected below along
+        with any other unrecognized value.
+        """
+        normalized = (value or "auto").lower()
+        mapped = _LEGACY_CLASSIFIER_BACKENDS.get(normalized, normalized)
+        if mapped != normalized:
+            _logger.warning(
+                "CLASSIFIER_BACKEND=%r is deprecated; treating it as %r. "
+                "Update your config before the alias is removed.",
+                normalized, mapped,
+            )
+        if mapped not in _VALID_CLASSIFIER_BACKENDS:
+            allowed = ", ".join(sorted(_VALID_CLASSIFIER_BACKENDS))
+            aliases = ", ".join(sorted(_LEGACY_CLASSIFIER_BACKENDS))
+            raise ValueError(
+                f"CLASSIFIER_BACKEND {value!r} is not recognized; choose one "
+                f"of: {allowed} (deprecated aliases still accepted: {aliases})"
+            )
+        return mapped
 
     @property
     def cors_origins_list(self) -> list[str]:

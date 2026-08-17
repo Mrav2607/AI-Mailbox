@@ -74,13 +74,14 @@ def test_classify_heuristic_backend(monkeypatch):
     assert model_version == "heuristic-v1"
 
 
-def test_classify_local_backend_falls_back_when_model_missing(monkeypatch, tmp_path):
-    # With no model on disk, the local backend must degrade to the gemini/
-    # heuristic path rather than raise.
+def test_classify_default_backend_falls_back_when_model_missing(monkeypatch, tmp_path):
+    # With no model on disk, the GLOBAL default ("auto" -- "local" is now a
+    # deprecated alias for it, plan §2/§3) must degrade to the llm/heuristic
+    # path rather than raise.
     from app.services.nlp import classifier, local_model
 
     local_model.reset()
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "auto")
     monkeypatch.setattr(classifier.settings, "classifier_model_path", str(tmp_path / "no-model-here"))
     monkeypatch.setattr(classifier.settings, "gemini_api_key", None)
 
@@ -669,10 +670,13 @@ def test_classify_precedence_heuristic_backend_ignores_user_routing(monkeypatch)
 
 def test_classify_precedence_local_available_wins_over_off_routing(monkeypatch):
     """Row 2 of the matrix: a healthy local encoder's result is returned as
-    -is, never downgraded to heuristic just because routing says "off"."""
+    -is, never downgraded to heuristic just because routing says "off". The
+    global default value itself isn't the point here (both "local" and
+    "auto" land in the same `_classify_attempt` branch) -- "auto" is the
+    canonical spelling as of plan §2/§3, "local" now a deprecated alias."""
     from app.services.nlp import classifier, local_model
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "auto")
     monkeypatch.setattr(local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test"))
     routing = ClassificationRouting(mode="off", credential=None)
     label, confidence, rationale, model_version = classify("anything at all", routing=routing)
@@ -754,14 +758,16 @@ def test_classify_with_usage_heuristic_backend_never_touched_provider(monkeypatc
     assert attempt.failure_category is None
 
 
-def test_classify_with_usage_local_backend_never_touched_provider(monkeypatch):
+def test_classify_with_usage_default_backend_never_touched_provider(monkeypatch):
     """The predicate trap the plan calls out by name: a CLASSIFIER_BACKEND=
-    local run must report llm_attempted=False / fallback_used=False -- it
-    never even considered an LLM, so it must never be counted as a degraded
-    run just because routing.mode happens to say "user"."""
+    auto run (the global default; "local" was the pre-rename spelling for
+    this same value, plan §2/§3) must report llm_attempted=False /
+    fallback_used=False when the encoder serves -- it never even considered
+    an LLM, so it must never be counted as a degraded run just because
+    routing.mode happens to say "user"."""
     from app.services.nlp import classifier, local_model
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "auto")
     monkeypatch.setattr(
         local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test")
     )
@@ -1042,12 +1048,13 @@ def test_classify_with_usage_server_path_malformed_response_is_invalid_response(
 def test_classify_default_backend_user_mode_never_consults_local_encoder(monkeypatch):
     """Case 1: the global default (backend not passed for this run) sends an
     opted-in user straight to their key -- the local encoder is never even
-    asked, so a deployment defaulting to local/auto (today's
-    CLASSIFIER_BACKEND default) still honors the opt-in instead of
-    classifying that mail for free."""
+    asked, so a deployment defaulting to "auto" (today's CLASSIFIER_BACKEND
+    default; "local" is now a deprecated alias for the same value, plan
+    §2/§3) still honors the opt-in instead of classifying that mail for
+    free."""
     from app.services.nlp import classifier, local_model
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "auto")
     monkeypatch.setattr(local_model, "try_predict", _explode)
 
     credential = LlmCredential(
@@ -1068,7 +1075,7 @@ def test_classify_default_backend_server_mode_uses_encoder(monkeypatch):
     key."""
     from app.services.nlp import classifier, local_model
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "auto")
     monkeypatch.setattr(
         local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test")
     )
@@ -1084,7 +1091,7 @@ def test_classify_default_backend_off_mode_uses_encoder(monkeypatch):
     mode="off" still uses the encoder and never calls an LLM."""
     from app.services.nlp import classifier, local_model
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "auto")
     monkeypatch.setattr(
         local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test")
     )
@@ -1102,7 +1109,7 @@ def test_classify_default_backend_no_routing_uses_encoder(monkeypatch):
     encoder."""
     from app.services.nlp import classifier, local_model
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "local")
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "auto")
     monkeypatch.setattr(
         local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test")
     )
@@ -1509,3 +1516,114 @@ def test_classify_fallback_local_has_no_effect_on_server_or_off_mode(monkeypatch
         assert classify("Can you help?", routing=opted_out) == classify(
             "Can you help?", routing=opted_in
         )
+
+
+# ---------------------------------------------------------------------------
+# "local_then_llm" -- the canonical per-run name for what per-run "auto" has
+# always done (plan: 2026-08-16-classifier-default-honesty §2). Normalized
+# in TWO places: mailbox.py's route (covered in test_validation.py) and here,
+# right at the top of `_classify_attempt` -- this is the second place, proving
+# a direct classify(backend="local_then_llm") call resolves correctly
+# regardless of the route ever running at all.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_local_then_llm_canonical_name_matches_auto_alias(monkeypatch):
+    """Same setup and same assertions as the explicit-"auto" case this
+    replaces (test_classify_explicit_auto_encoder_unavailable_user_mode_
+    reaches_llm) -- if the two spellings ever diverge, this and that test
+    disagree, which is the point: "local_then_llm" IS "auto" at the
+    dispatch boundary, just spelled the canonical way."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
+    credential = LlmCredential(
+        provider="mistral", base_url="https://api.mistral.ai/v1", api_key="k", model="mistral-small"
+    )
+    captured = {}
+
+    def spy(text, routing=None, local_tried=False, policy=None):
+        captured["local_tried"] = local_tried
+        captured["routing"] = routing
+        return ClassificationAttempt(
+            verdict=("promotional", 0.7, "sale", "spy-v1"),
+            provider_call_succeeded=True,
+            usage=None,
+        )
+
+    monkeypatch.setattr(classifier, "_classify_llm", spy)
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify(
+        "50% off this weekend!", backend="local_then_llm", routing=routing
+    )
+    assert model_version == "spy-v1"
+    assert captured["routing"] is routing
+    assert captured["local_tried"] is True  # the encoder was tried once before this
+
+
+def test_classify_local_then_llm_stops_never_at_heuristic_unlike_explicit_local(monkeypatch):
+    """`local_then_llm` retains "auto"'s local-first-THEN-LLM order -- unlike
+    an explicit "local", it does NOT stop at the heuristic when the encoder
+    is unavailable (D1a only ever applies to the literal "local" spelling).
+    Mirrors test_classify_explicit_local_user_mode_encoder_unavailable_
+    stops_at_heuristic's setup with backend="local_then_llm" instead of
+    "local", and asserts the opposite outcome."""
+    from app.services.nlp import classifier, local_model
+
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
+    content = json.dumps({"label": "security_alert", "confidence": 0.9, "rationale": "r"})
+    monkeypatch.setattr(
+        classifier, "call_chat_completion",
+        lambda *a, **k: LlmCallResult(content=content, usage=None),
+    )
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+    label, confidence, rationale, model_version = classify(
+        "Security alert: new login detected", backend="local_then_llm", routing=routing
+    )
+    assert label == "security_alert"
+    assert model_version == "openai:gpt-4o-mini"  # reached the LLM, never stopped at heuristic
+
+
+# ---------------------------------------------------------------------------
+# §1's BYOK activation contract -- and the wrong way to test it it names
+# explicitly: resolve_classification_routing never reads CLASSIFIER_BACKEND
+# (providers.py:474), so a "flip the setting, then resolve routing" test
+# proves nothing. The activation happens right here, in `_classify_attempt`,
+# only when `backend is None` and the effective global backend stops being
+# "heuristic" -- so this constructs `routing` directly (mode="user", as if
+# an opted-in PUT had already resolved) and flips only the global setting.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_byok_opt_in_dormant_under_heuristic_activates_under_auto(monkeypatch):
+    from app.services.nlp import classifier
+
+    wire_calls = []
+
+    def spy_call_chat_completion(*args, **kwargs):
+        wire_calls.append(1)
+        content = json.dumps({"label": "fyi", "confidence": 0.5, "rationale": "r"})
+        return LlmCallResult(content=content, usage=None)
+
+    monkeypatch.setattr(classifier, "call_chat_completion", spy_call_chat_completion)
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
+    )
+    # As if an opted-in PUT had already resolved to this -- deliberately NOT
+    # going through resolve_classification_routing, per the plan's note on
+    # why that would prove nothing here.
+    routing = ClassificationRouting(mode="user", credential=credential)
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "heuristic")
+    dormant = classify_with_usage("Can you help?", backend=None, routing=routing)
+    assert wire_calls == []
+    assert dormant.verdict[3] == "heuristic-v1"  # served by keyword rules, key untouched
+    assert dormant.llm_attempted is False
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "auto")
+    active = classify_with_usage("Can you help?", backend=None, routing=routing)
+    assert wire_calls == [1]
+    assert active.verdict[3] == "openai:gpt-4o-mini"  # the same stored credential, now reached

@@ -14,6 +14,7 @@ flush-before-commit ordering).
 
 from __future__ import annotations
 
+import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 from uuid import uuid4
@@ -25,7 +26,7 @@ from app.db.models import MailMessage
 from app.services.nlp import backfill
 from app.services.nlp import classifier as classifier_module
 from app.services.nlp.classifier import ClassificationAttempt
-from app.services.nlp.llm_client import INLINE_RETRIES, LlmCallError, LlmUsage
+from app.services.nlp.llm_client import INLINE_RETRIES, LlmCallError, LlmCallResult, LlmUsage
 from app.services.nlp.persistence import OPERATOR_MODEL_VERSION
 from app.services.nlp.providers import ClassificationRouting, LlmCredential
 
@@ -338,14 +339,16 @@ def test_run_backfill_threads_the_caller_supplied_policy_to_classify_with_usage(
 # ---------------------------------------------------------------------------
 
 
-def test_run_backfill_local_backend_reports_zero_llm_attempted_and_fell_back(monkeypatch):
+def test_run_backfill_default_backend_reports_zero_llm_attempted_and_fell_back(monkeypatch):
     """The predicate trap the plan calls out by name (first test to write):
-    a CLASSIFIER_BACKEND=local backfill must report fell_back=0 AND
-    llm_attempted=0 -- a naive implementation gating on routing.mode=="user"
-    would report this as 100% degraded even though no LLM was ever consulted."""
+    a CLASSIFIER_BACKEND=auto backfill (the global default; "local" is now a
+    deprecated alias for the same value, plan §2/§3) must report
+    fell_back=0 AND llm_attempted=0 -- a naive implementation gating on
+    routing.mode=="user" would report this as 100% degraded even though no
+    LLM was ever consulted."""
     from app.services.nlp import local_model
 
-    monkeypatch.setattr(classifier_module.settings, "classifier_backend", "local")
+    monkeypatch.setattr(classifier_module.settings, "classifier_backend", "auto")
     monkeypatch.setattr(
         local_model, "try_predict",
         lambda text: ("fyi", 0.5, "local rationale", "local:test"),
@@ -878,3 +881,97 @@ def test_run_backfill_protected_upsert_outcome_counts_as_skipped_not_created(mon
     # (classify_latest_threads) passes straight to the client.
     assert result["task_created"] == 0
     assert result["task_processed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# §1's required "runs through an ingester or backfill" test (plan:
+# 2026-08-16-classifier-default-honesty): a failed BYOK call with no
+# fallback_local opt-in must leave NO classification row written, not just
+# `classify()` returning `None` in isolation -- the write guard lives at the
+# call site (gmail_ingest.py:606's ingest twin), and run_backfill's own copy
+# is what's exercised here. classify_with_usage is deliberately NOT mocked:
+# it's the real dispatch (call_chat_completion IS mocked, at the wire) that
+# has to produce verdict=None for this to mean anything.
+# ---------------------------------------------------------------------------
+
+
+def test_run_backfill_byok_failure_with_no_fallback_writes_no_classification_row(monkeypatch):
+    from app.services.nlp import classifier as classifier_module, local_model
+
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
+
+    def failing_call(*args, **kwargs):
+        raise LlmCallError("connection_failed", None)
+
+    monkeypatch.setattr(classifier_module, "call_chat_completion", failing_call)
+
+    user_id = uuid4()
+    db = _single_message_db()
+    # fallback_local defaults False -- no encoder fallback, no heuristic
+    # fallback (phase 2, D-C/D-H left the heuristic out of this chain
+    # entirely), so a failed call must leave the message unclassified.
+    routing = ClassificationRouting(mode="user", credential=_CRED)
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+
+    upserts = []
+    monkeypatch.setattr(
+        backfill, "upsert_classification",
+        lambda *a, **k: (upserts.append(k), "written")[1],
+    )
+
+    result = backfill.run_backfill(db, user_id, limit=10, backend="llm")
+
+    assert upserts == []  # the write guard: no classification row for a None verdict
+    assert result["created"] == 0
+    assert result["left_unclassified"] == 1
+
+
+def test_run_backfill_byok_opt_in_dormant_under_heuristic_then_writes_a_row_under_auto(
+    monkeypatch,
+):
+    """Companion to test_classifier.py's direct-dispatch version of this same
+    §1 scenario, but through run_backfill so the write side is proven too:
+    under a "heuristic" global backend the opted-in credential is never
+    reached (no wire call, a heuristic row still gets written since the
+    heuristic always produces a verdict); flipping to "auto" reaches the
+    same stored credential and its row carries the BYOK model_version."""
+    from app.services.nlp import classifier as classifier_module, local_model
+
+    monkeypatch.setattr(local_model, "try_predict", lambda text: None)
+    wire_calls = []
+
+    def spy_call_chat_completion(*args, **kwargs):
+        wire_calls.append(1)
+        content = json.dumps({"label": "fyi", "confidence": 0.5, "rationale": "r"})
+        return LlmCallResult(content=content, usage=None)
+
+    monkeypatch.setattr(classifier_module, "call_chat_completion", spy_call_chat_completion)
+
+    user_id = uuid4()
+    routing = ClassificationRouting(mode="user", credential=_CRED)
+    monkeypatch.setattr(backfill, "ClassificationRouter", _fake_router_returning(routing))
+    # The successful BYOK call below has provider_call_succeeded=True, so
+    # run_backfill's real UsageAccumulator would try a genuine DB upsert on
+    # flush -- not what this test is about (usage recording has its own
+    # coverage above), so swap in the same fake the usage tests use.
+    monkeypatch.setattr(backfill, "UsageAccumulator", lambda uid: _FakeAcc(uid))
+
+    upserted_model_versions = []
+    monkeypatch.setattr(
+        backfill, "upsert_classification",
+        lambda db_arg, *, message_id, label, confidence, rationale, model_version: (
+            upserted_model_versions.append(model_version), "written"
+        )[1],
+    )
+
+    monkeypatch.setattr(classifier_module.settings, "classifier_backend", "heuristic")
+    dormant_result = backfill.run_backfill(db=_single_message_db(), user_id=user_id, limit=10)
+    assert wire_calls == []
+    assert upserted_model_versions == ["heuristic-v1"]
+
+    monkeypatch.setattr(classifier_module.settings, "classifier_backend", "auto")
+    active_result = backfill.run_backfill(db=_single_message_db(), user_id=user_id, limit=10)
+    assert wire_calls == [1]
+    assert upserted_model_versions == ["heuristic-v1", f"{_CRED.provider}:{_CRED.model}"]
+    assert dormant_result["created"] == 1
+    assert active_result["created"] == 1

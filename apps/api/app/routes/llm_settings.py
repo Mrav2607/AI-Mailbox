@@ -309,6 +309,13 @@ def _classifier_mix_kind(model_version: str | None) -> ClassifierMixKind:
         return "heuristic"
     if model_version == "user-override":
         return "manual"
+    if model_version in ("demo-seed", "demo-1", "seeded"):
+        # Every historic seed script's stamp (plan §5): the committed
+        # `seed_demo.py` uses "demo-seed"; the gitignored root scripts use
+        # "demo-1"/"seeded". None matches a real prefix below, so without
+        # this check they'd fall to the operator_key catch-all and misreport
+        # demo mail as paid operator usage.
+        return "demo"
     preset, sep, _rest = model_version.partition(":")
     if sep and preset in PROVIDER_PRESETS:
         return "user_key"
@@ -418,6 +425,19 @@ async def put_llm_settings(
     mean a user who's forgotten it can't touch anything else -- including
     turning off the classification opt-in they came here to revoke. A
     create still needs one, since there's nothing stored to fall back on.
+
+    ``classification_byok: true`` is accepted here regardless of the
+    deployment's ``CLASSIFIER_BACKEND`` -- including while it's
+    ``heuristic``, which never even reads routing (plan:
+    2026-08-16-classifier-default-honesty §1). That is deliberate, not an
+    oversight: rejecting the opt-in would punish "use my key when you can"
+    for a deployment-level setting the caller doesn't control. The flag can
+    therefore sit **dormant** -- saved and reported as
+    ``classification_eligible: false`` -- and be activated LATER, with no
+    further action from this caller, purely by an administrator changing
+    ``CLASSIFIER_BACKEND`` away from ``heuristic``. This is the one place
+    that dormancy is documented for an API-only caller, since the console
+    hides the opt-in checkbox entirely under a heuristic backend.
     """
     raw_body = await _read_bounded_body(request)
 

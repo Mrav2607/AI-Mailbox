@@ -63,9 +63,56 @@ def test_backfill_rejects_bad_bucket_and_backend(client):
     bad_backend = client.post("/api/v1/mail/classify/backfill?backend=not_a_model")
     assert bad_backend.status_code == 422
     assert "Invalid backend" in bad_backend.json()["detail"]
-    # The "gemini" alias still works, but an error must not teach it to anyone.
+    # Both "gemini" and "auto" still work as deprecated per-run aliases, but
+    # an error must not teach either of them to anyone (plan §2:
+    # _DOCUMENTED_BACKENDS hides both, advertises "local_then_llm").
     assert "gemini" not in bad_backend.json()["detail"]
+    assert "auto" not in bad_backend.json()["detail"]
     assert "llm" in bad_backend.json()["detail"]
+    assert "local_then_llm" in bad_backend.json()["detail"]
+
+
+@pytest.mark.parametrize("requested", ["local_then_llm", "auto"])
+def test_backfill_folds_local_then_llm_alias_to_auto_inline(client, monkeypatch, requested):
+    """"local_then_llm" is the canonical per-run name (plan §2); "auto" is
+    the deprecated per-run alias for the exact same value. Both must arrive
+    downstream as "auto" -- the string `_classify_attempt` actually
+    dispatches on -- so logs and task kwargs never show two names for one
+    per-run backend."""
+    from app.routes import mailbox
+
+    seen = []
+
+    def _spy(db, user_id, **kwargs):
+        seen.append(kwargs["backend"])
+        return {"status": "ok", "created": 0, "scanned": 0}
+
+    monkeypatch.setattr(mailbox, "run_backfill", _spy)
+
+    resp = client.post(f"/api/v1/mail/classify/backfill?backend={requested}&limit=10")
+
+    assert resp.status_code == 200
+    assert seen == ["auto"]
+
+
+def test_backfill_folds_local_then_llm_alias_to_auto_queued(client, monkeypatch):
+    """Same contract on the queued path -- the one that matters in practice,
+    since the default limit of 100 is over _MAX_INLINE_BACKFILL."""
+    from app.routes import mailbox
+
+    seen = []
+
+    class _FakeTask:
+        def delay(self, **kwargs):
+            seen.append(kwargs["backend"])
+            return MagicMock(id="task-1")
+
+    monkeypatch.setattr(mailbox, "backfill_threads_for_user", _FakeTask())
+
+    resp = client.post("/api/v1/mail/classify/backfill?backend=local_then_llm&limit=100")
+
+    assert resp.status_code == 202
+    assert seen == ["auto"]
 
 
 @pytest.mark.parametrize("requested", ["llm", "gemini"])
