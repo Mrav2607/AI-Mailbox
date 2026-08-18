@@ -75,18 +75,20 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
     # Email classifier backend -- canonical global values are "auto" (an
-    # opted-in BYOK key first, else the local encoder, else an LLM),
-    # "heuristic" (keyword rules only), or "llm" (LLM-backed, heuristic on
-    # failure). "local" and "gemini" are deprecated aliases for "auto"/"llm",
+    # opted-in BYOK key first, else the local encoder, else the heuristic),
+    # "heuristic" (keyword rules only), or "llm" (an opted-in BYOK key, else
+    # the heuristic -- no other LLM path exists). "local" and "gemini" are
+    # deprecated aliases for "auto"/"llm",
     # mapped below with a startup warning; "local_then_llm" is a per-run-only
     # value (services/nlp/classifier.py, routes/mailbox.py) and is rejected
     # here. See docs/plans/2026-08-16-classifier-default-honesty-plan.md §2-3.
     classifier_backend: str = Field(default="auto", alias="CLASSIFIER_BACKEND")
     classifier_model_path: str = Field(default="models/email-classifier", alias="CLASSIFIER_MODEL_PATH")
     # Opt-in switch for the second-stage LLM action extraction. Off by default:
-    # existing deployments already carry GEMINI_API_KEY for classification and
-    # must not silently start paying for a new workload. Even when true,
-    # extraction only runs if gemini_api_key is set (no non-LLM fallback).
+    # GEMINI_API_KEY serves extraction (and reply drafting) -- classification
+    # never uses it -- so turning this on must not silently start paying for a
+    # new workload. Even when true, extraction only runs if gemini_api_key is
+    # set (no non-LLM fallback).
     action_extraction_enabled: bool = Field(default=False, alias="ACTION_EXTRACTION_ENABLED")
     # When true (default), users without their own LLM credential fall back to the
     # operator's GEMINI_API_KEY for action extraction. Set false for BYOK-only:

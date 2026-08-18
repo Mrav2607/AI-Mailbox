@@ -106,12 +106,13 @@ def classify_message(message_id: str) -> dict:
                 model_version=model_version,
             )
 
-        # Only a resolved "user" payer gets recorded -- operator-paid usage
-        # is an explicit v1 non-goal (plan §1), and a threadless message has
-        # no user to attribute it to anyway. `routing.credential is not None`
-        # guards the same broken invariant classifier.py's `_classify_llm`
-        # already degrades for -- here it just means skip recording rather
-        # than an AttributeError after `upsert_classification` already ran.
+        # Only a resolved "user" payer gets recorded -- classification never
+        # spends a key anyone gets billed for outside BYOK mode (plan §1),
+        # and a threadless message has no user to attribute it to anyway.
+        # `routing.credential is not None` guards the same broken invariant
+        # that classifier.py's `_classify_llm` already degrades to the
+        # heuristic for -- here it just means skip recording rather than an
+        # AttributeError after `upsert_classification` already ran.
         usage_recorded = (
             thread is not None
             and routing is not None

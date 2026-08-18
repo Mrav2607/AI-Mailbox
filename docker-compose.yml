@@ -15,8 +15,8 @@
 #
 # The in-process torch classifier is OFF by default so the image stays small
 # and the build stays fast. Without it the app reaches the keyword heuristic --
-# but only when no LLM path can serve either; with a BYOK key or an operator
-# GEMINI_API_KEY configured, `auto` sends the message there first. To serve the
+# unless a user opted in their own BYOK key, `auto` never reaches an LLM for
+# classification (there is no operator-paid fallback). To serve the
 # fine-tuned model instead: drop it in ./models/email-classifier, set
 # CLASSIFIER_BACKEND=auto in deploy/.env, and build with
 # INSTALL_LOCAL_CLASSIFIER=true docker compose up --build

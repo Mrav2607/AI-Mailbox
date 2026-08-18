@@ -130,8 +130,9 @@ export interface ActionsResponse {
 
 // Classifier backends an operator can pick per run. "local" = fine-tuned
 // encoder, "llm" = whichever provider the routing resolves to (the user's own
-// key when they've opted in, otherwise the operator's), "heuristic" = keyword
-// rules. Was "gemini"; the API still accepts that spelling as an alias.
+// key when they've opted in, otherwise the keyword heuristic -- there's no
+// operator-paid fallback), "heuristic" = keyword rules. Was "gemini"; the API
+// still accepts that spelling as an alias.
 export type ClassifierBackend = "local" | "llm" | "heuristic";
 
 export interface IngestOptions {
@@ -338,10 +339,10 @@ export interface LlmSettings {
   // credential still isn't called when the local encoder handles a message
   // or the backend is heuristic.
   classification_eligible: boolean;
-  // Would picking the "llm" backend for a run actually reach an LLM? True when
-  // this user's key is eligible OR the operator has a server key. Server-derived
-  // because `classification_eligible` alone can't tell "the operator pays" from
-  // "this silently falls back to keyword rules".
+  // Would picking the "llm" backend for a run actually reach an LLM? True only
+  // when this user's own BYOK key is eligible -- there's no operator-paid
+  // fallback. Server-derived because `classification_eligible` alone can't
+  // tell "usable" from "this silently falls back to keyword rules".
   classification_llm_usable: boolean;
 }
 

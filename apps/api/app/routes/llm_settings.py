@@ -90,7 +90,6 @@ def _settings_payload(
     resolved: ResolvedExtraction,
     *,
     routing_is_user: bool,
-    routing_mode: str,
 ) -> dict:
     """The shared GET response shape. ``row`` carries every field that
     ``ResolvedExtraction`` doesn't (last_verified_at, the display fields) --
@@ -99,13 +98,16 @@ def _settings_payload(
     coverage from partial signals the way ``ResolvedExtraction``'s own
     docstring warns against.
 
-    ``routing_is_user``/``routing_mode`` both come from a SINGLE
-    ``resolve_classification_routing(...)`` call at the caller -- this never
-    re-resolves routing itself, so a mid-request state change can't produce
-    two different answers within one response.
+    ``routing_is_user`` comes from a SINGLE ``resolve_classification_routing
+    (...)`` call at the caller -- this never re-resolves routing itself, so a
+    mid-request state change can't produce two different answers within one
+    response.
 
     ``classification_eligible`` and ``classification_llm_usable`` read
-    similarly but answer different questions, and they diverge ON PURPOSE:
+    similarly but answer different questions, and they diverge ON PURPOSE
+    even though classification has no operator-paid path anymore (the
+    server-paid classify path was removed; classification is BYOK-or-
+    heuristic, full stop):
 
     - ``classification_eligible`` describes the DEFAULT path (no per-run
       override), which is why it's gated on ``classifier_uses_llm`` too --
@@ -115,23 +117,23 @@ def _settings_payload(
     - ``classification_llm_usable`` describes an EXPLICIT "llm" backend
       override (e.g. a backfill request), which bypasses a global
       `heuristic` default entirely -- so it is NOT gated on
-      `classifier_uses_llm`. It's true when this user's key routes, or when
-      routing resolved to "server" and an operator key exists. It must stay
-      false for `mode="off"` even with an operator key configured -- that
-      was a shipped bug (PR #18): `off` (an opted-in `custom` credential, or
-      the resolver's concurrent-state-change branch) still reports "usable"
-      under `routing_is_user or bool(gemini_api_key)`, and the UI would offer
-      an LLM option that silently runs keyword rules.
+      `classifier_uses_llm`. It's true only when this user's own opted-in
+      key routes (`routing_is_user`).
 
-    Do not collapse these back into one formula; that's re-introducing the
-    bug this fixed.
+    History: both formulas used to also check an operator `gemini_api_key`,
+    and PR #18 fixed a bug where that operator-key term reported "usable"
+    for `mode="off"` (an opted-in `custom` credential, or the resolver's
+    concurrent-state-change branch) even though `classifier.py` runs
+    keyword rules for `off` before either key is ever considered. Removing
+    the operator-paid classify path removed the operator-key term entirely,
+    which is why the two formulas now read identically in shape -- but the
+    `eligible`/`usable` divergence itself is untouched and still real: do
+    not collapse them back into one formula.
     """
     backend = _effective_backend()
     classifier_uses_llm = backend != "heuristic"
     classification_eligible = routing_is_user and classifier_uses_llm
-    classification_llm_usable = routing_is_user or (
-        routing_mode == "server" and bool(settings.gemini_api_key)
-    )
+    classification_llm_usable = routing_is_user
     return {
         "configured": row is not None,
         "provider": row.provider if row is not None else None,
@@ -166,9 +168,7 @@ def get_llm_settings(
     ).scalar_one_or_none()
     resolved = resolve_extraction_credential(db, current_user.id)
     routing = resolve_classification_routing(db, current_user.id)
-    return _settings_payload(
-        row, resolved, routing_is_user=routing.mode == "user", routing_mode=routing.mode
-    )
+    return _settings_payload(row, resolved, routing_is_user=routing.mode == "user")
 
 
 # `days` bounds: a 400-day cap matches the retention tick (plan §8), so the
@@ -298,12 +298,12 @@ def _classifier_mix_kind(model_version: str | None) -> ClassifierMixKind:
     """Maps a raw ``classification.model_version`` string onto the closed
     set of kinds the UI renders (plan §7). Matched against literal prefixes
     and the specific values each code path actually stamps -- never against
-    "any string with a colon" -- so a `custom`-credential quirk or an
-    operator's oddly-named `GEMINI_MODEL` can't be misfiled by accident of
-    string shape alone. This is the ONE place that mapping lives; the SQL
-    aggregate below groups by `model_version`, but every response row is by
-    `kind`, so a second copy of this logic would be how the two silently
-    drift.
+    "any string with a colon" -- so a `custom`-credential quirk or a
+    historical, oddly-named operator model stamp can't be misfiled by
+    accident of string shape alone. This is the ONE place that mapping
+    lives; the SQL aggregate below groups by `model_version`, but every
+    response row is by `kind`, so a second copy of this logic would be how
+    the two silently drift.
     """
     if model_version is None:
         return "unknown"
@@ -331,10 +331,13 @@ def _classifier_mix_kind(model_version: str | None) -> ClassifierMixKind:
     preset, sep, _rest = model_version.partition(":")
     if sep and preset in PROVIDER_PRESETS:
         return "user_key"
-    # Everything else is a bare operator-paid model name (settings.gemini_model,
-    # classifier.py:362) -- `custom` is excluded from PROVIDER_PRESETS on
-    # purpose (providers.py), so no row this router can ever see was stamped
-    # by one.
+    # Everything else is a bare model name (settings.gemini_model) from the
+    # now-removed server-paid classify path -- historical only. No row of
+    # this shape can be written anymore (that path is gone), but existing
+    # rows in the DB still carry the stamp, and `custom` is excluded from
+    # PROVIDER_PRESETS on purpose (providers.py), so no row this router can
+    # ever see was stamped by one. The mapping stays so those old rows don't
+    # get misfiled into `unknown`.
     return "operator_key"
 
 
@@ -662,9 +665,10 @@ async def put_llm_settings(
     # that isn't `routing_is_user` was either never opted in or opted in on
     # `custom` (force-cleared above), which resolve_classification_routing's
     # own "no row, or opted out -> server" branch treats as `mode="server"`
-    # -- never `"off"`. That's what makes `classification_llm_usable` below
-    # safe to fall straight to the operator-key check without a separate
-    # mode read.
+    # -- never `"off"`. That distinction no longer matters for
+    # `classification_llm_usable` below, though: with the operator-paid
+    # classify path removed, the formula is BYOK-or-nothing regardless of
+    # what mode a hypothetical fresh resolve would have returned.
     backend = _effective_backend()
     classifier_uses_llm = backend != "heuristic"
     routing_is_user = bool(row.classification_byok) and row.provider in PROVIDER_PRESETS
@@ -672,7 +676,7 @@ async def put_llm_settings(
     # Deliberately NOT gated on `classifier_uses_llm` -- same divergence as
     # `_settings_payload`'s, spelled out there. Do not "fix" this to match
     # `eligible`.
-    llm_usable = routing_is_user or bool(settings.gemini_api_key)
+    llm_usable = routing_is_user
     return {
         "configured": True,
         "provider": row.provider,

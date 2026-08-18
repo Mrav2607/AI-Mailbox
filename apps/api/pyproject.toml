@@ -22,7 +22,6 @@ dependencies = [
   "argon2-cffi>=23.1",
   "redis>=5.0",
   "celery>=5.3",
-  "google-genai>=1.9.0",
   "pydantic[email]>=2.0.0",
   # normalizer.py strips HTML email down to text with BeautifulSoup. lxml never
   # appears in an import -- it's named as the parser backend
@@ -30,9 +29,10 @@ dependencies = [
   # HTML email hits the ingest path at runtime. Keep them together.
   "beautifulsoup4>=4.12.0",
   "lxml>=5.0",
-  # Pulled in transitively by google-genai -> google-auth. Pin to a range that
-  # ships prebuilt wheels so pip never falls back to compiling the sdist, which
-  # requires a Rust toolchain (maturin) that isn't available locally.
+  # Direct dependency: Fernet (config.py, crypto.py) encrypts credentials at
+  # rest. Pin to a range that ships prebuilt wheels so pip never falls back to
+  # compiling the sdist, which requires a Rust toolchain (maturin) that isn't
+  # available locally.
   "cryptography>=42.0,<50",
 ]
 
@@ -44,6 +44,8 @@ dev = ["pytest", "ruff==0.15.19", "mypy"]
 # Required only for CLASSIFIER_BACKEND=local (in-process fine-tuned encoder).
 # Omit to run with the gemini/heuristic backends and a lean image.
 local-classifier = ["torch>=2.2", "transformers>=4.40"]
+# Required only by scripts/generate_synthetic.py (dev tooling, not the app).
+synthetic = ["google-genai>=1.9.0"]
 
 [tool.uvicorn]
 factory = false

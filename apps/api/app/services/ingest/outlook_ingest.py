@@ -444,10 +444,10 @@ def _upsert_page_messages(
                     # Only the user's own key gets recorded -- v1 tracks
                     # user-paid usage only (plan §1), same rule as Gmail's ingest.
                     # `routing.mode == "user"` is the single source of truth for
-                    # who pays; the operator-paid server path never shows up
-                    # here. Recorded regardless of verdict -- a failed call can
-                    # still have reached (and billed) the provider before coming
-                    # up empty (D3).
+                    # who pays; every other mode never reaches an LLM, so there's
+                    # nothing to bill here. Recorded regardless of verdict -- a
+                    # failed call can still have reached (and billed) the provider
+                    # before coming up empty (D3).
                     if routing.mode == "user" and routing.credential is not None:
                         usage_acc.record(
                             "classification",

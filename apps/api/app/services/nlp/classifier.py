@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from functools import lru_cache
-
-import httpx
 
 from app.core.config import settings
 from app.core.logging import logger
@@ -206,9 +203,10 @@ def classify(
 
     `routing` (see `providers.ClassificationRouting`) decides WHO PAYS if and
     only if the LLM path is actually reached. `None` and `mode="server"` are
-    byte-identical to the pre-BYOK behavior (the operator's key or
-    heuristic); `mode="off"` classifies heuristically without calling any LLM
-    at all, so neither key is spent.
+    byte-identical: both land on the heuristic, since there is no operator
+    LLM path left to reach; `mode="off"` classifies heuristically too,
+    without ever consulting `routing.credential`. Only `mode="user"` can
+    reach an LLM at all.
 
     `mode="user"` (an opted-in BYOK caller) is where `backend` and the global
     default genuinely diverge:
@@ -348,25 +346,10 @@ def _classify_attempt(
     return _classify_llm(text, routing, local_tried=False, policy=policy)
 
 
-@lru_cache(maxsize=1)
-def _genai_client():
-    """Build the Gemini client once per process (settings don't change at
-    runtime, so there's nothing to key on). The explicit timeout keeps a hung
-    call from pinning a threadpool thread forever -- the SDK measures it in
-    milliseconds."""
-    from google import genai
-    from google.genai import types
-
-    return genai.Client(
-        api_key=settings.gemini_api_key,
-        http_options=types.HttpOptions(timeout=30_000),
-    )
-
-
-# Shared by both LLM paths (native google-genai on the server key, and the
-# OpenAI-compat call on a user's BYOK credential) -- the BYOK path's fallback
-# test asserts the SAME strict parse a bad reply hits either way, so the two
-# paths must be judging the model against identical wording.
+# The BYOK path's prompt (OpenAI-compat call on a user's credential). The
+# operator-key native google-genai path that used to share this wording is
+# gone -- kept as one constant anyway since there's still only one place
+# that needs it.
 _CLASSIFICATION_PROMPT = (
     "You classify an email into exactly ONE label, from the RECIPIENT's point "
         "of view. Decide what the recipient must actually DO.\n\n"
@@ -431,10 +414,10 @@ def _classify_llm(
     """
     Dispatch to the LLM path that pays for this call, per `routing`
     (see `providers.ClassificationRouting` and `classify`'s docstring for the
-    full precedence rules). `None`/`mode="server"` is the unchanged native
-    google-genai path; `mode="user"` is the OpenAI-compatible BYOK path;
-    `mode="off"` never calls either -- straight to the heuristic classifier,
-    so the operator is never billed for a message the user opted out of.
+    full precedence rules). `mode="user"` is the only path that can reach an
+    LLM at all, through the OpenAI-compatible BYOK call; `None`, `mode="off"`,
+    and `mode="server"` all land on the heuristic classifier without ever
+    calling anyone.
 
     `local_tried` says whether `_classify_attempt` already attempted the
     local encoder on this call before reaching here. It only matters for
@@ -446,9 +429,9 @@ def _classify_llm(
     load" verdict are memoized per process. Still worth skipping, but it's
     slot contention we're avoiding here, not a cold start.
 
-    `policy` only reaches `call_chat_completion` on the `mode="user"` path
-    (`_classify_llm_server`'s native genai call is explicitly out of scope
-    for retries, per the phase 3 contract) -- see `classify()`'s docstring.
+    `policy` only reaches `call_chat_completion` on the `mode="user"` path --
+    it's meaningless everywhere else, since nothing else here ever issues a
+    request. See `classify()`'s docstring.
     """
     if routing is not None and routing.mode == "off":
         return _heuristic_attempt(text)
@@ -472,117 +455,7 @@ def _classify_llm(
             policy=policy,
         )
 
-    return _classify_llm_server(text)
-
-
-def _native_failure_category(exc: Exception) -> str | None:
-    """Map a native google-genai failure onto `llm_client`'s category names.
-
-    The operator path talks to Gemini through its own SDK, which raises its own
-    exception types rather than `LlmCallError`, so without this its failures
-    would land in `failure_categories` as nothing at all. Ordered most specific
-    first: `genai_errors.APIError` carries an HTTP status, so it maps to the
-    same `http_<status>` shape the BYOK path produces; a bare `TimeoutError`
-    never got an answer; anything else httpx raises is a transport failure.
-    Returns None for an unrecognised type rather than guessing.
-    """
-    # Imported lazily for the same reason the caller does it: the SDK is an
-    # optional dependency and may not be installed.
-    try:
-        from google.genai import errors as genai_errors
-    except ImportError:
-        genai_errors = None
-
-    if genai_errors is not None and isinstance(exc, genai_errors.APIError):
-        code = getattr(exc, "code", None)
-        return f"http_{code}" if code else "invalid_response"
-    if isinstance(exc, TimeoutError):
-        return "timed_out"
-    if isinstance(exc, httpx.HTTPError):
-        return "connection_failed"
-    return None
-
-
-def _classify_llm_server(text: str) -> ClassificationAttempt:
-    """LLM-backed classifier with heuristic fallback, on the operator's
-    Gemini key. Unchanged from before BYOK classification existed."""
-    if not settings.gemini_api_key:
-        return _heuristic_attempt(text)
-
-    # Each step below catches only what it can actually fail with. The old blanket
-    # `except Exception` also swallowed our own bugs -- a typo in here came back as
-    # a confident heuristic answer instead of a 500, which is exactly how a broken
-    # classifier hides in plain sight.
-    def fallback(reason: str, exc: Exception, *, llm_attempted: bool) -> ClassificationAttempt:
-        # Every path through here never reached (or never finished talking
-        # to) Gemini, so `provider_call_succeeded` stays False. `llm_attempted`
-        # distinguishes "a request never went out" (the SDK itself is
-        # unavailable) from "a request went out and failed" -- only the
-        # latter is a real fallback for reporting purposes.
-        logger.warning("Gemini classify %s, falling back to heuristic: %s", reason, exc)
-        label, confidence, rationale, _ = _heuristic_classify(text)
-        return ClassificationAttempt(
-            verdict=(label, confidence, rationale, "heuristic-fallback"),
-            provider_call_succeeded=False,
-            usage=None,
-            llm_attempted=llm_attempted,
-            fallback_used=llm_attempted,
-            # The native genai SDK doesn't raise LlmCallError, so map its
-            # failures onto the same taxonomy the BYOK path uses
-            # (llm_client.py). Without this the operator path reports a
-            # fallback with no reason, and the toast can only say "something
-            # degraded" -- which is the vagueness this feature exists to kill.
-            failure_category=_native_failure_category(exc),
-        )
-
-    try:
-        from google.genai import errors as genai_errors
-        from google.genai import types
-    except ImportError as exc:
-        return fallback("SDK is unavailable", exc, llm_attempted=False)
-
-    try:
-        response = _genai_client().models.generate_content(
-            model=settings.gemini_model,
-            contents=f"{_CLASSIFICATION_PROMPT}\n\nEmail:\n{text[:6000]}",
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
-    except (genai_errors.APIError, httpx.HTTPError, TimeoutError) as exc:
-        # Gemini refused, rate-limited us, or never answered -- no call
-        # completed.
-        return fallback("call failed", exc, llm_attempted=True)
-
-    # A response came back: the call reached Gemini and completed, whatever
-    # its content turns out to be. `provider_call_succeeded` is True from
-    # here on even if the parse below fails.
-    try:
-        label, confidence, rationale = _parse_llm_response(response.text or "")
-    except (json.JSONDecodeError, ValueError) as exc:
-        # A reply we can't map onto our taxonomy is the model's problem, not
-        # ours -- but the call still happened, so it still counts.
-        logger.warning("Gemini classify returned an unusable answer, falling back to heuristic: %s", exc)
-        label, confidence, rationale, _ = _heuristic_classify(text)
-        return ClassificationAttempt(
-            verdict=(label, confidence, rationale, "heuristic-fallback"),
-            provider_call_succeeded=True,
-            usage=None,
-            llm_attempted=True,
-            fallback_used=True,
-            failure_category="invalid_response",
-        )
-
-    return ClassificationAttempt(
-        verdict=(label, confidence, rationale, settings.gemini_model),
-        provider_call_succeeded=True,
-        # Operator-paid usage is an explicit v1 non-goal (plan §1), and Wave
-        # 2b's recorder filters this path out via `routing.mode` anyway --
-        # parsing `response.usage_metadata` here would be dead code implying
-        # a capability we don't actually expose. Don't "fix" this.
-        usage=None,
-        llm_attempted=True,
-        fallback_used=False,
-        failure_category=None,
-    )
+    return _heuristic_attempt(text)
 
 
 def _llm_user_failure_fallback(
@@ -599,8 +472,9 @@ def _llm_user_failure_fallback(
     keyword heuristic is no longer reachable from here at all -- an opted-in
     user (`fallback_local`) gets the local encoder if it can serve, else NO
     verdict; a user who never opted in gets no verdict straight away. The
-    heuristic stays a selectable backend and stays on the server path
-    (`_classify_llm_server`); it just isn't a link in this chain anymore.
+    heuristic stays a selectable backend and stays what `mode="server"` and
+    `mode="off"` fall back to; it just isn't a link in this BYOK chain
+    anymore.
 
     `provider_call_succeeded`/`usage` describe whether the LLM call itself
     reached the provider, not what produced the verdict -- they're passed
@@ -654,12 +528,10 @@ def _classify_llm_user(
     policy: RetryPolicy = NO_RETRIES,
 ) -> ClassificationAttempt:
     """
-    BYOK classification path: the same prompt and the same strict parse as
-    the server path, wired through the shared OpenAI-compatible call instead
-    of the native genai SDK. `model_version` is `f"{provider}:{model}"` --
-    deliberately different attribution from the server path's bare model
-    name, since a BYOK verdict can come from any provider/model the user
-    picked, not the operator's fixed Gemini deployment.
+    BYOK classification path, wired through the shared OpenAI-compatible call.
+    `model_version` is `f"{provider}:{model}"` -- attributed to whatever
+    provider/model the user picked, since BYOK isn't pinned to one deployment
+    the way the old operator-key path was.
 
     `local_tried` (D2/D2a): the failure path below tries the local encoder
     before giving up, but only once per call, and only when `fallback_local`
