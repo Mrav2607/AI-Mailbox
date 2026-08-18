@@ -913,6 +913,106 @@ def test_apply_gmail_labels_parent_delete_401_propagates():
     assert excinfo.value.response.status_code == 401
 
 
+def test_apply_gmail_labels_stale_cached_parent_entry_is_inert():
+    # `persist_gmail_label_map` merges add-only, so a legacy "CortexMail" ->
+    # id entry it once wrote can never leave the cache. Without gating the
+    # delete on a fresh listing, every single sync run would re-attempt
+    # deleting a long-gone label forever.
+    names = _needed_gmail_names()
+    cached_map = {name: f"ID-{name}" for name in names}
+    cached_map[service.LEGACY_GMAIL_PARENT_LABEL] = "STALE-P"
+    client = MagicMock()
+    client.get_thread_minimal.return_value = {"messages": [{"labelIds": []}]}
+
+    result = service.apply_gmail_labels(
+        client, provider_thread_id="t1", cached_map=cached_map, desired_label=None
+    )
+
+    # All six current names are already cached, so there's nothing that
+    # would trigger a fresh listing -- the stale parent entry never gets
+    # confirmed, so it's never acted on.
+    client.list_labels.assert_not_called()
+    client.delete_label.assert_not_called()
+    client.update_label.assert_not_called()
+    # Still dropped from the map going forward so it can't linger and get
+    # persisted right back into the cache.
+    assert service.LEGACY_GMAIL_PARENT_LABEL not in result.working_map
+
+
+def test_apply_gmail_labels_stale_cached_legacy_child_is_not_renamed():
+    # The cached legacy id might point at a label the user has since
+    # deleted or renamed themselves -- a fresh listing that confirms
+    # neither the legacy nor the new name exists must fall through to
+    # creating the new label, never rename off the stale cached id.
+    legacy_name = service.LEGACY_GMAIL_LABEL_NAMES["needs_reply"]
+    cached_map = {legacy_name: "STALE-ID"}
+    client = MagicMock()
+    client.list_labels.return_value = {"labels": []}
+    client.create_label.side_effect = lambda payload: {"id": f"NEW-{payload['name']}"}
+    client.get_thread_minimal.return_value = {"messages": [{"labelIds": []}]}
+
+    result = service.apply_gmail_labels(
+        client, provider_thread_id="t1", cached_map=cached_map, desired_label=None
+    )
+
+    client.update_label.assert_not_called()
+    new_name = service.gmail_label_full_name("needs_reply")
+    assert result.working_map[new_name] == f"NEW-{new_name}"
+
+
+def test_apply_gmail_labels_rename_uses_the_listings_id_not_a_stale_cached_one():
+    # The cached legacy entry is outdated (e.g. from before the user
+    # recreated the label in Gmail directly) -- the rename must act on
+    # whatever id the CURRENT listing reports, never the cached one.
+    legacy_name = service.LEGACY_GMAIL_LABEL_NAMES["needs_reply"]
+    cached_map = {legacy_name: "OUTDATED-ID"}
+    client = MagicMock()
+    client.list_labels.return_value = {"labels": [{"name": legacy_name, "id": "LISTING-ID"}]}
+    client.update_label.side_effect = lambda label_id, payload: {"id": label_id, **payload}
+    client.create_label.side_effect = lambda payload: {"id": f"NEW-{payload['name']}"}
+    client.get_thread_minimal.return_value = {"messages": [{"labelIds": []}]}
+
+    result = service.apply_gmail_labels(
+        client, provider_thread_id="t1", cached_map=cached_map, desired_label=None
+    )
+
+    new_name = service.gmail_label_full_name("needs_reply")
+    client.update_label.assert_any_call("LISTING-ID", {"name": new_name})
+    assert result.working_map[new_name] == "LISTING-ID"
+
+
+def test_apply_gmail_labels_rename_failure_falls_back_to_create():
+    legacy_name = service.LEGACY_GMAIL_LABEL_NAMES["needs_reply"]
+    client = MagicMock()
+    client.list_labels.return_value = {"labels": [{"name": legacy_name, "id": "LISTING-ID"}]}
+    client.update_label.side_effect = _http_error(500)
+    client.create_label.side_effect = lambda payload: {"id": f"NEW-{payload['name']}"}
+    client.get_thread_minimal.return_value = {"messages": [{"labelIds": []}]}
+
+    result = service.apply_gmail_labels(
+        client, provider_thread_id="t1", cached_map={}, desired_label=None
+    )
+
+    new_name = service.gmail_label_full_name("needs_reply")
+    created_names = [call.args[0]["name"] for call in client.create_label.call_args_list]
+    assert new_name in created_names
+    assert result.working_map[new_name] == f"NEW-{new_name}"
+
+
+def test_apply_gmail_labels_rename_401_propagates():
+    legacy_name = service.LEGACY_GMAIL_LABEL_NAMES["needs_reply"]
+    client = MagicMock()
+    client.list_labels.return_value = {"labels": [{"name": legacy_name, "id": "LISTING-ID"}]}
+    client.update_label.side_effect = _http_error(401)
+
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        service.apply_gmail_labels(
+            client, provider_thread_id="t1", cached_map={}, desired_label=None
+        )
+
+    assert excinfo.value.response.status_code == 401
+
+
 # ---------------------------------------------------------------------------
 # Outlook provider mechanics
 # ---------------------------------------------------------------------------
