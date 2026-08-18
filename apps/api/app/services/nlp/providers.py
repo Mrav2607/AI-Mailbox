@@ -454,9 +454,9 @@ _ROUTING_TTL_SECONDS = 60.0
 class ClassificationRouting:
     """
     Tri-state routing decision for one classification call -- deliberately
-    NOT `Optional[LlmCredential]`. The classifier reads a bare `None` as
-    "use the operator's server key", so an optional type would silently bill
-    the operator for a user whose credential just became blocked or
+    NOT `Optional[LlmCredential]`. The classifier reads a bare `None` as "no
+    BYOK routing", so an optional type would silently make it ambiguous
+    whether a user's credential is absent or just became blocked or
     ineligible. `credential` is set if and only if `mode == "user"`.
 
     `fallback_local` (plan: 2026-08-14-llm-failure-visibility phase 2, D-A/
@@ -466,6 +466,8 @@ class ClassificationRouting:
     on either of those.
     """
 
+    # "server" means no BYOK routing: local model or heuristic, never an LLM.
+    # Name kept for stability -- it no longer means the operator pays.
     mode: str  # "user" | "server" | "off"
     credential: LlmCredential | None
     fallback_local: bool = False
@@ -473,9 +475,12 @@ class ClassificationRouting:
 
 def resolve_classification_routing(db: Session, user_id: UUID) -> ClassificationRouting:
     """
-    Resolve who pays for classifying this user's messages, if and when the
-    LLM path is reached (routing never overrides `CLASSIFIER_BACKEND` or the
-    local encoder -- see `classifier.classify`).
+    Resolve whether this user's messages get BYOK LLM classification, and
+    with which credential, if and when the LLM path is reached (routing never
+    overrides `CLASSIFIER_BACKEND` or the local encoder -- see
+    `classifier.classify`). No mode here ever reaches an LLM the user didn't
+    bring a key for; `mode="server"` falls back to the local model or the
+    heuristic.
 
     Two-step read, and the ORDER is a security requirement, not an
     optimization:
@@ -508,21 +513,21 @@ def resolve_classification_routing(db: Session, user_id: UUID) -> Classification
        the database, so it can't return a stale identity-map instance.
 
     Resolution:
-      - no row, or opted out -> `("server", None)` -- today's behavior, the
-        operator's key or the heuristic fallback.
+      - no row, or opted out -> `("server", None)` -- no BYOK routing; the
+        classifier falls back to the local model or the heuristic.
       - opted in, `provider == "custom"` -> `("off", None)`, decided from the
         projected provider string alone. Presets-only in v1; no destination
         check, no DNS.
       - opted in, preset, second read returns zero rows -> `("off", None)`.
         The state changed mid-resolve; erring to `off` rather than `server`
-        is deliberate -- an unresolvable race must never hand the bill to
-        the operator. The next refresh (see `ClassificationRouter`) settles
-        it either way.
+        is deliberate -- an unresolvable race must never silently route to
+        an LLM call the user hasn't (yet, reliably) authorized. The next
+        refresh (see `ClassificationRouter`) settles it either way.
       - opted in, preset, second read confirms it -> `("user", credential)`.
 
     A DB error propagates -- the caller is mid-ingest and about to write to
     this same session, so swallowing it here would trade a loud failure for
-    a silent wrong-payer decision.
+    a silent wrong-routing decision.
     """
     projection = db.execute(
         select(

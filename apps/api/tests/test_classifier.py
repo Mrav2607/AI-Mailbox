@@ -3,7 +3,6 @@
 
 import json
 
-import httpx
 import pytest
 
 from app.services.nlp.classifier import (
@@ -401,38 +400,10 @@ def test_try_predict_vector_calibration_is_numerically_correct(monkeypatch):
     local_model.reset()
 
 
-def test_genai_client_is_cached_across_calls(monkeypatch):
-    pytest.importorskip("google.genai")
-    from app.services.nlp import classifier
-
-    monkeypatch.setattr(classifier.settings, "gemini_api_key", "test-key")
-    classifier._genai_client.cache_clear()
-    try:
-        first = classifier._genai_client()
-        assert classifier._genai_client() is first
-    finally:
-        # Don't leave a client built from the test key cached for other tests.
-        classifier._genai_client.cache_clear()
-
-
 # ---------------------------------------------------------------------------
 # Classification routing: tri-state dispatch inside _classify_llm, and the
 # frozen precedence matrix against CLASSIFIER_BACKEND / the local encoder.
 # ---------------------------------------------------------------------------
-
-
-def _fake_genai_response(label="fyi", confidence=0.8, rationale="test"):
-    class _FakeResponse:
-        text = json.dumps({"label": label, "confidence": confidence, "rationale": rationale})
-
-    class _FakeModels:
-        def generate_content(self, **kwargs):
-            return _FakeResponse()
-
-    class _FakeClient:
-        models = _FakeModels()
-
-    return _FakeClient()
 
 
 def _explode(*args, **kwargs):
@@ -490,30 +461,28 @@ def test_classify_routing_none_and_server_are_byte_identical_no_key(monkeypatch)
     assert result_none[3] == "heuristic-v1"
 
 
-def test_classify_routing_none_and_server_are_byte_identical_with_genai(monkeypatch):
-    """Same as above but through a mocked successful genai call -- both
-    routing=None and mode="server" must reach the native path and stamp the
-    bare model name, unchanged from before BYOK classification existed."""
+def test_classify_routing_none_and_server_are_byte_identical_key_is_ignored(monkeypatch):
+    """Same as above, but with a real-looking gemini_api_key set -- proving
+    the key is now ignored entirely. There is no operator LLM path left for
+    it to unlock; routing=None and mode="server" both still land on the
+    heuristic."""
     from app.services.nlp import classifier
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
-    monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
-    monkeypatch.setattr(classifier.settings, "gemini_model", "gemini-2.5-flash")
-    monkeypatch.setattr(
-        classifier, "_genai_client", lambda: _fake_genai_response(label="fyi")
-    )
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", "AIzaSyDreal-looking-key-value")
 
-    for routing in (None, ClassificationRouting(mode="server", credential=None)):
-        label, confidence, rationale, model_version = classify("hi there", routing=routing)
-        assert label == "fyi"
-        assert model_version == "gemini-2.5-flash"  # bare model name -- server attribution
+    result_none = classify("Can you review this?", routing=None)
+    result_server = classify(
+        "Can you review this?", routing=ClassificationRouting(mode="server", credential=None)
+    )
+    assert result_none == result_server
+    assert result_none[3] == "heuristic-v1"
 
 
 def test_classify_routing_user_mode_calls_openai_compat_with_credential(monkeypatch):
     from app.services.nlp import classifier
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
-    monkeypatch.setattr(classifier, "_genai_client", _explode)  # must never be built for mode="user"
 
     credential = LlmCredential(
         provider="openai", base_url="https://api.openai.com/v1", api_key="user-key", model="gpt-4o-mini"
@@ -547,7 +516,6 @@ def test_classify_with_usage_threads_the_caller_supplied_policy_to_the_wire_call
     from app.services.nlp.llm_client import WORKER_RETRIES
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
-    monkeypatch.setattr(classifier, "_genai_client", _explode)
 
     credential = LlmCredential(
         provider="openai", base_url="https://api.openai.com/v1", api_key="user-key", model="gpt-4o-mini"
@@ -567,13 +535,12 @@ def test_classify_with_usage_threads_the_caller_supplied_policy_to_the_wire_call
     assert captured["policy"] is WORKER_RETRIES
 
 
-def test_classify_routing_off_mode_never_builds_genai_client_or_calls_llm(monkeypatch):
-    """The point of the seam assertions here: proving the operator was not
-    billed, not merely checking the returned label."""
+def test_classify_routing_off_mode_never_calls_llm(monkeypatch):
+    """The point of the seam assertion here: proving nobody was billed, not
+    merely checking the returned label."""
     from app.services.nlp import classifier
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
-    monkeypatch.setattr(classifier, "_genai_client", _explode)
     monkeypatch.setattr(classifier, "call_chat_completion", _explode)
 
     routing = ClassificationRouting(mode="off", credential=None)
@@ -586,13 +553,11 @@ def test_classify_routing_off_mode_never_builds_genai_client_or_calls_llm(monkey
 def test_classify_routing_user_mode_with_no_credential_falls_back_to_heuristic(monkeypatch):
     """Guards the broken-invariant path: `assert` gets stripped under `-O`,
     so mode="user" with credential=None must be a real guard that returns
-    the heuristic, not a crash or a silent fall-through to the server path
-    (which would bill the operator for a user who opted in with their own
-    key)."""
+    the heuristic, not a crash or a silent fall-through that calls an LLM
+    for a user who opted in with their own key."""
     from app.services.nlp import classifier
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
-    monkeypatch.setattr(classifier, "_genai_client", _explode)
     monkeypatch.setattr(classifier, "call_chat_completion", _explode)
 
     routing = ClassificationRouting(mode="user", credential=None)
@@ -784,7 +749,6 @@ def test_classify_with_usage_routing_off_never_touched_provider(monkeypatch):
     from app.services.nlp import classifier
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
-    monkeypatch.setattr(classifier, "_genai_client", _explode)
     monkeypatch.setattr(classifier, "call_chat_completion", _explode)
 
     routing = ClassificationRouting(mode="off", credential=None)
@@ -797,7 +761,6 @@ def test_classify_with_usage_user_mode_no_credential_never_touched_provider(monk
     from app.services.nlp import classifier
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
-    monkeypatch.setattr(classifier, "_genai_client", _explode)
     monkeypatch.setattr(classifier, "call_chat_completion", _explode)
 
     routing = ClassificationRouting(mode="user", credential=None)
@@ -912,129 +875,21 @@ def test_classify_with_usage_user_mode_counts_the_call_even_when_content_is_unpa
     assert attempt.verdict is None
 
 
-def test_classify_with_usage_server_path_success_reports_call_but_no_usage(monkeypatch):
-    """Server (operator-paid) path: the call counts, but usage is
-    deliberately left None -- operator-paid usage is a v1 non-goal and
-    `response.usage_metadata` is never parsed here."""
+def test_classify_with_usage_explicit_llm_backend_no_byok_never_attempts_llm(monkeypatch):
+    """Explicit per-run backend="llm" with routing None or mode="server" --
+    neither can reach an LLM without a BYOK credential, so llm_attempted must
+    be False, not just provider_call_succeeded, regardless of whether
+    gemini_api_key happens to be set."""
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
-    monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
-    monkeypatch.setattr(classifier.settings, "gemini_model", "gemini-2.5-flash")
-    monkeypatch.setattr(
-        classifier, "_genai_client", lambda: _fake_genai_response(label="fyi")
-    )
+    monkeypatch.setattr(classifier.settings, "gemini_api_key", "AIzaSyDreal-looking-key-value")
 
     for routing in (None, ClassificationRouting(mode="server", credential=None)):
-        attempt = classify_with_usage("hi there", routing=routing)
-        assert attempt.provider_call_succeeded is True
-        assert attempt.usage is None
-        assert attempt.verdict[3] == "gemini-2.5-flash"
-        assert attempt.llm_attempted is True
+        attempt = classify_with_usage("Can you review this?", backend="llm", routing=routing)
+        assert attempt.verdict[3] == "heuristic-v1"
+        assert attempt.llm_attempted is False
         assert attempt.fallback_used is False
         assert attempt.failure_category is None
-
-
-def test_classify_with_usage_server_path_no_key_never_attempted_llm(monkeypatch):
-    """No operator key configured: the server path stops before ever trying
-    to reach Gemini -- llm_attempted must be False, not just
-    provider_call_succeeded."""
-    from app.services.nlp import classifier
-
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
-    monkeypatch.setattr(classifier.settings, "gemini_api_key", None)
-
-    attempt = classify_with_usage("Can you review this?")
-    assert attempt.llm_attempted is False
-    assert attempt.fallback_used is False
-    assert attempt.failure_category is None
-
-
-def test_classify_with_usage_server_path_call_failure_reports_attempted_fallback(monkeypatch):
-    """A Gemini call that goes out and fails (rate limit, timeout, ...) is a
-    real attempt-then-fallback -- unlike an unconfigured key or a missing
-    SDK, which never issue a request at all."""
-    from app.services.nlp import classifier
-
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
-    monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
-
-    class _ExplodingModels:
-        def generate_content(self, **kwargs):
-            raise TimeoutError("gemini took too long")
-
-    class _ExplodingClient:
-        models = _ExplodingModels()
-
-    monkeypatch.setattr(classifier, "_genai_client", lambda: _ExplodingClient())
-
-    attempt = classify_with_usage("Can you review this?")
-    assert attempt.verdict[3] == "heuristic-fallback"
-    assert attempt.llm_attempted is True
-    assert attempt.fallback_used is True
-    # The native genai SDK raises its own exception types, but its failures are
-    # mapped onto the same category names the BYOK path uses -- otherwise the
-    # operator path reports a fallback the toast can give no reason for.
-    assert attempt.failure_category == "timed_out"
-
-
-@pytest.mark.parametrize(
-    ("exc", "expected"),
-    [
-        (httpx.ConnectError("dns is having a day"), "connection_failed"),
-        (TimeoutError("gemini took too long"), "timed_out"),
-    ],
-)
-def test_classify_server_path_maps_native_failures_to_shared_categories(
-    monkeypatch, exc, expected
-):
-    """Each native SDK failure type lands on the taxonomy `failure_categories`
-    is aggregated from, so an operator-key deployment gets the same "why" a
-    BYOK one does."""
-    from app.services.nlp import classifier
-
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
-    monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
-
-    class _ExplodingModels:
-        def generate_content(self, **kwargs):
-            raise exc
-
-    class _ExplodingClient:
-        models = _ExplodingModels()
-
-    monkeypatch.setattr(classifier, "_genai_client", lambda: _ExplodingClient())
-
-    assert classify_with_usage("Can you review this?").failure_category == expected
-
-
-def test_classify_with_usage_server_path_malformed_response_is_invalid_response(monkeypatch):
-    """A Gemini reply that doesn't parse still counts as an attempt (the call
-    itself succeeded) and is categorized invalid_response, same taxonomy as
-    the BYOK path's malformed-response case."""
-    from app.services.nlp import classifier
-
-    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
-    monkeypatch.setattr(classifier.settings, "gemini_api_key", "server-key")
-
-    class _BadResponse:
-        text = "not json at all"
-
-    class _BadModels:
-        def generate_content(self, **kwargs):
-            return _BadResponse()
-
-    class _BadClient:
-        models = _BadModels()
-
-    monkeypatch.setattr(classifier, "_genai_client", lambda: _BadClient())
-
-    attempt = classify_with_usage("Can you review this?")
-    assert attempt.verdict[3] == "heuristic-fallback"
-    assert attempt.provider_call_succeeded is True
-    assert attempt.llm_attempted is True
-    assert attempt.fallback_used is True
-    assert attempt.failure_category == "invalid_response"
 
 
 # ---------------------------------------------------------------------------
@@ -1079,7 +934,6 @@ def test_classify_default_backend_server_mode_uses_encoder(monkeypatch):
     monkeypatch.setattr(
         local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test")
     )
-    monkeypatch.setattr(classifier, "_genai_client", _explode)
 
     routing = ClassificationRouting(mode="server", credential=None)
     label, confidence, rationale, model_version = classify("hi", routing=routing)
@@ -1096,7 +950,6 @@ def test_classify_default_backend_off_mode_uses_encoder(monkeypatch):
         local_model, "try_predict", lambda text: ("fyi", 0.5, "local rationale", "local:test")
     )
     monkeypatch.setattr(classifier, "call_chat_completion", _explode)
-    monkeypatch.setattr(classifier, "_genai_client", _explode)
 
     routing = ClassificationRouting(mode="off", credential=None)
     label, confidence, rationale, model_version = classify("hi", routing=routing)
@@ -1148,7 +1001,6 @@ def test_classify_explicit_local_user_mode_encoder_unavailable_stops_at_heuristi
 
     monkeypatch.setattr(local_model, "try_predict", lambda text: None)
     monkeypatch.setattr(classifier, "call_chat_completion", _explode)
-    monkeypatch.setattr(classifier, "_genai_client", _explode)
 
     credential = LlmCredential(
         provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
@@ -1204,7 +1056,6 @@ def test_classify_explicit_llm_user_mode_calls_the_key(monkeypatch):
     user's key."""
     from app.services.nlp import classifier
 
-    monkeypatch.setattr(classifier, "_genai_client", _explode)
     credential = LlmCredential(
         provider="openai", base_url="https://api.openai.com/v1", api_key="k", model="gpt-4o-mini"
     )
@@ -1507,7 +1358,6 @@ def test_classify_fallback_local_has_no_effect_on_server_or_off_mode(monkeypatch
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
     monkeypatch.setattr(classifier, "call_chat_completion", _explode)
-    monkeypatch.setattr(classifier, "_genai_client", _explode)
     monkeypatch.setattr(classifier.settings, "gemini_api_key", None)
 
     for mode in ("server", "off"):

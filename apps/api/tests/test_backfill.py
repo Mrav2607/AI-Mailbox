@@ -275,9 +275,9 @@ def test_run_backfill_builds_one_router_per_run_and_calls_routing_for_per_messag
 def test_run_backfill_custom_opt_in_credential_routes_off_with_no_server_call(monkeypatch):
     """A pre-existing custom-provider row with classification_byok=True is
     presets-only in v1 -- it must resolve to mode="off" and classify straight
-    to the heuristic, never touching the server-key path. Asserting the seam
-    (genai client, the BYOK wire call) is never built is the actual proof
-    that nobody got billed, not just the returned label."""
+    to the heuristic, never touching an LLM. Asserting the seam (the BYOK
+    wire call) is never built is the actual proof that nobody got billed,
+    not just the returned label."""
     user_id = uuid4()
     thread_id = uuid4()
     msg_id = uuid4()
@@ -291,7 +291,6 @@ def test_run_backfill_custom_opt_in_credential_routes_off_with_no_server_call(mo
     def _explode(*args, **kwargs):
         raise AssertionError("server key must never be used for an off-routed message")
 
-    monkeypatch.setattr(classifier_module, "_genai_client", _explode)
     monkeypatch.setattr(classifier_module, "call_chat_completion", _explode)
     monkeypatch.setattr(backfill, "upsert_classification", lambda *a, **k: "written")
 

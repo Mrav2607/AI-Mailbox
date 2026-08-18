@@ -73,17 +73,18 @@ class LlmSettingsOut(Response):
     # the local encoder handles a message.
     classification_eligible: bool
     # Would picking the EXPLICIT "llm" backend for a run actually reach an
-    # LLM? True when this user's own key routes ("user") OR the operator has
-    # a server key AND routing didn't resolve to "off". Deliberately NOT
-    # gated on `classifier_uses_llm` the way `classification_eligible` is --
-    # an explicit per-run backend override (e.g. a backfill request) bypasses
-    # a global `heuristic` default, so the two fields diverge on purpose. Do
-    # not "fix" them back to matching; see llm_settings.py's formula comment.
-    # `mode="off"` (an opted-in `custom` credential, or the resolver's
-    # concurrent-state-change branch) must report False even with an
-    # operator key configured -- that was a shipped bug (PR #18): the UI
-    # offered the LLM option and the run silently fell back to keyword
-    # rules.
+    # LLM? True when this user's own opted-in key routes ("user") -- BYOK
+    # only, since there's no operator-paid classify path anymore. Deliberately
+    # NOT gated on `classifier_uses_llm` the way `classification_eligible` is
+    # -- an explicit per-run backend override (e.g. a backfill request)
+    # bypasses a global `heuristic` default, so the two fields diverge on
+    # purpose. Do not "fix" them back to matching; see llm_settings.py's
+    # formula comment. History: PR #18 fixed a shipped bug where an operator
+    # key term in this formula reported True for `mode="off"` (an opted-in
+    # `custom` credential, or the resolver's concurrent-state-change branch)
+    # even though the UI's run would silently fall back to keyword rules --
+    # that operator-key term is gone now along with the path it guarded, but
+    # the eligible/usable divergence itself is unrelated and still stands.
     classification_llm_usable: bool
 
 

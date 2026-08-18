@@ -677,7 +677,7 @@ def test_resolve_classification_routing_carries_fallback_local_from_second_read(
 def test_resolve_classification_routing_second_read_empty_resolves_off():
     """A PUT landing between the two reads (toggle off, or switch to custom)
     must resolve to `off`, never `server` -- an unresolvable race must never
-    hand the bill to the operator."""
+    silently route to an LLM call the user hasn't (yet, reliably) authorized."""
     db = _FakeClassificationDB(("openai", True, None))
     routing = resolve_classification_routing(db, uuid4())
     assert routing == ClassificationRouting(mode="off", credential=None)

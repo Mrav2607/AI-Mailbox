@@ -216,10 +216,6 @@ def test_get_unconfigured_returns_nulls_and_flags(monkeypatch, user):
     # deprecated alias for the same value) -- this only needs a non-heuristic
     # backend, so any value in that bucket proves the same thing.
     monkeypatch.setattr(settings, "classifier_backend", "auto")
-    # Pinned, not assumed: classification_llm_usable falls back to the operator
-    # key, so a developer with GEMINI_API_KEY in their environment would flip
-    # this expectation without touching the code under test.
-    monkeypatch.setattr(settings, "gemini_api_key", None)
     monkeypatch.setattr(
         llm_settings, "resolve_extraction_credential",
         lambda db_, uid: _resolved(stored=False, source=None),
@@ -388,12 +384,12 @@ def test_get_classification_eligible_flips_false_to_true_when_backend_leaves_heu
     assert active["classification_eligible"] is True
 
 
-def test_get_llm_usable_true_on_operator_key_even_when_user_is_not_eligible(monkeypatch, user):
-    """The whole reason this field exists apart from classification_eligible.
-    Not eligible means "your key won't be used" -- but with an operator key
-    configured the LLM path still runs (operator-paid), so a client that
-    disabled the LLM option on eligibility alone would wrongly hide a working
-    backend on every server-key deployment."""
+def test_get_llm_usable_false_on_operator_key_when_user_is_not_eligible(monkeypatch, user):
+    """The operator-paid classify path is gone -- an operator `gemini_api_key`
+    must NOT make `classification_llm_usable` true anymore. The monkeypatched
+    key here is the proof: it's set, routing is "server" (not "user"), and
+    the field must still read False, because the formula no longer has an
+    operator-key term to fall back on at all."""
     row = _make_row(user_id=user.id, provider="openai", classification_byok=False)
     db = _CredentialDB({user.id.hex: row})
     _override(user, db)
@@ -408,13 +404,16 @@ def test_get_llm_usable_true_on_operator_key_even_when_user_is_not_eligible(monk
     monkeypatch.setattr(llm_settings.settings, "gemini_api_key", "operator-key")
     body = TestClient(app).get("/api/v1/settings/llm").json()
     assert body["classification_eligible"] is False
-    assert body["classification_llm_usable"] is True
+    assert body["classification_llm_usable"] is False
 
 
-def test_get_llm_usable_false_when_neither_user_nor_operator_has_a_key(monkeypatch, user):
-    """The reported case: picking the LLM backend for a backfill silently
-    classified with keyword rules instead. Nothing to call, so the client has
-    to be told the option is dead rather than let it no-op."""
+def test_get_llm_usable_false_without_byok_and_without_an_operator_key(monkeypatch, user):
+    """The baseline "nothing to call" case: no BYOK opt-in and no operator
+    key either. Distinct from the sibling test above, which pins an operator
+    key present to prove it's ignored -- this one proves the field is false
+    on the more common "nobody configured anything" path too. Picking the
+    LLM backend for a backfill here must not silently classify with keyword
+    rules while claiming it's "usable"."""
     row = _make_row(user_id=user.id, provider="openai", classification_byok=False)
     db = _CredentialDB({user.id.hex: row})
     _override(user, db)
@@ -459,11 +458,14 @@ def test_get_classification_eligible_false_for_out_of_band_custom_opt_in_row(mon
 
 
 def test_get_llm_usable_false_for_off_routing_even_with_an_operator_key(monkeypatch, user):
-    """The shipped bug (PR #18), fixed: `routing_is_user or bool(gemini_api_key)`
-    reported True for `mode="off"` whenever an operator key existed --
-    `classifier.py` returns heuristics for `off` before either key is even
-    considered, so the UI offered an LLM option that silently ran keyword
-    rules. `mode="off"` must report False regardless of the operator key.
+    """Still true after the operator-paid classify path was removed, though
+    for a stronger reason now: PR #18's shipped bug was `routing_is_user or
+    bool(gemini_api_key)` reporting True for `mode="off"` whenever an
+    operator key existed, since `classifier.py` returns heuristics for `off`
+    before either key is even considered. That operator-key term is gone
+    entirely now, so `mode="off"` reads False the same way every other
+    non-"user" mode does -- the pinned operator key here just proves it's
+    fully inert, not merely correctly gated.
     """
     row = _make_row(
         user_id=user.id, provider="custom", base_url="https://llm.internal/v1",
@@ -2193,9 +2195,11 @@ def test_classifier_mix_each_preset_prefix_maps_to_user_key(user, preset):
 
 
 def test_classifier_mix_bare_operator_model_name_maps_to_operator_key(user):
-    # No colon at all -- the operator-paid path (`_classify_llm_server` in
-    # classifier.py) stamps a bare `settings.gemini_model`, never a
-    # "provider:model" pair, and it must not be confused with a BYOK row.
+    # Historical only: no colon at all -- the now-removed operator-paid
+    # classify path used to stamp a bare `settings.gemini_model`, never a
+    # "provider:model" pair. No new row of this shape can be written
+    # anymore, but existing DB rows still carry the stamp, and it must not
+    # be confused with a BYOK row.
     db = _mix_db([("gemini-3.5-flash-lite", 86)])
     _override(user, db)
     resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
@@ -2232,9 +2236,10 @@ def test_classifier_mix_demo_seeds_still_await_the_demo_kind(user, seed_model_ve
     """Pins the DEFERRED state, not the desired one.
 
     None of the three historic seed stamps matches a real prefix, so they
-    fall through the catch-all and are reported as `operator_key` -- 100%
-    paid usage on a mailbox that never made a call. The `demo` kind that
-    fixes this exists in the schema and in the web label map already, but
+    fall through the catch-all and are reported as `operator_key` --
+    labeled as the historical operator-paid bucket on a mailbox that never
+    made a call. The `demo` kind that fixes this exists in the schema and
+    in the web label map already, but
     emitting it is held back one release: a browser tab open across the
     deploy is still running the previous bundle, which would interpolate
     `undefined` for a kind it has never seen.
