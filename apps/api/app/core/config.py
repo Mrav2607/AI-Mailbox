@@ -84,9 +84,10 @@ class Settings(BaseSettings):
     classifier_backend: str = Field(default="auto", alias="CLASSIFIER_BACKEND")
     classifier_model_path: str = Field(default="models/email-classifier", alias="CLASSIFIER_MODEL_PATH")
     # Opt-in switch for the second-stage LLM action extraction. Off by default:
-    # existing deployments already carry GEMINI_API_KEY for classification and
-    # must not silently start paying for a new workload. Even when true,
-    # extraction only runs if gemini_api_key is set (no non-LLM fallback).
+    # GEMINI_API_KEY serves extraction (and reply drafting) -- classification
+    # never uses it -- so turning this on must not silently start paying for a
+    # new workload. Even when true, extraction only runs if gemini_api_key is
+    # set (no non-LLM fallback).
     action_extraction_enabled: bool = Field(default=False, alias="ACTION_EXTRACTION_ENABLED")
     # When true (default), users without their own LLM credential fall back to the
     # operator's GEMINI_API_KEY for action extraction. Set false for BYOK-only:

@@ -44,11 +44,10 @@ The `migrate` service runs first and the app waits on health checks, so a single
 `docker compose up` comes up clean with no ordering races.
 
 **Classifier:** fetch the fine-tuned local model first — it's a one-time
-download, costs nothing per message, and works offline. With no LLM key
-configured (`GEMINI_API_KEY` unset, nobody opted into BYOK), no mail content
-leaves the machine. Add a key and that stops being true: under `auto` an
-opted-in user's key is tried *before* the encoder, and the operator's key is
-used when the encoder can't serve.
+download, costs nothing per message, and works offline. Unless a user opts
+into BYOK, no mail content ever leaves the machine — there is no operator-paid
+LLM step. Once a user opts in, `auto` tries their key *before* the encoder for
+their own mail only.
 
 The model is git-ignored (~256MB, trained on private data), so it ships as
 chunked assets on the `model-v2` GitHub Release. Fetch it (needs the
@@ -64,9 +63,10 @@ Without a model installed, the shipped default (`CLASSIFIER_BACKEND=auto`,
 no torch, no keys) degrades to the keyword `heuristic` backend — no deps
 required, which is enough to test the app end to end but gives worse results.
 
-Prefer an LLM over downloading 256MB? Set `GEMINI_API_KEY` and
-`CLASSIFIER_BACKEND=llm` instead — that's an ongoing per-message cost, so the
-local model is the better default for most self-hosters.
+Prefer an LLM over downloading 256MB? Set `CLASSIFIER_BACKEND=llm` and opt a
+user into BYOK — that's an ongoing per-message cost on their own key, so the
+local model is the better default for most self-hosters. There's no
+operator-key shortcut: `GEMINI_API_KEY` doesn't feed classification.
 
 **Gmail (optional):** to ingest real mail, fill `GOOGLE_CLIENT_ID` /
 `GOOGLE_CLIENT_SECRET` in `deploy/.env` and register
@@ -224,15 +224,14 @@ deploy templates and the code default ship `auto`). The canonical values:
   (loaded from `CLASSIFIER_MODEL_PATH`, default `models/email-classifier`;
   needs the `local-classifier` extra) if it can serve; if torch or the model
   files are missing, or the encoder can't produce a verdict, it falls through
-  to an LLM — the operator's `GEMINI_API_KEY` if one is set (keyword-heuristic
-  fallback on failure), otherwise the heuristic directly. If the model
+  to the keyword heuristic — there is no operator-paid LLM step. If the model
   directory contains a `calibration.json`, the encoder applies that confidence
   calibration at load time (absent file = raw confidences; a dir whose
   `config.json` marks `"calibration_required": true` refuses to serve
   uncalibrated).
 - `llm` — the same routing as `auto` minus the local-encoder step: an
-  opted-in user's own key first, else the operator's `GEMINI_API_KEY` with a
-  keyword-heuristic fallback.
+  opted-in user's own key, else the keyword heuristic directly. `llm` only
+  ever reaches an LLM through a user's own BYOK key.
 - `heuristic` — keyword rules only, no extra dependencies, no LLM calls at
   all. This is the one value that **doesn't** honor a saved key: it returns
   before an opted-in user's routing is even read.
@@ -243,10 +242,10 @@ removal — move off them when you touch this file). Per-run overrides (the
 console's backfill picker, or `backend=` on the classify endpoints) accept a
 different, stricter `local`: only an *explicit* per-run `backend="local"` is
 guaranteed to never reach an LLM even when the encoder can't serve (it ends
-at the heuristic instead) — the global default *may* reach one instead. It
-does not always: a user whose credential resolves to "off", or a deployment
-with no `GEMINI_API_KEY` and nobody opted in, ends at the heuristic too. The
-difference is the guarantee, not the usual outcome.
+at the heuristic instead) — the global default *may* reach one instead, but
+only via an opted-in user's own key; a user whose credential resolves to
+"off" ends at the heuristic too. The difference is the guarantee, not the
+usual outcome.
 Per-run also has `local_then_llm` ("local encoder,
 LLM on failure"), the per-run analogue of `auto`'s non-opted-in path; it
 isn't a valid value for `CLASSIFIER_BACKEND` itself.
