@@ -10,6 +10,7 @@ block that module composes.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -25,6 +26,8 @@ from app.services.ingest.outlook_client import OutlookClient
 from app.services.nlp.backfill import latest_label_subquery, latest_message_ordering
 from app.services.nlp.classifier import LABELS
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Names: internal label -> provider-facing display name (plan §3.2).
 # ---------------------------------------------------------------------------
@@ -35,20 +38,20 @@ DISPLAY_NAMES: dict[str, str] = {
     "fyi": "FYI",
     "promotional": "Promotional",
     "security_alert": "Security alert",
-    "spam": "Spam",
+    # Gmail reserves system label names ("Spam" among them) for top-level
+    # user labels, so we use Junk on both providers to keep the names
+    # consistent.
+    "spam": "Junk",
 }
 assert set(DISPLAY_NAMES) == set(LABELS)  # keep in lockstep with the classifier
 
-GMAIL_PARENT_LABEL = "CortexMail"
-OUTLOOK_CATEGORY_PREFIX = "CortexMail: "
-
 
 def gmail_label_full_name(label: str) -> str:
-    return f"{GMAIL_PARENT_LABEL}/{DISPLAY_NAMES[label]}"
+    return DISPLAY_NAMES[label]
 
 
 def outlook_category_name(label: str) -> str:
-    return f"{OUTLOOK_CATEGORY_PREFIX}{DISPLAY_NAMES[label]}"
+    return DISPLAY_NAMES[label]
 
 
 def _label_for_gmail_full_name(name: str) -> str:
@@ -58,12 +61,48 @@ def _label_for_gmail_full_name(name: str) -> str:
     raise ValueError(f"not a CortexMail-owned label name: {name!r}")
 
 
-GMAIL_OWNED_LABEL_NAMES: frozenset[str] = frozenset(
-    {GMAIL_PARENT_LABEL, *(gmail_label_full_name(lbl) for lbl in LABELS)}
+# Frozen literals of the pre-rename names, kept so syncs can clean them out
+# of real mailboxes -- never derive them from DISPLAY_NAMES, since that dict
+# reflects the CURRENT names and would silently break this cleanup the next
+# time a display name changes.
+LEGACY_GMAIL_PARENT_LABEL = "CortexMail"
+LEGACY_GMAIL_LABEL_NAMES: dict[str, str] = {
+    "needs_reply": "CortexMail/Needs reply",
+    "action_required": "CortexMail/Action required",
+    "fyi": "CortexMail/FYI",
+    "promotional": "CortexMail/Promotional",
+    "security_alert": "CortexMail/Security alert",
+    "spam": "CortexMail/Spam",
+}
+LEGACY_OUTLOOK_CATEGORY_NAMES: frozenset[str] = frozenset(
+    {
+        "CortexMail: Needs reply",
+        "CortexMail: Action required",
+        "CortexMail: FYI",
+        "CortexMail: Promotional",
+        "CortexMail: Security alert",
+        "CortexMail: Spam",
+    }
 )
 
-OUTLOOK_OWNED_CATEGORY_NAMES: frozenset[str] = frozenset(
-    outlook_category_name(label) for label in LABELS
+GMAIL_OWNED_LABEL_NAMES: frozenset[str] = frozenset(
+    gmail_label_full_name(lbl) for lbl in LABELS
+)
+
+# Everything a sync should be willing to adopt/strip off a mailbox: the six
+# current names plus every legacy name and the legacy parent -- listing
+# adoption, the L-1 cache drop, and the thread-removal intersection all
+# share this set. The parent id riding along in the removal set is harmless:
+# it was never applied to any thread, so intersecting against a thread's
+# live labelIds just never matches it.
+GMAIL_REMOVABLE_LABEL_NAMES: frozenset[str] = (
+    GMAIL_OWNED_LABEL_NAMES
+    | set(LEGACY_GMAIL_LABEL_NAMES.values())
+    | {LEGACY_GMAIL_PARENT_LABEL}
+)
+
+OUTLOOK_OWNED_CATEGORY_NAMES: frozenset[str] = (
+    frozenset(outlook_category_name(label) for label in LABELS) | LEGACY_OUTLOOK_CATEGORY_NAMES
 )
 
 # Gmail's documented allowed label-color hex palette (users.labels#color) --
@@ -454,19 +493,24 @@ def load_gmail_label_map(raw: str | None) -> dict[str, str]:
     return {str(k): str(v) for k, v in parsed.items() if isinstance(v, str)}
 
 
-def _rebuild_gmail_map_from_listing(client: GmailClient, working: dict[str, str]) -> None:
-    """Re-`GET /labels` and adopt ids by exact full-name match (P1-5) --
-    called at most once per task run, from either a create conflict or an
-    invalid-cached-id error at modify time."""
+def _rebuild_gmail_map_from_listing(client: GmailClient, working: dict[str, str]) -> dict[str, str]:
+    """Re-`GET /labels` and adopt ids by exact full-name match into
+    `working` (P1-5) -- called at most once per task run, from either a
+    create conflict or an invalid-cached-id error at modify time. Returns
+    the listing's full name->id map: the caller's fresh evidence of what
+    actually exists in the mailbox right now, as opposed to `working`,
+    which may still carry stale entries the listing didn't confirm.
+    """
     listing = client.list_labels()
     by_name = {
         label["name"]: label["id"]
         for label in listing.get("labels", [])
         if label.get("name") and label.get("id")
     }
-    for name in GMAIL_OWNED_LABEL_NAMES:
+    for name in GMAIL_REMOVABLE_LABEL_NAMES:
         if name in by_name:
             working[name] = by_name[name]
+    return by_name
 
 
 def _is_auth_error(exc: httpx.HTTPStatusError) -> bool:
@@ -483,9 +527,8 @@ def _create_gmail_label(
         "name": name,
         "labelListVisibility": "labelShow",
         "messageListVisibility": "show",
+        "color": GMAIL_LABEL_COLORS[_label_for_gmail_full_name(name)],
     }
-    if name != GMAIL_PARENT_LABEL:
-        payload["color"] = GMAIL_LABEL_COLORS[_label_for_gmail_full_name(name)]
     try:
         resp = client.create_label(payload)
         working[name] = resp["id"]
@@ -505,15 +548,66 @@ def _create_gmail_label(
 def _ensure_gmail_label_ids(
     client: GmailClient, working: dict[str, str], rebuilt: dict[str, bool]
 ) -> None:
-    """Ensure the parent AND all six children have ids in `working` (§3.2
-    step 1) -- parent-first, since a child's full name embeds it but there
-    is no separate parent-id field. All six are needed even when only one
-    is desired: step 2's removal intersects the thread's live labelIds
-    against every CortexMail-owned id, not just the desired one.
+    """Ensure all six of the current label names have ids in `working`
+    (§3.2 step 1). All six are needed even when only one is desired: step
+    2's removal intersects the thread's live labelIds against every owned
+    id, not just the desired one.
+
+    Also handles the one-shot migration off the old "CortexMail/<name>"
+    Gmail labels: if any of the six new names is missing, we first re-list
+    and adopt by exact name (this proactive listing does NOT spend the
+    once-per-run error-rebuild budget -- `rebuilt["done"]` stays False, so a
+    genuine create-conflict or invalid-cached-id later in the same run can
+    still trigger its own rebuild). A legacy label found by that listing
+    gets RENAMED in place rather than recreated -- that keeps its id,
+    color, and every thread application, so the migration costs zero
+    per-thread writes. Finally, the legacy "CortexMail" parent (never
+    applied to any thread) gets a best-effort delete.
+
+    Destructive migration actions (rename, delete) only ever act on ids the
+    CURRENT listing reported -- `working`, seeded from the persisted cache,
+    is a performance hint and can go stale (e.g. `persist_gmail_label_map`
+    merges add-only, so a legacy parent entry it once wrote can never be
+    dropped from the cache again). Acting on a cached id instead of the
+    listing's would mean re-attempting a delete forever once the legacy
+    label is gone, or worse, touching a label id the user has since
+    repurposed.
     """
-    for name in (GMAIL_PARENT_LABEL, *(gmail_label_full_name(lbl) for lbl in LABELS)):
-        if name not in working:
-            _create_gmail_label(client, working, name, rebuilt)
+    new_names = [gmail_label_full_name(lbl) for lbl in LABELS]
+    listed: dict[str, str] = {}
+    if any(name not in working for name in new_names):
+        listed = _rebuild_gmail_map_from_listing(client, working)
+
+    for label in LABELS:
+        new_name = gmail_label_full_name(label)
+        if new_name in working:
+            continue
+        legacy_name = LEGACY_GMAIL_LABEL_NAMES[label]
+        if legacy_name in listed:
+            try:
+                client.update_label(listed[legacy_name], {"name": new_name})
+                working[new_name] = listed[legacy_name]
+            except httpx.HTTPStatusError as exc:
+                if _is_auth_error(exc):
+                    raise
+                # Renaming can fail for reasons we don't want to
+                # pattern-match on -- fall back to creating the new label
+                # outright. The legacy label then lingers, but its id is
+                # still in GMAIL_REMOVABLE_LABEL_NAMES, so threads shed it
+                # as they sync normally.
+                _create_gmail_label(client, working, new_name, rebuilt)
+        else:
+            _create_gmail_label(client, working, new_name, rebuilt)
+
+    if LEGACY_GMAIL_PARENT_LABEL in listed:
+        try:
+            client.delete_label(listed[LEGACY_GMAIL_PARENT_LABEL])
+        except httpx.HTTPStatusError as exc:
+            if _is_auth_error(exc):
+                raise
+            # Cosmetic cleanup -- must never fail a sync.
+            logger.warning("Failed to delete legacy CortexMail parent Gmail label", exc_info=True)
+    working.pop(LEGACY_GMAIL_PARENT_LABEL, None)
 
 
 def apply_gmail_labels(
@@ -525,7 +619,8 @@ def apply_gmail_labels(
 ) -> GmailApplyResult:
     """§3.2 Gmail apply: ensure label ids, then union the thread's messages'
     labelIds (a Gmail Thread has no top-level labelIds, P2-4), intersect
-    with the six owned ids, and modify only that actually-present
+    with every removable id (the six current names plus anything left over
+    from the pre-rename mailbox), and modify only that actually-present
     intersection plus the desired id (self-healing: always reads live
     provider state, never trusts what we last recorded).
     """
@@ -533,10 +628,9 @@ def apply_gmail_labels(
     rebuilt = {"done": False}
 
     _ensure_gmail_label_ids(client, working, rebuilt)
-    owned_full_names = [gmail_label_full_name(lbl) for lbl in LABELS]
 
     def compute_and_modify() -> GmailApplyResult:
-        owned_ids = {working[n] for n in owned_full_names if n in working}
+        removable_ids = {working[n] for n in GMAIL_REMOVABLE_LABEL_NAMES if n in working}
         desired_id = (
             working.get(gmail_label_full_name(desired_label)) if desired_label else None
         )
@@ -544,7 +638,7 @@ def apply_gmail_labels(
         present_ids: set[str] = set()
         for message in thread.get("messages", []) or []:
             present_ids.update(message.get("labelIds", []) or [])
-        current_owned = present_ids & owned_ids
+        current_owned = present_ids & removable_ids
         add_ids = [desired_id] if desired_id and desired_id not in current_owned else []
         remove_ids = sorted(current_owned - ({desired_id} if desired_id else set()))
         if add_ids or remove_ids:
@@ -565,7 +659,7 @@ def apply_gmail_labels(
         # CortexMail-owned entry first so the listing can only repopulate
         # what's genuinely still there, then re-ensure so anything that's
         # gone gets recreated before we retry the modify.
-        for name in GMAIL_OWNED_LABEL_NAMES:
+        for name in GMAIL_REMOVABLE_LABEL_NAMES:
             working.pop(name, None)
         _rebuild_gmail_map_from_listing(client, working)
         _ensure_gmail_label_ids(client, working, rebuilt)
