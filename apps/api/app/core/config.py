@@ -75,9 +75,10 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
     # Email classifier backend -- canonical global values are "auto" (an
-    # opted-in BYOK key first, else the local encoder, else an LLM),
-    # "heuristic" (keyword rules only), or "llm" (LLM-backed, heuristic on
-    # failure). "local" and "gemini" are deprecated aliases for "auto"/"llm",
+    # opted-in BYOK key first, else the local encoder, else the heuristic),
+    # "heuristic" (keyword rules only), or "llm" (an opted-in BYOK key, else
+    # the heuristic -- no other LLM path exists). "local" and "gemini" are
+    # deprecated aliases for "auto"/"llm",
     # mapped below with a startup warning; "local_then_llm" is a per-run-only
     # value (services/nlp/classifier.py, routes/mailbox.py) and is rejected
     # here. See docs/plans/2026-08-16-classifier-default-honesty-plan.md §2-3.
