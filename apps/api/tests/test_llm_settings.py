@@ -2232,26 +2232,21 @@ def test_classifier_mix_null_model_version_maps_to_unknown(user):
     ["demo-seed", "demo-1", "seeded"],
     ids=["committed-seed_demo.py", "gitignored-seed_demo_data.py", "gitignored-seed_fake_threads.py"],
 )
-def test_classifier_mix_demo_seeds_still_await_the_demo_kind(user, seed_model_version):
-    """Pins the DEFERRED state, not the desired one.
+def test_classifier_mix_demo_seeds_map_to_the_demo_kind(user, seed_model_version):
+    """All three historic seed stamps must report as `demo`.
 
-    None of the three historic seed stamps matches a real prefix, so they
-    fall through the catch-all and are reported as `operator_key` --
-    labeled as the historical operator-paid bucket on a mailbox that never
-    made a call. The `demo` kind that fixes this exists in the schema and
-    in the web label map already, but
-    emitting it is held back one release: a browser tab open across the
-    deploy is still running the previous bundle, which would interpolate
-    `undefined` for a kind it has never seen.
-
-    When the follow-up lands, this test flips to asserting `demo`. Do not
-    "fix" it by mapping only some of the three -- all three seeders exist,
-    and a partial mapping leaves the others mislabeled.
+    Emission was deferred one release so tabs running the pre-tolerant
+    bundle wouldn't interpolate `undefined` for an unknown kind; that
+    release shipped, so this now asserts the real mapping. Do not "fix" a
+    failure here by mapping only some of the three -- all three seeders
+    exist, and a partial mapping leaves the others misfiled as
+    `operator_key`, the historical operator-paid bucket, on a mailbox
+    that never made a call.
     """
     db = _mix_db([(seed_model_version, 7)])
     _override(user, db)
     resp = TestClient(app).get("/api/v1/settings/llm/classifier-mix")
-    assert resp.json() == {"classifier_mix": [{"kind": "operator_key", "count": 7}]}
+    assert resp.json() == {"classifier_mix": [{"kind": "demo", "count": 7}]}
 
 
 def test_classifier_mix_sums_distinct_versions_of_one_kind_into_a_single_row(user):
