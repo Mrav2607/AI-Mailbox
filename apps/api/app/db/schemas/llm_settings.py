@@ -176,9 +176,9 @@ class LlmUsageOut(Response):
 # script's stamped model_version (`demo-seed`, `demo-1`, `seeded`) -- none of
 # which match a known prefix, so they used to fall through the catch-all and
 # get reported as `operator_key`: 100% paid usage on a mailbox that never
-# made a call. Do NOT delete `operator_key`'s catch-all to fix this; it's
-# also what buckets the retained bare-model-name operator path (see the
-# route's `_classifier_mix_kind`).
+# made a call. Do NOT delete `operator_key`'s catch-all to fix this; it
+# still buckets historical bare-model-name stamps from the removed
+# server-paid classify path (see the route's `_classifier_mix_kind`).
 ClassifierMixKind = Literal[
     "local", "user_key", "operator_key", "heuristic", "manual", "demo", "unknown"
 ]

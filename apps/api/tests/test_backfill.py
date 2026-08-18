@@ -723,8 +723,8 @@ def test_run_backfill_flushes_usage_even_when_every_message_is_no_verdict(monkey
 
 
 def test_run_backfill_server_mode_routing_records_nothing(monkeypatch):
-    # The regression guard for the routing-mode gate: the operator's server
-    # key must never get billed onto the user's readout.
+    # The regression guard for the routing-mode gate: only "user" mode spends
+    # a key anyone is billed for, so nothing lands on the user's readout here.
     user_id = uuid4()
     db = _single_message_db()
     routing = ClassificationRouting(mode="server", credential=None)

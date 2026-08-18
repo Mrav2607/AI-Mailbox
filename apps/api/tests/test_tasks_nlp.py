@@ -283,8 +283,8 @@ def test_classify_message_records_usage_only_for_user_mode_routing(monkeypatch):
 
 
 def test_classify_message_server_mode_routing_records_nothing(monkeypatch):
-    # The regression guard for the routing-mode gate: the operator's server
-    # key must never get billed onto the user's readout.
+    # The regression guard for the routing-mode gate: only "user" mode spends
+    # a key anyone is billed for, so nothing lands on the user's readout here.
     message, thread = _message_and_thread()
     db = MagicMock()
     db.get.side_effect = [message, thread]
