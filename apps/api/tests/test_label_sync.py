@@ -57,17 +57,28 @@ def test_display_names_cover_every_classifier_label():
     assert set(service.DISPLAY_NAMES) == set(LABELS)
 
 
-def test_gmail_full_name_is_nested_under_the_parent():
-    assert service.gmail_label_full_name("needs_reply") == "CortexMail/Needs reply"
+def test_gmail_full_name_is_the_plain_display_name():
+    assert service.gmail_label_full_name("needs_reply") == "Needs reply"
 
 
-def test_outlook_category_name_uses_the_prefix():
-    assert service.outlook_category_name("fyi") == "CortexMail: FYI"
+def test_outlook_category_name_is_the_plain_display_name():
+    assert service.outlook_category_name("fyi") == "FYI"
 
 
-def test_outlook_owned_names_cover_all_six_labels():
-    assert len(service.OUTLOOK_OWNED_CATEGORY_NAMES) == 6
+def test_spam_display_name_is_junk_on_both_providers():
+    # Gmail rejects a top-level user label named "Spam" (reserved system
+    # label name) -- Junk keeps the two providers consistent.
+    assert service.DISPLAY_NAMES["spam"] == "Junk"
+    assert service.gmail_label_full_name("spam") == "Junk"
+    assert service.outlook_category_name("spam") == "Junk"
+
+
+def test_outlook_owned_names_cover_all_six_labels_plus_their_legacy_names():
+    # Six current names + six legacy "CortexMail: <name>" names -- the strip/
+    # merge filter has to catch both so a re-sync cleans out the old ones.
+    assert len(service.OUTLOOK_OWNED_CATEGORY_NAMES) == 12
     assert service.outlook_category_name("spam") in service.OUTLOOK_OWNED_CATEGORY_NAMES
+    assert "CortexMail: Spam" in service.OUTLOOK_OWNED_CATEGORY_NAMES
 
 
 def test_gmail_colors_are_all_drawn_from_the_allowed_palette():
@@ -557,28 +568,28 @@ def test_load_gmail_label_map_tolerates_malformed_json():
 
 
 def test_persist_gmail_label_map_merges_without_clobbering_existing_entries():
-    account = _account_row(gmail_label_map='{"CortexMail": "L1"}', label_sync_generation=3)
+    account = _account_row(gmail_label_map='{"FYI": "L1"}', label_sync_generation=3)
     db = MagicMock()
     db.execute.side_effect = [_exec_result(scalar_one_or_none=account)]
     service.persist_gmail_label_map(
-        db, account.id, generation=3, learned={"CortexMail/Needs reply": "L2"}
+        db, account.id, generation=3, learned={"Needs reply": "L2"}
     )
     import json
 
     saved = json.loads(account.gmail_label_map)
-    assert saved == {"CortexMail": "L1", "CortexMail/Needs reply": "L2"}
+    assert saved == {"FYI": "L1", "Needs reply": "L2"}
     db.commit.assert_called_once()
 
 
 def test_persist_gmail_label_map_drops_writes_from_a_stale_generation():
-    account = _account_row(gmail_label_map='{"CortexMail": "L1"}', label_sync_generation=5)
+    account = _account_row(gmail_label_map='{"FYI": "L1"}', label_sync_generation=5)
     db = MagicMock()
     db.execute.side_effect = [_exec_result(scalar_one_or_none=account)]
     service.persist_gmail_label_map(
-        db, account.id, generation=3, learned={"CortexMail/Needs reply": "L2"}
+        db, account.id, generation=3, learned={"Needs reply": "L2"}
     )
     # Untouched -- generation moved past what this task captured at claim.
-    assert account.gmail_label_map == '{"CortexMail": "L1"}'
+    assert account.gmail_label_map == '{"FYI": "L1"}'
     db.rollback.assert_called_once()
     db.commit.assert_not_called()
 
@@ -589,12 +600,13 @@ def test_persist_gmail_label_map_drops_writes_from_a_stale_generation():
 
 
 def _needed_gmail_names() -> list[str]:
-    return [service.GMAIL_PARENT_LABEL, *(service.gmail_label_full_name(lbl) for lbl in LABELS)]
+    return [service.gmail_label_full_name(lbl) for lbl in LABELS]
 
 
-def test_apply_gmail_labels_creates_parent_first_with_house_colors():
+def test_apply_gmail_labels_creates_all_six_labels_with_house_colors():
     client = MagicMock()
-    ids = iter(f"L{i}" for i in range(7))
+    client.list_labels.return_value = {"labels": []}  # a brand-new mailbox, nothing to adopt
+    ids = iter(f"L{i}" for i in range(6))
     client.create_label.side_effect = lambda payload: {"id": next(ids)}
     client.get_thread_minimal.return_value = {"messages": [{"labelIds": []}]}
 
@@ -603,13 +615,11 @@ def test_apply_gmail_labels_creates_parent_first_with_house_colors():
     )
 
     created_names = [call.args[0]["name"] for call in client.create_label.call_args_list]
-    assert created_names[0] == service.GMAIL_PARENT_LABEL
     assert set(created_names) == set(_needed_gmail_names())
-    # The parent has no color; every child does, from the allowed palette.
-    parent_payload = client.create_label.call_args_list[0].args[0]
-    assert "color" not in parent_payload
-    child_payload = client.create_label.call_args_list[1].args[0]
-    assert child_payload["color"] in service.GMAIL_LABEL_COLORS.values()
+    # Every one of the six gets a color from the allowed palette -- there's
+    # no parent label anymore to carry the old no-color special case.
+    for call in client.create_label.call_args_list:
+        assert call.args[0]["color"] in service.GMAIL_LABEL_COLORS.values()
 
     desired_id = result.working_map[service.gmail_label_full_name("needs_reply")]
     client.modify_thread.assert_called_once_with("t1", add_ids=[desired_id], remove_ids=[])
@@ -662,8 +672,12 @@ def test_apply_gmail_labels_removal_strips_all_present_owned_ids():
 def test_apply_gmail_labels_rebuilds_once_on_create_conflict_then_raises_if_still_missing():
     client = MagicMock()
     client.create_label.side_effect = _http_error(409)
-    # The re-list is missing "spam" -- adoption can't find it, so the
-    # original conflict error propagates instead of looping forever.
+    # The listing is missing "Junk" (spam's new name) -- adoption can't find
+    # it, so the original conflict error propagates instead of looping
+    # forever. The empty cached map means the pre-listing migration pass
+    # runs first (it doesn't spend the rebuild budget), and then the
+    # create-conflict path spends its own once-per-run rebuild -- both
+    # listing calls see the same missing name, so two calls total.
     missing = service.gmail_label_full_name("spam")
     client.list_labels.return_value = {
         "labels": [
@@ -678,7 +692,7 @@ def test_apply_gmail_labels_rebuilds_once_on_create_conflict_then_raises_if_stil
             client, provider_thread_id="t1", cached_map={}, desired_label="spam"
         )
 
-    assert client.list_labels.call_count == 1
+    assert client.list_labels.call_count == 2
 
 
 def test_apply_gmail_labels_401_propagates_without_spending_the_rebuild():
@@ -738,7 +752,11 @@ def test_apply_gmail_labels_recreates_a_deleted_label_after_a_stale_id_fails_mod
         client, provider_thread_id="t1", cached_map=stale_map, desired_label="fyi"
     )
 
-    assert client.list_labels.call_count == 1
+    # The L-1 retry path's own rebuild leaves "fyi" still missing (it's
+    # genuinely gone from the listing), so `_ensure_gmail_label_ids`'s own
+    # missing-name check fires a second listing call before falling back to
+    # create -- both calls see the same fresh listing.
+    assert client.list_labels.call_count == 2
     # Only the deleted label was recreated -- everything else came back off
     # the fresh listing.
     client.create_label.assert_called_once()
@@ -748,6 +766,151 @@ def test_apply_gmail_labels_recreates_a_deleted_label_after_a_stale_id_fails_mod
         if name != fyi_name:
             assert result.working_map[name] == f"FRESH-{name}"
     client.modify_thread.assert_called_once_with("t1", add_ids=["NEW-fyi"], remove_ids=[])
+
+
+# ---------------------------------------------------------------------------
+# One-shot migration off the pre-rename Gmail labels/parent.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_gmail_labels_migrates_legacy_labels_by_renaming_in_place():
+    # An empty cached map + a listing full of the OLD names: every child
+    # gets renamed (not recreated) so it keeps its id, color, and existing
+    # thread applications, and the dead parent gets cleaned up.
+    client = MagicMock()
+    legacy_ids = {label: f"LID-{label}" for label in LABELS}
+    client.list_labels.return_value = {
+        "labels": [
+            {"name": service.LEGACY_GMAIL_LABEL_NAMES[label], "id": legacy_ids[label]}
+            for label in LABELS
+        ]
+        + [{"name": service.LEGACY_GMAIL_PARENT_LABEL, "id": "PARENT-ID"}]
+    }
+    client.get_thread_minimal.return_value = {"messages": [{"labelIds": []}]}
+    client.update_label.side_effect = lambda label_id, payload: {"id": label_id, **payload}
+
+    result = service.apply_gmail_labels(
+        client, provider_thread_id="t1", cached_map={}, desired_label=None
+    )
+
+    assert client.update_label.call_count == 6
+    client.create_label.assert_not_called()
+    for label in LABELS:
+        new_name = service.gmail_label_full_name(label)
+        client.update_label.assert_any_call(legacy_ids[label], {"name": new_name})
+        # Same id as the legacy label -- renaming keeps color and every
+        # existing thread application, unlike a create-from-scratch.
+        assert result.working_map[new_name] == legacy_ids[label]
+    client.delete_label.assert_called_once_with("PARENT-ID")
+
+
+def test_apply_gmail_labels_pre_listing_adopts_when_new_names_already_exist():
+    # Empty cached map, but the listing already has all six current names
+    # (e.g. a mailbox migrated by a previous run) -- pure adoption, no
+    # renames or creates needed.
+    client = MagicMock()
+    new_ids = {label: f"NID-{label}" for label in LABELS}
+    client.list_labels.return_value = {
+        "labels": [
+            {"name": service.gmail_label_full_name(label), "id": new_ids[label]}
+            for label in LABELS
+        ]
+    }
+    client.get_thread_minimal.return_value = {"messages": [{"labelIds": []}]}
+
+    result = service.apply_gmail_labels(
+        client, provider_thread_id="t1", cached_map={}, desired_label=None
+    )
+
+    client.create_label.assert_not_called()
+    client.update_label.assert_not_called()
+    for label in LABELS:
+        assert result.working_map[service.gmail_label_full_name(label)] == new_ids[label]
+    assert client.list_labels.call_count == 1
+
+
+def test_apply_gmail_labels_removal_intersection_includes_a_lingering_legacy_id():
+    # A thread still carries a legacy label id from before the migration --
+    # the removal intersection has to catch it even though it's not one of
+    # the six current names.
+    cached_map = {name: f"ID-{name}" for name in _needed_gmail_names()}
+    legacy_fyi_name = service.LEGACY_GMAIL_LABEL_NAMES["fyi"]
+    legacy_fyi_id = "LEGACY-FYI-ID"
+    cached_map[legacy_fyi_name] = legacy_fyi_id
+    client = MagicMock()
+    client.get_thread_minimal.return_value = {"messages": [{"labelIds": [legacy_fyi_id]}]}
+
+    result = service.apply_gmail_labels(
+        client, provider_thread_id="t1", cached_map=cached_map, desired_label=None
+    )
+
+    assert result.remove_ids == [legacy_fyi_id]
+    client.modify_thread.assert_called_once_with("t1", add_ids=[], remove_ids=[legacy_fyi_id])
+
+
+def test_apply_gmail_labels_adopts_new_name_over_renaming_when_both_exist():
+    # The user's mailbox happens to already have a top-level "Needs reply"
+    # label of their own AND the legacy "CortexMail/Needs reply" -- the new
+    # name's exact-match adoption wins, the legacy one is left alone (never
+    # renamed into), and its id still gets swept off the thread.
+    client = MagicMock()
+    client.list_labels.return_value = {
+        "labels": [
+            {"name": "Needs reply", "id": "USER-OWNED-ID"},
+            {"name": "CortexMail/Needs reply", "id": "LEGACY-ID"},
+        ]
+    }
+    client.create_label.side_effect = lambda payload: {"id": f"NEW-{payload['name']}"}
+    client.get_thread_minimal.return_value = {"messages": [{"labelIds": ["LEGACY-ID"]}]}
+
+    result = service.apply_gmail_labels(
+        client, provider_thread_id="t1", cached_map={}, desired_label="needs_reply"
+    )
+
+    assert result.working_map["Needs reply"] == "USER-OWNED-ID"
+    client.update_label.assert_not_called()
+    assert "LEGACY-ID" in result.remove_ids
+
+
+def test_apply_gmail_labels_parent_delete_failure_does_not_fail_the_sync():
+    client = MagicMock()
+    client.list_labels.return_value = {
+        "labels": [
+            {"name": service.gmail_label_full_name(label), "id": f"ID-{label}"}
+            for label in LABELS
+        ]
+        + [{"name": service.LEGACY_GMAIL_PARENT_LABEL, "id": "PARENT-ID"}]
+    }
+    client.delete_label.side_effect = _http_error(500)
+    client.get_thread_minimal.return_value = {"messages": [{"labelIds": []}]}
+
+    result = service.apply_gmail_labels(
+        client, provider_thread_id="t1", cached_map={}, desired_label=None
+    )
+
+    client.delete_label.assert_called_once_with("PARENT-ID")
+    # Cosmetic cleanup only -- the dead entry is dropped from the map either
+    # way, and nothing above propagated.
+    assert service.LEGACY_GMAIL_PARENT_LABEL not in result.working_map
+
+
+def test_apply_gmail_labels_parent_delete_401_propagates():
+    client = MagicMock()
+    client.list_labels.return_value = {
+        "labels": [
+            {"name": service.gmail_label_full_name(label), "id": f"ID-{label}"}
+            for label in LABELS
+        ]
+        + [{"name": service.LEGACY_GMAIL_PARENT_LABEL, "id": "PARENT-ID"}]
+    }
+    client.delete_label.side_effect = _http_error(401)
+
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        service.apply_gmail_labels(
+            client, provider_thread_id="t1", cached_map={}, desired_label=None
+        )
+
+    assert excinfo.value.response.status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +928,7 @@ def test_strip_owned_categories_404_on_target_is_satisfied():
 def test_strip_owned_categories_exact_name_match_only():
     client = MagicMock()
     client.get_message_categories.return_value = {
-        "categories": ["CortexMail: FYI", "CortexMail: Client A", "Personal"],
+        "categories": ["FYI", "FYI Weekly", "Personal"],
         "etag": "W/1",
     }
     client.set_message_categories.return_value = _outlook_resp(200)
@@ -774,16 +937,16 @@ def test_strip_owned_categories_exact_name_match_only():
 
     assert outcome == "cleaned"
     kept = client.set_message_categories.call_args.args[1]
-    # Only the exact owned name is removed -- "CortexMail: Client A" is a
-    # prefix collision that must survive untouched.
-    assert kept == ["CortexMail: Client A", "Personal"]
+    # Only the exact owned name is removed -- "FYI Weekly" is a near-miss
+    # that must survive untouched.
+    assert kept == ["FYI Weekly", "Personal"]
 
 
 def test_strip_owned_categories_412_remerges_once():
     client = MagicMock()
     client.get_message_categories.side_effect = [
-        {"categories": ["CortexMail: FYI"], "etag": "W/1"},
-        {"categories": ["CortexMail: FYI", "New"], "etag": "W/2"},
+        {"categories": ["FYI"], "etag": "W/1"},
+        {"categories": ["FYI", "New"], "etag": "W/2"},
     ]
     client.set_message_categories.side_effect = [_outlook_resp(412), _outlook_resp(200)]
 
@@ -800,16 +963,16 @@ def test_merge_desired_category_404_on_current_target_raises_item_failure():
     client = MagicMock()
     client.get_message_categories.return_value = None
     with pytest.raises(service.OutlookItemNotFound):
-        service._merge_desired_category(client, "m1", "CortexMail: FYI")
+        service._merge_desired_category(client, "m1", "FYI")
 
 
 def test_merge_desired_category_happy_path_appends_desired():
     client = MagicMock()
     client.get_message_categories.return_value = {"categories": ["Personal"], "etag": "W/1"}
     client.set_message_categories.return_value = _outlook_resp(200)
-    service._merge_desired_category(client, "m1", "CortexMail: FYI")
+    service._merge_desired_category(client, "m1", "FYI")
     merged = client.set_message_categories.call_args.args[1]
-    assert merged == ["Personal", "CortexMail: FYI"]
+    assert merged == ["Personal", "FYI"]
 
 
 def test_apply_outlook_category_cleans_previous_target_before_new_merge():
@@ -830,13 +993,13 @@ def test_apply_outlook_category_cleans_previous_target_before_new_merge():
     svc._merge_desired_category = fake_merge
     try:
         svc.apply_outlook_category(
-            client, new_target="m2", previous_target="m1", desired_name="CortexMail: FYI"
+            client, new_target="m2", previous_target="m1", desired_name="FYI"
         )
     finally:
         svc._strip_owned_categories = orig_strip
         svc._merge_desired_category = orig_merge
 
-    assert calls == [("strip", "m1"), ("merge", "m2", "CortexMail: FYI")]
+    assert calls == [("strip", "m1"), ("merge", "m2", "FYI")]
 
 
 def test_apply_outlook_category_skips_cleanup_when_target_unchanged():
@@ -844,10 +1007,42 @@ def test_apply_outlook_category_skips_cleanup_when_target_unchanged():
     client.get_message_categories.return_value = {"categories": [], "etag": "W/1"}
     client.set_message_categories.return_value = _outlook_resp(200)
     service.apply_outlook_category(
-        client, new_target="m1", previous_target="m1", desired_name="CortexMail: FYI"
+        client, new_target="m1", previous_target="m1", desired_name="FYI"
     )
     # Only the merge's own GET happens -- no separate cleanup round trip.
     assert client.get_message_categories.call_count == 1
+
+
+def test_merge_desired_category_strips_legacy_name_and_keeps_user_category():
+    # A message still carries the old "CortexMail: FYI" category plus the
+    # user's own "Client A" -- the merge has to strip the legacy name
+    # (exact match, part of OUTLOOK_OWNED_CATEGORY_NAMES), leave the user's
+    # category alone, and merge on the new plain name.
+    client = MagicMock()
+    client.get_message_categories.return_value = {
+        "categories": ["CortexMail: FYI", "Client A"],
+        "etag": "W/1",
+    }
+    client.set_message_categories.return_value = _outlook_resp(200)
+
+    service._merge_desired_category(client, "m1", "FYI")
+
+    merged = client.set_message_categories.call_args.args[1]
+    assert merged == ["Client A", "FYI"]
+
+
+def test_merge_desired_category_legacy_spam_category_merges_as_junk():
+    client = MagicMock()
+    client.get_message_categories.return_value = {
+        "categories": ["CortexMail: Spam"],
+        "etag": "W/1",
+    }
+    client.set_message_categories.return_value = _outlook_resp(200)
+
+    service._merge_desired_category(client, "m1", service.outlook_category_name("spam"))
+
+    merged = client.set_message_categories.call_args.args[1]
+    assert merged == ["Junk"]
 
 
 # ---------------------------------------------------------------------------
@@ -886,7 +1081,7 @@ def test_outlook_get_message_categories_missing_etag_raises_missing_etag_error(m
     # L3: Graph may omit @odata.etag from a $select response -- must raise a
     # clear, dedicated exception instead of letting a None etag reach the
     # If-Match header downstream.
-    ok = _http_resp(200, {"categories": ["CortexMail: FYI"]})  # no @odata.etag
+    ok = _http_resp(200, {"categories": ["FYI"]})  # no @odata.etag
     fake = _fake_pooled_client(get=[ok])
     monkeypatch.setattr(outlook_client, "_client", lambda: fake)
 
@@ -917,7 +1112,7 @@ def test_outlook_set_message_categories_huge_retry_after_fails_without_sleeping(
     fake = _fake_pooled_client(patch=[throttled])
     monkeypatch.setattr(outlook_client, "_client", lambda: fake)
 
-    resp = OutlookClient("tok").set_message_categories("m1", ["CortexMail: FYI"], etag="W/1")
+    resp = OutlookClient("tok").set_message_categories("m1", ["FYI"], etag="W/1")
 
     assert slept == []
     assert resp.status_code == 429
@@ -928,14 +1123,14 @@ def test_outlook_get_message_categories_retry_after_under_cap_still_sleeps_and_r
     slept = []
     monkeypatch.setattr(outlook_client.time, "sleep", lambda s: slept.append(s))
     throttled = _http_resp(429, headers={"Retry-After": "5"})
-    ok = _http_resp(200, {"categories": ["CortexMail: FYI"], "@odata.etag": "W/2"})
+    ok = _http_resp(200, {"categories": ["FYI"], "@odata.etag": "W/2"})
     fake = _fake_pooled_client(get=[throttled, ok])
     monkeypatch.setattr(outlook_client, "_client", lambda: fake)
 
     result = OutlookClient("tok").get_message_categories("m1")
 
     assert slept == [5.0]
-    assert result == {"categories": ["CortexMail: FYI"], "etag": "W/2"}
+    assert result == {"categories": ["FYI"], "etag": "W/2"}
 
 
 def test_gmail_modify_thread_5xx_backoff_is_capped(monkeypatch):
@@ -1019,7 +1214,7 @@ def test_sync_thread_labels_gmail_happy_path_records_and_persists_map(monkeypatc
     monkeypatch.setattr(tasks_label_sync, "set_pending_target", lambda *a, **k: True)
     _patch_passthrough_token_retry(monkeypatch)
     apply_result = service.GmailApplyResult(
-        working_map={"CortexMail": "L1"}, add_ids=["L2"], remove_ids=[]
+        working_map={"Junk": "L1"}, add_ids=["L2"], remove_ids=[]
     )
     monkeypatch.setattr(tasks_label_sync, "apply_gmail_labels", lambda *a, **k: apply_result)
     persist_mock = MagicMock()

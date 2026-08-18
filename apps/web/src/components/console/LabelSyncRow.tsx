@@ -102,7 +102,7 @@ export function LabelSyncRow({
         Sync labels to {connection.provider === "outlook" ? "Outlook" : "Gmail"}
       </label>
       <p className="text-[10px] font-mono text-muted-foreground leading-snug">
-        creates CortexMail labels in your mailbox
+        creates sorting labels in your mailbox
       </p>
       {enabled && !!drift && (
         <p className="text-[10px] font-mono text-muted-foreground leading-snug">

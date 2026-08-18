@@ -191,6 +191,23 @@ class GmailClient:
         resp.raise_for_status()
         return resp.json()
 
+    def update_label(self, label_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """PATCH /labels/{id}. Used to rename legacy CortexMail-prefixed
+        labels in place -- not retried; the caller has a create fallback.
+        """
+        headers = {"Authorization": f"Bearer {self.token}"}
+        resp = _client().patch(f"/labels/{label_id}", headers=headers, json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    def delete_label(self, label_id: str) -> None:
+        """DELETE /labels/{id}. Best-effort cleanup of the legacy parent
+        label -- not retried.
+        """
+        headers = {"Authorization": f"Bearer {self.token}"}
+        resp = _client().delete(f"/labels/{label_id}", headers=headers)
+        resp.raise_for_status()
+
     def modify_thread(
         self, thread_id: str, *, add_ids: list[str], remove_ids: list[str]
     ) -> dict[str, Any]:
