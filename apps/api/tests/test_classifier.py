@@ -74,9 +74,9 @@ def test_classify_heuristic_backend(monkeypatch):
 
 
 def test_classify_default_backend_falls_back_when_model_missing(monkeypatch, tmp_path):
-    # With no model on disk, the GLOBAL default ("auto" -- "local" is now a
-    # deprecated alias for it, plan §2/§3) must degrade to the llm/heuristic
-    # path rather than raise.
+    # With no model on disk, the GLOBAL default ("auto" -- "local" was
+    # renamed to it, plan §2/§3) must degrade to the llm/heuristic path
+    # rather than raise.
     from app.services.nlp import classifier, local_model
 
     local_model.reset()
@@ -638,7 +638,7 @@ def test_classify_precedence_local_available_wins_over_off_routing(monkeypatch):
     -is, never downgraded to heuristic just because routing says "off". The
     global default value itself isn't the point here (both "local" and
     "auto" land in the same `_classify_attempt` branch) -- "auto" is the
-    canonical spelling as of plan §2/§3, "local" now a deprecated alias."""
+    canonical spelling as of plan §2/§3, "local" was renamed to it."""
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "auto")
@@ -904,9 +904,8 @@ def test_classify_default_backend_user_mode_never_consults_local_encoder(monkeyp
     """Case 1: the global default (backend not passed for this run) sends an
     opted-in user straight to their key -- the local encoder is never even
     asked, so a deployment defaulting to "auto" (today's CLASSIFIER_BACKEND
-    default; "local" is now a deprecated alias for the same value, plan
-    §2/§3) still honors the opt-in instead of classifying that mail for
-    free."""
+    default; "local" was renamed to it, plan §2/§3) still honors the opt-in
+    instead of classifying that mail for free."""
     from app.services.nlp import classifier, local_model
 
     monkeypatch.setattr(classifier.settings, "classifier_backend", "auto")
