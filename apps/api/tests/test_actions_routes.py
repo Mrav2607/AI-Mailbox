@@ -10,12 +10,15 @@ hooks) use small hand-built fakes answering the exact calls a route makes,
 mirroring test_mailbox.py's approach.
 """
 
+import base64
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.deps import get_current_user, get_db
@@ -64,7 +67,11 @@ def test_list_default_status_and_empty_result(client):
     c, _, _ = client
     resp = c.get("/api/v1/mail/actions")
     assert resp.status_code == 200
-    assert resp.json() == {"items": [], "counts": {"open": 0, "overdue": 0}}
+    assert resp.json() == {
+        "items": [],
+        "counts": {"open": 0, "overdue": 0},
+        "next_cursor": None,
+    }
 
 
 @pytest.mark.parametrize("status", ["open", "done", "dismissed"])
@@ -88,6 +95,18 @@ def test_list_statement_carries_visibility_predicates(client):
     assert "classification.label IN ('needs_reply', 'action_required')" in compiled
     assert f"mail_thread.user_id = '{user.id.hex}'" in compiled
     assert "action_item.status = 'done'" in compiled
+
+
+def test_list_and_counts_statements_carry_action_item_user_id_predicate(client):
+    # D6: ActionItem.user_id lives in _visibility_predicates, so it shows up
+    # in BOTH the list statement and the counts aggregate -- never one
+    # without the other.
+    c, db, user = client
+    c.get("/api/v1/mail/actions?status=done")
+    list_compiled = _compiled(db.execute.call_args_list[0].args[0])
+    counts_compiled = _compiled(db.execute.call_args_list[1].args[0])
+    assert f"action_item.user_id = '{user.id.hex}'" in list_compiled
+    assert f"action_item.user_id = '{user.id.hex}'" in counts_compiled
 
 
 def test_list_statement_joins_classification_on_the_items_own_message(client):
@@ -137,6 +156,222 @@ def test_counts_overdue_requires_open_status_and_past_due_at(client):
     compiled = _compiled(db.execute.call_args_list[1].args[0])
     assert "action_item.status = 'open'" in compiled
     assert "action_item.due_at <" in compiled
+
+
+# ---------------------------------------------------------------------------
+# GET "" -- cursor: statement wiring
+# ---------------------------------------------------------------------------
+
+
+def test_list_statement_omits_cursor_predicate_when_no_cursor_given(client):
+    c, db, _ = client
+    c.get("/api/v1/mail/actions")
+    compiled = _compiled(db.execute.call_args_list[0].args[0])
+    # Nothing but the ordinary visibility/status predicates -- no stray
+    # `created_at <` / `due_at >` comparison sneaking in unconditionally.
+    assert "action_item.due_at >" not in compiled
+    assert "action_item.created_at <" not in compiled
+
+
+def test_list_statement_applies_cursor_predicate_in_non_null_due_segment(client):
+    c, db, user = client
+    token = actions._encode_agenda_cursor(
+        "open",
+        SimpleNamespace(
+            due_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            created_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            id=uuid4(),
+        ),
+    )
+    c.get(f"/api/v1/mail/actions?cursor={token}")
+    compiled = _compiled(db.execute.call_args_list[0].args[0])
+    assert "action_item.due_at > '2026-08-01" in compiled
+    assert "action_item.due_at IS NULL" in compiled
+
+
+def test_list_statement_applies_cursor_predicate_in_null_due_segment(client):
+    c, db, _ = client
+    token = actions._encode_agenda_cursor(
+        "open",
+        SimpleNamespace(
+            due_at=None,
+            created_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            id=uuid4(),
+        ),
+    )
+    c.get(f"/api/v1/mail/actions?cursor={token}")
+    compiled = _compiled(db.execute.call_args_list[0].args[0])
+    assert "action_item.due_at IS NULL" in compiled
+    assert "action_item.created_at < '2026-07-01" in compiled
+
+
+def test_list_next_cursor_is_null_on_short_page(client):
+    c, db, _ = client
+    # The shared fixture's `.all()` stub returns an empty list -- shorter
+    # than any positive `limit`, so no cursor should be minted.
+    resp = c.get("/api/v1/mail/actions?limit=5")
+    assert resp.json()["next_cursor"] is None
+
+
+def test_list_next_cursor_is_emitted_on_a_full_page():
+    # A full page (len(rows) == limit) must mint a cursor from the last row.
+    user = MagicMock(id=uuid4())
+    item = _make_action_item(due_at=None)
+    row = _Row(
+        item,
+        thread_subject="s",
+        provider="gmail",
+        sender="a@example.com",
+        display_email="a@example.com",
+        external_user_id="ext",
+        label="fyi",
+        last_message_at=None,
+    )
+    db = _ListThenCountsDB([row], (1, 0))
+    app.dependency_overrides[get_current_user] = lambda: user
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        resp = TestClient(app).get("/api/v1/mail/actions?limit=1")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.json()["next_cursor"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Cursor encode/decode -- unit-level validation matrix (D3)
+# ---------------------------------------------------------------------------
+
+
+def test_cursor_round_trips_through_encode_and_decode():
+    item = SimpleNamespace(
+        due_at=datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+        created_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        id=uuid4(),
+    )
+    token = actions._encode_agenda_cursor("open", item)
+    cursor = actions._decode_agenda_cursor(token, "open")
+    assert cursor.due_at == item.due_at
+    assert cursor.created_at == item.created_at
+    assert cursor.id == item.id
+
+
+def test_cursor_round_trips_with_null_due_at():
+    item = SimpleNamespace(
+        due_at=None,
+        created_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        id=uuid4(),
+    )
+    token = actions._encode_agenda_cursor("open", item)
+    cursor = actions._decode_agenda_cursor(token, "open")
+    assert cursor.due_at is None
+
+
+def test_cursor_decode_rejects_garbage_token():
+    with pytest.raises(HTTPException) as exc_info:
+        actions._decode_agenda_cursor("not-valid-base64!!", "open")
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == "invalid cursor"
+
+
+def test_cursor_decode_rejects_truncated_base64():
+    item = SimpleNamespace(
+        due_at=None, created_at=datetime(2026, 7, 1, tzinfo=timezone.utc), id=uuid4()
+    )
+    token = actions._encode_agenda_cursor("open", item)
+    with pytest.raises(HTTPException) as exc_info:
+        actions._decode_agenda_cursor(token[: len(token) // 2], "open")
+    assert exc_info.value.status_code == 422
+
+
+def test_cursor_decode_rejects_wrong_version():
+    payload = {
+        "v": 2,
+        "s": "open",
+        "d": None,
+        "c": "2026-07-01T00:00:00+00:00",
+        "i": str(uuid4()),
+    }
+    token = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    with pytest.raises(HTTPException) as exc_info:
+        actions._decode_agenda_cursor(token, "open")
+    assert exc_info.value.status_code == 422
+
+
+def test_cursor_decode_rejects_naive_created_at():
+    payload = {
+        "v": 1,
+        "s": "open",
+        "d": None,
+        "c": "2026-07-01T00:00:00",  # no tz offset
+        "i": str(uuid4()),
+    }
+    token = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    with pytest.raises(HTTPException) as exc_info:
+        actions._decode_agenda_cursor(token, "open")
+    assert exc_info.value.status_code == 422
+
+
+def test_cursor_decode_rejects_naive_due_at():
+    payload = {
+        "v": 1,
+        "s": "open",
+        "d": "2026-08-01T00:00:00",  # no tz offset
+        "c": "2026-07-01T00:00:00+00:00",
+        "i": str(uuid4()),
+    }
+    token = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    with pytest.raises(HTTPException) as exc_info:
+        actions._decode_agenda_cursor(token, "open")
+    assert exc_info.value.status_code == 422
+
+
+def test_cursor_decode_rejects_non_uuid_id():
+    payload = {
+        "v": 1,
+        "s": "open",
+        "d": None,
+        "c": "2026-07-01T00:00:00+00:00",
+        "i": "not-a-uuid",
+    }
+    token = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    with pytest.raises(HTTPException) as exc_info:
+        actions._decode_agenda_cursor(token, "open")
+    assert exc_info.value.status_code == 422
+
+
+def test_cursor_decode_rejects_status_mismatch():
+    item = SimpleNamespace(
+        due_at=None, created_at=datetime(2026, 7, 1, tzinfo=timezone.utc), id=uuid4()
+    )
+    token = actions._encode_agenda_cursor("open", item)
+    with pytest.raises(HTTPException) as exc_info:
+        actions._decode_agenda_cursor(token, "done")
+    assert exc_info.value.status_code == 422
+
+
+def test_cursor_decode_error_does_not_echo_the_token():
+    bogus_token = "totally-bogus-token-value-xyz"
+    with pytest.raises(HTTPException) as exc_info:
+        actions._decode_agenda_cursor(bogus_token, "open")
+    assert bogus_token not in str(exc_info.value.detail)
+
+
+def test_list_route_returns_422_for_invalid_cursor(client):
+    c, _, _ = client
+    resp = c.get("/api/v1/mail/actions?cursor=not-a-valid-cursor!!")
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "invalid cursor"
+
+
+def test_list_route_returns_422_for_cursor_status_mismatch(client):
+    c, _, _ = client
+    item = SimpleNamespace(
+        due_at=None, created_at=datetime(2026, 7, 1, tzinfo=timezone.utc), id=uuid4()
+    )
+    token = actions._encode_agenda_cursor("open", item)
+    resp = c.get(f"/api/v1/mail/actions?status=done&cursor={token}")
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "invalid cursor"
 
 
 # ---------------------------------------------------------------------------

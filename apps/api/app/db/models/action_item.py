@@ -53,8 +53,18 @@ class ActionItem(Base):
             name="ck_action_item_status",
         ),
         # Serves the agenda list/counts: WHERE user_id = ? AND outcome/status
-        # filters, ordered by due_at.
-        Index("ix_action_item_user_agenda", "user_id", "outcome", "status", "due_at"),
+        # filters, ordered to match the route's ORDER BY exactly (mixed
+        # ASC/NULLS LAST/DESC columns, so plain unordered columns can't serve
+        # the sort -- see docs/plans/2026-08-19-agenda-cursor-pagination-plan.md D6).
+        Index(
+            "ix_action_item_user_agenda",
+            "user_id",
+            "outcome",
+            "status",
+            text("due_at ASC NULLS LAST"),
+            text("created_at DESC"),
+            text("id DESC"),
+        ),
         # Serves the thread-done resolution write (FK columns aren't auto-indexed).
         Index("ix_action_item_thread", "thread_id", "outcome", "status"),
     )
