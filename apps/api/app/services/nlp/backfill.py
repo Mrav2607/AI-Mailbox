@@ -245,7 +245,7 @@ def run_backfill(
     # Failure-visibility counters (plan: 2026-08-14-llm-failure-visibility) --
     # read straight off ClassificationAttempt's explicit facts, never derived
     # from routing.mode or provider_call_succeeded (see that dataclass's
-    # docstring for why deriving is wrong: a CLASSIFIER_BACKEND=local run
+    # docstring for why deriving is wrong: an auto run without a BYOK opt-in
     # never touches an LLM at all, so it must report fell_back=0).
     llm_attempted = 0
     llm_failed = 0

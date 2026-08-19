@@ -236,19 +236,15 @@ deploy templates and the code default ship `auto`). The canonical values:
   all. This is the one value that **doesn't** honor a saved key: it returns
   before an opted-in user's routing is even read.
 
-`local` and `gemini` are deprecated aliases for `auto` and `llm` (still
-accepted, mapped at startup with a deprecation warning, scheduled for
-removal — move off them when you touch this file). Per-run overrides (the
-console's backfill picker, or `backend=` on the classify endpoints) accept a
-different, stricter `local`: only an *explicit* per-run `backend="local"` is
-guaranteed to never reach an LLM even when the encoder can't serve (it ends
-at the heuristic instead) — the global default *may* reach one instead, but
-only via an opted-in user's own key; a user whose credential resolves to
-"off" ends at the heuristic too. The difference is the guarantee, not the
-usual outcome.
-Per-run also has `local_then_llm` ("local encoder,
-LLM on failure"), the per-run analogue of `auto`'s non-opted-in path; it
-isn't a valid value for `CLASSIFIER_BACKEND` itself.
+Per-run overrides (the console's backfill picker, or `backend=` on the
+classify endpoints) accept a different, stricter `local`: only an *explicit*
+per-run `backend="local"` is guaranteed to never reach an LLM even when the
+encoder can't serve (it ends at the heuristic instead) — the global default
+*may* reach one instead, but only via an opted-in user's own key; a user
+whose credential resolves to "off" ends at the heuristic too. The difference
+is the guarantee, not the usual outcome. Per-run also has `local_then_llm`
+("local encoder, LLM on failure"), the per-run analogue of `auto`'s
+non-opted-in path; it isn't a valid value for `CLASSIFIER_BACKEND` itself.
 
 The trained model is **not** committed (`models/` is git-ignored) — fetch it
 from the `model-v2` release with `./fetch-model.sh`, or train your own with the
