@@ -1120,11 +1120,7 @@ export function mockGetClassifierMix(): ClassifierMix {
     { kind: "user_key", count: 86 },
     { kind: "heuristic", count: 11 },
     // Seeded demo rows get their own kind rather than falling to the
-    // operator-key catch-all. The API doesn't emit this yet -- it's held
-    // back a release so tabs still running the previous bundle don't meet a
-    // kind their label map has never heard of. Kept here anyway: preview is
-    // the only place the label renders until then, and it's what the mix
-    // will look like once the API half lands.
+    // operator-key catch-all, matching what the API emits.
     { kind: "demo", count: 15 },
     { kind: "manual", count: 1 },
   ];

@@ -313,21 +313,13 @@ def _classifier_mix_kind(model_version: str | None) -> ClassifierMixKind:
         return "heuristic"
     if model_version == "user-override":
         return "manual"
-    # DEFERRED, deliberately: the demo-seed stamps ("demo-seed", "demo-1",
-    # "seeded") should map to "demo" here, and the kind already exists in
-    # ClassifierMixKind and in the web label map. Emitting it is held back one
-    # release because a browser tab that is already open is still running the
-    # PREVIOUS bundle, whose summary interpolates its label map blindly and
-    # would render "undefined 15" for a kind it has never heard of. This
-    # release ships the tolerant renderer; once clients have picked it up, the
-    # mapping below is a two-line change with nothing left to break.
-    #
-    #   if model_version in ("demo-seed", "demo-1", "seeded"):
-    #       return "demo"
-    #
-    # Until then these fall to the operator_key catch-all, which is wrong but
-    # is exactly as wrong as it already was -- no regression, just not yet
-    # fixed.
+    # All three historic seed stamps map to "demo": "demo-seed" is what the
+    # committed seeder writes today, "demo-1" and "seeded" came from the two
+    # gitignored legacy scripts. Mapping only some of them would leave the
+    # rest misfiled as operator_key -- 100% paid usage on a mailbox that
+    # never made a call.
+    if model_version in ("demo-seed", "demo-1", "seeded"):
+        return "demo"
     preset, sep, _rest = model_version.partition(":")
     if sep and preset in PROVIDER_PRESETS:
         return "user_key"
