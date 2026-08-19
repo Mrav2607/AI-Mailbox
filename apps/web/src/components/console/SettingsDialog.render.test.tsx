@@ -6,6 +6,7 @@ import { SettingsDialog, type SettingsTab } from "./SettingsDialog";
 import type {
   ClassifierMixEntry,
   Connection,
+  LlmCredentialSummary,
   LlmProvider,
   LlmSettings,
   LlmUsage,
@@ -103,6 +104,43 @@ function findCheckboxByLabelText(text: string): HTMLInputElement {
   return input as HTMLInputElement;
 }
 
+function findRadioByLabelText(text: string): HTMLInputElement {
+  const label = Array.from(document.body.querySelectorAll("label")).find((l) =>
+    l.textContent?.includes(text),
+  );
+  if (!label) throw new Error(`radio label containing "${text}" not found`);
+  const input = label.querySelector('input[type="radio"]');
+  if (!input) throw new Error(`no radio inside label containing "${text}"`);
+  return input as HTMLInputElement;
+}
+
+// React patches the input element's own `value` setter to track what it
+// last rendered -- writing through it directly (`el.value = ...`) leaves
+// that tracker in sync, so a follow-up "input" event looks like a no-op and
+// never reaches onChange. Calling the native prototype's setter instead
+// bypasses the patch, same trick ReplyComposer's own render test uses.
+function setInputValue(el: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!
+    .set!;
+  setter.call(el, value);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function makeCredential(overrides: Partial<LlmCredentialSummary> = {}): LlmCredentialSummary {
+  return {
+    id: "cred-1",
+    name: "default",
+    provider: "openai",
+    model: "gpt-4o-mini",
+    key_suffix: "abcd",
+    last_verified_at: null,
+    active: true,
+    classification_byok: false,
+    classification_fallback_local: false,
+    ...overrides,
+  };
+}
+
 function Harness({
   initialTab = "accounts",
   connections = [],
@@ -118,6 +156,14 @@ function Harness({
   heuristicNoticeDismissed = false,
   onDismissHeuristicNotice = vi.fn(),
   classifierMix = null,
+  credentials = null,
+  onCreateCredential = vi.fn(),
+  creatingCredential = false,
+  onActivateCredential = vi.fn(),
+  activatingCredentialId = null,
+  onDeleteCredential = vi.fn(),
+  deletingCredentialId = null,
+  credentialDeleteError = null,
 }: {
   initialTab?: SettingsTab;
   connections?: Connection[];
@@ -140,6 +186,22 @@ function Harness({
   heuristicNoticeDismissed?: boolean;
   onDismissHeuristicNotice?: () => void;
   classifierMix?: ClassifierMixEntry[] | null;
+  credentials?: LlmCredentialSummary[] | null;
+  onCreateCredential?: (input: {
+    name: string;
+    provider: LlmProvider;
+    api_key: string;
+    model: string;
+    base_url?: string;
+    classification_byok?: boolean;
+    classification_fallback_local?: boolean;
+  }) => void;
+  creatingCredential?: boolean;
+  onActivateCredential?: (id: string) => void;
+  activatingCredentialId?: string | null;
+  onDeleteCredential?: (id: string) => void;
+  deletingCredentialId?: string | null;
+  credentialDeleteError?: { id: string; message: string } | null;
 }) {
   const [open, setOpen] = useState(true);
   const [tab, setTab] = useState<SettingsTab>(initialTab);
@@ -169,6 +231,14 @@ function Harness({
       classifierMixError={false}
       heuristicNoticeDismissed={heuristicNoticeDismissed}
       onDismissHeuristicNotice={onDismissHeuristicNotice}
+      credentials={credentials}
+      onCreateCredential={onCreateCredential}
+      creatingCredential={creatingCredential}
+      onActivateCredential={onActivateCredential}
+      activatingCredentialId={activatingCredentialId}
+      onDeleteCredential={onDeleteCredential}
+      deletingCredentialId={deletingCredentialId}
+      credentialDeleteError={credentialDeleteError}
       usage={usage}
       usageError={usageError}
       days={30}
@@ -471,6 +541,191 @@ describe("SettingsDialog ai tab heuristic-backend notice", () => {
       findButton("dismiss").dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
     expect(onDismissHeuristicNotice).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("SettingsDialog ai tab multi-credential list", () => {
+  it("does not render the credential list for a single credential -- no clutter for the common case", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings()}
+          usage={makeUsage()}
+          credentials={[makeCredential()]}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).not.toContain("your credentials");
+  });
+
+  it("renders the list with the active credential marked once there are 2+", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings()}
+          usage={makeUsage()}
+          credentials={[
+            makeCredential({ id: "cred-a", name: "Work", active: true }),
+            makeCredential({ id: "cred-b", name: "Personal", active: false }),
+          ]}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("your credentials");
+    expect(findRadioByLabelText("Work").checked).toBe(true);
+    expect(findRadioByLabelText("Personal").checked).toBe(false);
+  });
+
+  it("hides the remove button for the active row but shows it for inactive ones", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings()}
+          usage={makeUsage()}
+          credentials={[
+            makeCredential({ id: "cred-a", name: "Work", active: true }),
+            makeCredential({ id: "cred-b", name: "Personal", active: false }),
+          ]}
+        />,
+      );
+      await Promise.resolve();
+    });
+    // Only one "remove this credential" button in the LIST -- deleting the
+    // active credential has to go through the singular kill switch instead
+    // (its own "remove" button, further down the form, is a different
+    // control -- title-scoped here so this doesn't count that one too).
+    const removeButtons = Array.from(document.body.querySelectorAll("button")).filter(
+      (b) => b.title === "remove this credential",
+    );
+    expect(removeButtons.length).toBe(1);
+  });
+
+  it("clicking an inactive credential's radio fires onActivateCredential with its id", async () => {
+    const onActivateCredential = vi.fn();
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings()}
+          usage={makeUsage()}
+          credentials={[
+            makeCredential({ id: "cred-a", name: "Work", active: true }),
+            makeCredential({ id: "cred-b", name: "Personal", active: false }),
+          ]}
+          onActivateCredential={onActivateCredential}
+        />,
+      );
+      await Promise.resolve();
+    });
+    act(() => {
+      findRadioByLabelText("Personal").click();
+    });
+    expect(onActivateCredential).toHaveBeenCalledWith("cred-b");
+  });
+
+  it("clicking remove on an inactive credential fires onDeleteCredential with its id", async () => {
+    const onDeleteCredential = vi.fn();
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings()}
+          usage={makeUsage()}
+          credentials={[
+            makeCredential({ id: "cred-a", name: "Work", active: true }),
+            makeCredential({ id: "cred-b", name: "Personal", active: false }),
+          ]}
+          onDeleteCredential={onDeleteCredential}
+        />,
+      );
+      await Promise.resolve();
+    });
+    act(() => {
+      findButton("remove").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onDeleteCredential).toHaveBeenCalledWith("cred-b");
+  });
+
+  it("shows a 409 delete error inline on the row it's about, not as a toast", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings()}
+          usage={makeUsage()}
+          credentials={[
+            makeCredential({ id: "cred-a", name: "Work", active: true }),
+            makeCredential({ id: "cred-b", name: "Personal", active: false }),
+          ]}
+          credentialDeleteError={{
+            id: "cred-b",
+            message: "This is your active credential — switch to another one first.",
+          }}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain(
+      "This is your active credential — switch to another one first.",
+    );
+  });
+
+  it("add credential switches the form into create mode and submits through onCreateCredential", async () => {
+    const onCreateCredential = vi.fn();
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings()}
+          usage={makeUsage()}
+          onCreateCredential={onCreateCredential}
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    act(() => {
+      findButton("+ add another credential").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+    // The form now needs a name, and the API key field no longer offers to
+    // keep the saved one -- there's nothing stored yet for this new row.
+    expect(document.body.textContent).toContain(
+      "your key is encrypted, stored, and never shown again after you save it",
+    );
+
+    const nameInput = document.body.querySelector('input[maxlength="60"]') as HTMLInputElement;
+    act(() => {
+      setInputValue(nameInput, "Personal key");
+    });
+    const keyInput = document.body.querySelector('input[type="password"]') as HTMLInputElement;
+    act(() => {
+      setInputValue(keyInput, "sk-personal-key-12345678");
+    });
+    const modelInput = document.body.querySelector(
+      'input[placeholder="e.g. gpt-4o-mini"]',
+    ) as HTMLInputElement;
+    act(() => {
+      setInputValue(modelInput, "gpt-4o-mini");
+    });
+
+    act(() => {
+      findButton("add credential").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onCreateCredential).toHaveBeenCalledTimes(1);
+    expect(onCreateCredential.mock.calls[0][0]).toMatchObject({
+      name: "Personal key",
+      provider: "openai",
+      model: "gpt-4o-mini",
+      api_key: "sk-personal-key-12345678",
+    });
   });
 });
 

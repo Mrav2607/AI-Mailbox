@@ -218,6 +218,17 @@ export interface SettingsDialogProps {
   heuristicNoticeDismissed: LlmSettingsSectionProps["heuristicNoticeDismissed"];
   onDismissHeuristicNotice: LlmSettingsSectionProps["onDismissHeuristicNotice"];
 
+  // ai tab -- multi-credential list (2026-08-19-multi-credential-llm-
+  // profiles plan), same field names LlmSettingsSection takes.
+  credentials: LlmSettingsSectionProps["credentials"];
+  onCreateCredential: LlmSettingsSectionProps["onCreateCredential"];
+  creatingCredential: LlmSettingsSectionProps["creatingCredential"];
+  onActivateCredential: LlmSettingsSectionProps["onActivateCredential"];
+  activatingCredentialId: LlmSettingsSectionProps["activatingCredentialId"];
+  onDeleteCredential: LlmSettingsSectionProps["onDeleteCredential"];
+  deletingCredentialId: LlmSettingsSectionProps["deletingCredentialId"];
+  credentialDeleteError: LlmSettingsSectionProps["credentialDeleteError"];
+
   // usage tab -- same field names LlmUsageSection takes. `usage`/`usageError`
   // double as the ai tab's one-line usage summary, same as the field names
   // already shared between LlmSettingsSectionProps and LlmUsageSectionProps.
@@ -270,6 +281,14 @@ export function SettingsDialog({
   classifierMixError,
   heuristicNoticeDismissed,
   onDismissHeuristicNotice,
+  credentials,
+  onCreateCredential,
+  creatingCredential,
+  onActivateCredential,
+  activatingCredentialId,
+  onDeleteCredential,
+  deletingCredentialId,
+  credentialDeleteError,
   usage,
   usageError,
   days,
@@ -357,6 +376,14 @@ export function SettingsDialog({
               classifierMixError={classifierMixError}
               heuristicNoticeDismissed={heuristicNoticeDismissed}
               onDismissHeuristicNotice={onDismissHeuristicNotice}
+              credentials={credentials}
+              onCreateCredential={onCreateCredential}
+              creatingCredential={creatingCredential}
+              onActivateCredential={onActivateCredential}
+              activatingCredentialId={activatingCredentialId}
+              onDeleteCredential={onDeleteCredential}
+              deletingCredentialId={deletingCredentialId}
+              credentialDeleteError={credentialDeleteError}
             />
           </div>
           <div hidden={tab !== "usage"} className="h-full overflow-y-auto pr-0.5">

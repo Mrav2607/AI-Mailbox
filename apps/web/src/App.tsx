@@ -8,11 +8,14 @@ import {
   useState,
 } from "react";
 import {
+  activateLlmCredential,
   allRunsDeduplicated,
   ApiError,
   backfillActions,
   classifyBackfill,
+  createLlmCredential,
   deleteConnection,
+  deleteLlmCredential,
   deleteLlmSettings,
   deleteThread,
   flushDeleteThread,
@@ -33,6 +36,7 @@ import {
   ingestMail,
   listAuthProviders,
   listConnections,
+  listLlmCredentials,
   microsoftAuthCallback,
   microsoftConnectCallback,
   microsoftConnectStart,
@@ -676,6 +680,10 @@ export default function Console() {
       deleteLlmSettings,
       getLlmUsage,
       getClassifierMix,
+      listLlmCredentials,
+      createLlmCredential,
+      activateLlmCredential,
+      deleteLlmCredential,
       onSessionExpired: handleSessionExpired,
       toastSuccess: (message) => toast.success(message),
       toastError: (message) => toast.error(message),
@@ -708,16 +716,25 @@ export default function Console() {
     classifierMix,
     classifierMixError,
     llmUsageDays,
+    llmCredentials,
+    llmCreatingCredential,
+    llmActivatingCredentialId,
+    llmDeletingCredentialId,
+    llmCredentialDeleteError,
     refreshLlmSettings,
     retryLlmSettings,
     refreshLlmUsage,
     refreshClassifierMix,
+    refreshLlmCredentials,
     openLlmSettings,
     openLlmUsage,
     changeLlmUsageDays,
     doSaveLlmSettings,
     doTestLlmSettings,
     doRemoveLlmSettings,
+    doCreateLlmCredential,
+    doActivateLlmCredential,
+    doDeleteLlmCredential,
   } = useLlmPanel({ userId: user?.id ?? null, deps: llmPanelDeps, openSettings });
 
   // The settings dialog's only tab-change entry point (settings-card plan
@@ -731,9 +748,12 @@ export default function Console() {
     (tab: SettingsTab) => {
       setSettingsPanel(tab);
       if (tab === "ai" || tab === "usage") void refreshLlmUsage(llmUsageDays);
-      if (tab === "ai") void refreshClassifierMix();
+      if (tab === "ai") {
+        void refreshClassifierMix();
+        void refreshLlmCredentials();
+      }
     },
-    [refreshLlmUsage, llmUsageDays, refreshClassifierMix],
+    [refreshLlmUsage, llmUsageDays, refreshClassifierMix, refreshLlmCredentials],
   );
   settingsTabChangeRef.current = handleSettingsTabChange;
 
@@ -3683,6 +3703,14 @@ export default function Console() {
           onDismissHeuristicNotice={() =>
             setClassifierHeuristicNoticeVersion(CLASSIFIER_HEURISTIC_NOTICE_VERSION)
           }
+          credentials={llmCredentials}
+          onCreateCredential={doCreateLlmCredential}
+          creatingCredential={llmCreatingCredential}
+          onActivateCredential={doActivateLlmCredential}
+          activatingCredentialId={llmActivatingCredentialId}
+          onDeleteCredential={doDeleteLlmCredential}
+          deletingCredentialId={llmDeletingCredentialId}
+          credentialDeleteError={llmCredentialDeleteError}
           usage={llmUsage}
           usageError={llmUsageError}
           days={llmUsageDays}

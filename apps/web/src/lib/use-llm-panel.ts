@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError } from "@/lib/api";
 import type {
   ClassifierMixEntry,
+  LlmCredentialSummary,
   LlmProvider,
   LlmSettings,
   LlmTestResult,
@@ -10,7 +11,7 @@ import type {
   SettingsTab,
 } from "@/lib/types";
 
-// Mirrors the real api module's signatures for the six LLM endpoints this
+// Mirrors the real api module's signatures for the ten LLM endpoints this
 // hook touches, so tests can inject fakes instead of hitting the network.
 export interface LlmPanelDeps {
   getLlmSettings: () => Promise<LlmSettings>;
@@ -28,6 +29,21 @@ export interface LlmPanelDeps {
   deleteLlmSettings: () => Promise<void>;
   getLlmUsage: (days: number) => Promise<LlmUsage>;
   getClassifierMix: () => Promise<{ classifier_mix: ClassifierMixEntry[] }>;
+  // Multi-credential surface (2026-08-19-multi-credential-llm-profiles plan)
+  // -- listLlmCredentials/createLlmCredential/activateLlmCredential/
+  // deleteLlmCredential mirror api.ts's own signatures for those four.
+  listLlmCredentials: () => Promise<LlmCredentialSummary[]>;
+  createLlmCredential: (input: {
+    name: string;
+    provider: LlmProvider;
+    api_key: string;
+    model: string;
+    base_url?: string;
+    classification_byok?: boolean;
+    classification_fallback_local?: boolean;
+  }) => Promise<LlmCredentialSummary>;
+  activateLlmCredential: (id: string) => Promise<LlmCredentialSummary>;
+  deleteLlmCredential: (id: string) => Promise<void>;
   onSessionExpired: () => void;
   toastSuccess: (message: string) => void;
   toastError: (message: string) => void;
@@ -73,6 +89,29 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
   const [classifierMixError, setClassifierMixError] = useState(false);
   const [llmUsageDays, setLlmUsageDays] = useState(30);
 
+  // Multi-credential list (2026-08-19-multi-credential-llm-profiles plan) --
+  // every credential this user owns, active or not; null while the fetch
+  // hasn't landed yet, same tri-state contract as classifierMix above.
+  // Re-fetched on every "ai" tab activation (App's handleSettingsTabChange),
+  // not just the dialog's first open, same reasoning as usage/mix: a switch
+  // made in another tab/session must show up here too.
+  const [llmCredentials, setLlmCredentials] = useState<LlmCredentialSummary[] | null>(null);
+  const [llmCredentialsError, setLlmCredentialsError] = useState(false);
+  const [llmCreatingCredential, setLlmCreatingCredential] = useState(false);
+  // Which credential's activate/delete call is in flight, if any -- lets the
+  // list disable just the one row a click is already targeting, rather than
+  // freezing the whole list for an unrelated in-flight action.
+  const [llmActivatingCredentialId, setLlmActivatingCredentialId] = useState<string | null>(null);
+  const [llmDeletingCredentialId, setLlmDeletingCredentialId] = useState<string | null>(null);
+  // A by-id delete can still 409 (the target became active a moment before
+  // this request landed -- activate and delete aren't optimistic-locked
+  // against each other, D5) -- carries which row it was about so the list
+  // can show the message on that row specifically, not a generic toast.
+  const [llmCredentialDeleteError, setLlmCredentialDeleteError] = useState<{
+    id: string;
+    message: string;
+  } | null>(null);
+
   // Bumped on every save or remove of the LLM credential completes (success
   // or failure -- either way the stored credential may have changed). A test
   // in flight across that boundary captures the generation before awaiting and
@@ -102,6 +141,11 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
   // (the thing being summarized just changed), so those two bump this ref
   // too -- but nothing else does.
   const llmMixGenRef = useRef(0);
+  // The credential-list fetch gets its OWN counter too, same claim-first
+  // pattern as llmUsageGenRef/llmMixGenRef above -- two overlapping list
+  // fetches (e.g. re-opening the ai tab quickly) must let the most recent
+  // one win, not whichever happens to resolve last.
+  const llmCredentialsGenRef = useRef(0);
 
   useEffect(() => {
     // Every piece of LLM state below belongs to ONE account, so none of it may
@@ -122,6 +166,7 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
     llmSettingsGenRef.current++;
     llmUsageGenRef.current++;
     llmMixGenRef.current++;
+    llmCredentialsGenRef.current++;
     setLlmSettings(null);
     setLlmSettingsError(false);
     setLlmUsage(null);
@@ -129,6 +174,9 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
     setLlmTestResult(null);
     setClassifierMix(null);
     setClassifierMixError(false);
+    setLlmCredentials(null);
+    setLlmCredentialsError(false);
+    setLlmCredentialDeleteError(null);
     // The settings dialog itself closes via App's own account-scoped reset
     // (settingsPanel -> null alongside its other resets) -- this hook no
     // longer owns that state, just the data it's built from.
@@ -246,6 +294,31 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
     }
   }, [deps]);
 
+  // Every credential this user owns (2026-08-19-multi-credential-llm-
+  // profiles plan) -- always re-fetched, same claim-first generation guard
+  // as refreshLlmUsage/refreshClassifierMix above (see llmCredentialsGenRef's
+  // own comment).
+  const refreshLlmCredentials = useCallback(async () => {
+    const generation = ++llmCredentialsGenRef.current;
+    try {
+      const items = await deps.listLlmCredentials();
+      if (generation !== llmCredentialsGenRef.current) return; // superseded mid-flight -- discard
+      setLlmCredentials(items);
+      setLlmCredentialsError(false);
+    } catch (e) {
+      if (generation !== llmCredentialsGenRef.current) return; // ditto for a stale failure
+      if (e instanceof ApiError && e.status === 401) {
+        deps.onSessionExpired();
+        return;
+      }
+      // Same rule as usage/mix's own outage handling -- a failure here must
+      // never make the rest of the settings modal look broken. The single-
+      // credential form still works off llmSettings regardless.
+      setLlmCredentials(null);
+      setLlmCredentialsError(true);
+    }
+  }, [deps]);
+
   // Thin wrappers over App's openSettings (settings-card plan §3.3) -- the
   // dialog itself now owns open/close and every tab stays mounted, so the ai
   // tab renders its own loading/error/retry state off llmSettings/
@@ -356,8 +429,14 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
     setLlmRemoving(true);
     let removed = false;
     try {
+      // Kill switch (D4): wipes EVERY credential the caller owns, not just
+      // the active one -- so the credential list has to clear right along
+      // with the singular settings view.
       await deps.deleteLlmSettings();
       setLlmTestResult(null);
+      setLlmCredentials([]);
+      setLlmCredentialsError(false);
+      setLlmCredentialDeleteError(null);
       await refreshLlmSettings();
       deps.toastSuccess("AI credential removed");
       removed = true;
@@ -379,6 +458,124 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
     }
   }, [deps, refreshLlmSettings, refreshLlmUsage, llmUsageDays, refreshClassifierMix]);
 
+  // Adds a new named credential. Refreshes BOTH the credential list and the
+  // singular settings object, since a first credential is created active
+  // (D5) -- that changes what GET /settings/llm reports too, not just what
+  // shows up in the list. Fetched together (Promise.all) and applied in one
+  // state update so the two never land a render apart, which is what lets
+  // LlmSettingsSection re-key its hydration cleanly off the active id.
+  const doCreateLlmCredential = useCallback(
+    async (input: {
+      name: string;
+      provider: LlmProvider;
+      api_key: string;
+      model: string;
+      base_url?: string;
+      classification_byok?: boolean;
+      classification_fallback_local?: boolean;
+    }) => {
+      setLlmCreatingCredential(true);
+      // Guarded on the settings counter, same convention doSaveLlmSettings
+      // uses: this only discards its own result if the ACCOUNT changed
+      // while the request was in flight.
+      const generation = llmSettingsGenRef.current;
+      try {
+        await deps.createLlmCredential(input);
+        const [items, settings] = await Promise.all([
+          deps.listLlmCredentials(),
+          deps.getLlmSettings(),
+        ]);
+        if (generation === llmSettingsGenRef.current) {
+          setLlmCredentials(items);
+          setLlmCredentialsError(false);
+          setLlmSettings(settings);
+          setLlmTestResult(null);
+          deps.toastSuccess(`Added "${input.name}"`);
+        }
+      } catch (e) {
+        deps.toastError((e as Error).message || "could not add this credential");
+      } finally {
+        llmCredentialGenRef.current++;
+        llmUsageGenRef.current++;
+        llmMixGenRef.current++;
+        setLlmCreatingCredential(false);
+      }
+    },
+    [deps],
+  );
+
+  // Switches the caller's active credential. Same Promise.all/single-update
+  // pattern as doCreateLlmCredential above, for the same reason: the list
+  // and the singular settings view both change together, and applying them
+  // apart would let the form hydrate against a mismatched pair for a frame.
+  const doActivateLlmCredential = useCallback(
+    async (id: string) => {
+      setLlmActivatingCredentialId(id);
+      const generation = llmSettingsGenRef.current;
+      try {
+        await deps.activateLlmCredential(id);
+        const [items, settings] = await Promise.all([
+          deps.listLlmCredentials(),
+          deps.getLlmSettings(),
+        ]);
+        if (generation === llmSettingsGenRef.current) {
+          setLlmCredentials(items);
+          setLlmCredentialsError(false);
+          setLlmSettings(settings);
+          setLlmTestResult(null);
+          setLlmCredentialDeleteError(null);
+        }
+      } catch (e) {
+        deps.toastError((e as Error).message || "could not switch credentials");
+      } finally {
+        llmCredentialGenRef.current++;
+        llmUsageGenRef.current++;
+        llmMixGenRef.current++;
+        setLlmActivatingCredentialId(null);
+      }
+    },
+    [deps],
+  );
+
+  // Removes one inactive credential. Never touches llmSettings -- deleting a
+  // credential that ISN'T active can't change what GET /settings/llm
+  // reports, so only the list needs a refetch.
+  const doDeleteLlmCredential = useCallback(
+    async (id: string) => {
+      setLlmDeletingCredentialId(id);
+      setLlmCredentialDeleteError(null);
+      const generation = llmSettingsGenRef.current;
+      try {
+        await deps.deleteLlmCredential(id);
+        const items = await deps.listLlmCredentials();
+        if (generation === llmSettingsGenRef.current) {
+          setLlmCredentials(items);
+          setLlmCredentialsError(false);
+          deps.toastSuccess("Credential removed");
+        }
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 409) {
+          // Blocked because this row is the active credential -- the delete
+          // button is hidden for the active row, so reaching this means it
+          // was activated elsewhere a moment before this request landed.
+          // Surfaced on the row itself, not a toast, since the row is what
+          // the message is about.
+          if (generation === llmSettingsGenRef.current) {
+            setLlmCredentialDeleteError({
+              id,
+              message: "This is your active credential — switch to another one first.",
+            });
+          }
+        } else {
+          deps.toastError((e as Error).message || "could not remove this credential");
+        }
+      } finally {
+        setLlmDeletingCredentialId(null);
+      }
+    },
+    [deps],
+  );
+
   return {
     llmSettings,
     llmSettingsError,
@@ -391,15 +588,25 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
     classifierMix,
     classifierMixError,
     llmUsageDays,
+    llmCredentials,
+    llmCredentialsError,
+    llmCreatingCredential,
+    llmActivatingCredentialId,
+    llmDeletingCredentialId,
+    llmCredentialDeleteError,
     refreshLlmSettings,
     retryLlmSettings,
     refreshLlmUsage,
     refreshClassifierMix,
+    refreshLlmCredentials,
     openLlmSettings,
     openLlmUsage,
     changeLlmUsageDays,
     doSaveLlmSettings,
     doTestLlmSettings,
     doRemoveLlmSettings,
+    doCreateLlmCredential,
+    doActivateLlmCredential,
+    doDeleteLlmCredential,
   };
 }

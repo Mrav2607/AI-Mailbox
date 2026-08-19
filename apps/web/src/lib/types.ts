@@ -346,6 +346,24 @@ export interface LlmSettings {
   classification_llm_usable: boolean;
 }
 
+// One row of GET /settings/llm/credentials (2026-08-19-multi-credential-
+// llm-profiles plan) -- mirrors `LlmCredentialSummary` on the wire exactly.
+// The api_key never appears here, same discipline as `LlmSettings` above.
+export interface LlmCredentialSummary {
+  id: string;
+  name: string;
+  provider: LlmProvider;
+  model: string;
+  key_suffix: string;
+  last_verified_at: string | null;
+  // Named "active" on the wire, not "is_active" -- the API schema's own
+  // docstring explains why: this is what the multi-credential UI actually
+  // asks (a radio selection), while is_active is the DB/ORM-facing name.
+  active: boolean;
+  classification_byok: boolean;
+  classification_fallback_local: boolean;
+}
+
 // POST /settings/llm/test response. `error` is one of the extractor's
 // category constants (e.g. "blocked_by_policy", "invalid_response") --
 // never a raw exception message.

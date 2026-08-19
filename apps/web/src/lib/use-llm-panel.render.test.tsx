@@ -6,6 +6,7 @@ import { ApiError } from "@/lib/api";
 import type { SettingsTab } from "@/components/console/SettingsDialog";
 import type {
   ClassifierMixEntry,
+  LlmCredentialSummary,
   LlmProvider,
   LlmSettings,
   LlmTestResult,
@@ -68,6 +69,21 @@ function makeUsage(overrides: Partial<LlmUsage> = {}): LlmUsage {
 
 const MIX: ClassifierMixEntry[] = [{ kind: "local", count: 3 }];
 
+function makeCredential(overrides: Partial<LlmCredentialSummary> = {}): LlmCredentialSummary {
+  return {
+    id: "cred-1",
+    name: "default",
+    provider: "openai",
+    model: "gpt-4o-mini",
+    key_suffix: "abcd",
+    last_verified_at: null,
+    active: true,
+    classification_byok: false,
+    classification_fallback_local: false,
+    ...overrides,
+  };
+}
+
 describe("useLlmPanel rendered lifecycle", () => {
   let root: Root;
   let container: HTMLElement;
@@ -118,6 +134,14 @@ describe("useLlmPanel rendered lifecycle", () => {
       deleteLlmSettings: vi.fn(() => Promise.resolve()),
       getLlmUsage: vi.fn(() => Promise.resolve(makeUsage())),
       getClassifierMix: vi.fn(() => Promise.resolve({ classifier_mix: MIX })),
+      listLlmCredentials: vi.fn(() => Promise.resolve([makeCredential()])),
+      createLlmCredential: vi.fn((input: { name: string }) =>
+        Promise.resolve(makeCredential({ id: "cred-new", name: input.name })),
+      ),
+      activateLlmCredential: vi.fn((id: string) =>
+        Promise.resolve(makeCredential({ id, active: true })),
+      ),
+      deleteLlmCredential: vi.fn(() => Promise.resolve()),
       onSessionExpired,
       toastSuccess,
       toastError,
@@ -485,6 +509,175 @@ describe("useLlmPanel rendered lifecycle", () => {
 
       expect(api!.llmSettingsError).toBe(false);
       expect(toastError).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("multi-credential list", () => {
+    it("refreshLlmCredentials loads the list", async () => {
+      const items = [makeCredential({ id: "cred-1" }), makeCredential({ id: "cred-2" })];
+      deps.listLlmCredentials = vi.fn(() => Promise.resolve(items));
+
+      await act(async () => {
+        await api!.refreshLlmCredentials();
+      });
+
+      expect(api!.llmCredentials).toEqual(items);
+    });
+
+    it("doCreateLlmCredential adds the new row and refreshes settings -- a first credential is created active", async () => {
+      deps.listLlmCredentials = vi.fn(() =>
+        Promise.resolve([makeCredential({ id: "cred-new", name: "Work key" })]),
+      );
+      deps.getLlmSettings = vi.fn(() =>
+        Promise.resolve(makeSettings({ provider: "gemini", model: "gemini-2.0-flash" })),
+      );
+
+      await act(async () => {
+        await api!.doCreateLlmCredential({
+          name: "Work key",
+          provider: "gemini",
+          api_key: "gm-key-12345678",
+          model: "gemini-2.0-flash",
+        });
+      });
+
+      expect(api!.llmCredentials).toEqual([makeCredential({ id: "cred-new", name: "Work key" })]);
+      expect(api!.llmSettings).toEqual(
+        makeSettings({ provider: "gemini", model: "gemini-2.0-flash" }),
+      );
+      expect(toastSuccess).toHaveBeenCalledWith('Added "Work key"');
+      expect(api!.llmCreatingCredential).toBe(false);
+    });
+
+    it("a create failure toasts and leaves the list untouched", async () => {
+      deps.createLlmCredential = vi.fn(() =>
+        Promise.reject(new ApiError(422, "a credential with this name already exists")),
+      );
+
+      await act(async () => {
+        await api!.doCreateLlmCredential({
+          name: "dup",
+          provider: "openai",
+          api_key: "sk-12345678",
+          model: "gpt-4o-mini",
+        });
+      });
+
+      expect(toastError).toHaveBeenCalledWith("a credential with this name already exists");
+      expect(api!.llmCredentials).toBeNull();
+    });
+
+    it("a create failure at the cap surfaces the server's 422 message", async () => {
+      deps.createLlmCredential = vi.fn(() =>
+        Promise.reject(new ApiError(422, "credential limit reached")),
+      );
+
+      await act(async () => {
+        await api!.doCreateLlmCredential({
+          name: "sixth",
+          provider: "openai",
+          api_key: "sk-12345678",
+          model: "gpt-4o-mini",
+        });
+      });
+
+      expect(toastError).toHaveBeenCalledWith("credential limit reached");
+    });
+
+    it("doActivateLlmCredential switches the active credential and refreshes both list and settings", async () => {
+      deps.listLlmCredentials = vi.fn(() =>
+        Promise.resolve([
+          makeCredential({ id: "cred-1", active: false }),
+          makeCredential({ id: "cred-2", active: true }),
+        ]),
+      );
+      deps.getLlmSettings = vi.fn(() =>
+        Promise.resolve(makeSettings({ key_suffix: "cred-2-suffix" })),
+      );
+
+      await act(async () => {
+        await api!.doActivateLlmCredential("cred-2");
+      });
+
+      expect(api!.llmCredentials).toEqual([
+        makeCredential({ id: "cred-1", active: false }),
+        makeCredential({ id: "cred-2", active: true }),
+      ]);
+      expect(api!.llmSettings).toEqual(makeSettings({ key_suffix: "cred-2-suffix" }));
+      expect(api!.llmActivatingCredentialId).toBeNull();
+    });
+
+    it("doDeleteLlmCredential removes an inactive row and refreshes the list", async () => {
+      deps.deleteLlmCredential = vi.fn(() => Promise.resolve());
+      deps.listLlmCredentials = vi.fn(() => Promise.resolve([makeCredential({ id: "cred-1" })]));
+
+      await act(async () => {
+        await api!.doDeleteLlmCredential("cred-2");
+      });
+
+      expect(deps.deleteLlmCredential).toHaveBeenCalledWith("cred-2");
+      expect(api!.llmCredentials).toEqual([makeCredential({ id: "cred-1" })]);
+      expect(toastSuccess).toHaveBeenCalledWith("Credential removed");
+    });
+
+    it("a 409 deleting the active credential sets an inline row error, not a toast", async () => {
+      deps.deleteLlmCredential = vi.fn(() =>
+        Promise.reject(new ApiError(409, "cannot delete the active credential")),
+      );
+
+      await act(async () => {
+        await api!.doDeleteLlmCredential("cred-2");
+      });
+
+      expect(api!.llmCredentialDeleteError).toEqual({
+        id: "cred-2",
+        message: "This is your active credential — switch to another one first.",
+      });
+      expect(toastError).not.toHaveBeenCalled();
+    });
+
+    it("a non-409 delete failure toasts instead of setting the row error", async () => {
+      deps.deleteLlmCredential = vi.fn(() => Promise.reject(new Error("network down")));
+
+      await act(async () => {
+        await api!.doDeleteLlmCredential("cred-2");
+      });
+
+      expect(toastError).toHaveBeenCalledWith("network down");
+      expect(api!.llmCredentialDeleteError).toBeNull();
+    });
+
+    it("an account change clears the credential list and any pending row error", async () => {
+      deps.deleteLlmCredential = vi.fn(() =>
+        Promise.reject(new ApiError(409, "cannot delete the active credential")),
+      );
+      await act(async () => {
+        await api!.doDeleteLlmCredential("cred-2");
+      });
+      expect(api!.llmCredentialDeleteError).not.toBeNull();
+
+      await act(async () => {
+        await api!.refreshLlmCredentials();
+      });
+      expect(api!.llmCredentials).not.toBeNull();
+
+      render("user-b");
+
+      expect(api!.llmCredentials).toBeNull();
+      expect(api!.llmCredentialDeleteError).toBeNull();
+    });
+
+    it("the singular kill switch clears the credential list too, not just llmSettings", async () => {
+      await act(async () => {
+        await api!.refreshLlmCredentials();
+      });
+      expect(api!.llmCredentials).not.toBeNull();
+
+      await act(async () => {
+        await api!.doRemoveLlmSettings();
+      });
+
+      expect(api!.llmCredentials).toEqual([]);
     });
   });
 });

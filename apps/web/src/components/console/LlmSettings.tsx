@@ -3,12 +3,19 @@ import { fieldLabel, control } from "@/lib/ui";
 import type {
   ClassifierMixEntry,
   ClassifierMixKind,
+  LlmCredentialSummary,
   LlmProvider,
   LlmSettings,
   LlmTestResult,
   LlmUsage,
 } from "@/lib/types";
 import { PROVIDER_LABELS } from "@/lib/usage";
+
+// D8 (2026-08-19-multi-credential-llm-profiles plan): five named credentials
+// per user, enforced server-side under the D6 guard lock. Mirrored here only
+// to disable "add credential" pre-emptively -- a submit past this would
+// still 422 server-side either way, this just saves the round trip.
+const MAX_CREDENTIALS = 5;
 
 export interface LlmSettingsSectionProps {
   // Whether the containing dialog session is open right now -- purely a
@@ -70,6 +77,34 @@ export interface LlmSettingsSectionProps {
   // of this section's settings-derived flags.
   heuristicNoticeDismissed: boolean;
   onDismissHeuristicNotice: () => void;
+  // Multi-credential list (2026-08-19-multi-credential-llm-profiles plan) --
+  // every credential this user owns, active or not; null while the fetch
+  // hasn't landed yet. Rendered as a compact list ABOVE the form below, but
+  // only once there's actually something to choose between -- see the
+  // render site for why a single (or zero) credential renders the plain
+  // form unchanged from before this plan, no list clutter.
+  credentials: LlmCredentialSummary[] | null;
+  onCreateCredential: (input: {
+    name: string;
+    provider: LlmProvider;
+    api_key: string;
+    model: string;
+    base_url?: string;
+    classification_byok?: boolean;
+    classification_fallback_local?: boolean;
+  }) => void;
+  creatingCredential: boolean;
+  onActivateCredential: (id: string) => void;
+  // Which credential's /activate call is in flight, if any -- disables just
+  // the one radio a click already targeted, not the whole list.
+  activatingCredentialId: string | null;
+  onDeleteCredential: (id: string) => void;
+  deletingCredentialId: string | null;
+  // The server can still 409 a by-id delete if the target became active a
+  // moment before this request landed (activate/delete aren't optimistic-
+  // locked against each other) -- carries which row it was about so the
+  // list can show the message on that row specifically, not a generic toast.
+  credentialDeleteError: { id: string; message: string } | null;
 }
 
 // Hints only, shown as the model field's placeholder -- never submitted on
@@ -200,6 +235,14 @@ export function LlmSettingsSection({
   classifierMixError,
   heuristicNoticeDismissed,
   onDismissHeuristicNotice,
+  credentials,
+  onCreateCredential,
+  creatingCredential,
+  onActivateCredential,
+  activatingCredentialId,
+  onDeleteCredential,
+  deletingCredentialId,
+  credentialDeleteError,
 }: LlmSettingsSectionProps) {
   const [provider, setProvider] = useState<LlmProvider>("openai");
   const [model, setModel] = useState("");
@@ -207,7 +250,21 @@ export function LlmSettingsSection({
   const [baseUrl, setBaseUrl] = useState("");
   const [classificationByok, setClassificationByok] = useState(false);
   const [fallbackLocal, setFallbackLocal] = useState(false);
+  // "active" is the normal single-form flow (PUT against whichever
+  // credential is active); "create" swaps the same form into POST /settings
+  // /llm/credentials mode, gated behind the "add credential" button below.
+  const [formMode, setFormMode] = useState<"active" | "create">("active");
+  const [name, setName] = useState("");
   const hydratedRef = useRef(false);
+
+  function hydrateFromSettings(s: LlmSettings) {
+    setProvider(s.provider ?? "openai");
+    setModel(s.model ?? "");
+    setApiKey("");
+    setBaseUrl(s.provider === "custom" ? (s.base_url ?? "") : "");
+    setClassificationByok(s.classification_byok);
+    setFallbackLocal(s.classification_fallback_local);
+  }
 
   useEffect(() => {
     if (!open) {
@@ -216,13 +273,60 @@ export function LlmSettingsSection({
     }
     if (hydratedRef.current || !settings) return;
     hydratedRef.current = true;
-    setProvider(settings.provider ?? "openai");
-    setModel(settings.model ?? "");
-    setApiKey("");
-    setBaseUrl(settings.provider === "custom" ? (settings.base_url ?? "") : "");
-    setClassificationByok(settings.classification_byok);
-    setFallbackLocal(settings.classification_fallback_local);
+    hydrateFromSettings(settings);
   }, [open, settings]);
+
+  // Re-keys hydration on the ACTIVE credential's id (2026-08-19-multi-
+  // credential-llm-profiles plan): switching which credential is active
+  // (an explicit /activate call) has to re-hydrate the form even though
+  // `open` never toggles false in between -- otherwise the fields would
+  // keep showing whichever credential this dialog session started on.
+  // Guards against firing on the ordinary "credential list just finished
+  // its first fetch" transition (prev is null/undefined) -- that's not a
+  // real switch, and re-hydrating there would clobber an unsaved edit the
+  // [open, settings] effect above already handles correctly on its own.
+  const activeCredentialId = credentials?.find((c) => c.active)?.id ?? null;
+  const prevActiveCredentialIdRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const prev = prevActiveCredentialIdRef.current;
+    prevActiveCredentialIdRef.current = activeCredentialId;
+    if (prev == null || prev === activeCredentialId) return;
+    if (settings) hydrateFromSettings(settings);
+    setFormMode("active");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCredentialId]);
+
+  // Drops back out of create mode once a credential actually lands -- the
+  // count growing is the signal (whether or not the new one is active: a
+  // second-or-later credential is created inactive, D5, so activeCredentialId
+  // above wouldn't change for it). Re-hydrates from whatever's active now,
+  // which is a no-op if this create didn't touch it.
+  const prevCredentialsCountRef = useRef(credentials?.length ?? 0);
+  useEffect(() => {
+    const count = credentials?.length ?? 0;
+    if (formMode === "create" && count > prevCredentialsCountRef.current) {
+      setFormMode("active");
+      if (settings) hydrateFromSettings(settings);
+    }
+    prevCredentialsCountRef.current = count;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [credentials]);
+
+  function startCreate() {
+    setFormMode("create");
+    setName("");
+    setProvider("openai");
+    setModel("");
+    setApiKey("");
+    setBaseUrl("");
+    setClassificationByok(false);
+    setFallbackLocal(false);
+  }
+
+  function cancelCreate() {
+    setFormMode("active");
+    if (settings) hydrateFromSettings(settings);
+  }
 
   if (!settings) {
     if (settingsError) {
@@ -257,6 +361,11 @@ export function LlmSettingsSection({
   // never gets stored as a working model name or endpoint.
   const modelBlank = model.trim() === "";
   const baseUrlBlank = provider === "custom" && baseUrl.trim() === "";
+  // Create mode always needs a fresh name + key -- there's nothing stored
+  // yet to fall back on, unlike an edit of the already-active credential.
+  const nameBlank = formMode === "create" && name.trim() === "";
+  const apiKeyBlank = formMode === "create" && apiKey.trim() === "";
+  const atCredentialCap = (credentials?.length ?? 0) >= MAX_CREDENTIALS;
 
   return (
     <div className="space-y-2.5">
@@ -264,6 +373,77 @@ export function LlmSettingsSection({
         save your own API key and CortexMail uses it to pull deadlines and
         to-dos out of your mail.
       </p>
+
+      {/* Credential list (2026-08-19-multi-credential-llm-profiles plan) --
+          only shown once there are 2+ credentials to choose between, so a
+          user with the common zero-or-one-credential setup never sees it.
+          A single credential (or none) still uses the plain form below,
+          unchanged from before this plan. */}
+      {credentials && credentials.length >= 2 && (
+        <div className="space-y-1.5 rounded border border-border p-2">
+          <span className={fieldLabel}>your credentials</span>
+          <ul className="space-y-1">
+            {credentials.map((c) => (
+              <li key={c.id}>
+                <div className="flex items-center gap-2">
+                  <label className="flex min-w-0 flex-1 items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="active-credential"
+                      checked={c.active}
+                      disabled={c.active || activatingCredentialId !== null}
+                      onChange={() => onActivateCredential(c.id)}
+                    />
+                    <span
+                      className="min-w-0 flex-1 truncate text-[12px] font-mono text-foreground/90"
+                      title={c.name}
+                    >
+                      {c.name}
+                    </span>
+                  </label>
+                  <span className="shrink-0 text-[10.5px] font-mono text-muted-foreground">
+                    {PROVIDER_LABELS[c.provider]} · ••••{c.key_suffix}
+                  </span>
+                  {!c.active && (
+                    <button
+                      type="button"
+                      onClick={() => onDeleteCredential(c.id)}
+                      disabled={deletingCredentialId !== null}
+                      title="remove this credential"
+                      className="shrink-0 h-5 px-1.5 rounded border border-destructive/40 text-destructive hover:bg-destructive/10 text-[10px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+                    >
+                      {deletingCredentialId === c.id ? "removing…" : "remove"}
+                    </button>
+                  )}
+                </div>
+                {credentialDeleteError?.id === c.id && (
+                  <p className="pl-5 text-[10.5px] font-mono text-destructive leading-snug">
+                    {credentialDeleteError.message}
+                  </p>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {settings.configured && formMode === "active" && (
+        <div>
+          {atCredentialCap ? (
+            <p className="text-[10.5px] font-mono text-muted-foreground leading-snug">
+              you&apos;ve reached the 5-credential limit — remove one to add another
+            </p>
+          ) : (
+            <button
+              type="button"
+              onClick={startCreate}
+              className="h-6 px-2 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[10.5px] font-mono cursor-pointer transition-colors"
+            >
+              + add another credential
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Which classifier is doing the work, for THIS user, regardless of
           whether they hold a key -- see classifierMixSummary's comment for
@@ -320,7 +500,19 @@ export function LlmSettingsSection({
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          if (modelBlank || baseUrlBlank) return;
+          if (modelBlank || baseUrlBlank || nameBlank || apiKeyBlank) return;
+          if (formMode === "create") {
+            onCreateCredential({
+              name: name.trim(),
+              provider,
+              api_key: apiKey,
+              model: model.trim(),
+              base_url: provider === "custom" ? baseUrl.trim() : undefined,
+              classification_byok: provider === "custom" ? false : classificationByok,
+              classification_fallback_local: fallbackLocal,
+            });
+            return;
+          }
           // A blank key on an already-configured credential means "keep
           // what's stored" -- only a brand-new credential needs one.
           const keepsExistingKey = apiKey.trim() === "" && settings.configured;
@@ -335,6 +527,26 @@ export function LlmSettingsSection({
         }}
         className="space-y-2.5"
       >
+        {formMode === "create" && (
+          <label className="block space-y-1">
+            <span className={fieldLabel}>name</span>
+            <input
+              type="text"
+              required
+              maxLength={60}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. work openai key"
+              className={control}
+            />
+            {nameBlank && name.length > 0 && (
+              <span className="block text-[10.5px] text-destructive font-mono leading-snug">
+                name can&apos;t be just spaces
+              </span>
+            )}
+          </label>
+        )}
+
         <label className="block space-y-1">
           <span className={fieldLabel}>provider</span>
           <select
@@ -408,20 +620,20 @@ export function LlmSettingsSection({
           <input
             type="password"
             autoComplete="new-password"
-            required={!settings.configured}
+            required={formMode === "create" || !settings.configured}
             minLength={8}
             maxLength={512}
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
             placeholder={
-              settings.configured
+              formMode === "active" && settings.configured
                 ? "leave blank to keep your saved key"
                 : "paste your API key"
             }
             className={control}
           />
           <span className="block text-[10.5px] text-muted-foreground font-mono leading-snug">
-            {settings.configured
+            {formMode === "active" && settings.configured
               ? `leave this blank to keep your saved key (currently ending in ••••${settings.key_suffix})`
               : "your key is encrypted, stored, and never shown again after you save it"}
           </span>
@@ -446,7 +658,7 @@ export function LlmSettingsSection({
                 ? "Not available for a custom endpoint yet -- only the providers above."
                 : "Sorting runs on every email you receive, so it uses far more of your quota than the Agenda does. Off by default."}
             </p>
-            {settings.classification_byok && !settings.classification_eligible && (
+            {formMode === "active" && settings.classification_byok && !settings.classification_eligible && (
               <p className="text-[11px] font-mono text-primary-tint-foreground leading-snug pl-[18px]">
                 Your key isn&apos;t set up to sort your mail — the built-in rules are being
                 used instead.
@@ -480,35 +692,55 @@ export function LlmSettingsSection({
           </div>
         )}
 
-        <div className="flex items-center gap-2 pt-1">
-          <button
-            type="submit"
-            disabled={saving || modelBlank || baseUrlBlank}
-            className="h-7 px-3 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
-          >
-            {saving ? "saving…" : "save"}
-          </button>
-          <button
-            type="button"
-            onClick={onTest}
-            disabled={!settings.configured || testing || saving || removing}
-            className="h-7 px-3 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
-          >
-            {testing ? "testing…" : "test"}
-          </button>
-          {settings.configured && (
+        {formMode === "create" ? (
+          <div className="flex items-center gap-2 pt-1">
+            <button
+              type="submit"
+              disabled={creatingCredential || modelBlank || baseUrlBlank || nameBlank || apiKeyBlank}
+              className="h-7 px-3 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+            >
+              {creatingCredential ? "adding…" : "add credential"}
+            </button>
             <button
               type="button"
-              onClick={onRemove}
-              disabled={removing}
-              className="ml-auto h-7 px-3 rounded border border-destructive/40 text-destructive hover:bg-destructive/10 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+              onClick={cancelCreate}
+              disabled={creatingCredential}
+              className="h-7 px-3 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
-              {removing ? "removing…" : "remove"}
+              cancel
             </button>
-          )}
-        </div>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 pt-1">
+            <button
+              type="submit"
+              disabled={saving || modelBlank || baseUrlBlank}
+              className="h-7 px-3 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+            >
+              {saving ? "saving…" : "save"}
+            </button>
+            <button
+              type="button"
+              onClick={onTest}
+              disabled={!settings.configured || testing || saving || removing}
+              className="h-7 px-3 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+            >
+              {testing ? "testing…" : "test"}
+            </button>
+            {settings.configured && (
+              <button
+                type="button"
+                onClick={onRemove}
+                disabled={removing}
+                className="ml-auto h-7 px-3 rounded border border-destructive/40 text-destructive hover:bg-destructive/10 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
+              >
+                {removing ? "removing…" : "remove"}
+              </button>
+            )}
+          </div>
+        )}
 
-        {testResult && (
+        {formMode === "active" && testResult && (
           <p
             className={
               testResult.ok
@@ -522,7 +754,7 @@ export function LlmSettingsSection({
           </p>
         )}
 
-        {settings.configured && settings.last_verified_at && (
+        {formMode === "active" && settings.configured && settings.last_verified_at && (
           <p className="text-[10.5px] font-mono text-muted-foreground">
             last verified {new Date(settings.last_verified_at).toLocaleString()}
           </p>
