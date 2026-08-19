@@ -366,6 +366,16 @@ export function LlmSettingsSection({
   const nameBlank = formMode === "create" && name.trim() === "";
   const apiKeyBlank = formMode === "create" && apiKey.trim() === "";
   const atCredentialCap = (credentials?.length ?? 0) >= MAX_CREDENTIALS;
+  // True while ANY structural credential action is in flight, anywhere in
+  // this section -- creating one, activating one (any id), or deleting one
+  // (any id). Activate and delete aren't optimistic-locked against each
+  // other server-side (D5), so leaving an unrelated row's delete button
+  // live while an activate is pending on another row lets delete win the
+  // race and the activate 404s a moment later. Disabling every other
+  // structural control for the duration is simpler than trying to reason
+  // about which specific combinations are actually unsafe.
+  const structuralActionInFlight =
+    creatingCredential || activatingCredentialId !== null || deletingCredentialId !== null;
 
   return (
     <div className="space-y-2.5">
@@ -391,7 +401,7 @@ export function LlmSettingsSection({
                       type="radio"
                       name="active-credential"
                       checked={c.active}
-                      disabled={c.active || activatingCredentialId !== null}
+                      disabled={c.active || structuralActionInFlight}
                       onChange={() => onActivateCredential(c.id)}
                     />
                     <span
@@ -408,7 +418,7 @@ export function LlmSettingsSection({
                     <button
                       type="button"
                       onClick={() => onDeleteCredential(c.id)}
-                      disabled={deletingCredentialId !== null}
+                      disabled={structuralActionInFlight}
                       title="remove this credential"
                       className="shrink-0 h-5 px-1.5 rounded border border-destructive/40 text-destructive hover:bg-destructive/10 text-[10px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
                     >
@@ -696,7 +706,9 @@ export function LlmSettingsSection({
           <div className="flex items-center gap-2 pt-1">
             <button
               type="submit"
-              disabled={creatingCredential || modelBlank || baseUrlBlank || nameBlank || apiKeyBlank}
+              disabled={
+                structuralActionInFlight || modelBlank || baseUrlBlank || nameBlank || apiKeyBlank
+              }
               className="h-7 px-3 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
               {creatingCredential ? "adding…" : "add credential"}

@@ -679,5 +679,142 @@ describe("useLlmPanel rendered lifecycle", () => {
 
       expect(api!.llmCredentials).toEqual([]);
     });
+
+    it("a credential list GET already in flight when the kill switch fires does not resurrect deleted rows", async () => {
+      const listFetch = deferred<LlmCredentialSummary[]>();
+      deps.listLlmCredentials = vi.fn(() => listFetch.promise);
+
+      await act(async () => {
+        void api!.refreshLlmCredentials();
+      });
+      expect(api!.llmCredentials).toBeNull();
+
+      // The kill switch fires while that GET is still in flight -- it
+      // bumps the list generation up front and clears immediately.
+      await act(async () => {
+        await api!.doRemoveLlmSettings();
+      });
+      expect(api!.llmCredentials).toEqual([]);
+
+      // Without the guard, this stale GET landing afterward would put the
+      // deleted rows straight back on top of the clear above.
+      await act(async () => {
+        listFetch.resolve([makeCredential({ id: "cred-1" })]);
+        await listFetch.promise.catch(() => {});
+      });
+
+      expect(api!.llmCredentials).toEqual([]);
+    });
+
+    it("a successful save refreshes the credential list, not just llmSettings", async () => {
+      deps.listLlmCredentials = vi.fn(() =>
+        Promise.resolve([
+          makeCredential({ id: "cred-1", provider: "gemini", model: "gemini-2.0-flash" }),
+        ]),
+      );
+
+      await act(async () => {
+        await api!.doSaveLlmSettings({ provider: "gemini", model: "gemini-2.0-flash" });
+      });
+
+      // A save can change provider/model/key_suffix on the active row --
+      // leaving the list stale here would show the old values right next
+      // to the just-saved form.
+      expect(api!.llmCredentials).toEqual([
+        makeCredential({ id: "cred-1", provider: "gemini", model: "gemini-2.0-flash" }),
+      ]);
+    });
+
+    it("an account change resets the structural-action flags, not just the list data", async () => {
+      const activate = deferred<LlmCredentialSummary>();
+      deps.activateLlmCredential = vi.fn(() => activate.promise);
+
+      let activatePromise!: Promise<void>;
+      await act(async () => {
+        activatePromise = api!.doActivateLlmCredential("cred-2");
+      });
+      expect(api!.llmActivatingCredentialId).toBe("cred-2");
+
+      render("user-b");
+
+      // Without this reset, user-b would open the ai tab and find "cred-2"
+      // stuck disabled for an activate that was never theirs.
+      expect(api!.llmActivatingCredentialId).toBeNull();
+
+      await act(async () => {
+        activate.resolve(makeCredential({ id: "cred-2", active: true }));
+        await activatePromise.catch(() => {});
+      });
+    });
+
+    it("a stale action completing after an account switch does not clobber the new account's own in-flight action, or toast at them", async () => {
+      const userACreate = deferred<LlmCredentialSummary>();
+      deps.createLlmCredential = vi.fn(() => userACreate.promise);
+
+      let aCreatePromise!: Promise<void>;
+      await act(async () => {
+        aCreatePromise = api!.doCreateLlmCredential({
+          name: "A's key",
+          provider: "openai",
+          api_key: "sk-aaaaaaaa",
+          model: "gpt-4o-mini",
+        });
+      });
+      expect(api!.llmCreatingCredential).toBe(true);
+
+      render("user-b");
+      expect(api!.llmCreatingCredential).toBe(false);
+
+      // user-b starts their own create before user-a's stale one settles.
+      const userBCreate = deferred<LlmCredentialSummary>();
+      deps.createLlmCredential = vi.fn(() => userBCreate.promise);
+      let bCreatePromise!: Promise<void>;
+      await act(async () => {
+        bCreatePromise = api!.doCreateLlmCredential({
+          name: "B's key",
+          provider: "openai",
+          api_key: "sk-bbbbbbbb",
+          model: "gpt-4o-mini",
+        });
+      });
+      expect(api!.llmCreatingCredential).toBe(true);
+
+      // user-a's create finally resolves -- without the identity guard,
+      // this would clear user-b's still-in-flight flag out from under them
+      // and toast user-a's success at user-b's screen.
+      await act(async () => {
+        userACreate.resolve(makeCredential({ id: "cred-a", name: "A's key" }));
+        await aCreatePromise;
+      });
+      expect(api!.llmCreatingCredential).toBe(true);
+      expect(toastSuccess).not.toHaveBeenCalledWith('Added "A\'s key"');
+
+      await act(async () => {
+        userBCreate.resolve(makeCredential({ id: "cred-b", name: "B's key" }));
+        await bCreatePromise;
+      });
+      expect(api!.llmCreatingCredential).toBe(false);
+      expect(toastSuccess).toHaveBeenCalledWith('Added "B\'s key"');
+    });
+
+    it("a stale activate rejection after an account switch does not toast at the new account", async () => {
+      const activate = deferred<LlmCredentialSummary>();
+      deps.activateLlmCredential = vi.fn(() => activate.promise);
+
+      let activatePromise!: Promise<void>;
+      await act(async () => {
+        activatePromise = api!.doActivateLlmCredential("cred-1");
+      });
+      render("user-b");
+      expect(api!.llmActivatingCredentialId).toBeNull();
+
+      await act(async () => {
+        activate.reject(new Error("network down"));
+        await activatePromise.catch(() => {});
+      });
+
+      expect(toastError).not.toHaveBeenCalled();
+      expect(api!.llmActivatingCredentialId).toBeNull();
+    });
   });
 });

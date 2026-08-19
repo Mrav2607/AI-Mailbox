@@ -727,6 +727,40 @@ describe("SettingsDialog ai tab multi-credential list", () => {
       api_key: "sk-personal-key-12345678",
     });
   });
+
+  it("disables the other row's delete button and add-credential submit while an activate is pending", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings()}
+          usage={makeUsage()}
+          credentials={[
+            makeCredential({ id: "cred-a", name: "Work", active: true }),
+            makeCredential({ id: "cred-b", name: "Personal", active: false }),
+          ]}
+          activatingCredentialId="cred-b"
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    // Activate and delete aren't optimistic-locked against each other
+    // server-side -- if delete stayed clickable here, it could win the
+    // race and the pending activate would 404 a moment later.
+    const removeButtons = Array.from(document.body.querySelectorAll("button")).filter(
+      (b) => b.title === "remove this credential",
+    );
+    expect(removeButtons.length).toBe(1);
+    expect(removeButtons[0]!.disabled).toBe(true);
+
+    act(() => {
+      findButton("+ add another credential").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+    expect(findButton("add credential").disabled).toBe(true);
+  });
 });
 
 describe("SettingsDialog ai tab classifier-mix summary forward compatibility", () => {

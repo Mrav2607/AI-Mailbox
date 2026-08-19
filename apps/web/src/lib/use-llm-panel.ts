@@ -144,7 +144,11 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
   // The credential-list fetch gets its OWN counter too, same claim-first
   // pattern as llmUsageGenRef/llmMixGenRef above -- two overlapping list
   // fetches (e.g. re-opening the ai tab quickly) must let the most recent
-  // one win, not whichever happens to resolve last.
+  // one win, not whichever happens to resolve last. Every structural
+  // mutation (create/activate/delete/save/remove) ALSO bumps this directly,
+  // synchronously before its own request goes out -- a list GET that was
+  // already in flight when one of those starts must be dropped, not land
+  // afterward and repaint the list with data the mutation just made stale.
   const llmCredentialsGenRef = useRef(0);
 
   useEffect(() => {
@@ -177,6 +181,15 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
     setLlmCredentials(null);
     setLlmCredentialsError(false);
     setLlmCredentialDeleteError(null);
+    // The three structural-action flags below are per-id/per-boolean, not
+    // per-account data, but they're exactly as account-scoped as everything
+    // above: without this, the next person to sign in on this tab can
+    // inherit "creating"/"activating X"/"deleting Y" from whoever was just
+    // signed in, which freezes their own controls disabled for an action
+    // that isn't theirs and was never actually in flight for them.
+    setLlmCreatingCredential(false);
+    setLlmActivatingCredentialId(null);
+    setLlmDeletingCredentialId(null);
     // The settings dialog itself closes via App's own account-scoped reset
     // (settingsPanel -> null alongside its other resets) -- this hook no
     // longer owns that state, just the data it's built from.
@@ -369,6 +382,12 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
     }) => {
       setLlmSaving(true);
       let saved = false;
+      // Bumped synchronously, before the PUT even goes out -- a save can
+      // change provider/model/key_suffix on the active row, so a credential
+      // list GET already in flight when this starts must be dropped rather
+      // than allowed to land afterward and repaint the list with what the
+      // row looked like before this save.
+      llmCredentialsGenRef.current++;
       // Guarded on the settings counter, not the credential one: a save is
       // meant to write settings, so it must not invalidate itself. This only
       // discards the response if the ACCOUNT changed while the PUT was in
@@ -401,9 +420,14 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
       if (saved) {
         void refreshLlmUsage(llmUsageDays);
         void refreshClassifierMix();
+        // The row this save touched can have a different provider/model/
+        // key_suffix now -- the list has to catch up too, not just the
+        // singular view. refreshLlmCredentials claims its own fresh
+        // generation, so it isn't dropped by the bump above.
+        void refreshLlmCredentials();
       }
     },
-    [deps, refreshLlmUsage, llmUsageDays, refreshClassifierMix],
+    [deps, refreshLlmUsage, llmUsageDays, refreshClassifierMix, refreshLlmCredentials],
   );
 
   const doTestLlmSettings = useCallback(async () => {
@@ -428,15 +452,22 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
   const doRemoveLlmSettings = useCallback(async () => {
     setLlmRemoving(true);
     let removed = false;
+    // Bumped synchronously, before the DELETE goes out -- this is the kill
+    // switch (D4), and a credential list GET that was already in flight
+    // when it started must be dropped, not land afterward and resurrect
+    // the rows this is about to wipe over the clear below.
+    const credentialsGeneration = ++llmCredentialsGenRef.current;
     try {
       // Kill switch (D4): wipes EVERY credential the caller owns, not just
       // the active one -- so the credential list has to clear right along
       // with the singular settings view.
       await deps.deleteLlmSettings();
       setLlmTestResult(null);
-      setLlmCredentials([]);
-      setLlmCredentialsError(false);
-      setLlmCredentialDeleteError(null);
+      if (credentialsGeneration === llmCredentialsGenRef.current) {
+        setLlmCredentials([]);
+        setLlmCredentialsError(false);
+        setLlmCredentialDeleteError(null);
+      }
       await refreshLlmSettings();
       deps.toastSuccess("AI credential removed");
       removed = true;
@@ -477,15 +508,28 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
       setLlmCreatingCredential(true);
       // Guarded on the settings counter, same convention doSaveLlmSettings
       // uses: this only discards its own result if the ACCOUNT changed
-      // while the request was in flight.
+      // while the request was in flight. Captured up front so a completion
+      // landing after a switch can tell it's no longer the current identity
+      // -- the account-change effect already reset creatingCredential for
+      // whoever's here now, and they may have started their own create by
+      // the time this settles, so a stale completion must never touch their
+      // state or toast at them about an action they didn't take.
       const generation = llmSettingsGenRef.current;
+      // Bumped synchronously, before the POST goes out -- a new credential
+      // changes the list (and, if it's the first one, the active row too),
+      // so a list GET already in flight must be dropped rather than allowed
+      // to land afterward without the row this just added.
+      const credentialsGeneration = ++llmCredentialsGenRef.current;
       try {
         await deps.createLlmCredential(input);
         const [items, settings] = await Promise.all([
           deps.listLlmCredentials(),
           deps.getLlmSettings(),
         ]);
-        if (generation === llmSettingsGenRef.current) {
+        if (
+          generation === llmSettingsGenRef.current &&
+          credentialsGeneration === llmCredentialsGenRef.current
+        ) {
           setLlmCredentials(items);
           setLlmCredentialsError(false);
           setLlmSettings(settings);
@@ -493,12 +537,16 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
           deps.toastSuccess(`Added "${input.name}"`);
         }
       } catch (e) {
-        deps.toastError((e as Error).message || "could not add this credential");
+        if (generation === llmSettingsGenRef.current) {
+          deps.toastError((e as Error).message || "could not add this credential");
+        }
       } finally {
         llmCredentialGenRef.current++;
         llmUsageGenRef.current++;
         llmMixGenRef.current++;
-        setLlmCreatingCredential(false);
+        if (generation === llmSettingsGenRef.current) {
+          setLlmCreatingCredential(false);
+        }
       }
     },
     [deps],
@@ -511,14 +559,24 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
   const doActivateLlmCredential = useCallback(
     async (id: string) => {
       setLlmActivatingCredentialId(id);
+      // Same identity guard as doCreateLlmCredential above -- captured up
+      // front so a completion landing after a switch never clears a
+      // different user's own in-flight activate or toasts at them.
       const generation = llmSettingsGenRef.current;
+      // Bumped synchronously, before the PATCH goes out -- switching which
+      // credential is active changes which row is marked active in the
+      // list, so a list GET already in flight must be dropped.
+      const credentialsGeneration = ++llmCredentialsGenRef.current;
       try {
         await deps.activateLlmCredential(id);
         const [items, settings] = await Promise.all([
           deps.listLlmCredentials(),
           deps.getLlmSettings(),
         ]);
-        if (generation === llmSettingsGenRef.current) {
+        if (
+          generation === llmSettingsGenRef.current &&
+          credentialsGeneration === llmCredentialsGenRef.current
+        ) {
           setLlmCredentials(items);
           setLlmCredentialsError(false);
           setLlmSettings(settings);
@@ -526,12 +584,16 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
           setLlmCredentialDeleteError(null);
         }
       } catch (e) {
-        deps.toastError((e as Error).message || "could not switch credentials");
+        if (generation === llmSettingsGenRef.current) {
+          deps.toastError((e as Error).message || "could not switch credentials");
+        }
       } finally {
         llmCredentialGenRef.current++;
         llmUsageGenRef.current++;
         llmMixGenRef.current++;
-        setLlmActivatingCredentialId(null);
+        if (generation === llmSettingsGenRef.current) {
+          setLlmActivatingCredentialId(null);
+        }
       }
     },
     [deps],
@@ -544,11 +606,19 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
     async (id: string) => {
       setLlmDeletingCredentialId(id);
       setLlmCredentialDeleteError(null);
+      // Same identity guard as the other two structural actions above.
       const generation = llmSettingsGenRef.current;
+      // Bumped synchronously, before the DELETE goes out -- same reasoning
+      // as create/activate above: the row this removes has to stay gone,
+      // not get reintroduced by a list GET that started before this call.
+      const credentialsGeneration = ++llmCredentialsGenRef.current;
       try {
         await deps.deleteLlmCredential(id);
         const items = await deps.listLlmCredentials();
-        if (generation === llmSettingsGenRef.current) {
+        if (
+          generation === llmSettingsGenRef.current &&
+          credentialsGeneration === llmCredentialsGenRef.current
+        ) {
           setLlmCredentials(items);
           setLlmCredentialsError(false);
           deps.toastSuccess("Credential removed");
@@ -566,11 +636,13 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
               message: "This is your active credential — switch to another one first.",
             });
           }
-        } else {
+        } else if (generation === llmSettingsGenRef.current) {
           deps.toastError((e as Error).message || "could not remove this credential");
         }
       } finally {
-        setLlmDeletingCredentialId(null);
+        if (generation === llmSettingsGenRef.current) {
+          setLlmDeletingCredentialId(null);
+        }
       }
     },
     [deps],
