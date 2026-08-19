@@ -1,14 +1,24 @@
-"""BYOK LLM settings routes: view/save/test/remove the caller's own
-extraction credential.
+"""BYOK LLM settings routes: view/save/test/remove the caller's credentials.
 
-GET, DELETE, and ``/test`` are sync ``def``s -- the repo's deliberate
-threadpool convention (REVIEW.md), which is what keeps ``/test``'s blocking
-provider call (and, for a stored ``custom`` row, its blocking DNS
-re-check) off the event loop. ``PUT`` is the one ``async def`` in this
-router: it has to read the raw request body itself (see its docstring for
-why no body parameter is declared), and its own blocking work -- the
-custom-endpoint DNS check -- is awaited through the policy's async wrapper
-so the event loop is never touched either way.
+A caller can hold several named credentials (plan: 2026-08-19-multi-
+credential-llm-profiles), of which at most one is active; ``GET``/``PUT``/
+``DELETE`` under ``/settings/llm`` are active-credential VIEWS (D4) kept for
+backward compatibility, while ``/settings/llm/credentials`` and its
+sub-routes are the additive multi-credential surface (D5). Every STRUCTURAL
+mutation across both surfaces (PUT's rewrite, create, activate, either
+DELETE) runs under the D6 guard protocol -- see ``_lock_guard_user``'s
+docstring for why a per-user lock beats a credential-row lock here.
+
+GET, DELETE, and ``/test`` under the singular surface are sync ``def``s --
+the repo's deliberate threadpool convention (REVIEW.md), which is what
+keeps ``/test``'s blocking provider call (and, for a stored ``custom`` row,
+its blocking DNS re-check) off the event loop. ``PUT`` and ``POST
+/credentials`` are the router's ``async def``s: both read a raw request
+body themselves (see ``put_llm_settings``'s docstring for why no body
+parameter is declared), and their own blocking work -- the custom-endpoint
+DNS check -- is awaited through the policy's async wrapper so the event
+loop is never touched either way. ``activate``/the by-id ``DELETE`` take no
+body and no DNS re-check, so they're sync ``def``s like the rest.
 
 Every lookup/mutation below filters ``UserLlmCredential.user_id ==
 current_user.id`` -- ownership is a WHERE clause, never an assumption.
@@ -20,6 +30,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Iterable
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import ColumnElement, func, select, update
@@ -40,6 +51,9 @@ from app.db.models import (
 from app.db.schemas.llm_settings import (
     ClassifierMixKind,
     ClassifierMixOut,
+    LlmCredentialDeleted,
+    LlmCredentialList,
+    LlmCredentialSummary,
     LlmSettingsOut,
     LlmTestResultOut,
     LlmUsageOut,
@@ -69,6 +83,13 @@ _MAX_KEY_LEN = 512
 # a real model name -- both are rejected here with a fixed detail, not left
 # for the provider's own error message to surface.
 _MAX_MODEL_LEN = 200
+# name: same bounds discipline, plan D7. 60 chars is comfortably more than
+# any reasonable label ("work openai key") while still a hard cap.
+_MIN_NAME_LEN = 1
+_MAX_NAME_LEN = 60
+# D8: five named credentials per user. Checked under the D6 guard lock, not
+# a DB constraint -- no single-column check can express "count(*) <= 5".
+_MAX_CREDENTIALS_PER_USER = 5
 
 
 def _effective_backend() -> str:
@@ -83,6 +104,113 @@ def _effective_backend() -> str:
     normalization ever moves again.
     """
     return (settings.classifier_backend or "auto").lower()
+
+
+def _lock_guard_user(db: Session, user_id: UUID) -> None:
+    """D6's serialization anchor: locks the caller's `app_user` row via
+    `SELECT ... FOR UPDATE` before any STRUCTURAL read or write of their
+    credential rows (create, activate, delete, PUT's field rewrite --
+    `/test`'s verify stamp stays guard-free, as today).
+
+    Row locks on the credential rows alone can't serialize a create: with
+    zero-to-four existing rows there's no row to lock the gap with, so two
+    concurrent creates could both count 4 and insert a 5th and 6th -- no DB
+    constraint enforces the cap. `app_user` always exists (exactly one row,
+    trivial to find) and needs no advisory-lock key-collision bookkeeping,
+    so it's the stable thing every credential mutation locks instead. This
+    REPLACES the old single-row `with_for_update()` PUT used to take on the
+    credential row itself -- no route below takes a separate credential-row
+    lock of its own; this is THE lock.
+    """
+    db.execute(select(AppUser.id).where(AppUser.id == user_id).with_for_update())
+
+
+def _credential_rows(db: Session, user_id: UUID) -> list[UserLlmCredential]:
+    """Plain (lock-free) read of every credential row the caller owns.
+    Safe to call ONLY after `_lock_guard_user` has locked this user's guard
+    row -- every other writer for this user is already serialized behind
+    that lock, so there's nothing left here for a row-level lock to add.
+    """
+    return list(
+        db.execute(
+            select(UserLlmCredential).where(UserLlmCredential.user_id == user_id)
+        ).scalars().all()
+    )
+
+
+def _active_row(rows: list[UserLlmCredential]) -> UserLlmCredential | None:
+    return next((row for row in rows if row.is_active), None)
+
+
+def _validate_name(name_input: object) -> str:
+    """Trimmed, 1..60 chars (D7) -- same fixed-detail, never-echo discipline
+    as every other field this router validates by hand."""
+    if not isinstance(name_input, str):
+        raise HTTPException(status_code=422, detail="name must be a string")
+    name = name_input.strip()
+    if not (_MIN_NAME_LEN <= len(name) <= _MAX_NAME_LEN):
+        raise HTTPException(status_code=422, detail="name length out of bounds")
+    return name
+
+
+def _resolve_classification_byok(
+    classification_byok_input: bool | None,
+    provider: str,
+    existing: UserLlmCredential | None,
+) -> bool:
+    """Absent flag means false on create, unchanged on update (`existing`
+    is `None` for every create path, including `POST /credentials`, so this
+    reduces to "false unless explicitly set" there). A `custom` provider
+    always forces false -- an explicit true+custom ask already 422'd at the
+    caller, so what's left is a flag the credential is INHERITING across a
+    switch to `custom`; clearing it means no stored row ever combines
+    provider="custom" with classification_byok=true, which `resolve_
+    classification_routing` would otherwise have to treat as "off" anyway.
+    """
+    if classification_byok_input is not None:
+        value = classification_byok_input
+    elif existing is not None:
+        value = bool(existing.classification_byok)
+    else:
+        value = False
+    return False if provider == "custom" else value
+
+
+def _resolve_classification_fallback_local(
+    classification_fallback_local_input: bool | None,
+    existing: UserLlmCredential | None,
+) -> bool:
+    """Same absent-preserves convention as `_resolve_classification_byok`:
+    absent means false on create, unchanged on update. Unlike that flag,
+    this one is never forced by provider or by `classification_byok` itself
+    -- it's simply inert until `classification_byok` is also true (see the
+    model's own docstring), so writing it while BYOK is off (or the
+    provider is `custom`) is allowed and persisted exactly as given, never
+    coerced or reset.
+    """
+    if classification_fallback_local_input is not None:
+        return classification_fallback_local_input
+    if existing is not None:
+        return bool(existing.classification_fallback_local)
+    return False
+
+
+def _credential_summary(row: UserLlmCredential) -> dict:
+    """The shared response shape for every multi-credential route (`GET
+    /credentials`, `POST /credentials`, `POST /credentials/{id}/activate`)
+    -- never the api_key, same discipline as `_settings_payload`."""
+    return {
+        "id": row.id,
+        "name": row.name,
+        "provider": row.provider,
+        "model": row.model,
+        # Last 4 chars only, safe since the minimum stored key length is 8.
+        "key_suffix": row.api_key[-4:],
+        "last_verified_at": row.last_verified_at,
+        "active": row.is_active,
+        "classification_byok": bool(row.classification_byok),
+        "classification_fallback_local": bool(row.classification_fallback_local),
+    }
 
 
 def _settings_payload(
@@ -163,8 +291,14 @@ def get_llm_settings(
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    """The caller's ACTIVE credential, as a view (D4): a user can now hold
+    several named credentials, so this filters on `is_active` -- without it,
+    `scalar_one_or_none()` below RAISES the moment a second row exists.
+    """
     row = db.execute(
-        select(UserLlmCredential).where(UserLlmCredential.user_id == current_user.id)
+        select(UserLlmCredential).where(
+            UserLlmCredential.user_id == current_user.id, UserLlmCredential.is_active
+        )
     ).scalar_one_or_none()
     resolved = resolve_extraction_credential(db, current_user.id)
     routing = resolve_classification_routing(db, current_user.id)
@@ -404,58 +538,21 @@ async def _read_bounded_body(request: Request) -> bytes:
     return bytes(chunks)
 
 
-@router.put("", response_model=LlmSettingsOut)
-async def put_llm_settings(
-    request: Request,
-    current_user: AppUser = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict:
-    """Save (or replace) the caller's one credential.
+async def _validate_credential_payload(
+    payload: dict,
+) -> tuple[str, str, str, str | None, bool, bool | None, bool | None]:
+    """Context-free field validation shared by `PUT /settings/llm` and
+    `POST /settings/llm/credentials` -- everything about a credential body
+    except how `api_key`'s absence should be handled (PUT can fall back to
+    a stored key; a create has nothing to fall back on, so that decision is
+    the caller's). Same fixed-detail, never-echo discipline throughout;
+    see `put_llm_settings`'s own docstring for why this whole router reads
+    bodies by hand instead of declaring a pydantic one.
 
-    Deliberately takes ONLY ``request: Request`` -- no body parameter of any
-    kind (not a pydantic model, not ``Body(...)``, not even ``bytes``).
-    FastAPI only parses/validates a request body when a body FIELD is
-    declared on the route; declaring one here would let a type-invalid
-    payload (e.g. ``api_key`` as a list) fail pydantic before this function
-    ever runs, and the app's default validation handler echoes the rejected
-    input straight back in the 422 -- api_key included. Reading and
-    validating the body by hand is what keeps it genuinely raw.
-
-    This is the router's one ``async def`` because its only blocking work,
-    the custom-endpoint DNS check, is awaited through
-    ``validate_custom_base_url_async`` -- the shared executor future is
-    awaited rather than blocked on, so the event loop is never held for the
-    3s DNS budget.
-
-    ``api_key`` is the one field that can be OMITTED on an update: the
-    server never returns the raw key, so requiring it on every save would
-    mean a user who's forgotten it can't touch anything else -- including
-    turning off the classification opt-in they came here to revoke. A
-    create still needs one, since there's nothing stored to fall back on.
-
-    ``classification_byok: true`` is accepted here regardless of the
-    deployment's ``CLASSIFIER_BACKEND`` -- including while it's
-    ``heuristic``, which never even reads routing (plan:
-    2026-08-16-classifier-default-honesty §1). That is deliberate, not an
-    oversight: rejecting the opt-in would punish "use my key when you can"
-    for a deployment-level setting the caller doesn't control. The flag can
-    therefore sit **dormant** -- saved and reported as
-    ``classification_eligible: false`` -- and be activated LATER, with no
-    further action from this caller, purely by an administrator changing
-    ``CLASSIFIER_BACKEND`` away from ``heuristic``. This is the one place
-    that dormancy is documented for an API-only caller, since the console
-    hides the opt-in checkbox entirely under a heuristic backend.
+    Returns `(provider, model, base_url, api_key, api_key_provided,
+    classification_byok_input, classification_fallback_local_input)` --
+    `api_key` is the stripped value if present, else `None`.
     """
-    raw_body = await _read_bounded_body(request)
-
-    try:
-        payload = json.loads(raw_body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise HTTPException(status_code=422, detail="malformed request body")
-
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=422, detail="request body must be a JSON object")
-
     provider = payload.get("provider")
     api_key = payload.get("api_key")
     model = payload.get("model")
@@ -476,13 +573,6 @@ async def put_llm_settings(
             status_code=422, detail="classification_fallback_local must be a boolean"
         )
 
-    # Absent OR explicit null api_key both mean "keep the stored one" -- the
-    # server never echoes the raw key back, so that's the ONLY way to edit
-    # anything else (e.g. the classification flag) without the caller having
-    # the original key in hand. There's nothing to keep on a brand-new row,
-    # so a create with no key (or an explicit null) still 422s below, once we
-    # know whether a row exists to fall back on. Only a non-null value gets
-    # validated right away.
     api_key_provided = api_key is not None
     if api_key_provided:
         if not isinstance(api_key, str):
@@ -523,46 +613,101 @@ async def put_llm_settings(
             "are not eligible for classification in v1",
         )
 
-    def _resolve_classification_byok(existing: UserLlmCredential | None) -> bool:
-        """Absent flag means false on create, unchanged on update. A
-        `custom` provider always forces false here -- an explicit true+custom
-        ask already 422'd above, so what's left is a flag the credential is
-        INHERITING across a switch to `custom`; clearing it means no stored
-        row ever combines provider="custom" with classification_byok=true,
-        which `resolve_classification_routing` would otherwise have to treat
-        as "off" anyway.
-        """
-        if classification_byok_input is not None:
-            value = classification_byok_input
-        elif existing is not None:
-            value = bool(existing.classification_byok)
-        else:
-            value = False
-        return False if provider == "custom" else value
+    return (
+        provider,
+        model,
+        base_url,
+        api_key,
+        api_key_provided,
+        classification_byok_input,
+        classification_fallback_local_input,
+    )
 
-    def _resolve_classification_fallback_local(existing: UserLlmCredential | None) -> bool:
-        """Same absent-preserves convention as `_resolve_classification_byok`:
-        absent means false on create, unchanged on update. Unlike that flag,
-        this one is never forced by provider or by `classification_byok`
-        itself -- it's simply inert until `classification_byok` is also true
-        (see the model's own docstring), so writing it while BYOK is off (or
-        while the provider is `custom`) is allowed and persisted exactly as
-        given, never coerced or reset.
-        """
-        if classification_fallback_local_input is not None:
-            return classification_fallback_local_input
-        if existing is not None:
-            return bool(existing.classification_fallback_local)
-        return False
 
-    # FOR UPDATE before the read-then-branch: two concurrent PUTs for the
-    # same user otherwise both read the same revision and bump it only
-    # once, weakening the id+revision guard /test relies on. The lock
-    # serializes the second caller behind the first -- for an EXISTING row.
+@router.put("", response_model=LlmSettingsOut)
+async def put_llm_settings(
+    request: Request,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Save (or replace) the caller's ACTIVE credential (D4): a user can now
+    hold several named ones, but PUT stays a view onto the single active
+    slot, for backward compatibility -- naming/switching between several
+    goes through ``POST /settings/llm/credentials`` and its ``/activate``
+    sibling instead.
+
+    Deliberately takes ONLY ``request: Request`` -- no body parameter of any
+    kind (not a pydantic model, not ``Body(...)``, not even ``bytes``).
+    FastAPI only parses/validates a request body when a body FIELD is
+    declared on the route; declaring one here would let a type-invalid
+    payload (e.g. ``api_key`` as a list) fail pydantic before this function
+    ever runs, and the app's default validation handler echoes the rejected
+    input straight back in the 422 -- api_key included. Reading and
+    validating the body by hand (``_validate_credential_payload``, shared
+    with the create route) is what keeps it genuinely raw.
+
+    This is one of the router's two ``async def``s because its only
+    blocking work, the custom-endpoint DNS check, is awaited through
+    ``validate_custom_base_url_async`` -- the shared executor future is
+    awaited rather than blocked on, so the event loop is never held for the
+    3s DNS budget.
+
+    ``api_key`` is the one field that can be OMITTED on an update: the
+    server never returns the raw key, so requiring it on every save would
+    mean a user who's forgotten it can't touch anything else -- including
+    turning off the classification opt-in they came here to revoke. A
+    create still needs one, since there's nothing stored to fall back on.
+
+    ``classification_byok: true`` is accepted here regardless of the
+    deployment's ``CLASSIFIER_BACKEND`` -- including while it's
+    ``heuristic``, which never even reads routing (plan:
+    2026-08-16-classifier-default-honesty §1). That is deliberate, not an
+    oversight: rejecting the opt-in would punish "use my key when you can"
+    for a deployment-level setting the caller doesn't control. The flag can
+    therefore sit **dormant** -- saved and reported as
+    ``classification_eligible: false`` -- and be activated LATER, with no
+    further action from this caller, purely by an administrator changing
+    ``CLASSIFIER_BACKEND`` away from ``heuristic``. This is the one place
+    that dormancy is documented for an API-only caller, since the console
+    hides the opt-in checkbox entirely under a heuristic backend.
+
+    Concurrency (D6): guard-locks ``app_user`` first, then reads the active
+    row in the locked-set -- there is no separate credential-row
+    ``FOR UPDATE`` anymore; the guard lock IS the serialization. On a
+    brand-new user (no active row, no credentials at all), this creates the
+    first one, named ``"default"`` (matching the migration backfill's
+    choice) and active. The IntegrityError "existing row wins" branch below
+    re-reads the ACTIVE row rather than any row by user_id, since a user can
+    now legitimately own more than one.
+    """
+    raw_body = await _read_bounded_body(request)
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=422, detail="malformed request body")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+
+    (
+        provider,
+        model,
+        base_url,
+        api_key,
+        api_key_provided,
+        classification_byok_input,
+        classification_fallback_local_input,
+    ) = await _validate_credential_payload(payload)
+
+    # D6: lock the guard row before reading or writing this user's
+    # credentials -- see _lock_guard_user's docstring for why a per-user
+    # lock beats a credential-row lock here.
+    _lock_guard_user(db, current_user.id)
     row = db.execute(
-        select(UserLlmCredential)
-        .where(UserLlmCredential.user_id == current_user.id)
-        .with_for_update()
+        select(UserLlmCredential).where(
+            UserLlmCredential.user_id == current_user.id, UserLlmCredential.is_active
+        )
     ).scalar_one_or_none()
     now = datetime.now(timezone.utc)
 
@@ -590,8 +735,12 @@ async def put_llm_settings(
             or target.base_url != base_url
             or target.model != model
         )
-        target.classification_byok = _resolve_classification_byok(target)
-        target.classification_fallback_local = _resolve_classification_fallback_local(target)
+        target.classification_byok = _resolve_classification_byok(
+            classification_byok_input, provider, target
+        )
+        target.classification_fallback_local = _resolve_classification_fallback_local(
+            classification_fallback_local_input, target
+        )
         target.provider = provider
         target.base_url = base_url
         target.api_key = effective_api_key
@@ -602,22 +751,22 @@ async def put_llm_settings(
         target.updated_at = now
 
     if row is None:
-        # FOR UPDATE takes NO lock when the SELECT matches zero rows --
-        # Postgres only locks rows it actually returns -- so for a
-        # brand-new user the unique constraint (`uq_llm_credential_user`),
-        # not the lock, is what serializes two concurrent first-time PUTs.
-        # The loser's INSERT raises IntegrityError here; roll back, re-read
-        # the winner's now-committed row WITH the lock (it's lockable now
-        # that it exists), and apply the normal update path against it --
-        # last writer wins, exactly as two sequential saves would behave.
+        # Guard-locked, so this is the ONLY writer for this user right now
+        # -- the IntegrityError branch below is belt-and-suspenders (D6),
+        # not the primary serialization mechanism the way it was before the
+        # guard existed.
         row = UserLlmCredential(
             user_id=current_user.id,
+            name="default",
             provider=provider,
             base_url=base_url,
             api_key=effective_api_key,
             model=model,
-            classification_byok=_resolve_classification_byok(None),
-            classification_fallback_local=_resolve_classification_fallback_local(None),
+            classification_byok=_resolve_classification_byok(classification_byok_input, provider, None),
+            classification_fallback_local=_resolve_classification_fallback_local(
+                classification_fallback_local_input, None
+            ),
+            is_active=True,
             revision=1,
         )
         row.updated_at = now
@@ -627,9 +776,9 @@ async def put_llm_settings(
         except IntegrityError:
             db.rollback()
             row = db.execute(
-                select(UserLlmCredential)
-                .where(UserLlmCredential.user_id == current_user.id)
-                .with_for_update()
+                select(UserLlmCredential).where(
+                    UserLlmCredential.user_id == current_user.id, UserLlmCredential.is_active
+                )
             ).scalar_one_or_none()
             if row is None:
                 # The winning row vanished between the failed insert and
@@ -746,10 +895,187 @@ def delete_llm_settings(
     current_user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Response:
-    row = db.execute(
-        select(UserLlmCredential).where(UserLlmCredential.user_id == current_user.id)
-    ).scalar_one_or_none()
-    if row is not None:
+    """Kill switch (D4): removes EVERY credential row the caller owns, not
+    just the active one -- a wider sweep than the pre-multi-credential
+    behavior, which had at most one row to begin with. Keeps its
+    documented "remove my key entirely" meaning; use the by-id
+    ``DELETE /settings/llm/credentials/{id}`` instead to remove a single
+    inactive spare.
+
+    Guard-locked (D6) like every other structural mutation, so a concurrent
+    create/activate for this user can't interleave with the wipe.
+    """
+    _lock_guard_user(db, current_user.id)
+    rows = _credential_rows(db, current_user.id)
+    for row in rows:
         db.delete(row)
+    if rows:
         db.commit()
     return Response(status_code=204)
+
+
+@router.get("/credentials", response_model=LlmCredentialList)
+def list_llm_credentials(
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Every credential the caller owns, active or not (D5). Unguarded --
+    a plain read reflects whatever's already committed; a mutation racing
+    this GET is fine to observe either before or after, same as any other
+    list endpoint in this API.
+    """
+    rows = db.execute(
+        select(UserLlmCredential)
+        .where(UserLlmCredential.user_id == current_user.id)
+        .order_by(UserLlmCredential.created_at)
+    ).scalars().all()
+    return {"items": [_credential_summary(row) for row in rows]}
+
+
+@router.post("/credentials", response_model=LlmCredentialSummary, status_code=201)
+async def create_llm_credential(
+    request: Request,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Add a new named credential (D5). Same raw-body, no-key-echo
+    validation path as ``PUT /settings/llm`` (``_validate_credential_
+    payload``) -- see that route's docstring for why no pydantic body model
+    is declared. Unlike PUT, ``api_key`` is always required here: a create
+    has nothing stored to fall back on.
+
+    Active iff it's the caller's first credential (D5) -- every subsequent
+    create starts inactive, so a switch is always an explicit ``/activate``
+    call, never an implicit side effect of adding a spare.
+
+    Guard-locked (D6): the cap (D8, five per user) and the per-user name
+    uniqueness are both re-checked in the SAME locked read, since row locks
+    alone can't serialize a create -- see ``_lock_guard_user``'s docstring
+    for why a zero-to-four-row create race needs the app_user lock instead.
+    """
+    raw_body = await _read_bounded_body(request)
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=422, detail="malformed request body")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+
+    name = _validate_name(payload.get("name"))
+
+    (
+        provider,
+        model,
+        base_url,
+        api_key,
+        api_key_provided,
+        classification_byok_input,
+        classification_fallback_local_input,
+    ) = await _validate_credential_payload(payload)
+
+    if not api_key_provided:
+        # Same fixed detail PUT uses for the analogous "nothing to fall
+        # back on" case -- from the caller's point of view both are "no
+        # usable key came through."
+        raise HTTPException(status_code=422, detail="api_key must be a string")
+
+    _lock_guard_user(db, current_user.id)
+    rows = _credential_rows(db, current_user.id)
+    if len(rows) >= _MAX_CREDENTIALS_PER_USER:
+        raise HTTPException(status_code=422, detail="credential limit reached")
+    if any(existing.name == name for existing in rows):
+        raise HTTPException(status_code=422, detail="a credential with this name already exists")
+
+    now = datetime.now(timezone.utc)
+    row = UserLlmCredential(
+        user_id=current_user.id,
+        name=name,
+        provider=provider,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        classification_byok=_resolve_classification_byok(classification_byok_input, provider, None),
+        classification_fallback_local=_resolve_classification_fallback_local(
+            classification_fallback_local_input, None
+        ),
+        is_active=not rows,
+        revision=1,
+    )
+    row.updated_at = now
+    db.add(row)
+    db.commit()
+    return _credential_summary(row)
+
+
+@router.post("/credentials/{credential_id}/activate", response_model=LlmCredentialSummary)
+def activate_llm_credential(
+    credential_id: UUID,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Switch the caller's active credential (D5). 404s if ``credential_id``
+    doesn't belong to the caller -- ownership is a WHERE clause inside
+    ``_credential_rows``, never an assumption.
+
+    Concurrency contract (D6): serialized LAST-WRITER-WINS, not "one 409s."
+    Two concurrent activates of DIFFERENT credentials both return 200 under
+    the guard lock -- the second request validly re-switches after the
+    first commits, so the later commit's target is the one left active.
+
+    Forced flush order, and it's a correctness requirement, not style: ORM
+    attribute-assignment order does NOT control the emitted SQL order, and
+    the partial unique index (``uq_llm_credential_user_active``) checks
+    IMMEDIATELY -- it isn't deferrable. Flipping the old active row to
+    false and flushing THAT before setting the target true is what stops a
+    legitimate switch from bouncing off the index (both rows would
+    otherwise briefly be active in the same statement batch).
+
+    Does NOT bump ``revision`` -- that field guards ``/test``'s verify
+    stamp against a since-replaced credential's CONTENTS changing;
+    activating changes which row is read, not the row's contents.
+    ``ClassificationRouter``'s per-run memo (providers.py) means an
+    in-flight ingest can keep classifying on the previously-active key for
+    up to ~60s after this call returns -- the same key-rotation window that
+    already exists today, just now reachable by a switch instead of only a
+    key replacement.
+    """
+    _lock_guard_user(db, current_user.id)
+    rows = _credential_rows(db, current_user.id)
+    target = next((row for row in rows if row.id == credential_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="credential not found")
+
+    if not target.is_active:
+        old_active = _active_row(rows)
+        if old_active is not None:
+            old_active.is_active = False
+            db.flush()
+        target.is_active = True
+    db.commit()
+    return _credential_summary(target)
+
+
+@router.delete("/credentials/{credential_id}", response_model=LlmCredentialDeleted)
+def delete_llm_credential(
+    credential_id: UUID,
+    current_user: AppUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Remove one named credential (D5) -- 409s if it's the active one
+    (switch to another with ``/activate`` first, or use the singular
+    ``DELETE /settings/llm`` kill switch to remove everything at once).
+    404s if ``credential_id`` isn't the caller's.
+    """
+    _lock_guard_user(db, current_user.id)
+    rows = _credential_rows(db, current_user.id)
+    target = next((row for row in rows if row.id == credential_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="credential not found")
+    if target.is_active:
+        raise HTTPException(status_code=409, detail="cannot delete the active credential")
+
+    db.delete(target)
+    db.commit()
+    return {"status": "deleted"}

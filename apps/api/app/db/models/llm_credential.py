@@ -8,6 +8,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Text,
     UniqueConstraint,
@@ -22,15 +23,31 @@ from ..types import EncryptedText
 
 class UserLlmCredential(Base):
     """
-    One BYOK LLM credential per user, used for action extraction. Presets pin
-    their base_url server-side; only "custom" accepts a caller-supplied one,
-    and only through the destination policy in services/nlp/providers.py.
+    Named BYOK LLM credentials, up to five per user, of which at most one is
+    active (`uq_llm_credential_user_active` below). Every resolver in
+    services/nlp/providers.py -- extraction, classification -- reads only
+    the active row; classification/reply-drafting opt-ins travel with
+    whichever credential is active (plan: 2026-08-19-multi-credential-llm-
+    profiles). Presets pin their base_url server-side; only "custom" accepts
+    a caller-supplied one, and only through the destination policy in
+    services/nlp/providers.py.
     """
 
     __tablename__ = "user_llm_credential"
     __table_args__ = (
-        # Exactly one credential per user -- multi-credential profiles are deferred.
-        UniqueConstraint("user_id", name="uq_llm_credential_user"),
+        UniqueConstraint("user_id", "name", name="uq_llm_credential_user_name"),
+        # The <=1-active half of the invariant (D2 in the plan above): "at
+        # most one active row per user," which a plain unique constraint
+        # can't express since it would also forbid multiple INACTIVE rows.
+        # Declared here (not just in the migration) so `alembic check` sees
+        # it on both sides -- MIGRATION_ONLY_INDEXES in alembic/env.py is the
+        # documented fallback if this comparator round-trip ever regresses.
+        Index(
+            "uq_llm_credential_user_active",
+            "user_id",
+            unique=True,
+            postgresql_where=text("is_active"),
+        ),
         CheckConstraint(
             "provider IN ('openai', 'gemini', 'openrouter', 'groq', 'mistral', 'custom')",
             name="ck_llm_credential_provider",
@@ -46,6 +63,15 @@ class UserLlmCredential(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("app_user.id", ondelete="CASCADE")
     )
+    # Trimmed, 1..60 chars, validated in-route (schemas/llm_settings.py's
+    # PUT-has-no-request-schema rationale applies here too -- the new create
+    # route validates by hand for the same "never echo a rejected value"
+    # discipline). Migration backfill named every pre-existing row "default".
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    # At most one true per user, enforced by uq_llm_credential_user_active
+    # above -- see providers.py's resolvers for what a false/no-active-row
+    # state means at read time.
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     provider: Mapped[str] = mapped_column(Text, nullable=False)
     # Always stored resolved and normalized -- presets pin it, only "custom"
     # accepts a caller value, and only through the destination policy.

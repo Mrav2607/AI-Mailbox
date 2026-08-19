@@ -1,5 +1,6 @@
 from datetime import date, datetime
 from typing import Literal
+from uuid import UUID
 
 from .common import Response
 
@@ -86,6 +87,45 @@ class LlmSettingsOut(Response):
     # that operator-key term is gone now along with the path it guarded, but
     # the eligible/usable divergence itself is unrelated and still stands.
     classification_llm_usable: bool
+
+
+class LlmCredentialSummary(Response):
+    """One row of `GET /settings/llm/credentials`, and what `POST
+    /settings/llm/credentials` and its `/activate` sibling return back --
+    the api_key never appears here, same discipline as `LlmSettingsOut`.
+
+    `active` mirrors the stored row's `is_active` -- named differently on
+    the wire since "active" is what the multi-credential UI actually asks
+    (a radio selection), while `is_active` is the DB/ORM-facing name.
+    """
+
+    id: UUID
+    name: str
+    provider: LlmProvider
+    model: str
+    key_suffix: str
+    last_verified_at: datetime | None
+    active: bool
+    classification_byok: bool
+    classification_fallback_local: bool
+
+
+class LlmCredentialList(Response):
+    """`GET /settings/llm/credentials` response -- every credential the
+    caller owns, active or not. An empty `items` list (never a 404) means
+    the caller has no stored credentials at all.
+    """
+
+    items: list[LlmCredentialSummary]
+
+
+class LlmCredentialDeleted(Response):
+    """`DELETE /settings/llm/credentials/{id}` response for a non-active
+    credential. The active one 409s instead (see the route's docstring) --
+    this shape is only ever returned on an actual deletion.
+    """
+
+    status: Literal["deleted"]
 
 
 class LlmTestResultOut(Response):

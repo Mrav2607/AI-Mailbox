@@ -55,8 +55,9 @@ def resolve_reply_draft_credential(db: Session, user_id: UUID) -> ResolvedExtrac
     """Credential resolution for the reply-draft stage REUSES
     `resolve_extraction_credential`'s BYOK semantics wholesale -- same
     BYOK-only 409s, blocked-custom-endpoint dead-stop, server-fallback flag
-    -- rather than forking it. There is exactly one stored credential row
-    per user; extraction and reply-draft both resolve it the same way, they
+    -- rather than forking it. A user can hold several named credentials,
+    but at most one ACTIVE row per user (partial unique index); extraction
+    and reply-draft both resolve that same active row the same way, they
     just record usage under different stages.
     """
     return resolve_extraction_credential(db, user_id)

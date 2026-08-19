@@ -17,6 +17,7 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -49,6 +50,8 @@ def _make_row(
     *,
     id=None,
     user_id=None,
+    name="default",
+    is_active=True,
     provider="openai",
     base_url="https://api.openai.com/v1",
     api_key="sk-stored-key-1234",
@@ -61,6 +64,8 @@ def _make_row(
     return SimpleNamespace(
         id=id or uuid4(),
         user_id=user_id or uuid4(),
+        name=name,
+        is_active=is_active,
         provider=provider,
         base_url=base_url,
         api_key=api_key,
@@ -93,63 +98,127 @@ def _resolved(
     )
 
 
+class _CredentialResult:
+    """Answers both call shapes this router issues against a credential
+    SELECT: ``.scalar_one_or_none()`` (every singular route, whose WHERE
+    clauses narrow to at most one row -- e.g. ``user_id = ... AND
+    is_active``) and ``.scalars().all()`` (``_credential_rows``'s multi-row
+    read, used by the new create/activate/delete-by-id/kill-switch routes).
+    """
+
+    def __init__(self, rows: list[object]):
+        self._rows = rows
+
+    def scalar_one_or_none(self):
+        return self._rows[0] if self._rows else None
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+
 class _CredentialDB:
-    """Keys rows by ``user_id.hex``; a SELECT is answered by parsing the
-    literal ``user_id`` out of the compiled WHERE clause, and an UPDATE (the
-    /test verify stamp) by parsing the literal ``id`` + ``revision`` pair --
-    so ownership and the id+revision race guard are proven against what the
-    route actually issued, not asserted by fiat."""
+    """A multi-row store, one LIST of credential rows per ``user_id.hex`` --
+    a user can now own several. A SELECT is answered by parsing the literal
+    ``user_id`` (and, when present, ``is_active``/``id``) predicates out of
+    the compiled WHERE clause; an UPDATE (the /test verify stamp) by parsing
+    the literal ``id`` + ``revision`` pair -- so ownership, the ``is_active``
+    filter, and the id+revision race guard are all proven against what the
+    route actually issued, not asserted by fiat.
+
+    Constructor values may be a single row (the common single-active-row
+    fixture shape every pre-existing test in this module already uses) or a
+    list of rows (multi-credential tests) -- both are normalized to a list.
+    """
 
     def __init__(self, rows: dict[str, object] | None = None):
-        self.rows: dict[str, object] = dict(rows or {})
+        self.rows: dict[str, list] = {
+            user_hex: (value if isinstance(value, list) else [value])
+            for user_hex, value in (rows or {}).items()
+        }
         self.commits = 0
         self.rollbacks = 0
+        self.flushes = 0
         self.added: list[object] = []
         self.deleted: list[object] = []
         self.statements: list[object] = []
+        # user_id hexes _lock_guard_user locked, in call order -- lets a
+        # test pin that the guard ran (and ran FIRST) without caring about
+        # the AppUser row's actual contents, which this fake never models.
+        self.guard_locks: list[str] = []
 
     def execute(self, stmt):
         self.statements.append(stmt)
-        result = MagicMock()
         if isinstance(stmt, Update):
+            result = MagicMock()
             matched = self._match_update(stmt)
             if matched is not None:
                 matched.last_verified_at = datetime.now(timezone.utc)
             result.rowcount = 1 if matched is not None else 0
             return result
-        result.scalar_one_or_none.return_value = self._match_select(stmt)
-        return result
 
-    def _match_select(self, stmt):
         compiled = _compiled(stmt)
-        for user_hex, row in self.rows.items():
-            if f"user_llm_credential.user_id = '{user_hex}'" in compiled:
-                return row
-        return None
+        if "FROM app_user" in compiled:
+            match = re.search(r"app_user\.id = '([0-9a-f]{32})'", compiled)
+            if match:
+                self.guard_locks.append(match.group(1))
+            return _CredentialResult([])
+        return _CredentialResult(self._match_credential_rows(compiled))
+
+    def _match_credential_rows(self, compiled: str) -> list:
+        # Only the WHERE clause (never the SELECT column list, which lists
+        # `user_llm_credential.is_active`/`.id` as plain column names on
+        # every entity select) decides which predicates are actually being
+        # filtered on.
+        where_clause = compiled.partition("WHERE")[2]
+        user_match = re.search(r"user_llm_credential\.user_id = '([0-9a-f]{32})'", where_clause)
+        rows = list(self.rows.get(user_match.group(1), [])) if user_match else []
+        if "user_llm_credential.is_active" in where_clause:
+            rows = [row for row in rows if row.is_active]
+        id_match = re.search(r"user_llm_credential\.id = '([0-9a-f]{32})'", where_clause)
+        if id_match:
+            rows = [row for row in rows if row.id.hex == id_match.group(1)]
+        return rows
 
     def _match_update(self, stmt):
         compiled = _compiled(stmt)
-        for row in self.rows.values():
-            if (
-                f"user_llm_credential.id = '{row.id.hex}'" in compiled
-                and f"user_llm_credential.revision = {row.revision}" in compiled
-            ):
-                return row
+        for bucket in self.rows.values():
+            for row in bucket:
+                if (
+                    f"user_llm_credential.id = '{row.id.hex}'" in compiled
+                    and f"user_llm_credential.revision = {row.revision}" in compiled
+                ):
+                    return row
         return None
 
     def add(self, row):
+        # Mimics the ORM's flush-time id default (mapped_column(default=
+        # uuid.uuid4)): a real Session assigns it on flush, which this fake
+        # never runs, so a freshly constructed row would otherwise reach the
+        # response with `id=None` and fail LlmCredentialSummary validation.
+        if row.id is None:
+            row.id = uuid4()
         self.added.append(row)
-        self.rows[row.user_id.hex] = row
+        self.rows.setdefault(row.user_id.hex, []).append(row)
 
     def delete(self, row):
         self.deleted.append(row)
-        self.rows = {k: v for k, v in self.rows.items() if v is not row}
+        remaining = [r for r in self.rows.get(row.user_id.hex, []) if r is not row]
+        if remaining:
+            self.rows[row.user_id.hex] = remaining
+        else:
+            self.rows.pop(row.user_id.hex, None)
 
     def commit(self):
         self.commits += 1
 
     def rollback(self):
         self.rollbacks += 1
+
+    def flush(self):
+        self.flushes += 1
 
 
 @pytest.fixture
@@ -1691,12 +1760,11 @@ def test_put_revision_increments_on_a_flag_only_edit_same_as_any_other_write(use
 # ---------------------------------------------------------------------------
 
 
-def test_put_select_issues_for_update_before_the_insert_or_update_branch(user):
-    """Every PUT locks the row (if any) before branching -- two concurrent
-    PUTs against an EXISTING row would otherwise both read the same
-    revision and bump it only once. FOR UPDATE takes no lock when this
-    SELECT matches zero rows (see the IntegrityError-fallback test below for
-    how the very-first-save race is closed separately)."""
+def test_put_locks_the_app_user_guard_row_before_reading_credentials(user):
+    """D6: every PUT locks the caller's app_user guard row FIRST, then reads
+    the active credential (no separate credential-row FOR UPDATE anymore --
+    the guard lock IS the serialization). Two concurrent PUTs for the same
+    user now serialize on THIS lock rather than racing an insert."""
     db = _CredentialDB()
     _override(user, db)
     resp = TestClient(app).put(
@@ -1704,10 +1772,17 @@ def test_put_select_issues_for_update_before_the_insert_or_update_branch(user):
         json={"provider": "openai", "api_key": "sk-abcdefgh", "model": "gpt-4o-mini"},
     )
     assert resp.status_code == 200
-    select_statement = db.statements[0]
-    compiled = _compiled(select_statement)
-    assert "FOR UPDATE" in compiled
-    assert f"user_llm_credential.user_id = '{user.id.hex}'" in compiled
+    guard_statement = db.statements[0]
+    compiled_guard = _compiled(guard_statement)
+    assert "FOR UPDATE" in compiled_guard
+    assert f"app_user.id = '{user.id.hex}'" in compiled_guard
+    assert db.guard_locks == [user.id.hex]
+
+    credential_select = db.statements[1]
+    compiled_credential = _compiled(credential_select)
+    assert "FOR UPDATE" not in compiled_credential
+    assert f"user_llm_credential.user_id = '{user.id.hex}'" in compiled_credential
+    assert "user_llm_credential.is_active" in compiled_credential
 
 
 def test_put_concurrent_first_save_falls_back_to_update_after_integrity_error(user):
@@ -1742,7 +1817,7 @@ def test_put_concurrent_first_save_falls_back_to_update_after_integrity_error(us
         # insert. What it exposes on the next read is whatever the OTHER
         # session already committed, which is this winner row.
         db.rows.pop(user.id.hex, None)
-        db.rows[user.id.hex] = winner_row
+        db.rows[user.id.hex] = [winner_row]
 
     db.commit = _commit_raises_once
     db.rollback = _rollback_reveals_the_winner
@@ -1830,7 +1905,7 @@ def test_put_two_user_isolation_never_touches_the_other_users_row():
     assert resp.status_code == 200
     assert row_b.provider == "gemini"
     assert row_b.model == "untouched"
-    assert db.rows[user_a.id.hex].provider == "openai"
+    assert db.rows[user_a.id.hex][0].provider == "openai"
 
 
 # ---------------------------------------------------------------------------
@@ -2006,7 +2081,7 @@ def test_test_delete_then_recreate_during_test_race_never_stamps_the_new_row(mon
         # DELETE + PUT lands mid-test: an entirely new row (new id) replaces
         # the old one, also starting at revision 1 -- revision alone
         # couldn't catch this ABA; the id predicate is what does.
-        db.rows[user.id.hex] = new_row
+        db.rows[user.id.hex] = [new_row]
         return True, None, 10
 
     monkeypatch.setattr(llm_settings, "test_credential", _slow_test)
@@ -2120,6 +2195,346 @@ def test_delete_two_user_isolation():
     assert resp.status_code == 204
     assert user_a.id.hex not in db.rows
     assert user_b.id.hex in db.rows
+
+
+def test_delete_kill_switch_removes_every_row_the_caller_owns_not_just_the_active_one(user):
+    """D4's widened blast radius: the singular DELETE is a kill switch over
+    ALL of the caller's credentials now, active or not -- a user with an
+    active row and an inactive spare loses both in one call."""
+    active = _make_row(user_id=user.id, name="default", is_active=True)
+    spare = _make_row(user_id=user.id, name="work", is_active=False)
+    db = _CredentialDB({user.id.hex: [active, spare]})
+    _override(user, db)
+    resp = TestClient(app).delete("/api/v1/settings/llm")
+    assert resp.status_code == 204
+    assert user.id.hex not in db.rows
+    assert db.commits == 1
+
+
+def test_delete_locks_the_app_user_guard_row_first(user):
+    row = _make_row(user_id=user.id)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    TestClient(app).delete("/api/v1/settings/llm")
+    assert db.guard_locks == [user.id.hex]
+    assert "FOR UPDATE" in _compiled(db.statements[0])
+    assert "FROM app_user" in _compiled(db.statements[0])
+
+
+# ---------------------------------------------------------------------------
+# GET/POST/activate/DELETE /settings/llm/credentials -- the multi-credential
+# surface (plan: 2026-08-19-multi-credential-llm-profiles, D5/D6/D8).
+# ---------------------------------------------------------------------------
+
+
+def test_credentials_list_returns_every_row_active_and_inactive(user):
+    active = _make_row(
+        user_id=user.id, name="default", is_active=True, provider="openai", model="gpt-4o-mini",
+    )
+    spare = _make_row(
+        user_id=user.id, name="work", is_active=False, provider="gemini", model="gemini-2.5-flash",
+    )
+    db = _CredentialDB({user.id.hex: [active, spare]})
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/credentials")
+    assert resp.status_code == 200
+    body = resp.json()
+    names = {item["name"] for item in body["items"]}
+    assert names == {"default", "work"}
+    active_item = next(item for item in body["items"] if item["name"] == "default")
+    assert active_item["active"] is True
+    assert active_item["provider"] == "openai"
+    assert active_item["key_suffix"] == active.api_key[-4:]
+    inactive_item = next(item for item in body["items"] if item["name"] == "work")
+    assert inactive_item["active"] is False
+
+
+def test_credentials_list_never_echoes_the_api_key(user):
+    secret = "sk-super-secret-key-9999"
+    row = _make_row(user_id=user.id, api_key=secret)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/credentials")
+    assert secret not in resp.text
+
+
+def test_credentials_list_empty_state_is_200_with_empty_items(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/credentials")
+    assert resp.status_code == 200
+    assert resp.json() == {"items": []}
+
+
+def test_credentials_list_two_user_isolation(user):
+    user_a = user
+    user_b = MagicMock(id=uuid4())
+    row_a = _make_row(user_id=user_a.id, name="a-cred")
+    row_b = _make_row(user_id=user_b.id, name="b-cred")
+    db = _CredentialDB({user_a.id.hex: row_a, user_b.id.hex: row_b})
+    _override(user_a, db)
+    resp = TestClient(app).get("/api/v1/settings/llm/credentials")
+    names = {item["name"] for item in resp.json()["items"]}
+    assert names == {"a-cred"}
+
+
+def test_get_singular_returns_the_active_row_when_two_exist(monkeypatch, user):
+    """Pins the filter's presence, not just the happy path: this would have
+    raised (MultipleResultsFound) before is_active was added to GET's
+    WHERE clause."""
+    active = _make_row(user_id=user.id, name="default", is_active=True, provider="openai")
+    inactive = _make_row(user_id=user.id, name="spare", is_active=False, provider="gemini")
+    db = _CredentialDB({user.id.hex: [active, inactive]})
+    _override(user, db)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=True, source="user"),
+    )
+    resp = TestClient(app).get("/api/v1/settings/llm")
+    assert resp.status_code == 200
+    assert resp.json()["provider"] == "openai"
+
+
+def test_get_singular_statement_filters_on_is_active(monkeypatch, user):
+    db = _CredentialDB()
+    _override(user, db)
+    monkeypatch.setattr(
+        llm_settings, "resolve_extraction_credential",
+        lambda db_, uid: _resolved(stored=False),
+    )
+    TestClient(app).get("/api/v1/settings/llm")
+    compiled = _compiled(db.statements[0])
+    assert "user_llm_credential.is_active" in compiled
+
+
+def test_put_create_names_the_first_credential_default_and_active(user):
+    """The singular API never asks for a name -- PUT's create branch always
+    names the row "default", matching the migration backfill's choice, and
+    marks it active (today's behavior, unaffected by the multi-credential
+    surface)."""
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": "sk-abcdefgh", "model": "gpt-4o-mini"},
+    )
+    assert resp.status_code == 200
+    created = db.added[0]
+    assert created.name == "default"
+    assert created.is_active is True
+
+
+def test_create_credential_first_one_is_active(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).post(
+        "/api/v1/settings/llm/credentials",
+        json={"name": "work", "provider": "openai", "api_key": "sk-abcdefgh", "model": "m"},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["name"] == "work"
+    assert body["active"] is True
+    assert body["provider"] == "openai"
+    assert body["key_suffix"] == "efgh"
+    assert db.added[0].is_active is True
+
+
+def test_create_credential_second_one_starts_inactive(user):
+    existing = _make_row(user_id=user.id, name="default", is_active=True)
+    db = _CredentialDB({user.id.hex: existing})
+    _override(user, db)
+    resp = TestClient(app).post(
+        "/api/v1/settings/llm/credentials",
+        json={"name": "backup", "provider": "gemini", "api_key": "sk-abcdefgh", "model": "m"},
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["active"] is False
+    assert existing.is_active is True  # untouched -- create never switches
+
+
+def test_create_credential_never_echoes_the_api_key(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).post(
+        "/api/v1/settings/llm/credentials",
+        json={"name": "work", "provider": "openai", "api_key": "sk-secret-1234", "model": "m"},
+    )
+    assert "sk-secret-1234" not in resp.text
+
+
+def test_create_credential_requires_api_key(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).post(
+        "/api/v1/settings/llm/credentials",
+        json={"name": "work", "provider": "openai", "model": "m"},
+    )
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "api_key must be a string"}
+    assert db.added == []
+
+
+@pytest.mark.parametrize("bad_name", ["", "   ", "n" * 61], ids=["empty", "whitespace", "over-long"])
+def test_create_credential_name_length_out_of_bounds_is_422(user, bad_name):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).post(
+        "/api/v1/settings/llm/credentials",
+        json={"name": bad_name, "provider": "openai", "api_key": "sk-abcdefgh", "model": "m"},
+    )
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "name length out of bounds"}
+
+
+def test_create_credential_non_string_name_is_422(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).post(
+        "/api/v1/settings/llm/credentials",
+        json={"name": ["work"], "provider": "openai", "api_key": "sk-abcdefgh", "model": "m"},
+    )
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "name must be a string"}
+
+
+def test_create_credential_duplicate_name_is_422(user):
+    existing = _make_row(user_id=user.id, name="work")
+    db = _CredentialDB({user.id.hex: existing})
+    _override(user, db)
+    resp = TestClient(app).post(
+        "/api/v1/settings/llm/credentials",
+        json={"name": "work", "provider": "gemini", "api_key": "sk-abcdefgh", "model": "m"},
+    )
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "a credential with this name already exists"}
+    assert db.added == []
+
+
+def test_create_credential_sixth_is_422_cap_reached(user):
+    rows = [
+        _make_row(user_id=user.id, name=f"cred-{i}", is_active=(i == 0))
+        for i in range(5)
+    ]
+    db = _CredentialDB({user.id.hex: rows})
+    _override(user, db)
+    resp = TestClient(app).post(
+        "/api/v1/settings/llm/credentials",
+        json={"name": "one-too-many", "provider": "openai", "api_key": "sk-abcdefgh", "model": "m"},
+    )
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "credential limit reached"}
+    assert db.added == []
+
+
+def test_create_credential_locks_the_app_user_guard_row_before_the_cap_check(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).post(
+        "/api/v1/settings/llm/credentials",
+        json={"name": "work", "provider": "openai", "api_key": "sk-abcdefgh", "model": "m"},
+    )
+    assert resp.status_code == 201
+    assert db.guard_locks == [user.id.hex]
+
+
+def test_activate_credential_switches_active_row_with_flush_between(user):
+    old_active = _make_row(user_id=user.id, name="default", is_active=True)
+    target = _make_row(user_id=user.id, name="work", is_active=False)
+    db = _CredentialDB({user.id.hex: [old_active, target]})
+    _override(user, db)
+    resp = TestClient(app).post(f"/api/v1/settings/llm/credentials/{target.id}/activate")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "work"
+    assert body["active"] is True
+    assert old_active.is_active is False
+    assert target.is_active is True
+    # D6's forced flush order: the old row's flip to false must be flushed
+    # BEFORE the target flips true, or the partial unique index would
+    # reject the switch in real Postgres.
+    assert db.flushes == 1
+    assert db.commits == 1
+
+
+def test_activate_credential_already_active_is_a_no_op_200(user):
+    target = _make_row(user_id=user.id, name="default", is_active=True)
+    db = _CredentialDB({user.id.hex: target})
+    _override(user, db)
+    resp = TestClient(app).post(f"/api/v1/settings/llm/credentials/{target.id}/activate")
+    assert resp.status_code == 200
+    assert resp.json()["active"] is True
+    assert db.flushes == 0  # nothing to flip
+
+
+def test_activate_credential_404_when_not_the_callers(user):
+    other_user_row = _make_row(user_id=uuid4(), name="not-mine")
+    db = _CredentialDB({other_user_row.user_id.hex: other_user_row})
+    _override(user, db)
+    resp = TestClient(app).post(f"/api/v1/settings/llm/credentials/{other_user_row.id}/activate")
+    assert resp.status_code == 404
+
+
+def test_activate_credential_404_when_id_does_not_exist(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).post(f"/api/v1/settings/llm/credentials/{uuid4()}/activate")
+    assert resp.status_code == 404
+
+
+def test_activate_credential_locks_the_app_user_guard_row_first(user):
+    target = _make_row(user_id=user.id, name="default", is_active=True)
+    db = _CredentialDB({user.id.hex: target})
+    _override(user, db)
+    TestClient(app).post(f"/api/v1/settings/llm/credentials/{target.id}/activate")
+    assert db.guard_locks == [user.id.hex]
+
+
+def test_delete_credential_by_id_removes_a_non_active_row(user):
+    active = _make_row(user_id=user.id, name="default", is_active=True)
+    spare = _make_row(user_id=user.id, name="spare", is_active=False)
+    db = _CredentialDB({user.id.hex: [active, spare]})
+    _override(user, db)
+    resp = TestClient(app).delete(f"/api/v1/settings/llm/credentials/{spare.id}")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "deleted"}
+    assert db.rows[user.id.hex] == [active]
+
+
+def test_delete_credential_by_id_409s_for_the_active_row(user):
+    active = _make_row(user_id=user.id, name="default", is_active=True)
+    db = _CredentialDB({user.id.hex: active})
+    _override(user, db)
+    resp = TestClient(app).delete(f"/api/v1/settings/llm/credentials/{active.id}")
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": "cannot delete the active credential"}
+    assert db.rows[user.id.hex] == [active]  # untouched, still present
+    assert db.deleted == []
+
+
+def test_delete_credential_by_id_404_when_not_the_callers(user):
+    other_user_row = _make_row(user_id=uuid4(), name="not-mine")
+    db = _CredentialDB({other_user_row.user_id.hex: other_user_row})
+    _override(user, db)
+    resp = TestClient(app).delete(f"/api/v1/settings/llm/credentials/{other_user_row.id}")
+    assert resp.status_code == 404
+
+
+def test_delete_credential_by_id_404_when_id_does_not_exist(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).delete(f"/api/v1/settings/llm/credentials/{uuid4()}")
+    assert resp.status_code == 404
+
+
+def test_delete_credential_by_id_locks_the_app_user_guard_row_first(user):
+    spare = _make_row(user_id=user.id, name="spare", is_active=False)
+    active = _make_row(user_id=user.id, name="default", is_active=True)
+    db = _CredentialDB({user.id.hex: [active, spare]})
+    _override(user, db)
+    TestClient(app).delete(f"/api/v1/settings/llm/credentials/{spare.id}")
+    assert db.guard_locks == [user.id.hex]
 
 
 # ---------------------------------------------------------------------------
