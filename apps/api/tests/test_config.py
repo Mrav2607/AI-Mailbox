@@ -119,7 +119,7 @@ def test_scheduling_can_still_be_disabled_with_zero():
 
 
 # ---------------------------------------------------------------------------
-# CLASSIFIER_BACKEND normalization/legacy-mapping/rejection (plan:
+# CLASSIFIER_BACKEND normalization/rejection (plan:
 # 2026-08-16-classifier-default-honesty §3).
 #
 # Constructs real `Settings` objects rather than monkeypatching the
@@ -135,22 +135,19 @@ def test_classifier_backend_defaults_to_auto():
 
 
 @pytest.mark.parametrize(
-    "raw, expected",
-    [
-        ("local", "auto"),
-        ("gemini", "llm"),
-        ("LOCAL", "auto"),
-        ("Gemini", "llm"),
-    ],
-    ids=["local-to-auto", "gemini-to-llm", "uppercase-local", "mixed-case-gemini"],
+    "raw",
+    ["local", "gemini", "LOCAL", "Gemini", " Local "],
+    ids=["local", "gemini", "uppercase-local", "mixed-case-gemini", "padded-local"],
 )
-def test_classifier_backend_maps_legacy_spellings(raw, expected):
-    # Behaviour-preserving renames (plan §2/§3). The docs moved to `auto` in
-    # this branch, but every .env already copied from them says `local`, and
-    # those deployments have to keep booting -- not just keep classifying
-    # correctly.
-    s = Settings(_env_file=None, CLASSIFIER_BACKEND=raw)
-    assert s.classifier_backend == expected
+def test_classifier_backend_rejects_removed_legacy_aliases(raw):
+    # `local`/`gemini` used to map onto `auto`/`llm` with a startup warning
+    # (plan §2/§3), but that deprecation window is over -- they're just
+    # unrecognized values now, same as any other typo.
+    with pytest.raises(ValidationError, match="CLASSIFIER_BACKEND") as exc_info:
+        Settings(_env_file=None, CLASSIFIER_BACKEND=raw)
+    message = str(exc_info.value)
+    assert "alias" not in message.lower()
+    assert "auto, heuristic, llm" in message
 
 
 def test_classifier_backend_blank_defaults_to_auto():
@@ -172,13 +169,6 @@ def test_classifier_backend_whitespace_only_defaults_to_auto(raw):
     # Same fallback a truly blank value gets -- whitespace-only is blank as
     # far as an operator is concerned, so it must not raise.
     s = Settings(_env_file=None, CLASSIFIER_BACKEND=raw)
-    assert s.classifier_backend == "auto"
-
-
-def test_classifier_backend_strips_before_mapping_a_legacy_alias():
-    # The strip has to happen before the alias lookup, not after, or a padded
-    # legacy value misses the map and falls through to the reject branch.
-    s = Settings(_env_file=None, CLASSIFIER_BACKEND=" local ")
     assert s.classifier_backend == "auto"
 
 

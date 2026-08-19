@@ -212,9 +212,9 @@ def test_get_unconfigured_returns_nulls_and_flags(monkeypatch, user):
     monkeypatch.setattr(settings, "action_extraction_enabled", True)
     monkeypatch.setattr(settings, "llm_custom_endpoints_enabled", False)
     monkeypatch.setattr(settings, "llm_private_endpoints_enabled", False)
-    # "auto" is the canonical global default (plan §2/§3; "local" is now a
-    # deprecated alias for the same value) -- this only needs a non-heuristic
-    # backend, so any value in that bucket proves the same thing.
+    # "auto" is the canonical global default (plan §2/§3) -- this only needs
+    # a non-heuristic backend, so any value in that bucket proves the same
+    # thing.
     monkeypatch.setattr(settings, "classifier_backend", "auto")
     monkeypatch.setattr(
         llm_settings, "resolve_extraction_credential",
@@ -501,14 +501,11 @@ def test_get_classifier_backend_fields_use_the_normalized_expression(
 ):
     # Must be the SAME normalization `classify()` applies -- comparing the
     # raw config string would misreport an uppercase or empty value. This is
-    # deliberately NOT the place that covers "gemini"/"local" input any more
-    # (plan §3): `Settings`' own validator maps both to their canonical
-    # spelling AT CONSTRUCTION, so `settings.classifier_backend` can never
-    # observably BE "gemini" once a real app has booted -- see
-    # test_get_classifier_backend_field_reflects_the_legacy_mapping below,
-    # which builds a real `Settings` object to prove that, rather than
-    # monkeypatching this singleton's attribute directly (which bypasses the
-    # validator and would prove the mapping runs when it doesn't).
+    # deliberately NOT the place that covers "gemini"/"local" input (plan
+    # §3): those spellings are rejected outright at `Settings` construction
+    # now, so `settings.classifier_backend` can never observably BE "gemini"
+    # once a real app has booted -- see test_config.py's rejection tests for
+    # that.
     db = _CredentialDB()
     _override(user, db)
     monkeypatch.setattr(settings, "classifier_backend", raw_backend)
@@ -520,37 +517,6 @@ def test_get_classifier_backend_fields_use_the_normalized_expression(
     body = resp.json()
     assert body["classifier_backend"] == expected_backend
     assert body["classifier_uses_llm"] is expected_uses_llm
-
-
-@pytest.mark.parametrize(
-    "legacy_value, mapped_value",
-    [("gemini", "llm"), ("local", "auto")],
-    ids=["gemini-to-llm", "local-to-auto"],
-)
-def test_get_classifier_backend_field_reflects_the_legacy_mapping(
-    monkeypatch, user, legacy_value, mapped_value,
-):
-    """§3: both legacy globals change what GET /settings/llm reports, because
-    the mapping happens once at `Settings` construction and this endpoint
-    just echoes `settings.classifier_backend` -- a real deployment that sets
-    CLASSIFIER_BACKEND=gemini (or =local) will show "llm" (or "auto") here,
-    never the raw legacy spelling. Builds a real `Settings` object (like
-    test_config.py) rather than monkeypatching a raw string directly, so
-    this actually exercises the mapping instead of assuming it."""
-    from app.core.config import Settings
-
-    mapped_settings = Settings(_env_file=None, CLASSIFIER_BACKEND=legacy_value)
-    assert mapped_settings.classifier_backend == mapped_value
-
-    db = _CredentialDB()
-    _override(user, db)
-    monkeypatch.setattr(settings, "classifier_backend", mapped_settings.classifier_backend)
-    monkeypatch.setattr(
-        llm_settings, "resolve_extraction_credential",
-        lambda db_, uid: _resolved(stored=False),
-    )
-    resp = TestClient(app).get("/api/v1/settings/llm")
-    assert resp.json()["classifier_backend"] == mapped_value
 
 
 # ---------------------------------------------------------------------------

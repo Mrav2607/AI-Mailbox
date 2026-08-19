@@ -340,8 +340,8 @@ def test_run_backfill_threads_the_caller_supplied_policy_to_classify_with_usage(
 
 def test_run_backfill_default_backend_reports_zero_llm_attempted_and_fell_back(monkeypatch):
     """The predicate trap the plan calls out by name (first test to write):
-    a CLASSIFIER_BACKEND=auto backfill (the global default; "local" is now a
-    deprecated alias for the same value, plan §2/§3) must report
+    a CLASSIFIER_BACKEND=auto backfill (the global default; "local" was
+    renamed to it, plan §2/§3) must report
     fell_back=0 AND llm_attempted=0 -- a naive implementation gating on
     routing.mode=="user" would report this as 100% degraded even though no
     LLM was ever consulted."""
