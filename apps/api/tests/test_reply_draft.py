@@ -77,6 +77,60 @@ def test_build_thread_context_falls_back_to_snippet_when_no_body():
     assert "short preview" in context
 
 
+def test_generate_reply_draft_anthropic_wire_round_trip_zero_consumer_edits(monkeypatch):
+    """The whole point of the Anthropic wire branch (plan: 2026-08-19 native-
+    anthropic-byok-plan.md): reply_draft.py needs ZERO edits to consume it.
+    Drives the REAL call_chat_completion through a fake Anthropic Messages
+    API transport (httpx.MockTransport) -- not reply_draft.call_chat_completion
+    mocked away -- so llm_client.py's tool-use re-serialization is what
+    reply_draft._parse_draft actually parses, exactly like it would an
+    OpenAI-shaped reply."""
+    import httpx
+
+    from app.services.nlp import llm_client as llm_client_module
+
+    anthropic_payload = {
+        "stop_reason": "tool_use",
+        "content": [
+            {
+                "type": "tool_use",
+                "name": "emit_json",
+                "input": {"draft_text": "Sounds great, see you then."},
+            }
+        ],
+        "usage": {"input_tokens": 30, "output_tokens": 10},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.anthropic.com/v1/messages"
+        assert request.headers["x-api-key"] == "sk-ant-key"
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json=anthropic_payload)
+
+    real_client_cls = httpx.Client
+
+    class _MockedClient(real_client_cls):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("transport", httpx.MockTransport(handler))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(llm_client_module.httpx, "Client", _MockedClient)
+
+    credential = LlmCredential(
+        provider="anthropic",
+        base_url="https://api.anthropic.com/v1",
+        api_key="sk-ant-key",
+        model="claude-haiku-4-5",
+    )
+    attempt = reply_draft.generate_reply_draft(
+        credential=credential, subject="Lunch", messages=[_message()]
+    )
+
+    assert attempt.draft_text == "Sounds great, see you then."
+    assert attempt.provider_call_succeeded is True
+    assert attempt.usage == LlmUsage(prompt_tokens=30, completion_tokens=10, total_tokens=None)
+
+
 def test_generate_reply_draft_success(monkeypatch):
     call_result = LlmCallResult(
         content=json.dumps({"draft_text": "Sounds great, see you then."}),

@@ -75,14 +75,15 @@ class CallContext:
 
 
 PROVIDER_PRESETS: dict[str, str] = {
-    # provider key -> pinned base_url (production OpenAI-compatible surface).
-    # anthropic is deliberately ABSENT: its compat layer is documented as
-    # testing-only and ignores response_format -- native support is deferred.
+    # provider key -> pinned base_url. Every entry here is OpenAI-compatible
+    # EXCEPT anthropic, which llm_client.py dispatches to its own native
+    # Messages API wire shape -- see that module's Anthropic branch.
     "openai": "https://api.openai.com/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
     "openrouter": "https://openrouter.ai/api/v1",
     "groq": "https://api.groq.com/openai/v1",
     "mistral": "https://api.mistral.ai/v1",
+    "anthropic": "https://api.anthropic.com/v1",
 }
 
 

@@ -32,7 +32,7 @@ class UserLlmCredential(Base):
         # Exactly one credential per user -- multi-credential profiles are deferred.
         UniqueConstraint("user_id", name="uq_llm_credential_user"),
         CheckConstraint(
-            "provider IN ('openai', 'gemini', 'openrouter', 'groq', 'mistral', 'custom')",
+            "provider IN ('openai', 'gemini', 'openrouter', 'groq', 'mistral', 'anthropic', 'custom')",
             name="ck_llm_credential_provider",
         ),
     )
