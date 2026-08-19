@@ -298,7 +298,7 @@ key, and name a model. The key is encrypted at rest and never sent back to the
 browser — only its last 4 characters are shown. **Test** makes one real call
 so a bad key fails here instead of silently later.
 
-Supported providers, all through the OpenAI-compatible chat API:
+Supported providers:
 
 | Provider | Example model |
 |---|---|
@@ -307,13 +307,13 @@ Supported providers, all through the OpenAI-compatible chat API:
 | OpenRouter | `openai/gpt-4o-mini` |
 | Groq | `llama-3.3-70b-versatile` |
 | Mistral | `mistral-small-latest` |
+| Anthropic | `claude-haiku-4-5` |
 
-Anthropic is not in this list on purpose. Its OpenAI-compatible endpoint
-accepts the request but ignores the JSON response format this feature relies
-on, so replies aren't guaranteed to be machine-readable. Nothing bad gets
-stored — the parser rejects anything malformed — but the calls would be paid
-for and thrown away, which reads like flaky extraction. Native support is a
-possible follow-up.
+Every provider speaks the OpenAI-compatible chat API except Anthropic, which
+runs on its own native Messages API under the hood — that's what guarantees
+its replies come back structured (its OpenAI-compat shim ignores the JSON
+response format this feature relies on). Custom endpoints are still
+OpenAI-shaped only.
 
 #### Using your key for sorting too
 

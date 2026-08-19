@@ -893,6 +893,7 @@ const PRESET_BASE_URLS: Partial<Record<LlmProvider, string>> = {
   openrouter: "https://openrouter.ai/api/v1",
   groq: "https://api.groq.com/openai/v1",
   mistral: "https://api.mistral.ai/v1",
+  anthropic: "https://api.anthropic.com/v1",
 };
 
 // Demo mode starts CONFIGURED so preview shows a live settings state instead

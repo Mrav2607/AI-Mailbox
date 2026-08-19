@@ -500,6 +500,57 @@ describe("SettingsDialog ai tab classifier-mix summary forward compatibility", (
   });
 });
 
+describe("SettingsDialog ai tab provider picker", () => {
+  it("offers Anthropic alongside the other presets", async () => {
+    await act(async () => {
+      root.render(<Harness initialTab="ai" settings={makeSettings()} usage={makeUsage()} />);
+      await Promise.resolve();
+    });
+    const select = document.body.querySelector("select")!;
+    const optionLabels = Array.from(select.querySelectorAll("option")).map((o) =>
+      o.textContent?.trim(),
+    );
+    expect(optionLabels).toContain("Anthropic");
+  });
+});
+
+describe("SettingsDialog usage tab dashboard links", () => {
+  it("links Anthropic's usage dashboard when it shows up in the by-provider breakdown", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="usage"
+          settings={makeSettings({ provider: "anthropic" })}
+          usage={makeUsage({
+            totals: {
+              calls: 4,
+              calls_with_total_tokens: 4,
+              prompt_tokens: 400,
+              completion_tokens: 100,
+              total_tokens: 500,
+            },
+            by_provider: [
+              {
+                provider: "anthropic",
+                calls: 4,
+                calls_with_total_tokens: 4,
+                prompt_tokens: 400,
+                completion_tokens: 100,
+                total_tokens: 500,
+              },
+            ],
+          })}
+        />,
+      );
+      await Promise.resolve();
+    });
+    const link = Array.from(document.body.querySelectorAll("a")).find((a) =>
+      a.textContent?.includes("Anthropic"),
+    );
+    expect(link?.getAttribute("href")).toBe("https://console.anthropic.com/settings/usage");
+  });
+});
+
 describe("SettingsDialog focus on open", () => {
   it("focuses the active tab button, not the first tabbable element", async () => {
     await act(async () => {

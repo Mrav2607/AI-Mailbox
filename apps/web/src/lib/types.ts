@@ -291,14 +291,15 @@ export interface User {
 }
 
 // BYOK LLM providers, mirroring PROVIDER_PRESETS in the API's providers.py
-// plus "custom". Anthropic is deliberately absent -- its OpenAI-compat layer
-// ignores response_format, so it's not offered as an extraction backend.
+// plus "custom". Anthropic runs on its native Messages API server-side,
+// not the OpenAI-compat shim the other presets share.
 export type LlmProvider =
   | "openai"
   | "gemini"
   | "openrouter"
   | "groq"
   | "mistral"
+  | "anthropic"
   | "custom";
 
 // Mirrors LlmSettingsOut (GET/PUT /settings/llm). Unconfigured

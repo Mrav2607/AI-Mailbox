@@ -80,6 +80,7 @@ const MODEL_PLACEHOLDERS: Record<LlmProvider, string> = {
   openrouter: "e.g. openai/gpt-4o-mini",
   groq: "e.g. llama-3.3-70b-versatile",
   mistral: "e.g. mistral-small-latest",
+  anthropic: "e.g. claude-haiku-4-5",
   custom: "the model name your endpoint expects",
 };
 
@@ -89,6 +90,7 @@ const PRESET_PROVIDERS: LlmProvider[] = [
   "openrouter",
   "groq",
   "mistral",
+  "anthropic",
 ];
 
 // Maps the /test route's fixed category constants -- never a raw exception
