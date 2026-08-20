@@ -164,6 +164,7 @@ function Harness({
   onDeleteCredential = vi.fn(),
   deletingCredentialId = null,
   credentialDeleteError = null,
+  credentialsError = false,
 }: {
   initialTab?: SettingsTab;
   connections?: Connection[];
@@ -202,6 +203,7 @@ function Harness({
   onDeleteCredential?: (id: string) => void;
   deletingCredentialId?: string | null;
   credentialDeleteError?: { id: string; message: string } | null;
+  credentialsError?: boolean;
 }) {
   const [open, setOpen] = useState(true);
   const [tab, setTab] = useState<SettingsTab>(initialTab);
@@ -239,6 +241,7 @@ function Harness({
       onDeleteCredential={onDeleteCredential}
       deletingCredentialId={deletingCredentialId}
       credentialDeleteError={credentialDeleteError}
+      credentialsError={credentialsError}
       usage={usage}
       usageError={usageError}
       days={30}
@@ -545,6 +548,21 @@ describe("SettingsDialog ai tab heuristic-backend notice", () => {
 });
 
 describe("SettingsDialog ai tab multi-credential list", () => {
+  it("shows an inline error when the credential list fetch failed", async () => {
+    await act(async () => {
+      root.render(
+        <Harness
+          initialTab="ai"
+          settings={makeSettings()}
+          usage={makeUsage()}
+          credentialsError={true}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("could not load your credential list");
+  });
+
   it("does not render the credential list for a single credential -- no clutter for the common case", async () => {
     await act(async () => {
       root.render(

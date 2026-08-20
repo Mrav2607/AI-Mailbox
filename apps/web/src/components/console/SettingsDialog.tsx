@@ -228,6 +228,7 @@ export interface SettingsDialogProps {
   onDeleteCredential: LlmSettingsSectionProps["onDeleteCredential"];
   deletingCredentialId: LlmSettingsSectionProps["deletingCredentialId"];
   credentialDeleteError: LlmSettingsSectionProps["credentialDeleteError"];
+  credentialsError: LlmSettingsSectionProps["credentialsError"];
 
   // usage tab -- same field names LlmUsageSection takes. `usage`/`usageError`
   // double as the ai tab's one-line usage summary, same as the field names
@@ -289,6 +290,7 @@ export function SettingsDialog({
   onDeleteCredential,
   deletingCredentialId,
   credentialDeleteError,
+  credentialsError,
   usage,
   usageError,
   days,
@@ -377,6 +379,7 @@ export function SettingsDialog({
               heuristicNoticeDismissed={heuristicNoticeDismissed}
               onDismissHeuristicNotice={onDismissHeuristicNotice}
               credentials={credentials}
+              credentialsError={credentialsError}
               onCreateCredential={onCreateCredential}
               creatingCredential={creatingCredential}
               onActivateCredential={onActivateCredential}

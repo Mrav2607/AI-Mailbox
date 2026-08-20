@@ -84,6 +84,9 @@ export interface LlmSettingsSectionProps {
   // render site for why a single (or zero) credential renders the plain
   // form unchanged from before this plan, no list clutter.
   credentials: LlmCredentialSummary[] | null;
+  // True when the credential list fetch itself failed -- the list may be
+  // stale or missing, which is different from "no credentials".
+  credentialsError: boolean;
   onCreateCredential: (input: {
     name: string;
     provider: LlmProvider;
@@ -238,6 +241,7 @@ export function LlmSettingsSection({
   heuristicNoticeDismissed,
   onDismissHeuristicNotice,
   credentials,
+  credentialsError,
   onCreateCredential,
   creatingCredential,
   onActivateCredential,
@@ -385,6 +389,13 @@ export function LlmSettingsSection({
         save your own API key and CortexMail uses it to pull deadlines and
         to-dos out of your mail.
       </p>
+
+      {credentialsError && (
+        <p className="text-[11px] font-mono text-destructive">
+          could not load your credential list — close and reopen settings to
+          retry.
+        </p>
+      )}
 
       {/* Credential list (2026-08-19-multi-credential-llm-profiles plan) --
           only shown once there are 2+ credentials to choose between, so a
@@ -728,7 +739,7 @@ export function LlmSettingsSection({
           <div className="flex items-center gap-2 pt-1">
             <button
               type="submit"
-              disabled={saving || modelBlank || baseUrlBlank}
+              disabled={saving || structuralActionInFlight || modelBlank || baseUrlBlank}
               className="h-7 px-3 rounded border border-primary/50 bg-primary/15 hover:bg-primary/25 text-primary-tint-foreground text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
               {saving ? "saving…" : "save"}
@@ -736,7 +747,9 @@ export function LlmSettingsSection({
             <button
               type="button"
               onClick={onTest}
-              disabled={!settings.configured || testing || saving || removing}
+              disabled={
+                !settings.configured || testing || saving || removing || structuralActionInFlight
+              }
               className="h-7 px-3 rounded border border-border bg-[var(--color-panel-hi)] hover:bg-accent text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
             >
               {testing ? "testing…" : "test"}
@@ -745,7 +758,10 @@ export function LlmSettingsSection({
               <button
                 type="button"
                 onClick={onRemove}
-                disabled={removing}
+                // The singular flow's own flags don't cover a pending
+                // activate/delete on the list above -- a remove racing
+                // those is the same hazard the per-row controls guard.
+                disabled={removing || structuralActionInFlight}
                 className="ml-auto h-7 px-3 rounded border border-destructive/40 text-destructive hover:bg-destructive/10 text-[12px] font-mono cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-default"
               >
                 {removing ? "removing…" : "remove"}

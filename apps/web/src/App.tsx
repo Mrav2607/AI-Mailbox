@@ -751,6 +751,7 @@ export default function Console() {
     classifierMixError,
     llmUsageDays,
     llmCredentials,
+    llmCredentialsError,
     llmCreatingCredential,
     llmActivatingCredentialId,
     llmDeletingCredentialId,
@@ -3842,6 +3843,7 @@ export default function Console() {
             setClassifierHeuristicNoticeVersion(CLASSIFIER_HEURISTIC_NOTICE_VERSION)
           }
           credentials={llmCredentials}
+          credentialsError={llmCredentialsError}
           onCreateCredential={doCreateLlmCredential}
           creatingCredential={llmCreatingCredential}
           onActivateCredential={doActivateLlmCredential}
