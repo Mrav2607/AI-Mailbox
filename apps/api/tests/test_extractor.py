@@ -180,12 +180,16 @@ def test_extract_action_date_only_resolves_to_end_of_day_utc(monkeypatch):
     assert result.due_at == datetime(2024, 3, 15, 23, 59, 59, tzinfo=timezone.utc)
 
 
-def test_extract_action_prompt_includes_received_at(monkeypatch):
+def test_extract_action_user_content_includes_received_at(monkeypatch):
+    """D7 (extraction-cost-hardening): received_at moved out of the prompt
+    and into the per-message user_content (a Received: header line) so the
+    instruction block stays byte-identical across calls."""
     calls = []
     monkeypatch.setattr(extractor, "call_chat_completion", _stub_returns(json.dumps(VALID_PAYLOAD), calls=calls))
     received_at = datetime(2024, 3, 10, 12, 0, 0, tzinfo=timezone.utc)
     extract_action(**_default_kwargs(received_at=received_at))
-    assert received_at.isoformat() in calls[0]["prompt"]
+    assert received_at.isoformat() in calls[0]["user_content"]
+    assert received_at.isoformat() not in calls[0]["prompt"]
 
 
 def test_extract_action_model_version_attribution(monkeypatch):

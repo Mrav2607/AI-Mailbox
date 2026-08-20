@@ -111,13 +111,29 @@ class ExtractionAttempt:
 
 
 def _build_message_text(
-    subject: str | None, sender: str | None, snippet: str | None, body_text: str | None
+    subject: str | None,
+    sender: str | None,
+    snippet: str | None,
+    body_text: str | None,
+    received_at: datetime | None,
 ) -> str:
-    """Assemble the email text handed to the model alongside the prompt."""
+    """
+    Assemble the email text handed to the model alongside the prompt.
+
+    Carries the `Received:` header line (D7: prompt-caching hygiene) --
+    the instruction block in `_EXTRACTION_PROMPT` is now byte-identical
+    across every call, so only this per-message text varies.
+    """
+    received_at_str = (
+        received_at.astimezone(timezone.utc).isoformat()
+        if received_at is not None
+        else "unknown"
+    )
     return "\n".join(
         [
             f"From: {sender or '(unknown)'}",
             f"Subject: {subject or '(no subject)'}",
+            f"Received: {received_at_str}",
             "",
             snippet or "",
             body_text or "",
@@ -125,46 +141,39 @@ def _build_message_text(
     ).strip()
 
 
-def _build_prompt(received_at: datetime | None) -> str:
-    # received_at anchors relative deadlines ("by Friday", "end of week") --
-    # without it the model would have to guess "today", and guessing a date
-    # it can't see is exactly the invented-deadline failure mode this
-    # feature exists to avoid.
-    received_at_str = (
-        received_at.astimezone(timezone.utc).isoformat()
-        if received_at is not None
-        else "unknown"
-    )
-    return (
-        "You read one email already flagged as needing a reply or a "
-        "concrete action from the RECIPIENT, and extract the single "
-        "underlying obligation as structured JSON.\n\n"
-        f"The message's received_at (ISO 8601 UTC) is: {received_at_str}. "
-        "Resolve any relative deadline ('by Friday', 'end of week', 'in 3 "
-        "days') against this timestamp -- never against today's date.\n\n"
-        "Rules:\n"
-        "- has_action: false if there is actually no concrete task -- a "
-        "marketing CTA, an optional/automated 'confirm'/'renew'/'verify', "
-        "or informational text with nothing for the recipient to DO. Same "
-        "boundary discipline as classification: when unsure, false.\n"
-        "- kind: one of reply, payment, signature, form, rsvp, deadline, "
-        "other -- pick the closest match.\n"
-        "- title: imperative and concrete (e.g. 'Pay invoice #429'), at "
-        f"most {_TITLE_MAX_LEN} characters.\n"
-        "- due_at: the resolved deadline as an ISO 8601 UTC timestamp, or "
-        "null if no deadline is stated or clearly implied. NEVER invent a "
-        "date that isn't in the text.\n"
-        "- due_is_date_only: true if only a calendar date was given with "
-        "no time of day -- in that case set due_at to 23:59:59 UTC of that "
-        "date.\n"
-        "- due_raw: the deadline phrase as written in the email (e.g. 'by "
-        "end of week'), or null.\n"
-        "- amount / currency: a stated monetary amount and its currency "
-        "code, or null for both. NEVER invent an amount.\n"
-        "- confidence: 0-1, how confident you are in this extraction.\n\n"
-        "Return JSON only with keys: has_action, kind, title, due_at, "
-        "due_is_date_only, due_raw, amount, currency, confidence."
-    )
+# D7 (2026-08-19-extraction-cost-hardening): a plain module constant, not a
+# function -- received_at used to make this a per-call string, but it now
+# lives in the message text (_build_message_text) instead, so the
+# instruction block is the same bytes on every call and can be cached.
+# received_at still anchors relative deadlines ("by Friday", "end of
+# week") -- without it the model would have to guess "today", and guessing
+# a date it can't see is exactly the invented-deadline failure mode this
+# feature exists to avoid.
+_EXTRACTION_PROMPT = (
+    "You read one email already flagged as needing a reply or a concrete "
+    "action from the RECIPIENT and extract the single underlying "
+    "obligation as JSON. Resolve relative deadlines ('by Friday', 'end of "
+    "week', 'in 3 days') against the email's Received: line, never "
+    "today's date.\n\n"
+    "Rules:\n"
+    "- has_action: false for a marketing CTA, an optional/automated "
+    "'confirm'/'renew'/'verify', or text with nothing for the recipient "
+    "to DO. Unsure -> false.\n"
+    "- kind: reply, payment, signature, form, rsvp, deadline, or other -- "
+    "closest match.\n"
+    "- title: imperative, concrete (e.g. 'Pay invoice #429'), max "
+    f"{_TITLE_MAX_LEN} chars.\n"
+    "- due_at: resolved deadline as ISO 8601 UTC, or null if none stated "
+    "or clearly implied. Never invent a date.\n"
+    "- due_is_date_only: true if only a date was given, no time -- then "
+    "set due_at to 23:59:59 UTC of that date.\n"
+    "- due_raw: the deadline phrase as written, or null.\n"
+    "- amount / currency: a stated amount and its currency code, or null "
+    "for both. Never invent an amount.\n"
+    "- confidence: 0-1.\n\n"
+    "Return JSON only with keys: has_action, kind, title, due_at, "
+    "due_is_date_only, due_raw, amount, currency, confidence."
+)
 
 
 def _parse_due_at(due_at_raw: object, due_is_date_only: object) -> tuple[datetime | None, str | None]:
@@ -317,11 +326,10 @@ def _extract_attempt(
     still records exactly one attempt's worth of usage either way (plan:
     phase 3 of the LLM-failure work).
     """
-    message_text = _build_message_text(subject, sender, snippet, body_text)
-    prompt = _build_prompt(received_at)
+    message_text = _build_message_text(subject, sender, snippet, body_text, received_at)
 
     try:
-        call_result = _call_llm(credential, prompt, message_text, policy)
+        call_result = _call_llm(credential, _EXTRACTION_PROMPT, message_text, policy)
     except ExtractionCallError as exc:
         logger.warning(
             "Action extraction failed for provider %s: %s", credential.provider, exc.category
@@ -469,10 +477,9 @@ def test_credential(
     thread a policy through from, and getting one transient retry for free
     matches every other inline call site's treatment.
     """
-    prompt = _build_prompt(None)
     start = time.monotonic()
     try:
-        call_result = _call_llm(credential, prompt, _TEST_CREDENTIAL_MESSAGE, policy)
+        call_result = _call_llm(credential, _EXTRACTION_PROMPT, _TEST_CREDENTIAL_MESSAGE, policy)
     except ExtractionCallError as exc:
         return False, exc.category, int((time.monotonic() - start) * 1000)
 

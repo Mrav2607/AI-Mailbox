@@ -351,44 +351,46 @@ def _classify_attempt(
 # gone -- kept as one constant anyway since there's still only one place
 # that needs it.
 _CLASSIFICATION_PROMPT = (
-    "You classify an email into exactly ONE label, from the RECIPIENT's point "
-        "of view. Decide what the recipient must actually DO.\n\n"
-        "Labels:\n"
-        "- needs_reply: the recipient is personally expected to WRITE BACK. A real "
-        "person asks them a question, requests info, or awaits their response.\n"
-        "- action_required: the recipient must personally complete a concrete "
-        "off-email task with a real consequence or deadline -- pay an invoice, sign "
-        "a document, submit a form, RSVP to a real invitation, reset a password they "
-        "must change. NOT a reply, and NOT optional.\n"
-        "- fyi: informational / automated / transactional mail to read for awareness. "
-        "Receipts, order & shipping updates, notifications, statements, newsletters "
-        "you subscribed to, calendar notices, app/system alerts. This is the DEFAULT "
-        "when no genuine personal task or reply is required.\n"
-        "- promotional: marketing, sales, offers, deals, or bulk mail trying to get "
-        "you to buy or click. Has a commercial/advertising intent.\n"
-        "- security_alert: account or login security -- verification codes, new "
-        "sign-ins, suspicious activity, password/2FA notices.\n"
-        "- spam: junk, scams, or phishing.\n\n"
-        "CRITICAL boundary rules (this is where mistakes happen):\n"
-        "1. Marketing CTAs are NOT action_required. 'Shop now', 'click here', "
-        "'limited time', 'upgrade today', auto-renewal notices -> promotional or fyi.\n"
-        "2. A soft/optional/automated 'confirm', 'renew', 'click', 'verify' is NOT "
-        "action_required. Only use action_required when the recipient genuinely has "
-        "to do the task or face a consequence.\n"
-        "3. When unsure between action_required and fyi, choose fyi. Most automated "
-        "and bulk email is fyi.\n"
-        "4. needs_reply requires a real human awaiting YOUR written response, not an "
-        "automated 'do not reply' message.\n\n"
-        "Examples:\n"
-        "- 'Your Amazon order has shipped, arriving Tuesday' -> fyi\n"
-        "- 'Your monthly statement is ready to view' -> fyi\n"
-        "- 'Invoice #429 is due Friday, pay to avoid late fees' -> action_required\n"
-        "- 'Please sign the attached contract by EOD' -> action_required\n"
-        "- 'Hey, can you send me the report when you get a chance?' -> needs_reply\n"
-        "- '50% off this weekend only -- shop now!' -> promotional\n"
-        "- 'New sign-in to your account from a new device' -> security_alert\n\n"
-        "Return JSON only with keys: label, confidence (0-1), rationale."
-    )
+    "You classify an email into exactly ONE label, from the RECIPIENT's "
+    "point of view -- what must they actually DO?\n\n"
+    "Labels:\n"
+    "- needs_reply: recipient must WRITE BACK -- a real person asked a "
+    "question, requested info, or awaits a reply.\n"
+    "- action_required: a concrete off-email task with a real deadline or "
+    "consequence -- pay, sign, submit a form, RSVP, reset a required "
+    "password. Not a reply, not optional.\n"
+    "- fyi: informational/automated/transactional mail for awareness "
+    "(receipts, shipping updates, statements, newsletters, system "
+    "alerts). DEFAULT when no genuine task or reply is required.\n"
+    "- promotional: marketing/sales/offers/bulk mail with commercial "
+    "intent.\n"
+    "- security_alert: account/login security -- codes, new sign-ins, "
+    "suspicious activity, password/2FA notices.\n"
+    "- spam: junk, scams, or phishing.\n\n"
+    "Boundary rules:\n"
+    "1. Marketing CTAs ('shop now', 'click here', 'limited time', "
+    "auto-renewal) -> promotional or fyi, not action_required.\n"
+    "2. A soft/optional/automated 'confirm'/'renew'/'verify' is not "
+    "action_required -- only when the recipient must act or face a real "
+    "consequence.\n"
+    "3. Unsure between action_required and fyi? Choose fyi -- most "
+    "automated/bulk mail is fyi.\n"
+    "4. needs_reply needs a real human awaiting YOUR written reply, not an "
+    "automated do-not-reply message.\n\n"
+    "Examples:\n"
+    "- '50% off this weekend only -- shop now!' -> promotional, not "
+    "action_required.\n"
+    "- 'Your monthly statement is ready to view' -> fyi, not "
+    "action_required.\n"
+    "- 'Automated notice: your account was updated. Do not reply.' -> "
+    "fyi, not needs_reply.\n\n"
+    "Return JSON only with keys: label, confidence (0-1), rationale."
+)
+
+# D9 (2026-08-19-extraction-cost-hardening): prod p50 body is ~2,450 chars,
+# so the median call is untouched by this cap -- it only trims the long tail,
+# where the label signal is already in the first few thousand chars anyway.
+_CLASSIFICATION_TEXT_MAX_LEN = 3000
 
 # The BYOK classification call's own token budget -- a label/confidence/
 # rationale reply is far smaller than extraction's structured JSON, so this
@@ -547,7 +549,7 @@ def _classify_llm_user(
         result = call_chat_completion(
             credential,
             prompt=_CLASSIFICATION_PROMPT,
-            user_content=f"Email:\n{text[:6000]}",
+            user_content=f"Email:\n{text[:_CLASSIFICATION_TEXT_MAX_LEN]}",
             max_tokens=_CLASSIFICATION_MAX_TOKENS,
             timeout=_CLASSIFICATION_TIMEOUT_S,
             policy=policy,

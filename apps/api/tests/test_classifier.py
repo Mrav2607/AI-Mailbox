@@ -507,6 +507,39 @@ def test_classify_routing_user_mode_calls_openai_compat_with_credential(monkeypa
     assert captured["timeout"] == classifier._CLASSIFICATION_TIMEOUT_S
 
 
+@pytest.mark.parametrize(
+    "content_len,expected_text_len",
+    [(2999, 2999), (3000, 3000), (3001, 3000)],
+)
+def test_classify_user_content_truncates_at_classification_text_max_len(
+    monkeypatch, content_len, expected_text_len
+):
+    """D9 (extraction-cost-hardening): classification's own cap is 3,000
+    chars, tighter than extraction's 6,000 -- pins the exact truncation
+    boundary rather than just trusting the slice syntax."""
+    from app.services.nlp import classifier
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+
+    credential = LlmCredential(
+        provider="openai", base_url="https://api.openai.com/v1", api_key="user-key", model="gpt-4o-mini"
+    )
+    captured = {}
+
+    def fake_call(cred, *, prompt, user_content, max_tokens, timeout, policy=None):
+        captured["user_content"] = user_content
+        content = json.dumps({"label": "fyi", "confidence": 0.5, "rationale": "r"})
+        return LlmCallResult(content=content, usage=None)
+
+    monkeypatch.setattr(classifier, "call_chat_completion", fake_call)
+
+    routing = ClassificationRouting(mode="user", credential=credential)
+    classify("x" * content_len, routing=routing)
+
+    body = captured["user_content"].removeprefix("Email:\n")
+    assert len(body) == expected_text_len
+
+
 def test_classify_with_usage_threads_the_caller_supplied_policy_to_the_wire_call(monkeypatch):
     """The entry-point-assignment contract (plan: phase 3 of the LLM-failure
     work): whatever RetryPolicy the caller passes to classify_with_usage()

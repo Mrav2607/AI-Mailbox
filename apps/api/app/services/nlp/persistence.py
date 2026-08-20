@@ -49,9 +49,10 @@ CREDENTIAL_CLASS_FAILURE_CATEGORIES = frozenset({"http_401", "http_403", "http_4
 OPERATOR_MODEL_VERSION = "user-override"
 
 # Bounded snapshot cap for classification_feedback.input_text: the first
-# FEEDBACK_TEXT_MAX chars of build_classification_text(...)'s output. Matches
-# the LLM paths' own 6,000-char cap and sits ~4x the local model's 256-token
-# window, so it's generous enough to cover what either classifier actually
+# FEEDBACK_TEXT_MAX chars of build_classification_text(...)'s output. Sized
+# independently of either classifier's own cap (classifier.py's LLM path
+# truncates at 3,000 chars as of D9; the local encoder's window is smaller
+# still) -- 6,000 stays generous enough to cover what either one actually
 # saw without storing unbounded email bodies forever.
 FEEDBACK_TEXT_MAX = 6000
 
