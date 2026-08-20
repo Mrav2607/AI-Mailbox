@@ -1030,6 +1030,33 @@ def test_put_preset_ignores_caller_base_url_and_saves(user):
     assert saved.revision == 1
 
 
+def test_put_anthropic_preset_pins_base_url_never_echoes_key_and_get_round_trips(user):
+    """The D7 regression: without `anthropic` in the `LlmProvider` response
+    Literal, this PUT (and the following GET) would 500 on response
+    validation instead of returning the saved row."""
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "anthropic", "api_key": "sk-ant-abcdefgh", "model": "claude-haiku-4-5"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["provider"] == "anthropic"
+    assert body["base_url"] == "https://api.anthropic.com/v1"
+    assert body["configured"] is True
+    assert body["key_suffix"] == "efgh"
+    assert "api_key" not in body
+    assert "sk-ant-abcdefgh" not in resp.text
+
+    get_resp = TestClient(app).get("/api/v1/settings/llm")
+    assert get_resp.status_code == 200
+    get_body = get_resp.json()
+    assert get_body["provider"] == "anthropic"
+    assert get_body["base_url"] == "https://api.anthropic.com/v1"
+    assert "sk-ant-abcdefgh" not in get_resp.text
+
+
 def test_put_custom_provider_422_when_flag_off(monkeypatch, user):
     db = _CredentialDB()
     _override(user, db)
@@ -2151,7 +2178,7 @@ def test_classifier_mix_local_prefix_maps_to_local(user):
 
 
 @pytest.mark.parametrize(
-    "preset", ["openai", "gemini", "openrouter", "groq", "mistral"],
+    "preset", ["openai", "gemini", "openrouter", "groq", "mistral", "anthropic"],
 )
 def test_classifier_mix_each_preset_prefix_maps_to_user_key(user, preset):
     db = _mix_db([(f"{preset}:some-model", 5)])

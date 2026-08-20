@@ -700,6 +700,16 @@ describe("mock llm settings", () => {
     expect(updated.base_url).toBe("https://api.mistral.ai/v1");
   });
 
+  it("put pins the anthropic preset's base_url, ignoring any caller-supplied value", () => {
+    const updated = mockPutLlmSettings({
+      provider: "anthropic",
+      api_key: "anthropic-key-5678",
+      model: "claude-haiku-4-5",
+      base_url: "https://not-the-real-endpoint.example",
+    });
+    expect(updated.base_url).toBe("https://api.anthropic.com/v1");
+  });
+
   it("put stores a custom base_url as given", () => {
     const updated = mockPutLlmSettings({
       provider: "custom",

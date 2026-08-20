@@ -1,10 +1,15 @@
-"""Shared OpenAI-compatible chat-completions wire call.
+"""Shared LLM wire call for every BYOK provider.
 
-Extraction and classification both need the same call -- a bearer-key POST
-to a preset or user-supplied (`provider="custom"`) endpoint -- with only the
-prompt, content, and response parsing differing. This module owns the wire
-call and every security rule around it; callers own their own prompt and
-parsing.
+Extraction and classification both need the same call -- a POST to a preset
+or user-supplied (`provider="custom"`) endpoint -- with only the prompt,
+content, and response parsing differing. Every preset except `anthropic` is
+OpenAI-compatible (chat-completions shape); `anthropic` gets its own native
+Messages API branch inside `_call_once`, since its OpenAI-compat shim ignores
+`response_format` and can't guarantee valid JSON back. Both branches share
+the same connect/watchdog/deadline machinery and return the same
+`LlmCallResult` contract, so callers never know which shape actually ran.
+This module owns the wire call and every security rule around it; callers
+own their own prompt and parsing.
 """
 
 from __future__ import annotations
@@ -256,6 +261,18 @@ def _sleep(seconds: float) -> None:
 # behind it is, so it gets its own cap well inside the overall budget.
 _CONNECT_TIMEOUT_S = 5.0
 
+# Anthropic Messages API wire constants (D3). Pinned to a module constant,
+# not read from anywhere caller-supplied -- this is a protocol version, not
+# a per-request choice.
+_ANTHROPIC_VERSION = "2023-06-01"
+_ANTHROPIC_MESSAGES_PATH = "/messages"
+# D2: the one tool every Anthropic call forces via tool_choice, with a
+# maximally permissive schema -- the direct analog of OpenAI's
+# `response_format: {"type": "json_object"}`, guaranteeing valid JSON back
+# without guaranteeing any particular shape (consumers validate that
+# themselves, same as the OpenAI path).
+_ANTHROPIC_TOOL_NAME = "emit_json"
+
 
 def _raise_invalid_response(provider: str, status: int) -> NoReturn:
     logger.warning("LLM call returned a malformed response shape for provider %s", provider)
@@ -376,6 +393,66 @@ def _parse_usage(payload: object) -> LlmUsage | None:
     )
 
 
+def _parse_anthropic_usage(payload: object) -> LlmUsage | None:
+    """
+    Same defensiveness as `_parse_usage`, for Anthropic's differently-named
+    fields (`input_tokens`/`output_tokens` under `usage`). D3: Anthropic
+    never reports a total of its own, so `total_tokens` is always `None`
+    here -- never computed as `input_tokens + output_tokens`, for the same
+    reason `_parse_usage` never synthesizes one: the usage recorder tracks
+    "calls that reported a usable total" as its own counter, and a number we
+    made up would corrupt it.
+    """
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return None
+
+    prompt_tokens = _parse_token_count(usage.get("input_tokens"))
+    completion_tokens = _parse_token_count(usage.get("output_tokens"))
+
+    if prompt_tokens is None and completion_tokens is None:
+        return None
+
+    return LlmUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=None)
+
+
+def _parse_anthropic_response(payload: object, provider: str, status: int) -> LlmCallResult:
+    """
+    D2's exact (not fuzzy) response contract for the forced-tool-use shape:
+    `stop_reason` must be `"tool_use"` AND `content` must hold EXACTLY ONE
+    block with `type == "tool_use"` and `name == _ANTHROPIC_TOOL_NAME`,
+    whose `input` is a dict. Every other shape -- another stop_reason with an
+    incidental valid-looking block, zero or multiple tool_use blocks, the
+    wrong tool name, a text-only refusal, non-dict input -- is
+    `invalid_response`, same as an OpenAI-shaped malformed reply. The
+    validated dict is re-serialized with `json.dumps` into
+    `LlmCallResult.content`, so every consumer's own `json.loads` + shape
+    validation keeps doing its job unchanged.
+    """
+    if not isinstance(payload, dict) or payload.get("stop_reason") != "tool_use":
+        _raise_invalid_response(provider, status)
+
+    content = payload.get("content")
+    if not isinstance(content, list):
+        _raise_invalid_response(provider, status)
+
+    tool_use_blocks = [
+        block for block in content if isinstance(block, dict) and block.get("type") == "tool_use"
+    ]
+    if len(tool_use_blocks) != 1:
+        _raise_invalid_response(provider, status)
+
+    block = tool_use_blocks[0]
+    if block.get("name") != _ANTHROPIC_TOOL_NAME:
+        _raise_invalid_response(provider, status)
+
+    tool_input = block.get("input")
+    if not isinstance(tool_input, dict):
+        _raise_invalid_response(provider, status)
+
+    return LlmCallResult(content=json.dumps(tool_input), usage=_parse_anthropic_usage(payload))
+
+
 def _call_once(
     credential: LlmCredential,
     *,
@@ -426,30 +503,52 @@ def _call_once(
         except DestinationRejected as exc:
             raise LlmCallError("blocked_by_policy", None) from exc
 
-    body = {
-        "model": credential.model,
-        "messages": [{"role": "user", "content": f"{prompt}\n\n{user_content}"}],
-        "response_format": {"type": "json_object"},
-        "max_tokens": max_tokens,
-    }
-
-    if pinned is not None:
-        url = f"{pinned.url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {credential.api_key}",
-            # The server on the other end still needs the hostname it was
-            # configured with, even though we're connecting to its IP.
-            "Host": pinned.host_header,
+    if credential.provider == "anthropic":
+        # Anthropic is a preset (providers.py) -- its base_url is always the
+        # operator-pinned one, never a caller value, so there's no custom
+        # destination to pin here the way provider="custom" needs above.
+        url = f"{credential.base_url}{_ANTHROPIC_MESSAGES_PATH}"
+        # D3: x-api-key + a pinned protocol version, deliberately NO
+        # Authorization header -- this is a different auth scheme, not an
+        # OpenAI-compat one wearing a different header name.
+        headers = {"x-api-key": credential.api_key, "anthropic-version": _ANTHROPIC_VERSION}
+        body = {
+            "model": credential.model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": f"{prompt}\n\n{user_content}"}],
+            "tools": [{"name": _ANTHROPIC_TOOL_NAME, "input_schema": {"type": "object"}}],
+            "tool_choice": {
+                "type": "tool",
+                "name": _ANTHROPIC_TOOL_NAME,
+                "disable_parallel_tool_use": True,
+            },
         }
-        # None for http, or when the host was already an IP literal -- the
-        # SNI extension of the TLS ClientHello is meaningless there, and
-        # httpx would otherwise send the bare IP as both SNI and the
-        # hostname it verifies the certificate against.
-        extensions = {"sni_hostname": pinned.sni_hostname} if pinned.sni_hostname else None
-    else:
-        url = f"{credential.base_url}/chat/completions"
-        headers = {"Authorization": f"Bearer {credential.api_key}"}
         extensions = None
+    else:
+        body = {
+            "model": credential.model,
+            "messages": [{"role": "user", "content": f"{prompt}\n\n{user_content}"}],
+            "response_format": {"type": "json_object"},
+            "max_tokens": max_tokens,
+        }
+
+        if pinned is not None:
+            url = f"{pinned.url}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {credential.api_key}",
+                # The server on the other end still needs the hostname it was
+                # configured with, even though we're connecting to its IP.
+                "Host": pinned.host_header,
+            }
+            # None for http, or when the host was already an IP literal -- the
+            # SNI extension of the TLS ClientHello is meaningless there, and
+            # httpx would otherwise send the bare IP as both SNI and the
+            # hostname it verifies the certificate against.
+            extensions = {"sni_hostname": pinned.sni_hostname} if pinned.sni_hostname else None
+        else:
+            url = f"{credential.base_url}/chat/completions"
+            headers = {"Authorization": f"Bearer {credential.api_key}"}
+            extensions = None
 
     # trust_env=False is mandatory: httpx otherwise honors HTTP(S)_PROXY/
     # ALL_PROXY env vars and would route the bearer credential through a
@@ -515,6 +614,9 @@ def _call_once(
             credential.provider, type(exc).__name__,
         )
         raise LlmCallError("invalid_response", status) from exc
+
+    if credential.provider == "anthropic":
+        return _parse_anthropic_response(payload, credential.provider, status)
 
     # Explicit shape checks -- never let an uncaught IndexError/KeyError/
     # TypeError leak out of a malformed but "successful" reply.

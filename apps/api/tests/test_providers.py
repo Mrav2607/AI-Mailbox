@@ -106,8 +106,8 @@ def test_preset_base_urls_are_pinned():
         "openrouter": "https://openrouter.ai/api/v1",
         "groq": "https://api.groq.com/openai/v1",
         "mistral": "https://api.mistral.ai/v1",
+        "anthropic": "https://api.anthropic.com/v1",
     }
-    assert "anthropic" not in PROVIDER_PRESETS
 
 
 def test_resolve_preset_base_url_ignores_caller_value():
@@ -115,6 +115,7 @@ def test_resolve_preset_base_url_ignores_caller_value():
     structurally there's nothing for a caller value to override."""
     assert resolve_preset_base_url("openai") == PROVIDER_PRESETS["openai"]
     assert resolve_preset_base_url("gemini") == PROVIDER_PRESETS["gemini"]
+    assert resolve_preset_base_url("anthropic") == PROVIDER_PRESETS["anthropic"]
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +659,24 @@ def test_resolve_classification_routing_opt_in_true_preset_returns_user():
     )
     assert routing.fallback_local is False  # _make_classification_row's default
     assert len(db.statements) == 2  # the re-asserted second read did fire
+
+
+def test_resolve_classification_routing_opt_in_true_anthropic_preset_returns_user():
+    """_CLASSIFICATION_ELIGIBLE_PROVIDERS derives from PROVIDER_PRESETS.keys()
+    (providers.py) -- proves anthropic picked up eligibility automatically,
+    with no code change to the resolver itself (D6)."""
+    full = _make_classification_row(
+        provider="anthropic", api_key="user-key-1234", model="claude-haiku-4-5"
+    )
+    db = _FakeClassificationDB(("anthropic", True, full))
+    routing = resolve_classification_routing(db, uuid4())
+    assert routing.mode == "user"
+    assert routing.credential == LlmCredential(
+        provider="anthropic",
+        base_url=PROVIDER_PRESETS["anthropic"],
+        api_key="user-key-1234",
+        model="claude-haiku-4-5",
+    )
 
 
 def test_resolve_classification_routing_carries_fallback_local_from_second_read():
