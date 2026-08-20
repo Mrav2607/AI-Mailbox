@@ -418,6 +418,10 @@ def test_test_credential_anthropic_wire_round_trip_zero_consumer_edits(monkeypat
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "https://api.anthropic.com/v1/messages"
+        # Proves the /test path really rode the Anthropic wire branch:
+        # its auth scheme, not a Bearer header that happened to get a 200.
+        assert request.headers["x-api-key"] == "sk-ant-key"
+        assert "authorization" not in request.headers
         return httpx.Response(200, json=anthropic_payload)
 
     real_client_cls = httpx.Client
