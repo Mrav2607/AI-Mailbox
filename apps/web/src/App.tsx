@@ -142,6 +142,11 @@ const nextSortMode = (m: SortMode): SortMode =>
 // server telling us back fewer than this is how we know we've hit the end.
 const PAGE_SIZE = 200;
 
+// One agenda page (docs/plans/2026-08-19-agenda-cursor-pagination-plan.md
+// D5). Its own constant, not PAGE_SIZE — the agenda paginates by cursor, not
+// offset, and the two views are free to pick different page sizes.
+const ACTIONS_PAGE_SIZE = 100;
+
 // How long to wait after a keystroke before live search re-queries the
 // server, and how short a query can be before it's not worth searching yet.
 const LIVE_SEARCH_DEBOUNCE_MS = 300;
@@ -244,11 +249,16 @@ export default function Console() {
     done: 0,
     snoozed: 0,
   });
-  // Agenda's own data — always cross-account, never paginated (the API caps
-  // at 500 and cursor pagination is a deferred follow-up).
+  // Agenda's own data — always cross-account, paginated by cursor (its own
+  // state below, separate from triage's hasMore/loadingMore cluster).
   const [actions, setActions] = useState<ActionItem[]>([]);
   const [actionsLoading, setActionsLoading] = useState(false);
   const [actionsError, setActionsError] = useState<string | null>(null);
+  // The agenda's own pagination — null means "no more pages" (never
+  // inferred from row count). Set from every page response, load-more or
+  // refresh alike.
+  const [actionsNextCursor, setActionsNextCursor] = useState<string | null>(null);
+  const [actionsLoadingMore, setActionsLoadingMore] = useState(false);
   // undefined (not zeroed) means the server hasn't told us about the feature
   // yet, or it's off — mirrors CountsResponse.actions itself.
   const [actionCounts, setActionCounts] = useState<ActionCounts | undefined>(undefined);
@@ -382,6 +392,8 @@ export default function Console() {
   selectedIdRef.current = selectedId;
   const itemsRef = useRef<TriageItem[]>([]);
   itemsRef.current = items;
+  const actionsRef = useRef<ActionItem[]>([]);
+  actionsRef.current = actions;
   const accountFilterRef = useRef(accountFilter);
   accountFilterRef.current = accountFilter;
   // Always the LATEST signed-in identity -- handleConnectionUpdated's
@@ -407,11 +419,33 @@ export default function Console() {
   // refetches: resolving an action removes it optimistically, and a fetch that
   // was already in flight would otherwise land afterwards and put it back.
   const actionsGenRef = useRef(0);
+  // Set for the duration of a refreshActions() cursor-walk (background or
+  // not); loadMoreActions no-ops while it's set, and starting a walk bumps
+  // actionsGenRef first so a load-more response already in flight against
+  // the old cursor is dropped by its own generation check either way.
+  const actionsRefreshInFlight = useRef(false);
+  // Counts refresh WALKS specifically, unlike actionsGenRef, which local
+  // mutations also bump (doActionStatus's optimistic removal). The finally
+  // block below keys the guard/spinner release on THIS counter: keying it on
+  // actionsGenRef would let a mid-walk local resolve strand the guard set
+  // (and the spinner on) with no newer walk around to ever release them.
+  const actionsRefreshRequestRef = useRef(0);
+  // loadMoreActions's own in-flight guard. actionsLoadingMore (state) only
+  // updates on the next render, so two IntersectionObserver callbacks firing
+  // back-to-back can both read it as false and both fetch the same cursor —
+  // this ref is set synchronously, before the first await, so the second
+  // call sees it immediately.
+  const actionsLoadMoreInFlight = useRef(false);
   // Same idea again for connections -- the label-sync drift poll (below) can
   // overlap with a manual refreshConnections() from account connect/disconnect,
   // and an older response landing after a newer one would clobber it.
   const connectionsGenRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement>(null);
+  // The agenda's own scroll container and load-more sentinel — deliberately
+  // separate from listScrollRef/sentinelRef above, which belong to triage's
+  // pane and aren't even mounted while the agenda is on screen.
+  const agendaScrollRef = useRef<HTMLDivElement>(null);
+  const agendaSentinelRef = useRef<HTMLDivElement>(null);
   const liveSearchRef = useRef<LiveSearchController | null>(null);
 
   useEffect(() => {
@@ -760,25 +794,47 @@ export default function Console() {
     }
   }, [handleSessionExpired]);
 
-  // The agenda's own fetch, parallel to refreshList but with no paging (the
-  // API caps at 500 items, and there's no offset param to page through).
+  // The agenda's own fetch, parallel to refreshList but keyset-paged instead
+  // of offset-paged (docs/plans/2026-08-19-agenda-cursor-pagination-plan.md).
+  // A quiet (background) refresh must not collapse a scrolled multi-page
+  // view back to page one, so this walks the SAME pager from the top,
+  // ACTIONS_PAGE_SIZE at a time, accumulating locally until it's gathered at
+  // least as many rows as were already loaded (or runs out of pages), then
+  // commits once: the collected rows AND the final walked page's cursor
+  // together, under a single generation check. Page one's cursor must never
+  // survive that swap — it would make the next load-more re-fetch page two.
   const refreshActions = useCallback(
     async (opts?: { quiet?: boolean }) => {
       const quiet = opts?.quiet ?? false;
       if (!quiet) setActionsLoading(true);
       setActionsError(null);
+      // Bump first: any load-more response already in flight against the old
+      // cursor gets dropped by its own generation check the moment this walk
+      // starts, not just once it finishes.
       const generation = ++actionsGenRef.current;
+      const refreshRequest = ++actionsRefreshRequestRef.current;
+      actionsRefreshInFlight.current = true;
+      const targetDepth = actionsRef.current.length;
       try {
-        // 500 is the API's `le` cap for this param -- request it explicitly.
-        const res = await getActions("open", 500);
-        // Superseded by a newer refetch, or by a local resolve that happened
-        // while this was in flight — either way this payload is already stale.
-        if (generation !== actionsGenRef.current) return;
+        let cursor: string | undefined;
+        let collected: ActionItem[] = [];
+        let finalCursor: string | null = null;
+        for (;;) {
+          const res = await getActions("open", ACTIONS_PAGE_SIZE, cursor);
+          // Superseded by a newer refetch, or by a local resolve that
+          // happened while this was in flight — this walk is already stale.
+          if (generation !== actionsGenRef.current) return;
+          collected = collected.concat(res.items);
+          finalCursor = res.next_cursor;
+          if (finalCursor === null || collected.length >= targetDepth) break;
+          cursor = finalCursor;
+        }
         // A thread mid-undo-window is already gone from the UI but not yet
         // from the server — same masking the triage/search paths already do,
         // otherwise a deleted thread's agenda rows come right back.
-        const rows = res.items.filter((a) => !pendingDeletes.current.has(a.thread_id));
+        const rows = collected.filter((a) => !pendingDeletes.current.has(a.thread_id));
         setActions(rows);
+        setActionsNextCursor(finalCursor);
         // Runs on quiet refreshes too. A background refresh shouldn't move the
         // cursor for its own sake, and it doesn't — this only rewrites the
         // selection when the row it was pointing at is gone. Leaving it
@@ -796,13 +852,73 @@ export default function Console() {
         if (generation !== actionsGenRef.current) return;
         setActionsError((e as Error).message ?? "failed to load");
       } finally {
-        // Same reason: an older request finishing must not clear the spinner
-        // a newer one is still waiting on.
-        if (!quiet && generation === actionsGenRef.current) setActionsLoading(false);
+        // Release the guard and spinner only if this walk is still the
+        // LATEST walk — a stale one finishing after a newer one started must
+        // not clear either out from under it (loadMoreActions would fire
+        // against the old cursor). Keyed on the walk counter, NOT
+        // actionsGenRef: a local resolve bumps that mid-walk with no new
+        // walk behind it, and this walk still owns the release then.
+        if (refreshRequest === actionsRefreshRequestRef.current) {
+          actionsRefreshInFlight.current = false;
+          // Cleared regardless of THIS walk's quiet flag: a loud refresh
+          // superseded by a quiet auto-sync one leaves the spinner set by
+          // the loud walk, and only the latest (quiet) walk gets in here —
+          // if it skipped the clear, an empty agenda would spin forever.
+          // Clearing an already-false flag is a no-op, so this is safe for
+          // the all-quiet case too.
+          setActionsLoading(false);
+        }
       }
     },
     [handleSessionExpired],
   );
+
+  // Agenda infinite scroll: fetches the next cursor page and appends it.
+  // Mutually excluded with refreshActions — a refresh bumps actionsGenRef
+  // before this ever sees the in-flight response, and this no-ops outright
+  // while a refresh walk is running so the two can never interleave.
+  const loadMoreActions = useCallback(async () => {
+    if (
+      actionsRefreshInFlight.current ||
+      actionsLoadMoreInFlight.current ||
+      actionsLoadingMore ||
+      !actionsNextCursor
+    )
+      return;
+    // Set synchronously, before the first await — actionsLoadingMore (state)
+    // wouldn't be visible to a second observer callback firing before the
+    // next render, and that's exactly the race this guard exists to close.
+    actionsLoadMoreInFlight.current = true;
+    const generation = actionsGenRef.current;
+    setActionsLoadingMore(true);
+    try {
+      const res = await getActions("open", ACTIONS_PAGE_SIZE, actionsNextCursor);
+      // A refresh (or a local resolve) landed first — drop this page rather
+      // than append rows onto a list that's already moved on.
+      if (generation !== actionsGenRef.current) return;
+      // Compute the existing-id set from the functional setter's own `prev`,
+      // not from actionsRef.current — that ref can be one render behind, and
+      // dedupe-against-stale-state is how a slipped duplicate response would
+      // double-append even with the in-flight guard above.
+      setActions((prev) => {
+        const existingIds = new Set(prev.map((a) => a.id));
+        const fresh = res.items.filter(
+          (a) => !pendingDeletes.current.has(a.thread_id) && !existingIds.has(a.id),
+        );
+        return [...prev, ...fresh];
+      });
+      setActionsNextCursor(res.next_cursor);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        handleSessionExpired();
+        return;
+      }
+      toast.error((e as Error).message ?? "failed to load more");
+    } finally {
+      actionsLoadMoreInFlight.current = false;
+      setActionsLoadingMore(false);
+    }
+  }, [actionsNextCursor, actionsLoadingMore, handleSessionExpired]);
 
   const refreshConnections = useCallback(async () => {
     const generation = ++connectionsGenRef.current;
@@ -1239,6 +1355,25 @@ export default function Console() {
     observer.observe(target);
     return () => observer.disconnect();
   }, [hasMore, searchMode, loadMore]);
+
+  // Same trigger, agenda's own instance: fires loadMoreActions once its
+  // sentinel nears the bottom of the agenda's OWN scroll container
+  // (agendaScrollRef), never listScrollRef — a copy rooted on the wrong
+  // container would just never intersect and silently never load more.
+  useEffect(() => {
+    if (!actionsNextCursor) return;
+    const root = agendaScrollRef.current;
+    const target = agendaSentinelRef.current;
+    if (!root || !target) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) loadMoreActions();
+      },
+      { root, rootMargin: "400px" },
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [actionsNextCursor, loadMoreActions]);
 
   // Login/logout keeps the Console mounted (see the in-place reload note
   // above), so account-scoped state survives a sign-out and would otherwise
@@ -3125,8 +3260,8 @@ export default function Console() {
       <div className="h-10 shrink-0 border-b border-border bg-[var(--color-panel)] panel-lift flex items-center px-3 gap-2.5 font-mono text-[11.5px]">
         <span className="text-primary font-semibold tracking-tight shrink-0">agenda</span>
         <span className="text-muted-foreground tabular-nums shrink-0">
-          {/* The fetched list caps at the 200-row limit; the aggregate from
-              actionCounts is the real total once loaded. */}
+          {/* Before the first page lands, fall back to what's loaded so far;
+              actionCounts is the real cross-account total once it arrives. */}
           {actionCounts?.open ?? flattenedAgenda.length} open
           {actionCounts && actionCounts.overdue > 0 ? ` · ${actionCounts.overdue} overdue` : ""}
         </span>
@@ -3148,7 +3283,7 @@ export default function Console() {
           </button>
         )}
       </div>
-      <div className="flex-1 overflow-y-auto scrollbar-thin">
+      <div ref={agendaScrollRef} className="flex-1 overflow-y-auto scrollbar-thin">
         <AgendaList
           groups={agendaGroups}
           focusedId={selectedActionId}
@@ -3170,6 +3305,9 @@ export default function Console() {
             !llmSettings.fallback_active
           }
           onSetupExtraction={openLlmSettings}
+          hasMore={actionsNextCursor != null}
+          loadingMore={actionsLoadingMore}
+          sentinelRef={agendaSentinelRef}
         />
       </div>
     </section>

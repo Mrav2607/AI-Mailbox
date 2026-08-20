@@ -353,6 +353,30 @@ describe("getActions", () => {
     expect(res.items.length).toBeGreaterThan(0);
     expect(res.items.every((i) => i.status === "open")).toBe(true);
   });
+
+  it("omits cursor from the query string when not given", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ items: [], counts: { open: 0, overdue: 0 }, next_cursor: null });
+    await api.getActions("open", 100);
+    const url = requestedUrl(fetchMock);
+    expect(url.searchParams.has("cursor")).toBe(false);
+  });
+
+  it("passes cursor through as an opaque query param", async () => {
+    const api = await importLiveApi();
+    const fetchMock = stubFetch({ items: [], counts: { open: 0, overdue: 0 }, next_cursor: null });
+    await api.getActions("open", 100, "opaque-token");
+    const url = requestedUrl(fetchMock);
+    expect(url.searchParams.get("cursor")).toBe("opaque-token");
+  });
+
+  it("returns next_cursor untouched alongside items+counts", async () => {
+    const api = await importLiveApi();
+    const body = { items: [], counts: { open: 0, overdue: 0 }, next_cursor: "next-token" };
+    stubFetch(body);
+    const res = await api.getActions();
+    expect(res.next_cursor).toBe("next-token");
+  });
 });
 
 describe("setActionStatus", () => {

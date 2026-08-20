@@ -185,6 +185,38 @@ describe("mock agenda", () => {
     expect(result.status).toBe("queued");
     expect(result.task_id).toMatch(/^mock-actions-task-/);
   });
+
+  it("has enough generated open rows to genuinely page past a 100-row limit", () => {
+    expect(mockActions("open", 10_000).items.length).toBeGreaterThan(100);
+  });
+
+  it("pages the open board to completion: full pages carry a cursor, the last short page carries none", () => {
+    const pageSize = 100;
+    const first = mockActions("open", pageSize);
+    expect(first.items).toHaveLength(pageSize);
+    expect(first.next_cursor).not.toBeNull();
+
+    const second = mockActions("open", pageSize, first.next_cursor!);
+    expect(second.next_cursor).toBeNull(); // the walk ends here — not enough rows for a third full page
+    expect(second.items.length).toBeGreaterThan(0);
+    expect(second.items.length).toBeLessThan(pageSize);
+
+    // Disjoint and order-preserving: concatenating the two pages reproduces
+    // a single unpaged request over the same rows, no skip, no duplicate.
+    const whole = mockActions("open", 10_000).items;
+    const concatenated = [...first.items, ...second.items];
+    expect(concatenated.map((a) => a.id)).toEqual(whole.map((a) => a.id));
+    expect(new Set(concatenated.map((a) => a.id)).size).toBe(concatenated.length);
+  });
+
+  it("mints a cursor a status-mismatched call can't reuse, mirroring the API's own contract", () => {
+    // The mock doesn't validate this (only the real route does), but a
+    // caller switching status mid-walk still starts over cleanly rather than
+    // silently mixing pages from two different filtered views.
+    const openPage = mockActions("open", 100);
+    const dismissedWithOpenCursor = mockActions("dismissed", 100, openPage.next_cursor ?? undefined);
+    expect(dismissedWithOpenCursor.items.every((a) => a.status === "dismissed")).toBe(true);
+  });
 });
 
 describe("mock llm usage", () => {
