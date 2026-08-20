@@ -28,7 +28,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0029_multi_llm_credentials"
-down_revision = "0026_classification_fallback"
+down_revision = "0028_anthropic_provider"
 branch_labels = None
 depends_on = None
 
