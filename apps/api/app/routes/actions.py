@@ -155,13 +155,20 @@ def _decode_agenda_cursor(token: str, status: str) -> AgendaCursor:
     silently continue paging under another."""
     try:
         padded = token + "=" * (-len(token) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+        # validate=True rejects any byte outside the urlsafe alphabet instead
+        # of the stdlib's default of silently dropping it -- a cursor with
+        # junk characters should 422, not decode to a different payload.
+        raw = base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+        payload = json.loads(raw)
     except Exception as exc:
         raise _invalid_cursor() from exc
 
     if not isinstance(payload, dict):
         raise _invalid_cursor()
-    if payload.get("v") != 1 or payload.get("s") != status:
+    # `!= 1` also accepts `True` (bool is an int subclass) and `1.0` -- pin
+    # the type down to plain int so only what _encode_agenda_cursor actually
+    # writes round-trips.
+    if type(payload.get("v")) is not int or payload["v"] != 1 or payload.get("s") != status:
         raise _invalid_cursor()
 
     created_raw, due_raw, id_raw = payload.get("c"), payload.get("d"), payload.get("i")

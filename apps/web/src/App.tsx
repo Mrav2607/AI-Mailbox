@@ -424,6 +424,18 @@ export default function Console() {
   // actionsGenRef first so a load-more response already in flight against
   // the old cursor is dropped by its own generation check either way.
   const actionsRefreshInFlight = useRef(false);
+  // Counts refresh WALKS specifically, unlike actionsGenRef, which local
+  // mutations also bump (doActionStatus's optimistic removal). The finally
+  // block below keys the guard/spinner release on THIS counter: keying it on
+  // actionsGenRef would let a mid-walk local resolve strand the guard set
+  // (and the spinner on) with no newer walk around to ever release them.
+  const actionsRefreshRequestRef = useRef(0);
+  // loadMoreActions's own in-flight guard. actionsLoadingMore (state) only
+  // updates on the next render, so two IntersectionObserver callbacks firing
+  // back-to-back can both read it as false and both fetch the same cursor —
+  // this ref is set synchronously, before the first await, so the second
+  // call sees it immediately.
+  const actionsLoadMoreInFlight = useRef(false);
   // Same idea again for connections -- the label-sync drift poll (below) can
   // overlap with a manual refreshConnections() from account connect/disconnect,
   // and an older response landing after a newer one would clobber it.
@@ -800,6 +812,7 @@ export default function Console() {
       // cursor gets dropped by its own generation check the moment this walk
       // starts, not just once it finishes.
       const generation = ++actionsGenRef.current;
+      const refreshRequest = ++actionsRefreshRequestRef.current;
       actionsRefreshInFlight.current = true;
       const targetDepth = actionsRef.current.length;
       try {
@@ -839,10 +852,16 @@ export default function Console() {
         if (generation !== actionsGenRef.current) return;
         setActionsError((e as Error).message ?? "failed to load");
       } finally {
-        actionsRefreshInFlight.current = false;
-        // Same reason: an older request finishing must not clear the spinner
-        // a newer one is still waiting on.
-        if (!quiet && generation === actionsGenRef.current) setActionsLoading(false);
+        // Release the guard and spinner only if this walk is still the
+        // LATEST walk — a stale one finishing after a newer one started must
+        // not clear either out from under it (loadMoreActions would fire
+        // against the old cursor). Keyed on the walk counter, NOT
+        // actionsGenRef: a local resolve bumps that mid-walk with no new
+        // walk behind it, and this walk still owns the release then.
+        if (refreshRequest === actionsRefreshRequestRef.current) {
+          actionsRefreshInFlight.current = false;
+          if (!quiet) setActionsLoading(false);
+        }
       }
     },
     [handleSessionExpired],
@@ -853,7 +872,17 @@ export default function Console() {
   // before this ever sees the in-flight response, and this no-ops outright
   // while a refresh walk is running so the two can never interleave.
   const loadMoreActions = useCallback(async () => {
-    if (actionsRefreshInFlight.current || actionsLoadingMore || !actionsNextCursor) return;
+    if (
+      actionsRefreshInFlight.current ||
+      actionsLoadMoreInFlight.current ||
+      actionsLoadingMore ||
+      !actionsNextCursor
+    )
+      return;
+    // Set synchronously, before the first await — actionsLoadingMore (state)
+    // wouldn't be visible to a second observer callback firing before the
+    // next render, and that's exactly the race this guard exists to close.
+    actionsLoadMoreInFlight.current = true;
     const generation = actionsGenRef.current;
     setActionsLoadingMore(true);
     try {
@@ -861,11 +890,17 @@ export default function Console() {
       // A refresh (or a local resolve) landed first — drop this page rather
       // than append rows onto a list that's already moved on.
       if (generation !== actionsGenRef.current) return;
-      const existingIds = new Set(actionsRef.current.map((a) => a.id));
-      const fresh = res.items.filter(
-        (a) => !pendingDeletes.current.has(a.thread_id) && !existingIds.has(a.id),
-      );
-      setActions((prev) => [...prev, ...fresh]);
+      // Compute the existing-id set from the functional setter's own `prev`,
+      // not from actionsRef.current — that ref can be one render behind, and
+      // dedupe-against-stale-state is how a slipped duplicate response would
+      // double-append even with the in-flight guard above.
+      setActions((prev) => {
+        const existingIds = new Set(prev.map((a) => a.id));
+        const fresh = res.items.filter(
+          (a) => !pendingDeletes.current.has(a.thread_id) && !existingIds.has(a.id),
+        );
+        return [...prev, ...fresh];
+      });
       setActionsNextCursor(res.next_cursor);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
@@ -874,6 +909,7 @@ export default function Console() {
       }
       toast.error((e as Error).message ?? "failed to load more");
     } finally {
+      actionsLoadMoreInFlight.current = false;
       setActionsLoadingMore(false);
     }
   }, [actionsNextCursor, actionsLoadingMore, handleSessionExpired]);

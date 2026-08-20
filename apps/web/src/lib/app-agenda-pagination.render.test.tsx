@@ -404,6 +404,126 @@ describe("agenda cursor pagination", () => {
     expect(agendaRowIds()).not.toEqual(expect.arrayContaining(PAGE2.map((a) => a.id)));
   });
 
+  it("holds the in-flight guard while a newer refresh walk is still running, even after a stale walk resolves", async () => {
+    // Call 0: the agenda's first-ever load -- resolves right away and mints
+    // a real cursor, so there's something a wrongly-unblocked load-more
+    // could act on later. Calls 1 and 2 (walk A, then walk B) are left
+    // pending so the test can resolve them in a controlled, out-of-order
+    // sequence.
+    const pendingResolvers: Record<number, (r: ActionsResponse) => void> = {};
+    let callIndex = -1;
+    mockApi.getActions.mockImplementation(async () => {
+      callIndex += 1;
+      if (callIndex === 0) {
+        return { items: PAGE1, counts: { open: 100, overdue: 0 }, next_cursor: "c1" };
+      }
+      const d = deferred<ActionsResponse>();
+      pendingResolvers[callIndex] = d.resolve;
+      return d.promise;
+    });
+
+    await renderApp();
+    await goToAgenda(); // call 0 -- settles immediately
+    expect(agendaRowIds()).toHaveLength(100);
+
+    const bucketEntry = Array.from(
+      container.querySelectorAll<HTMLButtonElement>("nav button"),
+    )[0]!;
+
+    // Leave and come back: fires walk A (call 1), left pending.
+    await act(async () => {
+      bucketEntry.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+    await goToAgenda();
+
+    // Leave and come back again: fires walk B (call 2), also left pending,
+    // and bumps actionsGenRef past walk A's -- from here on, A is stale.
+    await act(async () => {
+      bucketEntry.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+    await goToAgenda();
+
+    expect(mockApi.getActions).toHaveBeenCalledTimes(3);
+
+    // Walk A (stale) resolves now, after walk B already started. Its own
+    // finally block must not clear the in-flight guard walk B still holds --
+    // that's the whole point of the generation check in the fix.
+    await act(async () => {
+      pendingResolvers[1]({ items: PAGE1, counts: { open: 100, overdue: 0 }, next_cursor: "c1" });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The board's cursor is still whatever call 0 minted -- a truthy value
+    // loadMoreActions would act on immediately if the guard were (wrongly)
+    // cleared by the stale walk. It must stay a no-op while walk B is
+    // still outstanding.
+    await fireIntersection(agendaObserver());
+    expect(mockApi.getActions).toHaveBeenCalledTimes(3);
+
+    // Walk B finally resolves -- everything settles normally, and the guard
+    // releases for real once its own generation is the current one.
+    await act(async () => {
+      pendingResolvers[2]({ items: PAGE1, counts: { open: 100, overdue: 0 }, next_cursor: "c1" });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(agendaRowIds()).toHaveLength(100);
+
+    // With the guard properly released, a load-more now goes through.
+    await fireIntersection(agendaObserver());
+    expect(mockApi.getActions).toHaveBeenCalledTimes(4);
+  });
+
+  it("suppresses a second observer fire that arrives before the first load-more's state update flushes", async () => {
+    const page2 = deferred<ActionsResponse>();
+    mockApi.getActions.mockImplementation(async (_status, _limit, cursor) => {
+      if (!cursor) {
+        return { items: PAGE1, counts: { open: 107, overdue: 0 }, next_cursor: "c1" };
+      }
+      return page2.promise;
+    });
+
+    await renderApp();
+    await goToAgenda();
+    expect(agendaRowIds()).toHaveLength(100);
+
+    const observer = agendaObserver();
+    // Two intersection callbacks fire back-to-back, synchronously -- before
+    // React's setActionsLoadingMore(true) from the first call has any
+    // chance to flush into a rerender. Only a synchronous ref (not the
+    // actionsLoadingMore state) can stop the second from double-fetching.
+    await act(async () => {
+      observer.callback(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        observer as unknown as IntersectionObserver,
+      );
+      observer.callback(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        observer as unknown as IntersectionObserver,
+      );
+      await Promise.resolve();
+    });
+
+    // Page one, plus exactly ONE load-more fetch -- the second callback's
+    // call must have no-op'd against the in-flight ref rather than issuing
+    // its own request against the same cursor.
+    expect(mockApi.getActions).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      page2.resolve({ items: PAGE2, counts: { open: 107, overdue: 0 }, next_cursor: null });
+      await page2.promise;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Exactly one copy of page two landed -- no duplicate rows from a
+    // second in-flight fetch racing the first's append.
+    expect(agendaRowIds()).toEqual([...PAGE1, ...PAGE2].map((a) => a.id));
+  });
+
   it("a fresh refetch after scrolling multiple pages deep walks the cursor forward and restores the same depth", async () => {
     mockApi.getActions.mockImplementation(pagedGetActions(TWO_PAGE_RESPONSES));
 

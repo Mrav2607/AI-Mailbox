@@ -237,6 +237,37 @@ def test_list_next_cursor_is_emitted_on_a_full_page():
     assert resp.json()["next_cursor"] is not None
 
 
+def test_list_following_a_full_page_cursor_into_an_empty_page_terminates_cleanly():
+    # Second half of plan edge case #7: page one is full and mints a cursor;
+    # paging with that cursor into a page with no more rows must return
+    # items: [] and next_cursor: null, not a leftover/dangling cursor.
+    user = MagicMock(id=uuid4())
+    item = _make_action_item(due_at=None)
+    row = _Row(
+        item,
+        thread_subject="s",
+        provider="gmail",
+        sender="a@example.com",
+        display_email="a@example.com",
+        external_user_id="ext",
+        label="fyi",
+        last_message_at=None,
+    )
+    db = _SequencedListDB([([row], (1, 0)), ([], (0, 0))])
+    app.dependency_overrides[get_current_user] = lambda: user
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        client = TestClient(app)
+        first = client.get("/api/v1/mail/actions?limit=1")
+        cursor = first.json()["next_cursor"]
+        assert cursor is not None
+        second = client.get(f"/api/v1/mail/actions?limit=1&cursor={cursor}")
+    finally:
+        app.dependency_overrides.clear()
+    assert second.json()["items"] == []
+    assert second.json()["next_cursor"] is None
+
+
 # ---------------------------------------------------------------------------
 # Cursor encode/decode -- unit-level validation matrix (D3)
 # ---------------------------------------------------------------------------
@@ -283,9 +314,44 @@ def test_cursor_decode_rejects_truncated_base64():
     assert exc_info.value.status_code == 422
 
 
+def test_cursor_decode_rejects_invalid_base64_chars_a_lenient_decode_would_accept():
+    # base64.urlsafe_b64decode's default (non-strict) mode silently drops any
+    # byte outside the base64 alphabet instead of erroring -- appending one
+    # to an otherwise-valid token still decodes to the original payload under
+    # that lenient mode, which is exactly the gap `validate=True` closes.
+    item = SimpleNamespace(
+        due_at=None, created_at=datetime(2026, 7, 1, tzinfo=timezone.utc), id=uuid4()
+    )
+    token = actions._encode_agenda_cursor("open", item)
+    tampered = token + "!"
+    padded = tampered + "=" * (-len(tampered) % 4)
+    assert json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))  # lenient: decodes fine
+    with pytest.raises(HTTPException) as exc_info:
+        actions._decode_agenda_cursor(tampered, "open")
+    assert exc_info.value.status_code == 422
+
+
 def test_cursor_decode_rejects_wrong_version():
     payload = {
         "v": 2,
+        "s": "open",
+        "d": None,
+        "c": "2026-07-01T00:00:00+00:00",
+        "i": str(uuid4()),
+    }
+    token = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    with pytest.raises(HTTPException) as exc_info:
+        actions._decode_agenda_cursor(token, "open")
+    assert exc_info.value.status_code == 422
+
+
+@pytest.mark.parametrize("bad_version", [True, 1.0])
+def test_cursor_decode_rejects_non_int_version(bad_version):
+    # `!= 1` alone would pass both of these: `True == 1` and `1.0 == 1` in
+    # Python. Only a plain int minted by `_encode_agenda_cursor` should
+    # round-trip.
+    payload = {
+        "v": bad_version,
         "s": "open",
         "d": None,
         "c": "2026-07-01T00:00:00+00:00",
@@ -423,6 +489,26 @@ class _ListThenCountsDB:
         result = MagicMock()
         result.all.return_value = self._rows
         result.one.return_value = self._counts_row
+        return result
+
+
+class _SequencedListDB:
+    """Like ``_ListThenCountsDB``, but drives MULTIPLE separate agenda
+    requests off the SAME stub -- each ``(rows, counts_row)`` pair in
+    ``responses`` answers one request's list-then-counts execute() pair, in
+    order, so a test can page across requests and assert on how the second
+    responds to what the first minted."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self._calls = 0
+
+    def execute(self, stmt):
+        rows, counts_row = self._responses[self._calls // 2]
+        self._calls += 1
+        result = MagicMock()
+        result.all.return_value = rows
+        result.one.return_value = counts_row
         return result
 
 

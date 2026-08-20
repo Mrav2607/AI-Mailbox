@@ -6,12 +6,15 @@ via TEST_DATABASE_URL so the offline suite stays green without a live
 database, schema built with `Base.metadata.create_all` against a
 `*_test`-only database, one truncated session per test. What the MagicMock
 route suite (test_actions_routes.py) can't prove and this tier does: (a) the
-extraction writer (`persistence.claim_action_item`) actually stamps
-`ActionItem.user_id` equal to its thread's owner -- the D6 "application
-convention, not a DB invariant" the new index/predicate leans on -- and (b) a
-real cursor-walk over real Postgres ordering, including the NULLS LAST
-boundary, duplicate sort keys spanning a page break, and a row completing
-mid-walk.
+REAL extraction path (`extraction_run._claim_extract_record`, the engine
+`run_extraction_for_message`/`run_extraction_sweep` both wrap) locks the
+thread, derives `user_id` off it, and only then claims the item -- so the
+item's `user_id` actually equals its thread's owner via that derivation, not
+just via whatever a test happens to hand `claim_action_item` directly. This
+is the D6 "application convention, not a DB invariant" the new index/
+predicate leans on. And (b) a real cursor-walk over real Postgres ordering,
+including the NULLS LAST boundary, duplicate sort keys spanning a page
+break, and a row completing mid-walk.
 
 Route functions are called directly (`actions.list_actions(...)`), not
 through TestClient -- same choice test_auth_integration.py makes, since the
@@ -40,7 +43,9 @@ from app.db.models import (
     ProviderAccount,
 )
 from app.routes import actions
-from app.services.nlp.persistence import claim_action_item
+from app.services.nlp import extraction_run
+from app.services.nlp.extractor import ExtractionAttempt, NoAction
+from app.services.nlp.providers import CallContext, LlmCredential
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
@@ -212,21 +217,41 @@ def _walk_all_pages(db, user, *, status="open", limit=3):
 # ---------------------------------------------------------------------------
 
 
-def test_claim_action_item_stamps_user_id_from_the_thread_owner(db_session):
+def test_extraction_run_stamps_action_item_user_id_from_the_locked_thread(
+    db_session, monkeypatch
+):
+    """Goes through `extraction_run._claim_extract_record` -- the real
+    engine both `run_extraction_for_message` and `run_extraction_sweep`
+    wrap -- instead of handing `thread.user_id` straight to
+    `claim_action_item`. That's the actual production derivation this
+    proves: lock the thread, read `user_id` off THAT row, then claim.
+    `extract_action_with_usage` is monkeypatched to a canned `NoAction`
+    result so the test stays a pure-DB assertion -- no outbound LLM call,
+    and no need to resolve a real BYOK credential first."""
     user, account = _seed_user_and_account(db_session)
     thread = _seed_thread(db_session, user, account)
     message = _seed_visible_message(db_session, thread)
 
-    token = claim_action_item(
+    monkeypatch.setattr(
+        extraction_run,
+        "extract_action_with_usage",
+        lambda **_kwargs: ExtractionAttempt(
+            result=NoAction(), provider_call_succeeded=True, usage=None
+        ),
+    )
+    stub_credential = LlmCredential(
+        provider="openai", base_url="https://example.invalid/v1", api_key="k", model="m"
+    )
+
+    bucket, derived_user_id = extraction_run._claim_extract_record(
         db_session,
-        message_id=message.id,
-        thread_id=thread.id,
-        user_id=thread.user_id,
-        thread_done=False,
+        message.id,
+        call_context=CallContext(credential=stub_credential, payer="operator"),
     )
     db_session.commit()
 
-    assert token is not None
+    assert bucket == "no_action"
+    assert derived_user_id == user.id
     row = db_session.execute(
         select(ActionItem).where(ActionItem.message_id == message.id)
     ).scalar_one()
