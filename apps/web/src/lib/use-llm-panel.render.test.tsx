@@ -6,6 +6,7 @@ import { ApiError } from "@/lib/api";
 import type { SettingsTab } from "@/components/console/SettingsDialog";
 import type {
   ClassifierMixEntry,
+  LlmCredentialSummary,
   LlmProvider,
   LlmSettings,
   LlmTestResult,
@@ -68,6 +69,21 @@ function makeUsage(overrides: Partial<LlmUsage> = {}): LlmUsage {
 
 const MIX: ClassifierMixEntry[] = [{ kind: "local", count: 3 }];
 
+function makeCredential(overrides: Partial<LlmCredentialSummary> = {}): LlmCredentialSummary {
+  return {
+    id: "cred-1",
+    name: "default",
+    provider: "openai",
+    model: "gpt-4o-mini",
+    key_suffix: "abcd",
+    last_verified_at: null,
+    active: true,
+    classification_byok: false,
+    classification_fallback_local: false,
+    ...overrides,
+  };
+}
+
 describe("useLlmPanel rendered lifecycle", () => {
   let root: Root;
   let container: HTMLElement;
@@ -118,6 +134,14 @@ describe("useLlmPanel rendered lifecycle", () => {
       deleteLlmSettings: vi.fn(() => Promise.resolve()),
       getLlmUsage: vi.fn(() => Promise.resolve(makeUsage())),
       getClassifierMix: vi.fn(() => Promise.resolve({ classifier_mix: MIX })),
+      listLlmCredentials: vi.fn(() => Promise.resolve([makeCredential()])),
+      createLlmCredential: vi.fn((input: { name: string }) =>
+        Promise.resolve(makeCredential({ id: "cred-new", name: input.name })),
+      ),
+      activateLlmCredential: vi.fn((id: string) =>
+        Promise.resolve(makeCredential({ id, active: true })),
+      ),
+      deleteLlmCredential: vi.fn(() => Promise.resolve()),
       onSessionExpired,
       toastSuccess,
       toastError,
@@ -485,6 +509,460 @@ describe("useLlmPanel rendered lifecycle", () => {
 
       expect(api!.llmSettingsError).toBe(false);
       expect(toastError).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("multi-credential list", () => {
+    it("refreshLlmCredentials loads the list", async () => {
+      const items = [makeCredential({ id: "cred-1" }), makeCredential({ id: "cred-2" })];
+      deps.listLlmCredentials = vi.fn(() => Promise.resolve(items));
+
+      await act(async () => {
+        await api!.refreshLlmCredentials();
+      });
+
+      expect(api!.llmCredentials).toEqual(items);
+    });
+
+    it("doCreateLlmCredential adds the new row and refreshes settings -- a first credential is created active", async () => {
+      deps.listLlmCredentials = vi.fn(() =>
+        Promise.resolve([makeCredential({ id: "cred-new", name: "Work key" })]),
+      );
+      deps.getLlmSettings = vi.fn(() =>
+        Promise.resolve(makeSettings({ provider: "gemini", model: "gemini-2.0-flash" })),
+      );
+
+      await act(async () => {
+        await api!.doCreateLlmCredential({
+          name: "Work key",
+          provider: "gemini",
+          api_key: "gm-key-12345678",
+          model: "gemini-2.0-flash",
+        });
+      });
+
+      expect(api!.llmCredentials).toEqual([makeCredential({ id: "cred-new", name: "Work key" })]);
+      expect(api!.llmSettings).toEqual(
+        makeSettings({ provider: "gemini", model: "gemini-2.0-flash" }),
+      );
+      expect(toastSuccess).toHaveBeenCalledWith('Added "Work key"');
+      expect(api!.llmCreatingCredential).toBe(false);
+    });
+
+    it("a create failure toasts and leaves the list untouched", async () => {
+      deps.createLlmCredential = vi.fn(() =>
+        Promise.reject(new ApiError(422, "a credential with this name already exists")),
+      );
+
+      await act(async () => {
+        await api!.doCreateLlmCredential({
+          name: "dup",
+          provider: "openai",
+          api_key: "sk-12345678",
+          model: "gpt-4o-mini",
+        });
+      });
+
+      expect(toastError).toHaveBeenCalledWith("a credential with this name already exists");
+      expect(api!.llmCredentials).toBeNull();
+    });
+
+    it("a create failure at the cap surfaces the server's 422 message", async () => {
+      deps.createLlmCredential = vi.fn(() =>
+        Promise.reject(new ApiError(422, "credential limit reached")),
+      );
+
+      await act(async () => {
+        await api!.doCreateLlmCredential({
+          name: "sixth",
+          provider: "openai",
+          api_key: "sk-12345678",
+          model: "gpt-4o-mini",
+        });
+      });
+
+      expect(toastError).toHaveBeenCalledWith("credential limit reached");
+    });
+
+    it("doActivateLlmCredential switches the active credential and refreshes both list and settings", async () => {
+      deps.listLlmCredentials = vi.fn(() =>
+        Promise.resolve([
+          makeCredential({ id: "cred-1", active: false }),
+          makeCredential({ id: "cred-2", active: true }),
+        ]),
+      );
+      deps.getLlmSettings = vi.fn(() =>
+        Promise.resolve(makeSettings({ key_suffix: "cred-2-suffix" })),
+      );
+
+      await act(async () => {
+        await api!.doActivateLlmCredential("cred-2");
+      });
+
+      expect(api!.llmCredentials).toEqual([
+        makeCredential({ id: "cred-1", active: false }),
+        makeCredential({ id: "cred-2", active: true }),
+      ]);
+      expect(api!.llmSettings).toEqual(makeSettings({ key_suffix: "cred-2-suffix" }));
+      expect(api!.llmActivatingCredentialId).toBeNull();
+    });
+
+    it("doDeleteLlmCredential removes an inactive row and refreshes the list", async () => {
+      deps.deleteLlmCredential = vi.fn(() => Promise.resolve());
+      deps.listLlmCredentials = vi.fn(() => Promise.resolve([makeCredential({ id: "cred-1" })]));
+
+      await act(async () => {
+        await api!.doDeleteLlmCredential("cred-2");
+      });
+
+      expect(deps.deleteLlmCredential).toHaveBeenCalledWith("cred-2");
+      expect(api!.llmCredentials).toEqual([makeCredential({ id: "cred-1" })]);
+      expect(toastSuccess).toHaveBeenCalledWith("Credential removed");
+    });
+
+    it("a 409 deleting the active credential sets an inline row error, not a toast", async () => {
+      deps.deleteLlmCredential = vi.fn(() =>
+        Promise.reject(new ApiError(409, "cannot delete the active credential")),
+      );
+
+      await act(async () => {
+        await api!.doDeleteLlmCredential("cred-2");
+      });
+
+      expect(api!.llmCredentialDeleteError).toEqual({
+        id: "cred-2",
+        message: "This is your active credential — switch to another one first.",
+      });
+      expect(toastError).not.toHaveBeenCalled();
+    });
+
+    it("a non-409 delete failure toasts instead of setting the row error", async () => {
+      deps.deleteLlmCredential = vi.fn(() => Promise.reject(new Error("network down")));
+
+      await act(async () => {
+        await api!.doDeleteLlmCredential("cred-2");
+      });
+
+      expect(toastError).toHaveBeenCalledWith("network down");
+      expect(api!.llmCredentialDeleteError).toBeNull();
+    });
+
+    it("an account change clears the credential list and any pending row error", async () => {
+      deps.deleteLlmCredential = vi.fn(() =>
+        Promise.reject(new ApiError(409, "cannot delete the active credential")),
+      );
+      await act(async () => {
+        await api!.doDeleteLlmCredential("cred-2");
+      });
+      expect(api!.llmCredentialDeleteError).not.toBeNull();
+
+      await act(async () => {
+        await api!.refreshLlmCredentials();
+      });
+      expect(api!.llmCredentials).not.toBeNull();
+
+      render("user-b");
+
+      expect(api!.llmCredentials).toBeNull();
+      expect(api!.llmCredentialDeleteError).toBeNull();
+    });
+
+    it("the singular kill switch clears the credential list too, not just llmSettings", async () => {
+      await act(async () => {
+        await api!.refreshLlmCredentials();
+      });
+      expect(api!.llmCredentials).not.toBeNull();
+
+      await act(async () => {
+        await api!.doRemoveLlmSettings();
+      });
+
+      expect(api!.llmCredentials).toEqual([]);
+    });
+
+    it("a credential list GET already in flight when the kill switch fires does not resurrect deleted rows", async () => {
+      const listFetch = deferred<LlmCredentialSummary[]>();
+      deps.listLlmCredentials = vi.fn(() => listFetch.promise);
+
+      await act(async () => {
+        void api!.refreshLlmCredentials();
+      });
+      expect(api!.llmCredentials).toBeNull();
+
+      // The kill switch fires while that GET is still in flight -- it
+      // bumps the list generation up front and clears immediately.
+      await act(async () => {
+        await api!.doRemoveLlmSettings();
+      });
+      expect(api!.llmCredentials).toEqual([]);
+
+      // Without the guard, this stale GET landing afterward would put the
+      // deleted rows straight back on top of the clear above.
+      await act(async () => {
+        listFetch.resolve([makeCredential({ id: "cred-1" })]);
+        await listFetch.promise.catch(() => {});
+      });
+
+      expect(api!.llmCredentials).toEqual([]);
+    });
+
+    it("a successful save refreshes the credential list, not just llmSettings", async () => {
+      deps.listLlmCredentials = vi.fn(() =>
+        Promise.resolve([
+          makeCredential({ id: "cred-1", provider: "gemini", model: "gemini-2.0-flash" }),
+        ]),
+      );
+
+      await act(async () => {
+        await api!.doSaveLlmSettings({ provider: "gemini", model: "gemini-2.0-flash" });
+      });
+
+      // A save can change provider/model/key_suffix on the active row --
+      // leaving the list stale here would show the old values right next
+      // to the just-saved form.
+      expect(api!.llmCredentials).toEqual([
+        makeCredential({ id: "cred-1", provider: "gemini", model: "gemini-2.0-flash" }),
+      ]);
+    });
+
+    it("an account change resets the structural-action flags, not just the list data", async () => {
+      const activate = deferred<LlmCredentialSummary>();
+      deps.activateLlmCredential = vi.fn(() => activate.promise);
+
+      let activatePromise!: Promise<void>;
+      await act(async () => {
+        activatePromise = api!.doActivateLlmCredential("cred-2");
+      });
+      expect(api!.llmActivatingCredentialId).toBe("cred-2");
+
+      render("user-b");
+
+      // Without this reset, user-b would open the ai tab and find "cred-2"
+      // stuck disabled for an activate that was never theirs.
+      expect(api!.llmActivatingCredentialId).toBeNull();
+
+      await act(async () => {
+        activate.resolve(makeCredential({ id: "cred-2", active: true }));
+        await activatePromise.catch(() => {});
+      });
+    });
+
+    it("a stale action completing after an account switch does not clobber the new account's own in-flight action, or toast at them", async () => {
+      const userACreate = deferred<LlmCredentialSummary>();
+      deps.createLlmCredential = vi.fn(() => userACreate.promise);
+
+      let aCreatePromise!: Promise<void>;
+      await act(async () => {
+        aCreatePromise = api!.doCreateLlmCredential({
+          name: "A's key",
+          provider: "openai",
+          api_key: "sk-aaaaaaaa",
+          model: "gpt-4o-mini",
+        });
+      });
+      expect(api!.llmCreatingCredential).toBe(true);
+
+      render("user-b");
+      expect(api!.llmCreatingCredential).toBe(false);
+
+      // user-b starts their own create before user-a's stale one settles.
+      const userBCreate = deferred<LlmCredentialSummary>();
+      deps.createLlmCredential = vi.fn(() => userBCreate.promise);
+      let bCreatePromise!: Promise<void>;
+      await act(async () => {
+        bCreatePromise = api!.doCreateLlmCredential({
+          name: "B's key",
+          provider: "openai",
+          api_key: "sk-bbbbbbbb",
+          model: "gpt-4o-mini",
+        });
+      });
+      expect(api!.llmCreatingCredential).toBe(true);
+
+      // user-a's create finally resolves -- without the identity guard,
+      // this would clear user-b's still-in-flight flag out from under them
+      // and toast user-a's success at user-b's screen.
+      await act(async () => {
+        userACreate.resolve(makeCredential({ id: "cred-a", name: "A's key" }));
+        await aCreatePromise;
+      });
+      expect(api!.llmCreatingCredential).toBe(true);
+      expect(toastSuccess).not.toHaveBeenCalledWith('Added "A\'s key"');
+
+      await act(async () => {
+        userBCreate.resolve(makeCredential({ id: "cred-b", name: "B's key" }));
+        await bCreatePromise;
+      });
+      expect(api!.llmCreatingCredential).toBe(false);
+      expect(toastSuccess).toHaveBeenCalledWith('Added "B\'s key"');
+    });
+
+    it("a create's post-commit reconciliation beats a refresh that claimed a newer generation but read pre-commit data", async () => {
+      const create = deferred<LlmCredentialSummary>();
+      deps.createLlmCredential = vi.fn(() => create.promise);
+
+      // deps.listLlmCredentials gets called twice: once by the interleaved
+      // refresh below (while the POST is still in flight, so it can only
+      // read the pre-commit list), and once by the create's own post-
+      // commit reconciliation. Track which call is which by order.
+      const staleList = deferred<LlmCredentialSummary[]>();
+      const freshList = deferred<LlmCredentialSummary[]>();
+      const listCalls = [staleList, freshList];
+      let listCallIndex = 0;
+      deps.listLlmCredentials = vi.fn(() => listCalls[listCallIndex++]!.promise);
+
+      const freshSettings = deferred<LlmSettings>();
+      deps.getLlmSettings = vi.fn(() => freshSettings.promise);
+
+      const oldRow = makeCredential({ id: "cred-1", name: "old" });
+      const newRow = makeCredential({ id: "cred-new", name: "Work key" });
+
+      let createPromise!: Promise<void>;
+      await act(async () => {
+        createPromise = api!.doCreateLlmCredential({
+          name: "Work key",
+          provider: "openai",
+          api_key: "sk-12345678",
+          model: "gpt-4o-mini",
+        });
+      });
+
+      // Something re-opens the ai tab while the POST above is still in
+      // flight (App's own refetch-on-tab-activation) -- this claims a
+      // NEWER generation than the create's own pre-request bump, but its
+      // GET can still only see the pre-commit list.
+      await act(async () => {
+        void api!.refreshLlmCredentials();
+      });
+
+      // The POST commits on the server.
+      await act(async () => {
+        create.resolve(newRow);
+        await create.promise;
+      });
+
+      // The create's own post-commit GETs land first, with the true new
+      // state -- the row it just added shows up.
+      await act(async () => {
+        freshList.resolve([oldRow, newRow]);
+        freshSettings.resolve(makeSettings({ provider: "openai", model: "gpt-4o-mini" }));
+        await createPromise;
+      });
+      expect(api!.llmCredentials).toEqual([oldRow, newRow]);
+
+      // The refresh's own GET, which started before the create committed,
+      // finally lands -- reading pre-commit data (just the old row). It
+      // must not win just because it claimed a higher generation number
+      // than the create's own post-commit reconciliation.
+      await act(async () => {
+        staleList.resolve([oldRow]);
+        await staleList.promise.catch(() => {});
+      });
+
+      expect(api!.llmCredentials).toEqual([oldRow, newRow]);
+    });
+
+    it("a stale kill switch completing after an account switch does not wipe the new account's list", async () => {
+      const userARemove = deferred<void>();
+      deps.deleteLlmSettings = vi.fn(() => userARemove.promise);
+
+      let aRemovePromise!: Promise<void>;
+      await act(async () => {
+        aRemovePromise = api!.doRemoveLlmSettings();
+      });
+
+      render("user-b");
+
+      // user-b loads their own credential list normally.
+      deps.listLlmCredentials = vi.fn(() =>
+        Promise.resolve([makeCredential({ id: "cred-b", name: "B's key", active: true })]),
+      );
+      await act(async () => {
+        await api!.refreshLlmCredentials();
+      });
+      expect(api!.llmCredentials).toHaveLength(1);
+
+      const toastCountBefore = (deps.toastSuccess as ReturnType<typeof vi.fn>).mock.calls.length;
+
+      // user-a's stale kill switch finally resolves. Its whole success path
+      // must bail on the identity check -- before the fix, its re-claimed
+      // list generation was compared synchronously (trivially true) and it
+      // cleared user-b's list and toasted at them.
+      await act(async () => {
+        userARemove.resolve();
+        await aRemovePromise;
+      });
+
+      expect(api!.llmCredentials).toHaveLength(1);
+      expect((deps.toastSuccess as ReturnType<typeof vi.fn>).mock.calls.length).toBe(
+        toastCountBefore,
+      );
+    });
+
+    it("a stale create completing after an account switch does not invalidate the new account's in-flight test", async () => {
+      const userACreate = deferred<LlmCredentialSummary>();
+      deps.createLlmCredential = vi.fn(() => userACreate.promise);
+
+      let aCreatePromise!: Promise<void>;
+      await act(async () => {
+        aCreatePromise = api!.doCreateLlmCredential({
+          name: "A's key",
+          provider: "openai",
+          api_key: "sk-aaaaaaaa",
+          model: "gpt-4o-mini",
+        });
+      });
+
+      render("user-b");
+
+      const bTest = deferred<LlmTestResult>();
+      deps.testLlmSettings = vi.fn(() => bTest.promise);
+      await act(async () => {
+        void api!.doTestLlmSettings();
+      });
+      expect(api!.llmTesting).toBe(true);
+
+      // user-a's stale create finally resolves -- its own write is already
+      // discarded by the settings-generation guard, but its finally block
+      // used to bump llmCredentialGenRef unconditionally regardless of
+      // whose completion this was. That bump would land in between user-b's
+      // test capturing its own generation and this resolving, discarding
+      // user-b's in-flight test for no reason of their own.
+      await act(async () => {
+        userACreate.resolve(makeCredential({ id: "cred-a", name: "A's key" }));
+        await aCreatePromise;
+      });
+
+      await act(async () => {
+        bTest.resolve({ ok: true, latency_ms: 7, error: null });
+        await bTest.promise;
+      });
+
+      // Without the guard, this would still be null -- the stray bump above
+      // would have made doTestLlmSettings' own identity check fail, and
+      // this actually-current result would be discarded.
+      expect(api!.llmTestResult).toEqual({ ok: true, latency_ms: 7, error: null });
+      expect(api!.llmTesting).toBe(false);
+    });
+
+    it("a stale activate rejection after an account switch does not toast at the new account", async () => {
+      const activate = deferred<LlmCredentialSummary>();
+      deps.activateLlmCredential = vi.fn(() => activate.promise);
+
+      let activatePromise!: Promise<void>;
+      await act(async () => {
+        activatePromise = api!.doActivateLlmCredential("cred-1");
+      });
+      render("user-b");
+      expect(api!.llmActivatingCredentialId).toBeNull();
+
+      await act(async () => {
+        activate.reject(new Error("network down"));
+        await activatePromise.catch(() => {});
+      });
+
+      expect(toastError).not.toHaveBeenCalled();
+      expect(api!.llmActivatingCredentialId).toBeNull();
     });
   });
 });

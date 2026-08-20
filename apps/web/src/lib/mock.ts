@@ -12,6 +12,7 @@ import type {
   Connection,
   CountsResponse,
   Label,
+  LlmCredentialSummary,
   LlmProvider,
   LlmSettings,
   LlmTestResult,
@@ -858,7 +859,8 @@ export function mockSendReply(threadId: string, input: SendReplyInput): ReplySen
 export function mockDraftReply(threadId: string): ReplyDraft {
   const item = ALL.find((i) => i.thread_id === threadId);
   if (!item) throw new ApiError(404, `Thread not found: ${threadId}`);
-  if (!LLM_SETTINGS.configured) {
+  const active = activeLlmCredential();
+  if (!active) {
     throw new ApiError(
       409,
       "No LLM credential is configured for drafting replies.",
@@ -871,8 +873,8 @@ export function mockDraftReply(threadId: string): ReplyDraft {
   const sender = senderName(item.latest_message_sender) ?? "there";
   return {
     draft_text: `Hi ${sender},\n\nThanks for the note — I'll follow up shortly.\n\nBest,`,
-    provider: LLM_SETTINGS.provider ?? "openai",
-    model: LLM_SETTINGS.model ?? "gpt-4o-mini",
+    provider: active.provider,
+    model: active.model,
   };
 }
 
@@ -944,10 +946,10 @@ export function mockBackfill(opts: BackfillOptions): BackfillResult {
       ? "local:email-classifier"
       : backend === "llm"
         ? // The real API stamps whichever model the resolved credential names,
-          // so read the currently-configured one rather than a fixed string --
+          // so read the currently-active one rather than a fixed string --
           // otherwise a backfill run after changing the model in settings would
           // still report the old one.
-          (LLM_SETTINGS.model ?? "llm")
+          (activeLlmCredential()?.model ?? "llm")
         : "heuristic-v1";
 
   let created = 0;
@@ -977,45 +979,139 @@ const PRESET_BASE_URLS: Partial<Record<LlmProvider, string>> = {
   anthropic: "https://api.anthropic.com/v1",
 };
 
-// Demo mode starts CONFIGURED so preview shows a live settings state instead
-// of the empty-state nudge. Mutable, same store pattern as CONNECTIONS above.
-// classification_byok starts true on this preset provider (classification_
-// eligible follows, true too) so preview shows the "local model handles most
-// mail, your key only backs it up" notice from the very first load.
-let LLM_SETTINGS: LlmSettings = {
-  configured: true,
-  provider: "openai",
-  model: "gpt-4o-mini",
-  base_url: PRESET_BASE_URLS.openai!,
-  key_suffix: "sk12",
-  last_verified_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+// Deployment-level flags, independent of which credential (if any) is
+// active -- the real API's equivalents live on settings the operator
+// controls, never on a credential row, so they don't belong in the
+// per-credential store below.
+const DEPLOYMENT_LLM_FLAGS = {
   extraction_enabled: true,
-  fallback_active: false,
   custom_endpoints_enabled: false,
   private_endpoints_enabled: false,
-  custom_blocked: false,
-  classification_byok: true,
-  // Starts off -- a true opt-in, same default as the real column. Harmless
-  // in preview since the mock provider never fails a call to begin with.
-  classification_fallback_local: false,
   classifier_uses_llm: true,
   classifier_backend: "auto",
-  classification_eligible: true,
-  // Preview has no operator key, so this tracks eligibility exactly -- which
-  // also lets the demo show the backfill form's disabled-LLM state when you
-  // untick the classification opt-in.
-  classification_llm_usable: true,
 };
 
-export function mockGetLlmSettings(): LlmSettings {
-  return { ...LLM_SETTINGS };
+// One row of the multi-credential store (2026-08-19-multi-credential-llm-
+// profiles plan) -- a user can hold several, at most one active. Keeps the
+// full api_key-derived key_suffix rather than a live key, same "never store
+// more than we'd echo" discipline the real credential summary follows.
+interface MockLlmCredential {
+  id: string;
+  name: string;
+  provider: LlmProvider;
+  model: string;
+  base_url: string;
+  key_suffix: string;
+  last_verified_at: string | null;
+  is_active: boolean;
+  classification_byok: boolean;
+  classification_fallback_local: boolean;
 }
 
-// Upserts the demo credential. Only the last 4 chars of the submitted key
-// ever get stored, same as the server. An absent key preserves the demo's
-// existing key_suffix -- mirroring the server's "nothing to replace it with"
-// rule -- and last_verified_at only clears when the key or another material
-// field actually changes, not on a flag-only edit.
+// Demo mode starts with ONE active credential so preview shows a live
+// settings state instead of the empty-state nudge. Mutable, same store
+// pattern as CONNECTIONS above. classification_byok starts true on this
+// preset provider (classification_eligible follows, true too) so preview
+// shows the "local model handles most mail, your key only backs it up"
+// notice from the very first load.
+let LLM_CREDENTIALS: MockLlmCredential[] = [
+  {
+    id: "mock-cred-1",
+    name: "default",
+    provider: "openai",
+    model: "gpt-4o-mini",
+    base_url: PRESET_BASE_URLS.openai!,
+    key_suffix: "sk12",
+    last_verified_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+    is_active: true,
+    classification_byok: true,
+    // Starts off -- a true opt-in, same default as the real column. Harmless
+    // in preview since the mock provider never fails a call to begin with.
+    classification_fallback_local: false,
+  },
+];
+
+// Monotonic, distinct from the seed row's fixed id -- mirrors the
+// mock-acct-N / mock-action-N id style used elsewhere in this file.
+let credentialSeq = 1;
+function nextCredentialId(): string {
+  credentialSeq += 1;
+  return `mock-cred-${credentialSeq}`;
+}
+
+function activeLlmCredential(): MockLlmCredential | null {
+  return LLM_CREDENTIALS.find((c) => c.is_active) ?? null;
+}
+
+// The singular GET/PUT/test/DELETE surface below is a VIEW onto whichever
+// row is active (D4) -- unconfigured, with every field null, iff there is
+// no active row (including "no credentials at all").
+function settingsFromActive(): LlmSettings {
+  const active = activeLlmCredential();
+  if (!active) {
+    return {
+      configured: false,
+      provider: null,
+      model: null,
+      base_url: null,
+      key_suffix: null,
+      last_verified_at: null,
+      ...DEPLOYMENT_LLM_FLAGS,
+      fallback_active: true,
+      custom_blocked: false,
+      classification_byok: false,
+      classification_fallback_local: false,
+      classification_eligible: false,
+      classification_llm_usable: false,
+    };
+  }
+  // Preview has no operator key, so eligibility tracks the opt-in exactly --
+  // which also lets the demo show the backfill form's disabled-LLM state
+  // when you untick the classification opt-in. `custom` never routes
+  // classification (presets-only in v1), same as the real API.
+  const eligible = active.provider === "custom" ? false : active.classification_byok;
+  return {
+    configured: true,
+    provider: active.provider,
+    model: active.model,
+    base_url: active.base_url,
+    key_suffix: active.key_suffix,
+    last_verified_at: active.last_verified_at,
+    ...DEPLOYMENT_LLM_FLAGS,
+    fallback_active: false,
+    custom_blocked: false,
+    classification_byok: active.classification_byok,
+    classification_fallback_local: active.classification_fallback_local,
+    classification_eligible: eligible,
+    classification_llm_usable: eligible,
+  };
+}
+
+function credentialSummary(row: MockLlmCredential): LlmCredentialSummary {
+  return {
+    id: row.id,
+    name: row.name,
+    provider: row.provider,
+    model: row.model,
+    key_suffix: row.key_suffix,
+    last_verified_at: row.last_verified_at,
+    active: row.is_active,
+    classification_byok: row.classification_byok,
+    classification_fallback_local: row.classification_fallback_local,
+  };
+}
+
+export function mockGetLlmSettings(): LlmSettings {
+  return settingsFromActive();
+}
+
+// Upserts the caller's ACTIVE credential (D4) -- creates the first one,
+// named "default" and active, if none exists yet, same as the real PUT
+// route. Only the last 4 chars of a submitted key ever get stored, same as
+// the server. An absent key preserves the existing key_suffix -- mirroring
+// the server's "nothing to replace it with" rule -- and last_verified_at
+// only clears when the key or another material field actually changes, not
+// on a flag-only edit.
 export function mockPutLlmSettings(input: {
   provider: LlmProvider;
   api_key?: string;
@@ -1024,77 +1120,137 @@ export function mockPutLlmSettings(input: {
   classification_byok?: boolean;
   classification_fallback_local?: boolean;
 }): LlmSettings {
+  const active = activeLlmCredential();
   const base_url =
     input.provider === "custom"
-      ? (input.base_url ?? LLM_SETTINGS.base_url)
-      : (PRESET_BASE_URLS[input.provider] ?? LLM_SETTINGS.base_url);
+      ? (input.base_url ?? active?.base_url ?? "")
+      : (PRESET_BASE_URLS[input.provider] ?? active?.base_url ?? "");
   // Absent means "unchanged", same as the server. Unlike the real API, this
   // deliberately does NOT force-clear the flag on a switch to "custom" --
   // the demo exists to show both notice states, and a stored
   // classification_byok=true against a custom provider is exactly the
   // out-of-band shape the "isn't set up to sort your mail" notice covers.
-  const classificationByok = input.classification_byok ?? LLM_SETTINGS.classification_byok;
+  const classificationByok = input.classification_byok ?? active?.classification_byok ?? false;
   // Same absent-means-unchanged rule, and same deliberate non-coercion: the
   // real API leaves this stored but inert when classification_byok is off,
   // so the mock does too rather than silently zeroing it out.
   const fallbackLocal =
-    input.classification_fallback_local ?? LLM_SETTINGS.classification_fallback_local;
-  const key_suffix = input.api_key ? input.api_key.slice(-4) : LLM_SETTINGS.key_suffix;
+    input.classification_fallback_local ?? active?.classification_fallback_local ?? false;
+  const key_suffix = input.api_key ? input.api_key.slice(-4) : (active?.key_suffix ?? "");
   const materialChanged =
     Boolean(input.api_key) ||
-    input.provider !== LLM_SETTINGS.provider ||
-    base_url !== LLM_SETTINGS.base_url ||
-    input.model !== LLM_SETTINGS.model;
-  LLM_SETTINGS = {
-    ...LLM_SETTINGS,
-    configured: true,
-    provider: input.provider,
-    model: input.model,
-    base_url,
-    key_suffix,
-    last_verified_at: materialChanged ? null : LLM_SETTINGS.last_verified_at,
-    fallback_active: false,
-    classification_byok: classificationByok,
-    classification_fallback_local: fallbackLocal,
-    classification_eligible: input.provider === "custom" ? false : classificationByok,
-    classification_llm_usable: input.provider === "custom" ? false : classificationByok,
-  };
-  return { ...LLM_SETTINGS };
+    !active ||
+    input.provider !== active.provider ||
+    base_url !== active.base_url ||
+    input.model !== active.model;
+  const last_verified_at = materialChanged ? null : (active?.last_verified_at ?? null);
+
+  if (active) {
+    active.provider = input.provider;
+    active.model = input.model;
+    active.base_url = base_url;
+    active.key_suffix = key_suffix;
+    active.last_verified_at = last_verified_at;
+    active.classification_byok = classificationByok;
+    active.classification_fallback_local = fallbackLocal;
+  } else {
+    LLM_CREDENTIALS.push({
+      id: nextCredentialId(),
+      name: "default",
+      provider: input.provider,
+      model: input.model,
+      base_url,
+      key_suffix,
+      last_verified_at,
+      is_active: true,
+      classification_byok: classificationByok,
+      classification_fallback_local: fallbackLocal,
+    });
+  }
+  return settingsFromActive();
 }
 
 // Every mock test call succeeds -- there's no real provider to fail against
 // in preview mode.
 export function mockTestLlmSettings(): LlmTestResult {
   const latency_ms = 180 + Math.floor(Math.random() * 220);
-  LLM_SETTINGS = { ...LLM_SETTINGS, last_verified_at: new Date().toISOString() };
+  const active = activeLlmCredential();
+  if (active) active.last_verified_at = new Date().toISOString();
   return { ok: true, latency_ms, error: null };
 }
 
-// Resets to unconfigured -- extraction then reads as covered by the
-// operator's fallback, mirroring a real deployment with
-// ACTION_EXTRACTION_SERVER_FALLBACK on.
+// Kill switch (D4): wipes EVERY credential the caller owns, not just the
+// active one -- mirrors the real DELETE route's widened blast. Extraction
+// then reads as covered by the operator's fallback, mirroring a real
+// deployment with ACTION_EXTRACTION_SERVER_FALLBACK on.
 export function mockDeleteLlmSettings(): void {
-  LLM_SETTINGS = {
-    configured: false,
-    provider: null,
-    model: null,
-    base_url: null,
-    key_suffix: null,
+  LLM_CREDENTIALS = [];
+}
+
+// --- Multi-credential surface (2026-08-19 plan) ------------------------------
+
+export function mockListLlmCredentials(): LlmCredentialSummary[] {
+  return LLM_CREDENTIALS.map(credentialSummary);
+}
+
+// D8's cap, mirrored here so the create/dup-name/limit-reached UI states are
+// demoable without a live API.
+const MOCK_MAX_CREDENTIALS = 5;
+
+export function mockCreateLlmCredential(input: {
+  name: string;
+  provider: LlmProvider;
+  api_key: string;
+  model: string;
+  base_url?: string;
+  classification_byok?: boolean;
+  classification_fallback_local?: boolean;
+}): LlmCredentialSummary {
+  const name = input.name.trim();
+  if (LLM_CREDENTIALS.length >= MOCK_MAX_CREDENTIALS) {
+    throw new ApiError(422, "credential limit reached");
+  }
+  if (LLM_CREDENTIALS.some((c) => c.name === name)) {
+    throw new ApiError(422, "a credential with this name already exists");
+  }
+  const base_url =
+    input.provider === "custom" ? (input.base_url ?? "") : (PRESET_BASE_URLS[input.provider] ?? "");
+  const row: MockLlmCredential = {
+    id: nextCredentialId(),
+    name,
+    provider: input.provider,
+    model: input.model,
+    base_url,
+    key_suffix: input.api_key.slice(-4),
     last_verified_at: null,
-    extraction_enabled: LLM_SETTINGS.extraction_enabled,
-    fallback_active: true,
-    custom_endpoints_enabled: LLM_SETTINGS.custom_endpoints_enabled,
-    private_endpoints_enabled: LLM_SETTINGS.private_endpoints_enabled,
-    custom_blocked: false,
-    // No credential left to opt in -- classification falls back to the
-    // deployment default, same as extraction's fallback story above.
-    classification_byok: false,
-    classification_fallback_local: false,
-    classifier_uses_llm: LLM_SETTINGS.classifier_uses_llm,
-    classifier_backend: LLM_SETTINGS.classifier_backend,
-    classification_eligible: false,
-    classification_llm_usable: false,
+    // Active iff it's the caller's first credential (D5) -- every later
+    // create starts inactive, same as the real route.
+    is_active: LLM_CREDENTIALS.length === 0,
+    classification_byok: input.provider === "custom" ? false : (input.classification_byok ?? false),
+    classification_fallback_local: input.classification_fallback_local ?? false,
   };
+  LLM_CREDENTIALS.push(row);
+  return credentialSummary(row);
+}
+
+export function mockActivateLlmCredential(id: string): LlmCredentialSummary {
+  const target = LLM_CREDENTIALS.find((c) => c.id === id);
+  if (!target) throw new ApiError(404, "credential not found");
+  if (!target.is_active) {
+    for (const c of LLM_CREDENTIALS) c.is_active = false;
+    target.is_active = true;
+  }
+  return credentialSummary(target);
+}
+
+// By-id delete (D5) -- 409s on the active row (switch to another first, or
+// use mockDeleteLlmSettings's kill switch), 404s on an id this store doesn't
+// have.
+export function mockDeleteLlmCredential(id: string): void {
+  const target = LLM_CREDENTIALS.find((c) => c.id === id);
+  if (!target) throw new ApiError(404, "credential not found");
+  if (target.is_active) throw new ApiError(409, "cannot delete the active credential");
+  LLM_CREDENTIALS = LLM_CREDENTIALS.filter((c) => c.id !== id);
 }
 
 // Deterministic multi-day demo usage so the console's usage card has real
@@ -1111,7 +1267,7 @@ export function mockDeleteLlmSettings(): void {
 // gap-filling in preview, instead of a dense series that never has a gap to
 // fill in the first place.
 function buildMockUsage(days: number): LlmUsage {
-  const provider = LLM_SETTINGS.provider ?? "openai";
+  const provider = activeLlmCredential()?.provider ?? "openai";
   const daily: LlmUsageDailyPoint[] = [];
   const stageTotals = {
     classification: { calls: 0, calls_with_total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },

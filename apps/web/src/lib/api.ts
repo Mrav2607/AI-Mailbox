@@ -9,6 +9,7 @@ import type {
   Connection,
   CountsResponse,
   Label,
+  LlmCredentialSummary,
   LlmProvider,
   LlmSettings,
   LlmTestResult,
@@ -25,11 +26,14 @@ import type {
 } from "./types";
 import {
   mockActions,
+  mockActivateLlmCredential,
   mockApplyLabel,
   mockBackfill,
   mockBackfillActions,
   mockCounts,
+  mockCreateLlmCredential,
   mockDeleteConnection,
+  mockDeleteLlmCredential,
   mockDeleteLlmSettings,
   mockDeleteThread,
   mockDraftReply,
@@ -38,6 +42,7 @@ import {
   mockGetLlmUsage,
   mockIngest,
   mockListConnections,
+  mockListLlmCredentials,
   mockOverview,
   mockPutLlmSettings,
   mockSearch,
@@ -1111,6 +1116,74 @@ export async function getLlmUsage(days = 30): Promise<LlmUsage> {
 export async function getClassifierMix(): Promise<ClassifierMix> {
   if (USE_MOCK) return mockGetClassifierMix();
   return request<ClassifierMix>("/settings/llm/classifier-mix");
+}
+
+// --- Multi-credential LLM profiles (2026-08-19 plan) ------------------------
+// A user can hold several named credentials, of which at most one is active;
+// GET/PUT/test/DELETE above stay views onto that active one (D4, unchanged
+// above). These four cover the additive surface: list everything, add a new
+// named credential, switch which one is active, and remove a single inactive
+// spare (the singular deleteLlmSettings above stays the "remove everything"
+// kill switch, D4's widened DELETE).
+
+// Every credential the caller owns, active or not -- an empty array (never
+// a 404) means nothing is stored yet.
+export async function listLlmCredentials(): Promise<LlmCredentialSummary[]> {
+  if (USE_MOCK) return mockListLlmCredentials();
+  const res = await request<{ items: LlmCredentialSummary[] }>("/settings/llm/credentials");
+  return res.items;
+}
+
+// Adds a new named credential. Active iff it's the caller's first one (D5)
+// -- every later create starts inactive, so switching is always an explicit
+// activateLlmCredential call. Unlike putLlmSettings, api_key is always
+// required here: a create has nothing stored to fall back on.
+export async function createLlmCredential(input: {
+  name: string;
+  provider: LlmProvider;
+  api_key: string;
+  model: string;
+  base_url?: string;
+  classification_byok?: boolean;
+  classification_fallback_local?: boolean;
+}): Promise<LlmCredentialSummary> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 150));
+    return mockCreateLlmCredential(input);
+  }
+  return request<LlmCredentialSummary>("/settings/llm/credentials", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+// Switches the caller's active credential. Both a switch's target and any
+// concurrent switch to a DIFFERENT credential can return 200 -- the server
+// serializes them, last writer wins (see the route's own docstring) -- so
+// this never itself represents a conflict to the caller.
+export async function activateLlmCredential(id: string): Promise<LlmCredentialSummary> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 120));
+    return mockActivateLlmCredential(id);
+  }
+  return request<LlmCredentialSummary>(
+    `/settings/llm/credentials/${encodeURIComponent(id)}/activate`,
+    { method: "POST" },
+  );
+}
+
+// Removes one named, non-active credential. 409s (as an ApiError) if `id` is
+// the active one -- activate another first, or use the singular
+// deleteLlmSettings kill switch to remove everything at once.
+export async function deleteLlmCredential(id: string): Promise<void> {
+  if (USE_MOCK) {
+    await new Promise((r) => setTimeout(r, 120));
+    mockDeleteLlmCredential(id);
+    return;
+  }
+  await request<{ status: string }>(`/settings/llm/credentials/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 }
 
 export { USE_MOCK };

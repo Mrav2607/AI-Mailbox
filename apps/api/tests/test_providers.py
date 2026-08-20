@@ -35,6 +35,10 @@ from app.services.nlp.providers import (
 )
 
 
+def _compiled(stmt) -> str:
+    return str(stmt.compile(compile_kwargs={"literal_binds": True}))
+
+
 class _FakeResult:
     def __init__(self, row):
         self._row = row
@@ -46,13 +50,16 @@ class _FakeResult:
 class _FakeDB:
     """Answers the one SELECT resolve_extraction_credential issues with a
     canned row (or None) regardless of the statement's exact shape -- the
-    statement itself is plain (filter by user_id) and not worth asserting
-    on here."""
+    statement itself is plain (filter by user_id AND is_active) and mostly
+    not worth asserting on, EXCEPT the is_active predicate's presence
+    itself, which a handful of tests below pin via `.statements`."""
 
     def __init__(self, row):
         self.row = row
+        self.statements = []
 
     def execute(self, stmt):
+        self.statements.append(stmt)
         return _FakeResult(self.row)
 
 
@@ -382,6 +389,23 @@ def test_resolve_extraction_credential_no_row_no_fallback_key(monkeypatch):
     assert result == ResolvedExtraction(None, None, False, None, None, None)
 
 
+def test_resolve_extraction_credential_where_clause_filters_on_is_active(monkeypatch):
+    """Plan: 2026-08-19-multi-credential-llm-profiles -- a user can now hold
+    several named credentials, of which at most one is active (partial
+    unique index); this pins the filter's PRESENCE in the compiled SQL, the
+    same discipline test_llm_settings.py's `_CredentialDB` uses for the
+    singular routes' WHERE clauses. `_FakeDB` always answers with its canned
+    row regardless of the query shape, so this is what actually proves the
+    resolver issues the filter rather than merely happening to work against
+    a single-row fixture.
+    """
+    row = _make_row(provider="openai")
+    db = _FakeDB(row)
+    resolve_extraction_credential(db, row.user_id)
+    where_clause = _compiled(db.statements[0]).partition("WHERE")[2]
+    assert "user_llm_credential.is_active" in where_clause
+
+
 # ---------------------------------------------------------------------------
 # extraction_available / extraction_feature_enabled
 # ---------------------------------------------------------------------------
@@ -700,6 +724,23 @@ def test_resolve_classification_routing_second_read_empty_resolves_off():
     db = _FakeClassificationDB(("openai", True, None))
     routing = resolve_classification_routing(db, uuid4())
     assert routing == ClassificationRouting(mode="off", credential=None)
+
+
+def test_resolve_classification_routing_both_reads_filter_on_is_active():
+    """Plan: 2026-08-19-multi-credential-llm-profiles -- BOTH reads must
+    filter on `is_active`, so an inactive spare (even one that still
+    carries `classification_byok=true` from before it was switched out --
+    the trap case the plan calls out) never routes classification. Pins the
+    filter's PRESENCE in each compiled WHERE clause, same discipline as
+    `test_resolve_extraction_credential_where_clause_filters_on_is_active`.
+    """
+    full = _make_classification_row(provider="openai")
+    db = _FakeClassificationDB(("openai", True, full))
+    resolve_classification_routing(db, uuid4())
+    assert len(db.statements) == 2
+    for stmt in db.statements:
+        where_clause = _compiled(stmt).partition("WHERE")[2]
+        assert "user_llm_credential.is_active" in where_clause
 
 
 def test_resolve_classification_routing_projection_never_selects_api_key():

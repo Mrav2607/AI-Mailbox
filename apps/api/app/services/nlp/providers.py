@@ -354,9 +354,18 @@ def resolve_extraction_credential(db: Session, user_id: UUID) -> ResolvedExtract
     their extraction elsewhere, and silently billing the operator's key
     instead would defeat the feature. Their extraction is simply unavailable
     until they fix or delete the credential.
+
+    A user can hold several named credentials (plan: 2026-08-19-multi-
+    credential-llm-profiles), of which at most one is ACTIVE (the partial
+    unique index on `user_id WHERE is_active`) -- this filters on that flag,
+    so "no active row" (a user with only inactive spares, or none at all)
+    falls straight through to the fallback/no-coverage branches below,
+    identically to today's "no row" case.
     """
     row = db.execute(
-        select(UserLlmCredential).where(UserLlmCredential.user_id == user_id)
+        select(UserLlmCredential).where(
+            UserLlmCredential.user_id == user_id, UserLlmCredential.is_active
+        )
     ).scalar_one_or_none()
 
     if row is not None:
@@ -483,6 +492,13 @@ def resolve_classification_routing(db: Session, user_id: UUID) -> Classification
     bring a key for; `mode="server"` falls back to the local model or the
     heuristic.
 
+    A user can hold several named credentials, of which at most one is
+    ACTIVE (partial unique index on `user_id WHERE is_active`) -- BOTH reads
+    below filter on that flag, so an inactive spare (even one that still
+    carries `classification_byok=true` from before it was switched out)
+    never routes classification. No row, or no ACTIVE row, means the same
+    thing here: `mode="server"`.
+
     Two-step read, and the ORDER is a security requirement, not an
     optimization:
 
@@ -535,7 +551,7 @@ def resolve_classification_routing(db: Session, user_id: UUID) -> Classification
             UserLlmCredential.provider,
             UserLlmCredential.classification_byok,
             UserLlmCredential.classification_fallback_local,
-        ).where(UserLlmCredential.user_id == user_id)
+        ).where(UserLlmCredential.user_id == user_id, UserLlmCredential.is_active)
     ).first()
 
     if projection is None or not projection.classification_byok:
@@ -555,6 +571,7 @@ def resolve_classification_routing(db: Session, user_id: UUID) -> Classification
             UserLlmCredential.user_id == user_id,
             UserLlmCredential.classification_byok.is_(True),
             UserLlmCredential.provider.in_(_CLASSIFICATION_ELIGIBLE_PROVIDERS),
+            UserLlmCredential.is_active,
         )
     ).first()
 
