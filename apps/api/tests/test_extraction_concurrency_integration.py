@@ -118,7 +118,7 @@ def session_factory(_engine):
     return factory
 
 
-def _seed(factory, *, model_version="openai:gpt-4o-mini"):
+def _seed(factory):
     """One user, one active BYOK credential, one thread, one actionable
     message with no existing action_item row (a never-claimed candidate --
     the exact shape the prod storm's fresh-mail candidates start as).

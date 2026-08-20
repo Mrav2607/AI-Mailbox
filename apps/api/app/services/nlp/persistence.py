@@ -163,6 +163,33 @@ def claimable_predicate(*, force: bool = False, model_version: str | None = None
     )
 
 
+def reset_failed_extraction_attempts(db: Session, user_id: UUID) -> None:
+    """D2 recovery: zero ``attempts`` on the caller's ``outcome='failed'``
+    ``action_item`` rows, under the SAME guard-locked transaction as the
+    credential mutation that's about to commit.
+
+    A credential-class failure (D2's cap-jump in `record_extraction` below) leaves
+    a row terminally capped at ``MAX_ATTEMPTS`` under the credential that
+    just failed it -- the whole point is to stop burning calls on a
+    credential known to be dead. But once the user actually FIXES that
+    credential (a material PUT, an activate, or a first-create landing
+    active), those rows must get a fresh claimable life, or D2's storm fix
+    would trade "storms forever" for "silently stuck forever" instead.
+
+    Callers gate this on what actually changed: a material rewrite or an
+    activate that switches which credential is active, yes; a flag-only PUT,
+    an inactive spare create, a single spare delete, or the kill switch, no
+    -- none of those change anything about the credential a failed row was
+    capped under, so resetting there would just re-spend calls against the
+    exact same dead credential.
+    """
+    db.execute(
+        update(ActionItem)
+        .where(ActionItem.user_id == user_id, ActionItem.outcome == "failed")
+        .values(attempts=0)
+    )
+
+
 def lock_guard_user(db: Session, user_id: UUID) -> None:
     """The single per-user serialization anchor (PR #64's D6 guard lock,
     ``llm_settings._lock_guard_user``): a ``SELECT ... FOR UPDATE`` on

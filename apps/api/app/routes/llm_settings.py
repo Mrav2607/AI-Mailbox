@@ -41,7 +41,6 @@ from app.core.config import settings
 from app.core.ratelimit import user_rate_limit
 from app.deps import get_current_user, get_db
 from app.db.models import (
-    ActionItem,
     AppUser,
     Classification,
     LlmUsageDaily,
@@ -130,33 +129,6 @@ def _lock_guard_user(db: Session, user_id: UUID) -> None:
     2026-08-19-extraction-cost-hardening D2).
     """
     persistence.lock_guard_user(db, user_id)
-
-
-def _reset_extraction_attempts(db: Session, user_id: UUID) -> None:
-    """D2 recovery: zero ``attempts`` on the caller's ``outcome='failed'``
-    ``action_item`` rows, under the SAME guard-locked transaction as the
-    credential mutation that's about to commit.
-
-    A credential-class failure (D2's cap-jump in `record_extraction`) leaves
-    a row terminally capped at ``MAX_ATTEMPTS`` under the credential that
-    just failed it -- the whole point is to stop burning calls on a
-    credential known to be dead. But once the user actually FIXES that
-    credential (a material PUT, an activate, or a first-create landing
-    active), those rows must get a fresh claimable life, or D2's storm fix
-    would trade "storms forever" for "silently stuck forever" instead.
-
-    Callers gate this on what actually changed: a material rewrite or an
-    activate that switches which credential is active, yes; a flag-only PUT,
-    an inactive spare create, a single spare delete, or the kill switch, no
-    -- none of those change anything about the credential a failed row was
-    capped under, so resetting there would just re-spend calls against the
-    exact same dead credential.
-    """
-    db.execute(
-        update(ActionItem)
-        .where(ActionItem.user_id == user_id, ActionItem.outcome == "failed")
-        .values(attempts=0)
-    )
 
 
 def _credential_rows(db: Session, user_id: UUID) -> list[UserLlmCredential]:
@@ -792,7 +764,7 @@ async def put_llm_settings(
             # active. A flag-only edit changes nothing about the credential
             # itself, so it deliberately does NOT reset (the row is still
             # capped under the SAME dead credential).
-            _reset_extraction_attempts(db, current_user.id)
+            persistence.reset_failed_extraction_attempts(db, current_user.id)
         target.updated_at = now
 
     if row is None:
@@ -820,7 +792,7 @@ async def put_llm_settings(
         # active -- same "the credential just changed" reasoning as a
         # material PUT above, for whatever failed rows predate having any
         # credential at all (e.g. rows capped under the server fallback).
-        _reset_extraction_attempts(db, current_user.id)
+        persistence.reset_failed_extraction_attempts(db, current_user.id)
         try:
             db.commit()
         except IntegrityError:
@@ -1066,7 +1038,7 @@ async def create_llm_credential(
         # credential is the same "the active credential just changed" event
         # as a material PUT -- reset. An inactive spare (rows non-empty)
         # changes nothing about which credential is active, so it does not.
-        _reset_extraction_attempts(db, current_user.id)
+        persistence.reset_failed_extraction_attempts(db, current_user.id)
     db.commit()
     return _credential_summary(row)
 
@@ -1119,7 +1091,7 @@ def activate_llm_credential(
         # so any of the caller's rows capped under the old one deserve a
         # fresh claimable life. A call that targets the already-active
         # credential (this branch doesn't run) changes nothing.
-        _reset_extraction_attempts(db, current_user.id)
+        persistence.reset_failed_extraction_attempts(db, current_user.id)
     db.commit()
     return _credential_summary(target)
 
@@ -1137,7 +1109,7 @@ def delete_llm_credential(
 
     Always removes an INACTIVE spare, so the active credential (whatever
     D2's cap-jumped rows are capped under) never changes here -- no
-    `_reset_extraction_attempts` call, same reasoning as the kill switch.
+    `persistence.reset_failed_extraction_attempts` call, same reasoning as the kill switch.
     """
     _lock_guard_user(db, current_user.id)
     rows = _credential_rows(db, current_user.id)

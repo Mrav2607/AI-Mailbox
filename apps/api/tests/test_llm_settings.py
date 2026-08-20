@@ -148,7 +148,7 @@ class _CredentialDB:
         # test pin that the guard ran (and ran FIRST) without caring about
         # the AppUser row's actual contents, which this fake never models.
         self.guard_locks: list[str] = []
-        # user_id hexes `_reset_extraction_attempts` targeted, in call order
+        # user_id hexes `persistence.reset_failed_extraction_attempts` targeted, in call order
         # -- lets a D2 recovery test assert whether a mutation reset this
         # caller's failed rows without this fake needing to model
         # `action_item` rows at all.
