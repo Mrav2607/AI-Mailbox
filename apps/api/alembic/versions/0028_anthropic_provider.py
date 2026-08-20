@@ -18,7 +18,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0028_anthropic_provider"
-down_revision = "0026_classification_fallback"
+down_revision = "0027_agenda_index_order"
 branch_labels = None
 depends_on = None
 
