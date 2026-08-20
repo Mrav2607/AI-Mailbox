@@ -1936,7 +1936,7 @@ def test_run_extraction_sweep_deadline_exceeded_mid_sweep_reports_partial_counts
 
     def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         calls.append(mid)
-        return "extracted", uuid4()
+        return "extracted", uuid4(), None
 
     monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
 
@@ -1945,6 +1945,10 @@ def test_run_extraction_sweep_deadline_exceeded_mid_sweep_reports_partial_counts
     assert calls == message_ids[:2]  # the third candidate's deadline check stopped it first
     assert result["status"] == "timed_out"
     assert result["processed"] == 2
+    # Proves the two claimed candidates actually ran the success path,
+    # not a swallowed unpack error from a stand-in returning the wrong shape.
+    assert result["extracted"] == 2
+    assert result["failed"] == 0
 
 
 def test_run_extraction_sweep_end_to_end_terminalizes_expired_at_cap_row(monkeypatch):
@@ -2020,12 +2024,12 @@ def test_run_extraction_sweep_resolves_credential_once_and_threads_it(monkeypatc
     def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         captured_call_contexts.append(call_context)
         captured_accs.append(acc)
-        return "extracted", uuid4()
+        return "extracted", uuid4(), None
 
     monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
 
     user_id = uuid4()
-    extraction_run.run_extraction_sweep(MagicMock(), user_id)
+    result = extraction_run.run_extraction_sweep(MagicMock(), user_id)
 
     assert resolve_calls == [user_id]  # exactly one resolution for the whole run
     assert [ctx.credential for ctx in captured_call_contexts] == [
@@ -2033,6 +2037,10 @@ def test_run_extraction_sweep_resolves_credential_once_and_threads_it(monkeypatc
     ]
     assert [ctx.payer for ctx in captured_call_contexts] == ["operator", "operator"]
     assert captured_accs[0] is captured_accs[1]  # one shared accumulator, not one per message
+    # Proves both claims actually ran the success path, not a swallowed
+    # unpack error from a stand-in returning the wrong shape.
+    assert result["extracted"] == 2
+    assert result["failed"] == 0
 
 
 # ---------------------------------------------------------------------------

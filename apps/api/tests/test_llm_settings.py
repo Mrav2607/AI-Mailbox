@@ -1606,7 +1606,9 @@ def test_put_classification_fallback_local_flag_only_edit_leaves_last_verified_a
     assert body["classification_fallback_local"] is True
     assert body["last_verified_at"] is not None
     assert row.last_verified_at == verified_at
-    assert row.revision == 4
+    # A flag-only edit doesn't touch the credential's contents, so revision
+    # stays put too -- see test_put_flag_only_edit_leaves_revision_alone.
+    assert row.revision == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1728,7 +1730,9 @@ def test_put_flag_only_edit_leaves_last_verified_at_untouched(user):
     body = resp.json()
     assert body["last_verified_at"] is not None
     assert row.last_verified_at == verified_at
-    assert row.revision == 4
+    # A flag-only edit doesn't touch the credential's contents, so revision
+    # stays put too -- see test_put_flag_only_edit_leaves_revision_alone.
+    assert row.revision == 3
     assert row.classification_byok is True
 
 
@@ -1779,7 +1783,11 @@ def test_put_model_change_clears_last_verified_at_even_when_api_key_is_absent(us
     assert row.api_key == "sk-stored-key-1234"
 
 
-def test_put_revision_increments_on_a_flag_only_edit_same_as_any_other_write(user):
+def test_put_flag_only_edit_leaves_revision_alone(user):
+    # Revision tracks the credential's CONTENTS (key/provider/base_url/
+    # model), not "was this row written to" -- a flag-only PUT racing an
+    # in-flight credential-class failure must not fence that failure's D2
+    # identity check (credential_id + revision) into a bogus mismatch.
     row = _make_row(user_id=user.id, provider="openai", model="gpt-4o-mini", revision=5)
     db = _CredentialDB({user.id.hex: row})
     _override(user, db)
@@ -1792,7 +1800,7 @@ def test_put_revision_increments_on_a_flag_only_edit_same_as_any_other_write(use
         },
     )
     assert resp.status_code == 200
-    assert row.revision == 6
+    assert row.revision == 5
 
 
 # ---------------------------------------------------------------------------
@@ -2770,6 +2778,36 @@ def test_put_flag_only_edit_does_not_reset_extraction_attempts(user):
         json={"provider": "openai", "model": "gpt-4o-mini", "classification_byok": True},
     )
     assert resp.status_code == 200
+    assert db.reset_calls == []
+
+
+def test_put_resend_of_the_identical_stored_key_does_not_reset_extraction_attempts(user):
+    # A caller who re-sends the SAME key their client already had cached
+    # (e.g. a form re-submit) hasn't changed the credential at all --
+    # `api_key_provided` alone used to be enough to call this "material,"
+    # which wrongly reopened rows still capped under this very credential.
+    verified_at = datetime.now(timezone.utc)
+    row = _make_row(
+        user_id=user.id,
+        provider="openai",
+        model="gpt-4o-mini",
+        api_key="sk-stored-key-1234",
+        revision=5,
+        last_verified_at=verified_at,
+    )
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "api_key": "sk-stored-key-1234",
+        },
+    )
+    assert resp.status_code == 200
+    assert row.revision == 5
+    assert row.last_verified_at == verified_at
     assert db.reset_calls == []
 
 

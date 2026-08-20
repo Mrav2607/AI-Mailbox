@@ -759,12 +759,15 @@ async def put_llm_settings(
     def _apply_update(target: UserLlmCredential) -> None:
         # Read BEFORE mutating -- both flag resolvers and `material_changed`
         # need `target`'s state as it stood before this write. A flag-only
-        # edit (no new key, same provider/base_url/model)
-        # must NOT clear last_verified_at -- that'd be a confusing "your
-        # verified key just went unverified" regression for a save that
-        # didn't touch the credential itself.
+        # edit, OR a re-send of the exact same key with the same
+        # provider/base_url/model, must NOT clear last_verified_at, bump
+        # revision, or reset extraction attempts -- none of those changed
+        # what credential is stored, so treating it as material would reopen
+        # rows that are still capped under the SAME dead credential.
+        # `target.api_key` is an EncryptedText column that reads back as
+        # plaintext, so this `!=` is a correct plaintext comparison.
         material_changed = (
-            api_key_provided
+            (api_key_provided and effective_api_key != target.api_key)
             or target.provider != provider
             or target.base_url != base_url
             or target.model != model
@@ -779,8 +782,8 @@ async def put_llm_settings(
         target.base_url = base_url
         target.api_key = effective_api_key
         target.model = model
-        target.revision += 1
         if material_changed:
+            target.revision += 1
             target.last_verified_at = None
             # D2 recovery: a material rewrite is exactly the fix a
             # credential-class cap-jump was waiting for -- reset this

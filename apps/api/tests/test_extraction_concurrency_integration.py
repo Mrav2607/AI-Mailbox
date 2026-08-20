@@ -298,6 +298,7 @@ def test_two_concurrent_claims_on_a_brand_new_row_self_limits(monkeypatch, sessi
 
     barrier = threading.Barrier(2)
     results = {}
+    errors = {}
 
     def worker(name):
         db = session_factory()
@@ -310,6 +311,8 @@ def test_two_concurrent_claims_on_a_brand_new_row_self_limits(monkeypatch, sessi
                 failure_categories=categories,
             )
             results[name] = (bucket, category)
+        except BaseException as exc:
+            errors[name] = exc
         finally:
             db.close()
 
@@ -318,6 +321,13 @@ def test_two_concurrent_claims_on_a_brand_new_row_self_limits(monkeypatch, sessi
         t.start()
     for t in threads:
         t.join(timeout=_JOIN_TIMEOUT)
+
+    # Catch a hung/still-running thread and a worker exception BEFORE
+    # touching `results` -- a bare KeyError from a thread that silently
+    # died is a much worse failure message than surfacing what it raised.
+    for t in threads:
+        assert not t.is_alive(), f"worker thread {t.name} did not finish in time"
+    assert not errors, f"worker thread(s) raised: {errors}"
 
     outcomes = [results["A"], results["B"]]
     winners = [r for r in outcomes if r[0] == "failed"]
@@ -381,6 +391,7 @@ def test_stale_lease_competing_reclaim_bounded_by_d2(monkeypatch, session_factor
     monkeypatch.setattr(extraction_run, "extract_action_with_usage", fake_extract)
 
     results = {}
+    errors = {}
 
     def run_a():
         db = session_factory()
@@ -391,6 +402,8 @@ def test_stale_lease_competing_reclaim_bounded_by_d2(monkeypatch, session_factor
                 failure_categories={},
             )
             results["A"] = (bucket, category)
+        except BaseException as exc:
+            errors["A"] = exc
         finally:
             db.close()
 
@@ -432,6 +445,9 @@ def test_stale_lease_competing_reclaim_bounded_by_d2(monkeypatch, session_factor
     # Now let A's stale attempt finish and try to record.
     release_a.set()
     thread_a.join(timeout=_JOIN_TIMEOUT)
+
+    assert not thread_a.is_alive(), "thread A did not finish in time"
+    assert not errors, f"worker thread(s) raised: {errors}"
 
     # B: a normal, successful record of a genuine failure.
     assert bucket_b == "failed"

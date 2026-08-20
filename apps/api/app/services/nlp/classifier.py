@@ -370,7 +370,7 @@ _CLASSIFICATION_PROMPT = (
     "Boundary rules:\n"
     "1. Marketing CTAs ('shop now', 'click here', 'limited time', "
     "auto-renewal) -> promotional or fyi, not action_required.\n"
-    "2. A soft/optional/automated 'confirm'/'renew'/'verify' is not "
+    "2. A soft/optional/automated 'confirm'/'renew'/'click'/'verify' is not "
     "action_required -- only when the recipient must act or face a real "
     "consequence.\n"
     "3. Unsure between action_required and fyi? Choose fyi -- most "
