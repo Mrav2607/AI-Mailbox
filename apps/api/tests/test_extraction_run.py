@@ -93,6 +93,9 @@ class _FakeResult:
     def all(self):
         return self._rows
 
+    def first(self):
+        return self._rows[0] if self._rows else None
+
 
 class _FakeDB:
     """Records every statement persistence.py hands to execute() and answers
@@ -283,8 +286,21 @@ def test_claimable_predicate_sql_shape():
     assert "outcome = 'pending' AND action_item.last_attempted_at <" in default_sql
     assert "!=" not in default_sql
 
-    forced_sql = _compiled_sql(persistence.claimable_predicate(force=True))
-    assert "outcome != 'pending'" in forced_sql
+    # D5: force no longer widens to "any non-pending row" -- `failed` is
+    # claimable regardless of the attempt cap, and a settled
+    # extracted/no_action row is claimable only when its stored
+    # model_version differs from the CURRENT one (IS DISTINCT FROM, not a
+    # NULL-poisoned !=).
+    forced_sql = _compiled_sql(
+        persistence.claimable_predicate(force=True, model_version="gemini:gemini-x")
+    )
+    assert "outcome = 'failed'" in forced_sql
+    assert "action_item.attempts < 3" in forced_sql  # still present for the UNforced disjunct
+    assert "outcome != 'pending'" not in forced_sql  # a live pending row is never stolen
+    assert (
+        "action_item.outcome IN ('extracted', 'no_action') "
+        "AND action_item.model_version IS DISTINCT FROM 'gemini:gemini-x'"
+    ) in forced_sql
 
 
 # ---------------------------------------------------------------------------
@@ -358,13 +374,19 @@ def test_claim_action_item_force_never_steals_live_pending():
     db = _FakeDB([_FakeResult(rowcount=0), _FakeResult(rowcount=1)])
     persistence.claim_action_item(
         db, message_id=uuid4(), thread_id=uuid4(), user_id=uuid4(),
-        thread_done=False, force=True,
+        thread_done=False, force=True, model_version="gemini:gemini-x",
     )
     where_sql = _compiled_sql(db.statements[1])
-    # force widens to "any non-pending row" -- a live (unexpired) pending row
-    # is deliberately absent from every disjunct, forced or not.
-    assert "outcome != 'pending'" in where_sql
+    # D5: force no longer widens to "any non-pending row" -- a live
+    # (unexpired) pending row is deliberately absent from every disjunct,
+    # forced or not, and neither is a settled row on the SAME model.
+    assert "outcome != 'pending'" not in where_sql
     assert "outcome = 'pending'" in where_sql  # still present: the expired-lease branch
+    assert "outcome = 'failed'" in where_sql
+    assert (
+        "action_item.outcome IN ('extracted', 'no_action') "
+        "AND action_item.model_version IS DISTINCT FROM 'gemini:gemini-x'"
+    ) in where_sql
 
 
 def test_claim_action_item_reclaim_on_done_thread_preserves_dismissed():
@@ -479,6 +501,191 @@ def test_record_extraction_label_mismatch_wins_as_ineligible():
     assert "kind" not in params
 
 
+def test_record_extraction_extracted_model_version_matches_call_context():
+    # D6: the extracted branch keeps preferring result.model_version -- this
+    # asserts they're the SAME value a real caller produces (both derived
+    # from the same call_context.credential), rather than silently letting
+    # the two diverge.
+    db = _FakeDB([_FakeResult(rowcount=1)])
+    call_context_model_version = "gemini:gemini-x"
+
+    persistence.record_extraction(
+        db, message_id=uuid4(), claim_token=uuid4(),
+        result=_extracted_action(model_version=call_context_model_version),
+        thread_done=False, label_still_actionable=True,
+        model_version=call_context_model_version,
+    )
+
+    params = _compiled_params(db.statements[0])
+    assert params["model_version"] == call_context_model_version
+
+
+def test_record_extraction_no_action_writes_passed_model_version():
+    # D6: no_action no longer hard-writes None -- it stamps the caller's
+    # model_version, same as the extracted branch.
+    db = _FakeDB([_FakeResult(rowcount=1)])
+
+    persistence.record_extraction(
+        db, message_id=uuid4(), claim_token=uuid4(),
+        result=NoAction(), thread_done=False, label_still_actionable=True,
+        model_version="gemini:gemini-x",
+    )
+
+    params = _compiled_params(db.statements[0])
+    assert params["model_version"] == "gemini:gemini-x"
+
+
+# ---------------------------------------------------------------------------
+# persistence.record_extraction -- D2 credential-class cap-jump
+# ---------------------------------------------------------------------------
+
+
+def test_record_extraction_credential_class_failure_caps_attempts_on_identity_match():
+    credential_id = uuid4()
+    user_id = uuid4()
+    # [guard-lock (ignored), active-credential re-read, the fenced UPDATE]
+    db = _FakeDB([
+        _FakeResult(),
+        _FakeResult(rows=[SimpleNamespace(id=credential_id, revision=2)]),
+        _FakeResult(rowcount=1),
+    ])
+
+    persistence.record_extraction(
+        db, message_id=uuid4(), claim_token=uuid4(),
+        result=None, thread_done=False, label_still_actionable=True,
+        user_id=user_id, failure_category="http_404",
+        credential_id=credential_id, credential_revision=2,
+    )
+
+    params = _compiled_params(db.statements[-1])
+    assert params["outcome"] == "failed"
+    assert params["attempts"] == persistence.MAX_ATTEMPTS
+
+
+def test_record_extraction_credential_class_failure_resets_attempts_on_identity_mismatch():
+    # Rotation race: the row's user has since switched to a DIFFERENT
+    # credential (different id, or same id but a bumped revision) by the
+    # time this record transaction re-reads it under the guard lock -- the
+    # mismatch resets attempts to 0 instead of stranding the row capped
+    # under a credential nobody's using anymore.
+    user_id = uuid4()
+    attempted_credential_id = uuid4()
+    now_active_credential_id = uuid4()
+    db = _FakeDB([
+        _FakeResult(),
+        _FakeResult(rows=[SimpleNamespace(id=now_active_credential_id, revision=1)]),
+        _FakeResult(rowcount=1),
+    ])
+
+    persistence.record_extraction(
+        db, message_id=uuid4(), claim_token=uuid4(),
+        result=None, thread_done=False, label_still_actionable=True,
+        user_id=user_id, failure_category="http_401",
+        credential_id=attempted_credential_id, credential_revision=1,
+    )
+
+    params = _compiled_params(db.statements[-1])
+    assert params["attempts"] == 0
+
+
+def test_record_extraction_credential_class_failure_same_id_different_revision_is_a_mismatch():
+    user_id = uuid4()
+    credential_id = uuid4()
+    db = _FakeDB([
+        _FakeResult(),
+        _FakeResult(rows=[SimpleNamespace(id=credential_id, revision=5)]),
+        _FakeResult(rowcount=1),
+    ])
+
+    persistence.record_extraction(
+        db, message_id=uuid4(), claim_token=uuid4(),
+        result=None, thread_done=False, label_still_actionable=True,
+        user_id=user_id, failure_category="http_403",
+        credential_id=credential_id, credential_revision=1,  # stale revision
+    )
+
+    params = _compiled_params(db.statements[-1])
+    assert params["attempts"] == 0
+
+
+def test_record_extraction_credential_class_failure_no_active_row_is_a_mismatch():
+    # The credential was deleted entirely (kill switch) between the attempt
+    # and this record -- no active row at all is treated the same as any
+    # other identity mismatch: fresh claimable life, not a strand.
+    user_id = uuid4()
+    db = _FakeDB([
+        _FakeResult(),
+        _FakeResult(rows=[]),
+        _FakeResult(rowcount=1),
+    ])
+
+    persistence.record_extraction(
+        db, message_id=uuid4(), claim_token=uuid4(),
+        result=None, thread_done=False, label_still_actionable=True,
+        user_id=user_id, failure_category="http_404",
+        credential_id=uuid4(), credential_revision=1,
+    )
+
+    params = _compiled_params(db.statements[-1])
+    assert params["attempts"] == 0
+
+
+def test_record_extraction_credential_class_failure_fallback_credential_caps_straight():
+    # No per-user row exists for the operator/fallback key (credential_id is
+    # None) -- there's nothing a PUT/activate could have rotated, so the cap
+    # applies directly, no active-credential re-read needed.
+    user_id = uuid4()
+    db = _FakeDB([_FakeResult(), _FakeResult(rowcount=1)])
+
+    persistence.record_extraction(
+        db, message_id=uuid4(), claim_token=uuid4(),
+        result=None, thread_done=False, label_still_actionable=True,
+        user_id=user_id, failure_category="http_404",
+        credential_id=None, credential_revision=None,
+    )
+
+    params = _compiled_params(db.statements[-1])
+    assert params["attempts"] == persistence.MAX_ATTEMPTS
+    # Only two statements: the guard lock and the fenced UPDATE -- no
+    # active-credential re-read was needed at all.
+    assert len(db.statements) == 2
+
+
+def test_record_extraction_non_credential_class_failure_leaves_attempts_untouched():
+    # http_429 (rate-limited) is transient and retries on its own -- no
+    # guard lock, no cap-jump, same as before D2 existed.
+    db = _FakeDB([_FakeResult(rowcount=1)])
+
+    persistence.record_extraction(
+        db, message_id=uuid4(), claim_token=uuid4(),
+        result=None, thread_done=False, label_still_actionable=True,
+        user_id=uuid4(), failure_category="http_429",
+        credential_id=uuid4(), credential_revision=1,
+    )
+
+    assert len(db.statements) == 1  # no guard lock, no credential re-read
+    params = _compiled_params(db.statements[0])
+    assert "attempts" not in params
+
+
+def test_record_extraction_credential_class_failure_without_user_id_is_a_noop():
+    # A caller that doesn't pass user_id (most of this module's own callers
+    # in this test file) gets the exact same failed-fields-untouched
+    # behavior D2 shipped on top of -- no identity check is even possible
+    # without a user to check it for.
+    db = _FakeDB([_FakeResult(rowcount=1)])
+
+    persistence.record_extraction(
+        db, message_id=uuid4(), claim_token=uuid4(),
+        result=None, thread_done=False, label_still_actionable=True,
+        failure_category="http_404",
+    )
+
+    assert len(db.statements) == 1
+    params = _compiled_params(db.statements[0])
+    assert "attempts" not in params
+
+
 def test_record_extraction_stale_token_affects_zero_rows():
     db = _FakeDB([_FakeResult(rowcount=0)])
 
@@ -522,7 +729,7 @@ def test_record_extraction_thread_done_stamps_status_on_every_branch(
 def test_claim_extract_record_missing_message_is_skipped():
     session = _FakeSession(message=None)
 
-    bucket, user_id = extraction_run._claim_extract_record(session, uuid4())
+    bucket, user_id, *_ = extraction_run._claim_extract_record(session, uuid4())
 
     assert (bucket, user_id) == ("skipped", None)
     assert session.executed == []
@@ -532,7 +739,7 @@ def test_claim_extract_record_missing_thread_is_skipped():
     message = _make_message()
     session = _FakeSession(message=message, thread=None)
 
-    bucket, user_id = extraction_run._claim_extract_record(session, message.id)
+    bucket, user_id, *_ = extraction_run._claim_extract_record(session, message.id)
 
     assert (bucket, user_id) == ("skipped", None)
 
@@ -547,7 +754,7 @@ def test_claim_extract_record_not_claimable_skips_before_extraction(monkeypatch)
         lambda **k: pytest.fail("extraction must not run without a claim"),
     )
 
-    bucket, user_id = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+    bucket, user_id, *_ = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     assert bucket == "skipped"
     assert user_id == thread.user_id
@@ -625,7 +832,7 @@ def test_claim_extract_record_locks_classification_before_reading_label(monkeypa
 
     monkeypatch.setattr(extraction_run, "record_extraction", fake_record)
 
-    bucket, _ = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+    bucket, _, *_ = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     classification_stmt = next(
         s for s in session.executed if s.column_descriptions[0]["name"] == "Classification"
@@ -742,7 +949,7 @@ def test_claim_extract_record_stale_record_is_skipped(monkeypatch):
     )
     monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: False)
 
-    bucket, _ = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+    bucket, _, *_ = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     assert bucket == "skipped"
 
@@ -770,7 +977,7 @@ def test_claim_extract_record_outcome_buckets(monkeypatch, label, result, expect
     )
     monkeypatch.setattr(extraction_run, "record_extraction", lambda *a, **k: True)
 
-    bucket, user_id = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+    bucket, user_id, *_ = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     assert bucket == expected
     assert user_id == thread.user_id
@@ -794,7 +1001,7 @@ def test_claim_extract_record_failure_categories_out_param_records_attempt_categ
     )
 
     categories: dict[str, int] = {}
-    bucket, _ = extraction_run._claim_extract_record(
+    bucket, _, *_ = extraction_run._claim_extract_record(
         session, message.id, call_context=_CTX, failure_categories=categories
     )
 
@@ -818,7 +1025,7 @@ def test_claim_extract_record_failure_categories_none_is_a_silent_no_op(monkeypa
         lambda **k: _extraction_attempt(None, provider_call_succeeded=False, failure_category="http_429"),
     )
 
-    bucket, _ = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+    bucket, _, *_ = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     assert bucket == "failed"
 
@@ -837,7 +1044,7 @@ def test_claim_extract_record_success_never_touches_failure_categories(monkeypat
     )
 
     categories: dict[str, int] = {}
-    bucket, _ = extraction_run._claim_extract_record(
+    bucket, _, *_ = extraction_run._claim_extract_record(
         session, message.id, call_context=_CTX, failure_categories=categories
     )
 
@@ -877,7 +1084,7 @@ def test_claim_extract_record_exception_after_claim_fences_to_failed(monkeypatch
     fresh_session = MagicMock()
     monkeypatch.setattr(extraction_run, "SessionLocal", lambda: nullcontext(fresh_session))
 
-    bucket, user_id = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
+    bucket, user_id, *_ = extraction_run._claim_extract_record(session, message.id, call_context=_CTX)
 
     assert bucket == "failed"
     assert user_id == thread.user_id
@@ -1071,7 +1278,7 @@ def test_claim_extract_record_failing_usage_flush_does_not_block_business_commit
 
     fake_acc = _FakeAcc(thread.user_id, flush_raises=SQLAlchemyError("boom"))
 
-    bucket, _ = extraction_run._claim_extract_record(
+    bucket, _, *_ = extraction_run._claim_extract_record(
         session, message.id, call_context=_USER_CTX, acc=fake_acc
     )
 
@@ -1094,7 +1301,7 @@ def test_claim_extract_record_rollback_path_discards_the_batch(monkeypatch):
     monkeypatch.setattr(extraction_run, "SessionLocal", lambda: nullcontext(fresh_session))
 
     fake_acc = _FakeAcc(thread.user_id)
-    bucket, _ = extraction_run._claim_extract_record(
+    bucket, _, *_ = extraction_run._claim_extract_record(
         session, message.id, call_context=_USER_CTX, acc=fake_acc
     )
 
@@ -1128,7 +1335,8 @@ def test_run_extraction_for_message_delegates_and_includes_user_id(monkeypatch):
     _enable_extraction(monkeypatch)
     user_id = uuid4()
     monkeypatch.setattr(
-        extraction_run, "_claim_extract_record", lambda db, mid, force=False: ("extracted", user_id)
+        extraction_run, "_claim_extract_record",
+        lambda db, mid, force=False: ("extracted", user_id, None),
     )
 
     result = extraction_run.run_extraction_for_message(MagicMock(), uuid4())
@@ -1284,6 +1492,34 @@ def test_run_extraction_sweep_recovery_uses_row_driven_candidates(monkeypatch):
     extraction_run.run_extraction_sweep(MagicMock(), uuid4(), recovery=True)
 
 
+def test_run_extraction_sweep_breaker_trips_during_recovery_too(monkeypatch):
+    """D3's streak logic isn't message-driven-only -- a recovery=True sweep
+    (the beat tick's row-driven pass) hits the exact same loop, so three
+    consecutive credential-class failures abort it identically."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4(), uuid4(), uuid4(), uuid4()]
+    monkeypatch.setattr(extraction_run, "_recovery_candidates", lambda *a, **k: message_ids)
+
+    calls = []
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
+        calls.append(mid)
+        return "failed", uuid4(), "http_404"
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+
+    result = extraction_run.run_extraction_sweep(MagicMock(), uuid4(), recovery=True)
+
+    assert calls == message_ids[:3]
+    assert result["status"] == "llm_unavailable"
+    assert result["aborted"] == 1
+
+
 def test_run_extraction_sweep_counts_a_bucket_per_message(monkeypatch):
     _enable_extraction(monkeypatch)
     monkeypatch.setattr(
@@ -1297,7 +1533,7 @@ def test_run_extraction_sweep_counts_a_bucket_per_message(monkeypatch):
     monkeypatch.setattr(
         extraction_run, "_claim_extract_record",
         lambda db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None: (
-            next(buckets), uuid4()
+            next(buckets), uuid4(), None
         ),
     )
 
@@ -1370,7 +1606,7 @@ def test_run_extraction_sweep_isolates_one_bad_message_and_continues(monkeypatch
     def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         if mid == bad_message:
             raise RuntimeError("boom")
-        return "extracted", uuid4()
+        return "extracted", uuid4(), None
 
     monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
     db = MagicMock()
@@ -1395,8 +1631,10 @@ def test_run_extraction_sweep_isolates_one_bad_message_and_continues(monkeypatch
 def test_run_extraction_sweep_stops_after_three_consecutive_failures_with_partial_counts(
     monkeypatch,
 ):
-    """Four candidates, every one a "failed" bucket -- the sweep stops after
-    the third and never even attempts the fourth."""
+    """Four candidates, every one a "failed" bucket with a credential-class
+    category (D3: the streak reads the category, not the bucket) -- the
+    sweep stops after the third and never even attempts the fourth, and
+    reports how many it skipped via the additive `aborted` count."""
     _enable_extraction(monkeypatch)
     monkeypatch.setattr(
         extraction_run, "resolve_extraction_credential",
@@ -1410,7 +1648,7 @@ def test_run_extraction_sweep_stops_after_three_consecutive_failures_with_partia
 
     def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
         calls.append(mid)
-        return "failed", uuid4()
+        return "failed", uuid4(), "http_404"
 
     monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
 
@@ -1423,14 +1661,16 @@ def test_run_extraction_sweep_stops_after_three_consecutive_failures_with_partia
     assert result["status"] == "llm_unavailable"
     assert result["processed"] == 3
     assert result["failed"] == 3
+    assert result["aborted"] == 1  # the fourth candidate, never even attempted
 
 
 def test_run_extraction_sweep_isolated_failures_among_successes_never_stop_and_counter_resets(
     monkeypatch,
 ):
     """Pattern: failed, extracted, failed, failed, extracted -- 3 failures
-    total but the longest CONSECUTIVE run is 2, under the threshold, so all
-    5 candidates get attempted."""
+    total but the longest CONSECUTIVE run of credential-class CATEGORIES
+    (D3: the streak reads the category, not the bucket) is 2, under the
+    threshold, so all 5 candidates get attempted."""
     _enable_extraction(monkeypatch)
     monkeypatch.setattr(
         extraction_run, "resolve_extraction_credential",
@@ -1441,9 +1681,10 @@ def test_run_extraction_sweep_isolated_failures_among_successes_never_stop_and_c
     monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
 
     buckets = iter(["failed", "extracted", "failed", "failed", "extracted"])
+    categories = iter(["http_404", None, "http_404", "http_404", None])
 
     def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
-        return next(buckets), uuid4()
+        return next(buckets), uuid4(), next(categories)
 
     monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
 
@@ -1453,6 +1694,66 @@ def test_run_extraction_sweep_isolated_failures_among_successes_never_stop_and_c
     assert result["status"] == "ok"
     assert result["failed"] == 3
     assert result["extracted"] == 2
+
+
+def test_run_extraction_sweep_three_consecutive_rate_limits_do_not_trip_the_breaker(monkeypatch):
+    """D3: http_429 is retryable and recovers on its own -- three consecutive
+    "failed" buckets with a non-credential-class category must NOT trip the
+    breaker, even though the OLD bucket-only breaker would have stopped
+    here. All 4 candidates get attempted, status "ok"."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4(), uuid4(), uuid4(), uuid4()]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    calls = []
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
+        calls.append(mid)
+        return "failed", uuid4(), "http_429"
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+
+    result = extraction_run.run_extraction_sweep(MagicMock(), uuid4())
+
+    assert calls == message_ids  # never stopped early
+    assert result["status"] == "ok"
+    assert result["processed"] == 4
+    assert result["failed"] == 4
+    assert result["aborted"] == 0
+
+
+def test_run_extraction_sweep_credential_class_streak_resets_on_a_success_between(monkeypatch):
+    """D3: config, config, SUCCESS, config, config -- two credential-class
+    failures, a success that resets the streak, then two more. The longest
+    consecutive run is 2, under the threshold, so the breaker never trips
+    even though there are 4 credential-class failures total."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4() for _ in range(5)]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    buckets = iter(["failed", "failed", "extracted", "failed", "failed"])
+    categories = iter(["http_403", "http_403", None, "http_403", "http_403"])
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
+        return next(buckets), uuid4(), next(categories)
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+
+    result = extraction_run.run_extraction_sweep(MagicMock(), uuid4())
+
+    assert result["processed"] == 5
+    assert result["status"] == "ok"
+    assert result["aborted"] == 0
 
 
 def test_run_extraction_sweep_containment_failure_does_not_trigger_llm_unavailable(monkeypatch):
@@ -1491,6 +1792,37 @@ def test_run_extraction_sweep_containment_failure_does_not_trigger_llm_unavailab
     assert db.rollback.call_count == 4
 
 
+def test_run_extraction_sweep_containment_failure_resets_the_credential_class_streak(monkeypatch):
+    """D3: two credential-class failures, an unrelated containment error,
+    then two more -- 4 real provider failures total but never 3 IN A ROW,
+    because the containment error explicitly resets the streak instead of
+    silently bridging the two runs into one continuous trip."""
+    _enable_extraction(monkeypatch)
+    monkeypatch.setattr(
+        extraction_run, "resolve_extraction_credential",
+        lambda db, uid: SimpleNamespace(credential=_CRED, source="fallback"),
+    )
+    monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda *a, **k: None)
+    message_ids = [uuid4() for _ in range(5)]
+    monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
+
+    calls = []
+
+    def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
+        calls.append(mid)
+        if len(calls) == 3:
+            raise RuntimeError("boom")
+        return "failed", uuid4(), "http_404"
+
+    monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
+
+    result = extraction_run.run_extraction_sweep(MagicMock(), uuid4())
+
+    assert calls == message_ids  # never stopped early
+    assert result["status"] == "ok"
+    assert result["aborted"] == 0
+
+
 def test_run_extraction_sweep_soft_time_limit_propagates_and_stops_the_sweep(monkeypatch):
     """BLOCKER (Codex review, phase 3): SoftTimeLimitExceeded is a plain
     Exception, so it must be special-cased ahead of the generic containment
@@ -1514,7 +1846,7 @@ def test_run_extraction_sweep_soft_time_limit_propagates_and_stops_the_sweep(mon
         calls.append(mid)
         if len(calls) == 2:
             raise SoftTimeLimitExceeded
-        return "extracted", uuid4()
+        return "extracted", uuid4(), None
 
     monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
     db = MagicMock()
@@ -1564,12 +1896,12 @@ def test_run_extraction_sweep_inner_deadline_on_last_candidate_reports_timed_out
     monkeypatch.setattr(extraction_run, "terminalize_expired_pending", lambda db, **k: None)
     monkeypatch.setattr(
         extraction_run, "resolve_extraction_credential",
-        lambda db, user_id: SimpleNamespace(credential=object(), source="user"),
+        lambda db, user_id: SimpleNamespace(credential=_CRED, source="user"),
     )
     monkeypatch.setattr(extraction_run, "_message_driven_candidates", lambda *a, **k: message_ids)
 
     def fake_claim(db, mid, force=False, call_context=None, acc=None, failure_categories=None, deadline=None):
-        return "deadline", uuid4()
+        return "deadline", uuid4(), None
 
     monkeypatch.setattr(extraction_run, "_claim_extract_record", fake_claim)
 
@@ -1739,11 +2071,20 @@ def test_message_driven_candidates_force_widens_existing_row_filter():
     db = _FakeDB([_FakeResult()])
     db.execute = lambda stmt: (db.statements.append(stmt), _FakeResult())[1]
     extraction_run._message_driven_candidates(
-        db, uuid4(), since_days=30, limit=10, force=True
+        db, uuid4(), since_days=30, limit=10, force=True, model_version="gemini:gemini-x"
     )
 
     sql = _compiled_sql(db.statements[0])
-    assert "action_item.outcome != 'pending'" in sql
+    # D5: force claims failed rows unconditionally, and extracted/no_action
+    # rows only when their stored model_version differs from the current one
+    # -- no longer "any non-pending row" (see claimable_predicate's own
+    # tests for the full SQL-shape assertion).
+    assert "action_item.outcome != 'pending'" not in sql
+    assert "action_item.outcome = 'failed'" in sql
+    assert (
+        "action_item.outcome IN ('extracted', 'no_action') "
+        "AND action_item.model_version IS DISTINCT FROM 'gemini:gemini-x'"
+    ) in sql
 
 
 def test_message_driven_candidates_coalesces_null_sent_at_for_cutoff_and_order():

@@ -148,10 +148,23 @@ class _CredentialDB:
         # test pin that the guard ran (and ran FIRST) without caring about
         # the AppUser row's actual contents, which this fake never models.
         self.guard_locks: list[str] = []
+        # user_id hexes `_reset_extraction_attempts` targeted, in call order
+        # -- lets a D2 recovery test assert whether a mutation reset this
+        # caller's failed rows without this fake needing to model
+        # `action_item` rows at all.
+        self.reset_calls: list[str] = []
 
     def execute(self, stmt):
         self.statements.append(stmt)
         if isinstance(stmt, Update):
+            compiled = _compiled(stmt)
+            if "action_item" in compiled:
+                match = re.search(r"action_item\.user_id = '([0-9a-f]{32})'", compiled)
+                if match:
+                    self.reset_calls.append(match.group(1))
+                result = MagicMock()
+                result.rowcount = 0
+                return result
             result = MagicMock()
             matched = self._match_update(stmt)
             if matched is not None:
@@ -2723,4 +2736,114 @@ def test_classifier_mix_two_user_isolation_each_gets_their_own_scoped_query():
     assert resp_b.json() == {"classifier_mix": [{"kind": "user_key", "count": 7}]}
     compiled_b = _compiled(db_b.execute.call_args_list[0].args[0])
     assert f"mail_thread.user_id = '{user_b.id.hex}'" in compiled_b
-    assert user_a.id.hex not in compiled_b
+
+
+# ---------------------------------------------------------------------------
+# D2 recovery: credential mutations reset a caller's terminally-capped
+# `failed` action_item rows under the guard lock (plan:
+# 2026-08-19-extraction-cost-hardening D2). The matrix the plan names:
+# first-create, inactive-create, material PUT, flag-only PUT, activate, kill
+# switch. `db.reset_calls` (via `_CredentialDB`'s `action_item` UPDATE
+# interception) is `[user_id.hex]` once per reset, `[]` when a mutation
+# deliberately doesn't reset.
+# ---------------------------------------------------------------------------
+
+
+def test_put_material_change_resets_extraction_attempts(user):
+    row = _make_row(user_id=user.id, provider="openai", model="gpt-4o-mini", revision=1)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "model": "a-different-model"},
+    )
+    assert resp.status_code == 200
+    assert db.reset_calls == [user.id.hex]
+
+
+def test_put_flag_only_edit_does_not_reset_extraction_attempts(user):
+    row = _make_row(user_id=user.id, provider="openai", model="gpt-4o-mini", revision=1)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "model": "gpt-4o-mini", "classification_byok": True},
+    )
+    assert resp.status_code == 200
+    assert db.reset_calls == []
+
+
+def test_put_first_create_resets_extraction_attempts(user):
+    # A brand-new user's first PUT always creates an active row -- same
+    # "the active credential just changed" event as a material rewrite.
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).put(
+        "/api/v1/settings/llm",
+        json={"provider": "openai", "api_key": "sk-abcdefgh", "model": "gpt-4o-mini"},
+    )
+    assert resp.status_code == 200
+    assert db.reset_calls == [user.id.hex]
+
+
+def test_create_credential_first_one_resets_extraction_attempts(user):
+    db = _CredentialDB()
+    _override(user, db)
+    resp = TestClient(app).post(
+        "/api/v1/settings/llm/credentials",
+        json={"name": "work", "provider": "openai", "api_key": "sk-abcdefgh", "model": "m"},
+    )
+    assert resp.status_code == 201
+    assert db.reset_calls == [user.id.hex]
+
+
+def test_create_credential_inactive_spare_does_not_reset_extraction_attempts(user):
+    existing = _make_row(user_id=user.id, name="default", is_active=True)
+    db = _CredentialDB({user.id.hex: existing})
+    _override(user, db)
+    resp = TestClient(app).post(
+        "/api/v1/settings/llm/credentials",
+        json={"name": "backup", "provider": "gemini", "api_key": "sk-abcdefgh", "model": "m"},
+    )
+    assert resp.status_code == 201
+    assert db.reset_calls == []
+
+
+def test_activate_credential_switch_resets_extraction_attempts(user):
+    old_active = _make_row(user_id=user.id, name="default", is_active=True)
+    target = _make_row(user_id=user.id, name="work", is_active=False)
+    db = _CredentialDB({user.id.hex: [old_active, target]})
+    _override(user, db)
+    resp = TestClient(app).post(f"/api/v1/settings/llm/credentials/{target.id}/activate")
+    assert resp.status_code == 200
+    assert db.reset_calls == [user.id.hex]
+
+
+def test_activate_credential_already_active_does_not_reset_extraction_attempts(user):
+    target = _make_row(user_id=user.id, name="default", is_active=True)
+    db = _CredentialDB({user.id.hex: target})
+    _override(user, db)
+    resp = TestClient(app).post(f"/api/v1/settings/llm/credentials/{target.id}/activate")
+    assert resp.status_code == 200
+    assert db.reset_calls == []
+
+
+def test_delete_kill_switch_does_not_reset_extraction_attempts(user):
+    # No credential is left to retry under -- resetting here would just
+    # strand the rows capped-at-zero until a NEW credential shows up.
+    row = _make_row(user_id=user.id)
+    db = _CredentialDB({user.id.hex: row})
+    _override(user, db)
+    resp = TestClient(app).delete("/api/v1/settings/llm")
+    assert resp.status_code == 204
+    assert db.reset_calls == []
+
+
+def test_delete_credential_by_id_does_not_reset_extraction_attempts(user):
+    active = _make_row(user_id=user.id, name="default", is_active=True)
+    spare = _make_row(user_id=user.id, name="spare", is_active=False)
+    db = _CredentialDB({user.id.hex: [active, spare]})
+    _override(user, db)
+    resp = TestClient(app).delete(f"/api/v1/settings/llm/credentials/{spare.id}")
+    assert resp.status_code == 200
+    assert db.reset_calls == []

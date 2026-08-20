@@ -68,10 +68,21 @@ class CallContext:
     """Who a resolved credential bills, for the usage-recording call sites
     Wave 2b wires up. Kept here, next to `LlmCredential`, rather than in
     `llm_client` -- that module owns transport and security only, never
-    `user_id` or billing attribution (see plan §3)."""
+    `user_id` or billing attribution (see plan §3).
+
+    `credential_id`/`revision` (plan: 2026-08-19-extraction-cost-hardening
+    D2) are the resolved row's identity at RESOLVE time -- `None` for a
+    fallback/operator credential, which has no per-user row to rotate.
+    `extraction_run` threads these through to `record_extraction`'s
+    credential-class cap-jump check, so a PUT/activate that rotates the
+    credential mid-sweep can be told apart from the one that actually
+    produced a given failure.
+    """
 
     credential: LlmCredential
     payer: Literal["user", "operator"]
+    credential_id: UUID | None = None
+    revision: int | None = None
 
 
 PROVIDER_PRESETS: dict[str, str] = {

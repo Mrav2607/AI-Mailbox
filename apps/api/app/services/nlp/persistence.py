@@ -20,11 +20,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, case, or_, update
+from sqlalchemy import and_, case, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.db.models import ActionItem, Classification
+from app.db.models import ActionItem, AppUser, Classification, UserLlmCredential
 from app.services.nlp.extractor import ExtractedAction, NoAction
 
 # A claim's lease: past this age, a fresh worker may steal a still-"pending"
@@ -32,6 +32,14 @@ from app.services.nlp.extractor import ExtractedAction, NoAction
 # its Celery lease).
 PENDING_LEASE = timedelta(minutes=30)
 MAX_ATTEMPTS = 3
+
+# Categories where every retry with the SAME credential fails identically --
+# a bad key (401), a forbidden model (403), or a retired/renamed model
+# (404). `blocked_by_policy` is deliberately excluded: it reflects mutable
+# deployment/DNS policy, not the credential itself, and policy recovery
+# must not require a credential mutation to revive rows (plan:
+# 2026-08-19-extraction-cost-hardening D2).
+CREDENTIAL_CLASS_FAILURE_CATEGORIES = frozenset({"http_401", "http_403", "http_404"})
 
 # Marks a label set by a human in the console rather than a model -- lets
 # every write path (this module, the route, backfill) agree on the string
@@ -105,16 +113,32 @@ def upsert_classification(
     return "written" if result.rowcount else "protected"
 
 
-def claimable_predicate(*, force: bool = False):
+def claimable_predicate(*, force: bool = False, model_version: str | None = None):
     """WHERE-clause fragment: is an EXISTING ``action_item`` row a valid claim
     target right now?
 
     Settled rows (``extracted`` / ``no_action``) are terminal; only
     ``ineligible`` (a reclassify-back must always be able to re-extract),
     ``failed`` under the attempt cap, and an expired ``pending`` lease under
-    the cap remain retryable. ``force`` widens this to any non-pending row --
-    an operator backfill can re-run a settled extraction, but force must
-    never steal a claim a live worker currently holds.
+    the cap remain retryable.
+
+    ``force`` (plan: 2026-08-19-extraction-cost-hardening D5) widens this,
+    but no longer to "any non-pending row" -- re-running a settled
+    extraction for free is only worth paying for when the model that
+    produced it has since changed:
+
+    - ``failed`` rows are claimable regardless of the attempt cap (retrying
+      failures is force's whole job).
+    - ``extracted``/``no_action`` rows are claimable ONLY when the row's
+      stored ``model_version`` differs from the CURRENT ``model_version``
+      (``f"{provider}:{model}"``, threaded from the caller's resolved
+      credential), via SQL ``IS DISTINCT FROM`` -- plain ``!=`` is
+      NULL-poisoned and would silently exclude every historical row with no
+      stored model_version, the opposite of what a one-time re-extraction
+      needs. Same model -> not claimable even under force; the paid result
+      stands.
+    - a live ``pending`` claim is still NEVER stolen, forced or not -- it's
+      simply absent from every disjunct below.
     """
     lease_cutoff = datetime.now(timezone.utc) - PENDING_LEASE
     base = or_(
@@ -126,9 +150,89 @@ def claimable_predicate(*, force: bool = False):
             ActionItem.attempts < MAX_ATTEMPTS,
         ),
     )
-    if force:
-        return or_(base, ActionItem.outcome != "pending")
-    return base
+    if not force:
+        return base
+    return or_(
+        base,
+        ActionItem.outcome == "failed",
+        and_(
+            ActionItem.outcome.in_(("extracted", "no_action")),
+            ActionItem.model_version.is_distinct_from(model_version),
+        ),
+    )
+
+
+def lock_guard_user(db: Session, user_id: UUID) -> None:
+    """The single per-user serialization anchor (PR #64's D6 guard lock,
+    ``llm_settings._lock_guard_user``): a ``SELECT ... FOR UPDATE`` on
+    ``app_user`` that every STRUCTURAL credential mutation takes before
+    reading or writing this user's credential rows.
+
+    Defined here rather than in the routes module so this extraction-record
+    path can take the SAME lock without services reaching up into routes --
+    ``llm_settings.py`` delegates to this implementation instead of keeping
+    its own copy. Used by ``record_extraction``'s D2 credential-identity
+    check: taking this lock before re-reading the active credential is what
+    stops a PUT/activate from committing between that read and the fenced
+    cap-jump write it guards (the TOCTOU Codex's pass 3 review caught).
+    """
+    db.execute(select(AppUser.id).where(AppUser.id == user_id).with_for_update())
+
+
+def _credential_class_cap_jump_attempts(
+    db: Session,
+    *,
+    user_id: UUID | None,
+    failure_category: str | None,
+    credential_id: UUID | None,
+    credential_revision: int | None,
+) -> int | None:
+    """The attempts value a credential-class failure should jump the row
+    to, or ``None`` to leave ``attempts`` untouched (plan D2).
+
+    ``None`` short-circuits whenever there's nothing to jump: a
+    non-credential-class category (retryable or `blocked_by_policy`), or no
+    ``user_id`` to check identity against (callers that don't care about D2
+    at all -- most of this module's own test suite -- simply never pass
+    ``failure_category``, so this stays a no-op for them, unchanged from
+    before D2 existed).
+
+    Identity check, ATOMIC with the caller's write: takes ``lock_guard_user``
+    THEN re-reads the user's currently active credential, all in the SAME
+    transaction ``record_extraction``'s fenced UPDATE commits -- so a
+    PUT/activate can no longer land between the read and the write. Match
+    (attempt's credential id+revision == the active row's) -> ``MAX_ATTEMPTS``,
+    terminalizing the row under the credential that actually produced this
+    failure. Mismatch -- a rotation raced this call -- -> ``0``, so the claim
+    this attempt already spent doesn't strand the row capped under a
+    credential nobody's using anymore; the row gets a fresh claimable life
+    under whichever credential is active now (fenced on the still-owned
+    claim token, same as any other `record_extraction` write).
+
+    A ``None`` ``credential_id`` (the operator/fallback key, never a
+    per-user row a PUT/activate can rotate) has nothing to compare identity
+    against, so the cap always applies straight -- no rotation is possible
+    without a row to rotate.
+    """
+    if failure_category not in CREDENTIAL_CLASS_FAILURE_CATEGORIES:
+        return None
+    if user_id is None:
+        return None
+    lock_guard_user(db, user_id)
+    if credential_id is None:
+        return MAX_ATTEMPTS
+    current = db.execute(
+        select(UserLlmCredential.id, UserLlmCredential.revision).where(
+            UserLlmCredential.user_id == user_id, UserLlmCredential.is_active
+        )
+    ).first()
+    if (
+        current is not None
+        and current.id == credential_id
+        and current.revision == credential_revision
+    ):
+        return MAX_ATTEMPTS
+    return 0
 
 
 def _done_stamp_columns(thread_done: bool, now: datetime) -> dict:
@@ -155,6 +259,7 @@ def claim_action_item(
     user_id: UUID,
     thread_done: bool,
     force: bool = False,
+    model_version: str | None = None,
 ) -> UUID | None:
     """Atomically claim ``message_id``'s ``action_item`` row for one
     extraction attempt.
@@ -166,6 +271,17 @@ def claim_action_item(
     between claim and record must never leave an open row on a done thread,
     where it would surface as an obligation after an auto-reopen. A forced
     reclaim of a dismissed row must preserve ``dismissed`` byte-for-byte.
+
+    ``model_version`` (plan D5) is threaded straight to this claim's own
+    ``claimable_predicate(force=force, model_version=model_version)`` --
+    without it, the claim's WHERE clause would compare against ``NULL``
+    (``IS DISTINCT FROM NULL``, true for any non-null stored value), a much
+    WEAKER gate than the one the caller's candidate SELECT already applied
+    to pick this row, and every settled row with SOME stored model_version
+    would claim regardless of whether it actually differs from the current
+    one. The candidate SELECT and this claim must agree on what "current"
+    means, or a message the SELECT rejected as same-model could still claim
+    here.
     """
     now = datetime.now(timezone.utc)
     token = uuid4()
@@ -190,7 +306,25 @@ def claim_action_item(
         .values(**insert_values)
         .on_conflict_do_nothing(constraint="uq_action_item_message")
     )
-    if db.execute(insert_stmt).rowcount:
+    # D4 (plan: 2026-08-19-extraction-cost-hardening, D1's actual root
+    # cause): preserve_rowcount matters here exactly like it does in
+    # upsert_classification -- without it, psycopg3 reports -1 (truthy!)
+    # for an INSERT ... ON CONFLICT DO NOTHING statement even when the
+    # conflict path fired and ZERO rows were actually inserted. Two
+    # concurrent first-ever claims on the SAME brand-new message (the
+    # owner's two mail connections firing concurrent sweeps) would both
+    # read a truthy rowcount here and BOTH believe they'd won the claim --
+    # the loser gets handed a claim_token that doesn't correspond to any
+    # row in the DB, spends a real wire call on it, and then fences out at
+    # record time (0 rows updated) as bucket "skipped" carrying a real
+    # failure_category. That's the exact prod storm signature: the
+    # existing consecutive-FAILURE breaker never sees it (it's a "skipped"
+    # bucket, not "failed"), so nothing bounds the loser's connection to a
+    # handful of calls the way D3 now does for a genuine failure streak.
+    # Repro: test_extraction_concurrency_integration.py's
+    # test_two_concurrent_claims_on_a_brand_new_row_self_limits fails
+    # without this line and passes with it.
+    if db.execute(insert_stmt.execution_options(preserve_rowcount=True)).rowcount:
         return token
 
     # Someone already has a row for this message -- try to (re)claim it.
@@ -203,7 +337,10 @@ def claim_action_item(
     }
     claim_stmt = (
         update(ActionItem)
-        .where(ActionItem.message_id == message_id, claimable_predicate(force=force))
+        .where(
+            ActionItem.message_id == message_id,
+            claimable_predicate(force=force, model_version=model_version),
+        )
         .values(**update_values)
     )
     if db.execute(claim_stmt).rowcount:
@@ -237,6 +374,11 @@ def record_extraction(
     thread_done: bool,
     label_still_actionable: bool,
     already_replied: bool = False,
+    model_version: str | None = None,
+    user_id: UUID | None = None,
+    failure_category: str | None = None,
+    credential_id: UUID | None = None,
+    credential_revision: int | None = None,
 ) -> bool:
     """Fenced write of an extraction attempt's outcome.
 
@@ -252,7 +394,33 @@ def record_extraction(
     result decides: ``ExtractedAction`` -> ``extracted``, ``NoAction`` ->
     ``no_action`` (extraction fields cleared -- a forced re-extraction that
     finds nothing must not leave stale fields from a prior attempt), ``None``
-    -> ``failed`` (fields untouched, transient failure).
+    -> ``failed`` (fields untouched, transient failure -- except for a
+    credential-class category, see below).
+
+    ``model_version`` (plan D6) is the attempt's ``f"{provider}:{model}"``,
+    written on BOTH settled branches: ``extracted`` keeps preferring
+    ``result.model_version`` (the extractor always sets it to this same
+    value, so this is not a behavior change -- see
+    ``test_record_extraction_extracted_model_version_matches_call_context``),
+    and ``no_action`` -- which carries no model version of its own -- now
+    stamps the parameter instead of hard-writing ``None``. This is what lets
+    D5's ``claimable_predicate(force=True)`` tell "this settled row came from
+    the CURRENT model" from "the model has since changed" via
+    ``IS DISTINCT FROM``.
+
+    ``failure_category``/``user_id``/``credential_id``/``credential_revision``
+    (plan D2) only matter on the ``result is None`` (failed) branch, and only
+    when ``failure_category`` is one of ``CREDENTIAL_CLASS_FAILURE_CATEGORIES``
+    -- every retry with the SAME credential would fail identically, so this
+    jumps ``attempts`` straight to ``MAX_ATTEMPTS`` (terminal) instead of
+    leaving it for the caller to burn two more calls on the same dead
+    credential. The identity check is atomic with this write (see
+    ``_credential_class_cap_jump_attempts``): a mismatch -- caught mid-flight
+    by a credential rotation -- writes ``attempts=0`` instead, so the claim
+    this attempt already spent doesn't strand the row capped under a
+    credential nobody's using anymore. Callers that don't pass
+    ``failure_category`` (most of this module's own test suite) get the
+    exact same ``failed``-with-fields-untouched behavior as before D2.
 
     Independent of which branch above fires: this record also resolves the
     row's existing ``"open"`` status to ``"done"`` when either ``thread_done``
@@ -295,10 +463,19 @@ def record_extraction(
             amount=None,
             currency=None,
             source_confidence=None,
-            model_version=None,
+            model_version=model_version,
         )
     else:
         values["outcome"] = "failed"
+        cap_jump = _credential_class_cap_jump_attempts(
+            db,
+            user_id=user_id,
+            failure_category=failure_category,
+            credential_id=credential_id,
+            credential_revision=credential_revision,
+        )
+        if cap_jump is not None:
+            values["attempts"] = cap_jump
 
     resolves_already_answered = (
         already_replied and isinstance(result, ExtractedAction) and result.kind == "reply"

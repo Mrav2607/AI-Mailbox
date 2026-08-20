@@ -243,7 +243,7 @@ def test_extraction_run_stamps_action_item_user_id_from_the_locked_thread(
         provider="openai", base_url="https://example.invalid/v1", api_key="k", model="m"
     )
 
-    bucket, derived_user_id = extraction_run._claim_extract_record(
+    bucket, derived_user_id, _category = extraction_run._claim_extract_record(
         db_session,
         message.id,
         call_context=CallContext(credential=stub_credential, payer="operator"),
