@@ -469,14 +469,19 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
       // the active one -- so the credential list has to clear right along
       // with the singular settings view.
       await deps.deleteLlmSettings();
+      // Identity first: a stale removal resolving after an account switch
+      // belongs to whoever was signed in before -- it must not clear the
+      // new account's list, refresh their settings, or toast at them. Only
+      // then re-claim the list generation, now that the DELETE has actually
+      // committed: a refresh that started while it was in flight (say, the
+      // ai tab getting reopened) can hold a NEWER number off the bump above
+      // while still reading PRE-delete data, and without the re-claim that
+      // stale-but-newer-numbered refresh would land after this clear and
+      // resurrect the very rows this just wiped. (Synchronously after the
+      // increment the claim check is trivially true -- it's kept for shape
+      // parity with create/activate/delete, where awaits separate the two.)
+      if (generation !== llmSettingsGenRef.current) return;
       setLlmTestResult(null);
-      // Re-claim the generation now that the DELETE has actually committed,
-      // rather than trusting the number captured before it went out. A
-      // refresh that started while the DELETE was still in flight (say, the
-      // ai tab getting reopened) can claim a NEWER number off the bump
-      // above while it's still reading PRE-delete data -- without re-
-      // claiming here, that stale-but-newer-numbered refresh would land
-      // after this clear and resurrect the very rows this just wiped.
       const postCredentialsGeneration = ++llmCredentialsGenRef.current;
       if (postCredentialsGeneration === llmCredentialsGenRef.current) {
         setLlmCredentials([]);

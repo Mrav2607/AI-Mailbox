@@ -862,6 +862,43 @@ describe("useLlmPanel rendered lifecycle", () => {
       expect(api!.llmCredentials).toEqual([oldRow, newRow]);
     });
 
+    it("a stale kill switch completing after an account switch does not wipe the new account's list", async () => {
+      const userARemove = deferred<void>();
+      deps.deleteLlmSettings = vi.fn(() => userARemove.promise);
+
+      let aRemovePromise!: Promise<void>;
+      await act(async () => {
+        aRemovePromise = api!.doRemoveLlmSettings();
+      });
+
+      render("user-b");
+
+      // user-b loads their own credential list normally.
+      deps.listLlmCredentials = vi.fn(() =>
+        Promise.resolve([makeCredential({ id: "cred-b", name: "B's key", active: true })]),
+      );
+      await act(async () => {
+        await api!.refreshLlmCredentials();
+      });
+      expect(api!.llmCredentials).toHaveLength(1);
+
+      const toastCountBefore = (deps.toastSuccess as ReturnType<typeof vi.fn>).mock.calls.length;
+
+      // user-a's stale kill switch finally resolves. Its whole success path
+      // must bail on the identity check -- before the fix, its re-claimed
+      // list generation was compared synchronously (trivially true) and it
+      // cleared user-b's list and toasted at them.
+      await act(async () => {
+        userARemove.resolve();
+        await aRemovePromise;
+      });
+
+      expect(api!.llmCredentials).toHaveLength(1);
+      expect((deps.toastSuccess as ReturnType<typeof vi.fn>).mock.calls.length).toBe(
+        toastCountBefore,
+      );
+    });
+
     it("a stale create completing after an account switch does not invalidate the new account's in-flight test", async () => {
       const userACreate = deferred<LlmCredentialSummary>();
       deps.createLlmCredential = vi.fn(() => userACreate.promise);
