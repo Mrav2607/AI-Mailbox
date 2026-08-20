@@ -118,6 +118,24 @@ const mockApi = vi.hoisted(() => {
 
 vi.mock("@/lib/api", () => mockApi);
 
+// Pass-through wrapper, not a stub: the real useAutoSync still runs for
+// every test, this just captures the latest onSynced callback so a test can
+// fire a genuine quiet refreshAll({ quiet: true }) on demand -- the only
+// production path that runs a QUIET agenda walk.
+const autoSyncHolder = vi.hoisted(() => ({
+  onSynced: null as null | (() => Promise<void> | void),
+}));
+vi.mock("@/lib/use-auto-sync", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/use-auto-sync")>();
+  return {
+    ...actual,
+    useAutoSync: (opts: Parameters<typeof actual.useAutoSync>[0]) => {
+      autoSyncHolder.onSynced = opts.onSynced ?? null;
+      return actual.useAutoSync(opts);
+    },
+  };
+});
+
 vi.mock("@/components/console/TopBar", () => ({
   TopBar: () => <div data-testid="mock-topbar" />,
 }));
@@ -475,6 +493,68 @@ describe("agenda cursor pagination", () => {
     // With the guard properly released, a load-more now goes through.
     await fireIntersection(agendaObserver());
     expect(mockApi.getActions).toHaveBeenCalledTimes(4);
+  });
+
+  it("clears the loading skeleton when a loud walk is superseded by a quiet one", async () => {
+    // The regression: a LOUD refresh sets actionsLoading, then a quiet
+    // auto-sync refresh supersedes it. The stale loud walk isn't the latest
+    // walk anymore so it can't clear the spinner, and if the latest (quiet)
+    // walk skipped the clear because it never SET the spinner, an empty
+    // agenda would sit on the skeleton forever.
+    const pendingResolvers: Record<number, (r: ActionsResponse) => void> = {};
+    let callIndex = -1;
+    const EMPTY: ActionsResponse = { items: [], counts: { open: 0, overdue: 0 }, next_cursor: null };
+    mockApi.getActions.mockImplementation(async () => {
+      callIndex += 1;
+      if (callIndex === 0) return EMPTY;
+      const d = deferred<ActionsResponse>();
+      pendingResolvers[callIndex] = d.resolve;
+      return d.promise;
+    });
+
+    await renderApp();
+    await goToAgenda(); // call 0 -- settles empty, no skeleton
+    expect(container.textContent).toContain("nothing on the agenda");
+
+    const bucketEntry = Array.from(
+      container.querySelectorAll<HTMLButtonElement>("nav button"),
+    )[0]!;
+
+    // Leave and come back: a LOUD walk (call 1), left pending -- with zero
+    // rows loaded, actionsLoading renders the skeleton.
+    await act(async () => {
+      bucketEntry.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+    await goToAgenda();
+    expect(container.textContent).not.toContain("nothing on the agenda");
+
+    // Auto-sync completes: refreshAll({ quiet: true }) starts a QUIET walk
+    // (call 2) that supersedes the loud one.
+    expect(autoSyncHolder.onSynced).toBeTruthy();
+    await act(async () => {
+      void autoSyncHolder.onSynced!();
+      await Promise.resolve();
+    });
+    expect(mockApi.getActions).toHaveBeenCalledTimes(3);
+
+    // The stale loud walk resolves first -- not the latest walk, so it must
+    // not touch the spinner either way.
+    await act(async () => {
+      pendingResolvers[1](EMPTY);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The quiet walk (the latest) resolves: even though IT never set the
+    // spinner, it owns the release now and must clear the one the loud walk
+    // left behind -- the empty state has to come back, not the skeleton.
+    await act(async () => {
+      pendingResolvers[2](EMPTY);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("nothing on the agenda");
   });
 
   it("suppresses a second observer fire that arrives before the first load-more's state update flushes", async () => {

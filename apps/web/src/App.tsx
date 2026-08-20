@@ -860,7 +860,13 @@ export default function Console() {
         // walk behind it, and this walk still owns the release then.
         if (refreshRequest === actionsRefreshRequestRef.current) {
           actionsRefreshInFlight.current = false;
-          if (!quiet) setActionsLoading(false);
+          // Cleared regardless of THIS walk's quiet flag: a loud refresh
+          // superseded by a quiet auto-sync one leaves the spinner set by
+          // the loud walk, and only the latest (quiet) walk gets in here —
+          // if it skipped the clear, an empty agenda would spin forever.
+          // Clearing an already-false flag is a no-op, so this is safe for
+          // the all-quiet case too.
+          setActionsLoading(false);
         }
       }
     },
