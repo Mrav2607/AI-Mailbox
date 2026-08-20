@@ -190,6 +190,13 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
     setLlmCreatingCredential(false);
     setLlmActivatingCredentialId(null);
     setLlmDeletingCredentialId(null);
+    // The three singular-flow flags get the same treatment for the same
+    // reason -- and because their finally blocks are generation-guarded,
+    // this reset is also what un-sticks them after an account switch (a
+    // stale completion deliberately no longer touches them).
+    setLlmSaving(false);
+    setLlmTesting(false);
+    setLlmRemoving(false);
     // The settings dialog itself closes via App's own account-scoped reset
     // (settingsPanel -> null alongside its other resets) -- this hook no
     // longer owns that state, just the data it's built from.
@@ -415,8 +422,10 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
           llmCredentialGenRef.current++;
           llmUsageGenRef.current++;
           llmMixGenRef.current++;
+          // Inside the identity guard like the bumps -- the identity-reset
+          // effect owns clearing this flag for the next account.
+          setLlmSaving(false);
         }
-        setLlmSaving(false);
       }
       // Refetch only on success, and only after the bump above -- otherwise
       // this fetch would capture the pre-bump generation and immediately
@@ -436,6 +445,11 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
 
   const doTestLlmSettings = useCallback(async () => {
     const generation = llmCredentialGenRef.current;
+    // Identity captured separately from the credential counter above: the
+    // counter also bumps on SAME-identity mutations (a save finishing
+    // mid-test), which should still release the flag below -- only an
+    // account switch hands the flag over to the identity-reset effect.
+    const identityGeneration = llmSettingsGenRef.current;
     setLlmTesting(true);
     setLlmTestResult(null);
     try {
@@ -449,7 +463,11 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
       if (generation !== llmCredentialGenRef.current) return; // ditto for a stale failure
       deps.toastError((e as Error).message || "could not test this credential");
     } finally {
-      setLlmTesting(false);
+      // Identity-guarded only -- a stale test from a signed-out account
+      // must not clear the flag out from under whoever owns the panel now
+      // (the identity-reset effect did that for them), but a same-identity
+      // credential change mid-test still releases it normally.
+      if (identityGeneration === llmSettingsGenRef.current) setLlmTesting(false);
     }
   }, [deps, refreshLlmSettings]);
 
@@ -489,9 +507,15 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
         setLlmCredentialDeleteError(null);
       }
       await refreshLlmSettings();
+      // Second identity check: the refresh above is its own await, and the
+      // account can change during it too -- the toast and the usage/mix
+      // follow-ups (gated on `removed` below) belong to whoever started
+      // this removal, never to whoever is signed in now.
+      if (generation !== llmSettingsGenRef.current) return;
       deps.toastSuccess("AI credential removed");
       removed = true;
     } catch (e) {
+      if (generation !== llmSettingsGenRef.current) return;
       deps.toastError((e as Error).message || "could not remove this credential");
     } finally {
       // Same as the save path: a removal invalidates an in-flight test, an
@@ -502,8 +526,11 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
         llmCredentialGenRef.current++;
         llmUsageGenRef.current++;
         llmMixGenRef.current++;
+        // Inside the identity guard like the bumps: a stale completion
+        // must not touch the new account's flag -- the identity-reset
+        // effect is what cleared it for them.
+        setLlmRemoving(false);
       }
-      setLlmRemoving(false);
     }
     // Same ordering rule as doSaveLlmSettings: refetch after the generation
     // bump above, and only once the remove actually went through.
