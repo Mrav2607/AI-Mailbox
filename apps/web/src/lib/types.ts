@@ -126,6 +126,10 @@ export interface ActionCounts {
 export interface ActionsResponse {
   items: ActionItem[];
   counts: ActionCounts;
+  // Opaque bookmark for the next cursor page — set iff this page came back
+  // full, null on a short/empty final page. Treat it as a token, never parse
+  // it (docs/plans/2026-08-19-agenda-cursor-pagination-plan.md D3/D4).
+  next_cursor: string | null;
 }
 
 // Classifier backends an operator can pick per run. "local" = fine-tuned
@@ -291,14 +295,15 @@ export interface User {
 }
 
 // BYOK LLM providers, mirroring PROVIDER_PRESETS in the API's providers.py
-// plus "custom". Anthropic is deliberately absent -- its OpenAI-compat layer
-// ignores response_format, so it's not offered as an extraction backend.
+// plus "custom". Anthropic runs on its native Messages API server-side,
+// not the OpenAI-compat shim the other presets share.
 export type LlmProvider =
   | "openai"
   | "gemini"
   | "openrouter"
   | "groq"
   | "mistral"
+  | "anthropic"
   | "custom";
 
 // Mirrors LlmSettingsOut (GET/PUT /settings/llm). Unconfigured

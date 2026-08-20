@@ -332,6 +332,51 @@ def test_extract_action_with_usage_real_preflight_rejection_never_attempted(monk
     assert attempt.failure_category == "blocked_by_policy"
 
 
+def test_extract_action_with_usage_anthropic_wire_round_trip_zero_consumer_edits(monkeypatch):
+    """The whole point of the Anthropic wire branch (plan: 2026-08-19 native-
+    anthropic-byok-plan.md): extractor.py needs ZERO edits to consume it.
+    Drives the REAL call_chat_completion through a fake Anthropic Messages
+    API transport (httpx.MockTransport) -- not extractor.call_chat_completion
+    mocked away -- so llm_client.py's tool-use re-serialization is what
+    extractor._parse_extraction actually parses, exactly like it would an
+    OpenAI-shaped reply."""
+    import httpx
+
+    anthropic_payload = {
+        "stop_reason": "tool_use",
+        "content": [{"type": "tool_use", "name": "emit_json", "input": VALID_PAYLOAD}],
+        "usage": {"input_tokens": 200, "output_tokens": 60},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.anthropic.com/v1/messages"
+        assert request.headers["x-api-key"] == "sk-ant-key"
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json=anthropic_payload)
+
+    real_client_cls = httpx.Client
+
+    class _MockedClient(real_client_cls):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("transport", httpx.MockTransport(handler))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(llm_client.httpx, "Client", _MockedClient)
+
+    credential = _make_credential(
+        provider="anthropic", base_url="https://api.anthropic.com/v1",
+        api_key="sk-ant-key", model="claude-haiku-4-5",
+    )
+    attempt = extract_action_with_usage(**_default_kwargs(credential=credential))
+
+    assert isinstance(attempt.result, ExtractedAction)
+    assert attempt.result.title == "Pay invoice #429"
+    assert attempt.provider_call_succeeded is True
+    assert attempt.usage == LlmUsage(prompt_tokens=200, completion_tokens=60, total_tokens=None)
+    assert attempt.llm_attempted is True
+    assert attempt.failure_category is None
+
+
 def test_extract_action_with_usage_no_action_result_still_carries_call_succeeded(monkeypatch):
     payload = {"has_action": False, "confidence": 0.9}
     usage = LlmUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
@@ -357,6 +402,46 @@ def test_test_credential_success(monkeypatch):
     ok, category, latency_ms = _test_credential(_make_credential())
     assert ok is True
     assert category is None
+
+
+def test_test_credential_anthropic_wire_round_trip_zero_consumer_edits(monkeypatch):
+    """`/settings/llm/test`'s entry point, same "zero consumer edits"
+    guarantee as the extract_action_with_usage round-trip above -- real
+    call_chat_completion through a fake Anthropic transport, nothing about
+    test_credential or its parsing mocked away."""
+    import httpx
+
+    anthropic_payload = {
+        "stop_reason": "tool_use",
+        "content": [{"type": "tool_use", "name": "emit_json", "input": VALID_PAYLOAD}],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.anthropic.com/v1/messages"
+        # Proves the /test path really rode the Anthropic wire branch:
+        # its auth scheme, not a Bearer header that happened to get a 200.
+        assert request.headers["x-api-key"] == "sk-ant-key"
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json=anthropic_payload)
+
+    real_client_cls = httpx.Client
+
+    class _MockedClient(real_client_cls):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("transport", httpx.MockTransport(handler))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(llm_client.httpx, "Client", _MockedClient)
+
+    credential = _make_credential(
+        provider="anthropic", base_url="https://api.anthropic.com/v1",
+        api_key="sk-ant-key", model="claude-haiku-4-5",
+    )
+    ok, category, latency_ms = _test_credential(credential)
+
+    assert ok is True
+    assert category is None
+    assert latency_ms >= 0
     assert latency_ms >= 0
 
 

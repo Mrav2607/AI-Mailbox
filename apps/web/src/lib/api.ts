@@ -973,12 +973,18 @@ export async function reclassify(
 // account, `status` defaulting to "open" like the API. `counts` in the
 // response is always the full open/overdue tally regardless of the status
 // filter, so switching status views doesn't make the badge count flicker.
+// `cursor` pages through the SAME status filter it was minted under
+// (docs/plans/2026-08-19-agenda-cursor-pagination-plan.md D3) -- omit it for
+// the first page, and pass back whatever `next_cursor` the previous page
+// returned to fetch the next one.
 export async function getActions(
   status: ActionStatus = "open",
   limit = 200,
+  cursor?: string,
 ): Promise<ActionsResponse> {
-  if (USE_MOCK) return mockActions(status, limit);
+  if (USE_MOCK) return mockActions(status, limit, cursor);
   const qs = new URLSearchParams({ status, limit: String(limit) });
+  if (cursor) qs.set("cursor", cursor);
   return request<ActionsResponse>(`/mail/actions?${qs.toString()}`);
 }
 

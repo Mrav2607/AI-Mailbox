@@ -90,7 +90,7 @@ jobs:
       # Real-DB integration tests -- the offline suite above stubs Postgres,
       # so this is the only job that exercises the actual schema end to end.
       - name: Test (real-Postgres integration)
-        run: pytest -q tests/test_auth_integration.py tests/test_feedback_integration.py tests/test_llm_credentials_integration.py
+        run: pytest -q tests/test_auth_integration.py tests/test_feedback_integration.py tests/test_actions_integration.py tests/test_llm_credentials_integration.py
 
   web:
     name: Web (lint · type · test · build)

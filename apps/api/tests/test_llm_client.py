@@ -61,6 +61,28 @@ def _choice_payload_with_usage(content: str, usage: object) -> dict:
     return payload
 
 
+def _make_anthropic_credential(**overrides):
+    kwargs = dict(
+        provider="anthropic",
+        base_url="https://api.anthropic.com/v1",
+        api_key=SECRET_KEY,
+        model="claude-haiku-4-5",
+    )
+    kwargs.update(overrides)
+    return LlmCredential(**kwargs)
+
+
+def _tool_use_payload(tool_input: object, **overrides) -> dict:
+    """A well-formed Anthropic Messages response: stop_reason=tool_use, one
+    tool_use block named emit_json carrying `tool_input`."""
+    payload = {
+        "stop_reason": "tool_use",
+        "content": [{"type": "tool_use", "name": "emit_json", "input": tool_input}],
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _install_mock_transport(monkeypatch, handler):
     """Route every httpx.Client call_chat_completion constructs through
     MockTransport(handler) -- no real network, no new dependency."""
@@ -123,6 +145,231 @@ def test_call_chat_completion_success_round_trip_asserts_wire_shape(monkeypatch)
     assert len(body["messages"]) == 1
     assert body["messages"][0]["role"] == "user"
     assert body["messages"][0]["content"] == "the prompt\n\nthe email text"
+
+
+# ---------------------------------------------------------------------------
+# Anthropic Messages API wire shape (D2-D4) -- mirrors the OpenAI suite
+# above, but for the native tool-use branch: URL join, headers (x-api-key +
+# pinned anthropic-version, NO Authorization), body shape (max_tokens, one
+# user message, the emit_json tool + exact tool_choice), and the D2 response
+# contract (stop_reason == "tool_use" AND exactly one emit_json tool_use
+# block with a dict input) with its invalid_response matrix.
+# ---------------------------------------------------------------------------
+
+
+def test_anthropic_call_success_round_trip_asserts_wire_shape(monkeypatch):
+    calls = []
+    tool_input = {"has_action": True}
+    _install_mock_transport(monkeypatch, _json_handler(200, _tool_use_payload(tool_input), calls))
+    credential = _make_anthropic_credential()
+
+    result = call_chat_completion(
+        credential, prompt="the prompt", user_content="the email text", max_tokens=512
+    )
+
+    assert isinstance(result, LlmCallResult)
+    # The tool's `input` dict, re-serialized -- not the raw Anthropic envelope.
+    assert json.loads(result.content) == tool_input
+    assert len(calls) == 1
+    request = calls[0]
+    assert str(request.url) == "https://api.anthropic.com/v1/messages"
+    assert request.headers["x-api-key"] == SECRET_KEY
+    assert request.headers["anthropic-version"] == "2023-06-01"
+    assert "authorization" not in request.headers
+    body = json.loads(request.content)
+    assert body["model"] == "claude-haiku-4-5"
+    assert body["max_tokens"] == 512
+    assert len(body["messages"]) == 1
+    assert body["messages"][0]["role"] == "user"
+    assert body["messages"][0]["content"] == "the prompt\n\nthe email text"
+    assert body["tools"] == [{"name": "emit_json", "input_schema": {"type": "object"}}]
+    assert body["tool_choice"] == {
+        "type": "tool",
+        "name": "emit_json",
+        "disable_parallel_tool_use": True,
+    }
+    # response_format is the OpenAI-shape signal -- must never leak onto this
+    # branch's body.
+    assert "response_format" not in body
+
+
+def test_anthropic_call_usage_maps_input_output_tokens_never_a_total(monkeypatch):
+    payload = _tool_use_payload(
+        {"ok": True}, usage={"input_tokens": 120, "output_tokens": 40}
+    )
+    _install_mock_transport(monkeypatch, _json_handler(200, payload))
+
+    result = call_chat_completion(
+        _make_anthropic_credential(), prompt="prompt", user_content="text", max_tokens=512
+    )
+
+    assert result.usage == LlmUsage(prompt_tokens=120, completion_tokens=40, total_tokens=None)
+
+
+def test_anthropic_call_usage_absent_is_none(monkeypatch):
+    _install_mock_transport(monkeypatch, _json_handler(200, _tool_use_payload({"ok": True})))
+
+    result = call_chat_completion(
+        _make_anthropic_credential(), prompt="prompt", user_content="text", max_tokens=512
+    )
+
+    assert result.usage is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Text-only refusal -- no tool_use block at all.
+        {"stop_reason": "end_turn", "content": [{"type": "text", "text": "sorry, I can't"}]},
+        # Right block, wrong stop_reason.
+        {
+            "stop_reason": "end_turn",
+            "content": [{"type": "tool_use", "name": "emit_json", "input": {"a": 1}}],
+        },
+        # Wrong tool name.
+        {
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "name": "some_other_tool", "input": {"a": 1}}],
+        },
+        # Multiple tool_use blocks -- disable_parallel_tool_use should prevent
+        # this, but the response contract is enforced regardless of intent.
+        {
+            "stop_reason": "tool_use",
+            "content": [
+                {"type": "tool_use", "name": "emit_json", "input": {"a": 1}},
+                {"type": "tool_use", "name": "emit_json", "input": {"b": 2}},
+            ],
+        },
+        # Zero tool_use blocks despite stop_reason == tool_use.
+        {"stop_reason": "tool_use", "content": []},
+        # Non-dict input.
+        {
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "name": "emit_json", "input": "not a dict"}],
+        },
+        # content isn't a list at all.
+        {"stop_reason": "tool_use", "content": "oops"},
+        # No content key.
+        {"stop_reason": "tool_use"},
+        # No stop_reason key.
+        {"content": [{"type": "tool_use", "name": "emit_json", "input": {"a": 1}}]},
+    ],
+    ids=[
+        "text-only-refusal",
+        "tool-use-wrong-stop-reason",
+        "wrong-tool-name",
+        "multiple-tool-use-blocks",
+        "zero-tool-use-blocks",
+        "non-dict-input",
+        "content-not-a-list",
+        "missing-content",
+        "missing-stop-reason",
+    ],
+)
+def test_anthropic_call_raises_invalid_response_for_every_d2_malformed_shape(monkeypatch, payload):
+    _install_mock_transport(monkeypatch, _json_handler(200, payload))
+    with pytest.raises(LlmCallError) as exc_info:
+        call_chat_completion(
+            _make_anthropic_credential(), prompt="prompt", user_content="text", max_tokens=512
+        )
+    assert exc_info.value.category == "invalid_response"
+
+
+def test_anthropic_call_raises_http_status_category_on_non_2xx(monkeypatch):
+    _install_mock_transport(monkeypatch, _json_handler(500, {"error": {"message": "boom"}}))
+    with pytest.raises(LlmCallError) as exc_info:
+        call_chat_completion(
+            _make_anthropic_credential(), prompt="prompt", user_content="text", max_tokens=512
+        )
+    assert exc_info.value.category == "http_500"
+    assert exc_info.value.status == 500
+
+
+def test_anthropic_529_overloaded_retries_and_succeeds(monkeypatch):
+    """D5: zero retry-policy change -- 529 (Anthropic's own "overloaded")
+    falls into the existing http_5xx bucket and is retried today with no
+    edit to _is_retryable_category."""
+    waits = _spy_sleep(monkeypatch)
+    handler = _sequenced_handler(
+        httpx.Response(529, json={"error": {"message": "overloaded"}}),
+        httpx.Response(200, json=_tool_use_payload({"ok": True})),
+    )
+    _install_mock_transport(monkeypatch, handler)
+    policy = RetryPolicy(max_attempts=2, total_budget_s=10.0, per_wait_cap_s=10.0)
+
+    result = call_chat_completion(
+        _make_anthropic_credential(),
+        prompt="prompt", user_content="text", max_tokens=512, policy=policy,
+    )
+
+    assert json.loads(result.content) == {"ok": True}
+    assert len(waits) == 1
+
+
+def test_anthropic_401_does_not_retry(monkeypatch):
+    calls = []
+    _install_mock_transport(monkeypatch, _json_handler(401, {"error": {"message": "bad key"}}, calls))
+    waits = _spy_sleep(monkeypatch)
+    policy = RetryPolicy(max_attempts=5, total_budget_s=10.0, per_wait_cap_s=10.0)
+
+    with pytest.raises(LlmCallError) as exc_info:
+        call_chat_completion(
+            _make_anthropic_credential(),
+            prompt="prompt", user_content="text", max_tokens=512, policy=policy,
+        )
+
+    assert exc_info.value.category == "http_401"
+    assert len(calls) == 1
+    assert waits == []
+
+
+def test_anthropic_call_watchdog_fires_on_a_stalled_stream(monkeypatch):
+    """Reuses the same stalled-response fixture as the OpenAI path's
+    _read_body_within_deadline coverage -- the watchdog machinery wraps both
+    branches identically (D4), so this proves the Anthropic branch actually
+    goes through it rather than a parallel read path that skips the
+    deadline."""
+    payload = json.dumps(_tool_use_payload({"ok": True})).encode()
+    chunks = [payload[i : i + 4] for i in range(0, len(payload), 4)]
+    assert len(chunks) > 2, "need several chunks for the trickle to be meaningful"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_ChunkedStream(chunks),
+            headers={"content-type": "application/json"},
+        )
+
+    _install_mock_transport(monkeypatch, handler)
+
+    ticks = iter([0.0, 0.0, 1.0, 11.0])
+    last = [0.0]
+
+    def fake_monotonic():
+        try:
+            last[0] = next(ticks)
+        except StopIteration:
+            pass
+        return last[0]
+
+    monkeypatch.setattr(llm_client.time, "monotonic", fake_monotonic)
+
+    with pytest.raises(LlmCallError) as excinfo:
+        call_chat_completion(
+            _make_anthropic_credential(),
+            prompt="prompt", user_content="text", max_tokens=512, timeout=10.0,
+        )
+
+    assert excinfo.value.category == "timed_out"
+
+
+def test_anthropic_call_never_logs_the_api_key(monkeypatch, caplog):
+    _install_mock_transport(monkeypatch, _json_handler(500, {"error": {"message": "boom"}}))
+    credential = _make_anthropic_credential(api_key=SECRET_KEY)
+    with caplog.at_level(logging.WARNING, logger="cortexmail"):
+        with pytest.raises(LlmCallError):
+            call_chat_completion(credential, prompt="prompt", user_content="text", max_tokens=512)
+    assert SECRET_KEY not in caplog.text
 
 
 # ---------------------------------------------------------------------------

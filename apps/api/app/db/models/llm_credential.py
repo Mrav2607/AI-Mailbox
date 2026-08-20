@@ -49,7 +49,7 @@ class UserLlmCredential(Base):
             postgresql_where=text("is_active"),
         ),
         CheckConstraint(
-            "provider IN ('openai', 'gemini', 'openrouter', 'groq', 'mistral', 'custom')",
+            "provider IN ('openai', 'gemini', 'openrouter', 'groq', 'mistral', 'anthropic', 'custom')",
             name="ck_llm_credential_provider",
         ),
     )

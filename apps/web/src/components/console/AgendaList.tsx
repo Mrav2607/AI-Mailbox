@@ -1,4 +1,5 @@
 import { Fragment } from "react";
+import type { RefObject } from "react";
 import { Check, ListTodo, X } from "lucide-react";
 import { emailLocalPart, senderName } from "@/lib/sender";
 import type { AgendaGroup, AgendaGroupKey } from "@/lib/agenda";
@@ -24,6 +25,12 @@ interface Props {
   // reading as "nothing extracted yet".
   noExtractionCoverage?: boolean;
   onSetupExtraction?: () => void;
+  // Whether the agenda has another cursor page to fetch — App owns the
+  // fetch and the IntersectionObserver, this just renders (or hides) the
+  // bottom sentinel node the observer watches.
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  sentinelRef?: RefObject<HTMLDivElement | null>;
 }
 
 const KIND_LABELS: Record<ActionKind, string> = {
@@ -191,6 +198,9 @@ export function AgendaList({
   onRowDoubleClick,
   noExtractionCoverage,
   onSetupExtraction,
+  hasMore,
+  loadingMore,
+  sentinelRef,
 }: Props) {
   if (error) {
     return (
@@ -238,26 +248,38 @@ export function AgendaList({
     );
   }
   return (
-    <ul className="divide-y divide-border" aria-label="agenda">
-      {groups.map((group) =>
-        group.items.length === 0 ? null : (
-          <Fragment key={group.key}>
-            <GroupHeader label={group.label} count={group.items.length} />
-            {group.items.map((item) => (
-              <AgendaRow
-                key={item.id}
-                item={item}
-                focused={item.id === focusedId}
-                groupKey={group.key}
-                showAccount={showAccount}
-                onSelect={onSelect}
-                onStatusChange={onStatusChange}
-                onRowDoubleClick={onRowDoubleClick}
-              />
-            ))}
-          </Fragment>
-        ),
+    <>
+      <ul className="divide-y divide-border" aria-label="agenda">
+        {groups.map((group) =>
+          group.items.length === 0 ? null : (
+            <Fragment key={group.key}>
+              <GroupHeader label={group.label} count={group.items.length} />
+              {group.items.map((item) => (
+                <AgendaRow
+                  key={item.id}
+                  item={item}
+                  focused={item.id === focusedId}
+                  groupKey={group.key}
+                  showAccount={showAccount}
+                  onSelect={onSelect}
+                  onStatusChange={onStatusChange}
+                  onRowDoubleClick={onRowDoubleClick}
+                />
+              ))}
+            </Fragment>
+          ),
+        )}
+      </ul>
+      {/* The bottom-of-list load-more trigger — App's IntersectionObserver
+          watches this node, rooted on the agenda's own scroll container. */}
+      {hasMore && (
+        <div
+          ref={sentinelRef}
+          className="h-10 flex items-center justify-center font-mono text-[11px] text-muted-foreground"
+        >
+          {loadingMore ? "loading more…" : ""}
+        </div>
       )}
-    </ul>
+    </>
   );
 }

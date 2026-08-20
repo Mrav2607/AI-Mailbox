@@ -15,6 +15,7 @@ export const PROVIDER_LABELS: Record<LlmProvider, string> = {
   openrouter: "OpenRouter",
   groq: "Groq",
   mistral: "Mistral",
+  anthropic: "Anthropic",
   custom: "Custom endpoint",
 };
 
@@ -22,15 +23,17 @@ export const PROVIDER_LABELS: Record<LlmProvider, string> = {
 // page. Deliberately partial: guessing a URL that 404s is worse than no link
 // at all, and "custom" has no dashboard we could point to anyway.
 //
-// OpenAI and OpenRouter get a deep link straight to the usage page. The rest
-// point at the console home instead: those products move their billing pages
-// around, and a stale deep link that 404s is worse than one extra click.
+// OpenAI, OpenRouter, and Anthropic get a deep link straight to the usage
+// page. The rest point at the console home instead: those products move
+// their billing pages around, and a stale deep link that 404s is worse than
+// one extra click.
 export const USAGE_DASHBOARD_URLS: Partial<Record<LlmProvider, string>> = {
   openai: "https://platform.openai.com/usage",
   openrouter: "https://openrouter.ai/activity",
   gemini: "https://aistudio.google.com/",
   groq: "https://console.groq.com/",
   mistral: "https://console.mistral.ai/",
+  anthropic: "https://console.anthropic.com/settings/usage",
 };
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;

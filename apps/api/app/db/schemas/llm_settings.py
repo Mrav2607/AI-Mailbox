@@ -12,7 +12,7 @@ from .common import Response
 # reads the raw body itself and validates api_key/provider/model/base_url by
 # hand with fixed-detail errors instead. Only RESPONSE shapes live here.
 
-LlmProvider = Literal["openai", "gemini", "openrouter", "groq", "mistral", "custom"]
+LlmProvider = Literal["openai", "gemini", "openrouter", "groq", "mistral", "anthropic", "custom"]
 
 
 class LlmSettingsOut(Response):

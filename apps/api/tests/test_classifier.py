@@ -847,6 +847,65 @@ def test_classify_with_usage_user_mode_success_carries_usage_through(monkeypatch
     assert attempt.verdict == ("spam", 0.9, "scam", "openai:gpt-4o-mini")
 
 
+def test_classify_with_usage_user_mode_anthropic_wire_round_trip_zero_consumer_edits(monkeypatch):
+    """The whole point of the Anthropic wire branch (plan: 2026-08-19 native-
+    anthropic-byok-plan.md): classifier.py needs ZERO edits to consume it.
+    Drives the REAL call_chat_completion through a fake Anthropic Messages
+    API transport (httpx.MockTransport) -- not classifier.call_chat_completion
+    mocked away -- so llm_client.py's tool-use re-serialization is what
+    classifier._parse_llm_response actually parses, exactly like it would an
+    OpenAI-shaped reply."""
+    import httpx
+
+    from app.services.nlp import classifier
+    from app.services.nlp import llm_client as llm_client_module
+
+    monkeypatch.setattr(classifier.settings, "classifier_backend", "llm")
+
+    anthropic_payload = {
+        "stop_reason": "tool_use",
+        "content": [
+            {
+                "type": "tool_use",
+                "name": "emit_json",
+                "input": {"label": "spam", "confidence": 0.92, "rationale": "obvious scam"},
+            }
+        ],
+        "usage": {"input_tokens": 80, "output_tokens": 12},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.anthropic.com/v1/messages"
+        assert request.headers["x-api-key"] == "sk-ant-key"
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json=anthropic_payload)
+
+    real_client_cls = httpx.Client
+
+    class _MockedClient(real_client_cls):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("transport", httpx.MockTransport(handler))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(llm_client_module.httpx, "Client", _MockedClient)
+
+    credential = LlmCredential(
+        provider="anthropic",
+        base_url="https://api.anthropic.com/v1",
+        api_key="sk-ant-key",
+        model="claude-haiku-4-5",
+    )
+    routing = ClassificationRouting(mode="user", credential=credential)
+
+    attempt = classify_with_usage("You won a $1,000 gift card!!!", routing=routing)
+
+    assert attempt.verdict == ("spam", 0.92, "obvious scam", "anthropic:claude-haiku-4-5")
+    assert attempt.provider_call_succeeded is True
+    assert attempt.usage == LlmUsage(prompt_tokens=80, completion_tokens=12, total_tokens=None)
+    assert attempt.llm_attempted is True
+    assert attempt.failure_category is None
+
+
 def test_classify_with_usage_user_mode_counts_the_call_even_when_content_is_unparseable(monkeypatch):
     """The one a future refactor is most likely to break: the provider
     answered (and billed the user) even though its content didn't parse, so

@@ -55,10 +55,15 @@ class ActionList(Response):
     no per-account filter here -- the agenda's whole point is one unified
     board across every connected account. `counts` is computed regardless of
     the `status` query filter.
+
+    `next_cursor` is an opaque bookmark for the next page -- set iff the page
+    came back full (`len(items) == limit`), `None` on a short/empty final
+    page. Callers should treat it as a token, not parse it.
     """
 
     items: list[ActionOut]
     counts: ActionCounts
+    next_cursor: str | None
 
 
 class ActionStatusRequest(Response):

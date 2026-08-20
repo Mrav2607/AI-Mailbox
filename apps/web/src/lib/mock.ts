@@ -1,6 +1,7 @@
 import type {
   ActionCounts,
   ActionItem,
+  ActionKind,
   ActionsResponse,
   ActionStatus,
   BackfillOptions,
@@ -356,6 +357,53 @@ const ACTIONS: ActionItem[] = [
   }),
 ];
 
+// The hand-picked rows above cover every visual state the agenda cares about,
+// but there's nowhere near ACTIONS_PAGE_SIZE (100, App.tsx) of them -- a demo
+// with only ~7 open actions would never reach page two. Pad the open board
+// out programmatically so preview mode genuinely pages, instead of hand-
+// writing a hundred more literals.
+const FILLER_KINDS: ActionKind[] = [
+  "reply",
+  "payment",
+  "signature",
+  "form",
+  "rsvp",
+  "deadline",
+  "other",
+];
+const FILLER_TITLES = [
+  "Follow up on renewal terms",
+  "Send the updated W-9",
+  "Approve the expense report",
+  "Confirm attendance",
+  "Submit the timesheet",
+  "Review the open pull request",
+  "Provide feedback on the proposal",
+  "Countersign the NDA",
+];
+const FILLER_COUNT = 100;
+for (let i = 0; i < FILLER_COUNT; i++) {
+  // Offset past the indices the hand-picked rows above already used, so the
+  // filler doesn't just pile more actions onto the same handful of threads.
+  const src = AGENDA_THREADS[(i + 30) % AGENDA_THREADS.length];
+  const hasDue = i % 5 !== 0;
+  ACTIONS.push(
+    actionFor(src, {
+      id: `mock-action-fill-${i}`,
+      kind: rand(FILLER_KINDS, i),
+      title: rand(FILLER_TITLES, i),
+      due_at: hasDue ? daysFromNow((i % 21) - 7) : null,
+      due_precision: hasDue ? (i % 2 === 0 ? "date" : "datetime") : null,
+      due_raw: hasDue ? "generated" : null,
+      amount: null,
+      currency: null,
+      source_confidence: 0.65 + ((i % 30) / 100),
+      status: "open",
+      created_at: daysFromNow(-((i % 14) + 1)),
+    }),
+  );
+}
+
 function mockActionCounts(): ActionCounts {
   const now = Date.now();
   let open = 0;
@@ -368,8 +416,41 @@ function mockActionCounts(): ActionCounts {
   return { open, overdue };
 }
 
-export function mockActions(status: ActionStatus = "open", limit = 200): ActionsResponse {
-  return { items: ACTIONS.filter((a) => a.status === status).slice(0, limit), counts: mockActionCounts() };
+// Mirrors the real route's ORDER BY (agenda cursor pagination plan, D1):
+// due_at ASC NULLS LAST, then created_at DESC, then id DESC. Kept separate
+// from ACTIONS's own insertion order so a page walk sees the same rows in
+// the same order the real API would, without ACTIONS itself needing to stay
+// sorted (writes just push/mutate it in place).
+function sortAgendaOrder(items: ActionItem[]): ActionItem[] {
+  return [...items].sort((a, b) => {
+    if (a.due_at !== b.due_at) {
+      if (a.due_at === null) return 1;
+      if (b.due_at === null) return -1;
+      const byDue = a.due_at.localeCompare(b.due_at);
+      if (byDue !== 0) return byDue;
+    }
+    const byCreated = b.created_at.localeCompare(a.created_at);
+    if (byCreated !== 0) return byCreated;
+    return b.id.localeCompare(a.id);
+  });
+}
+
+// Preview's stand-in for the cursor: how many rows of this sorted, status-
+// filtered view the caller has already walked. Opaque to the app either way
+// (it never parses this back) -- no need to mirror the real base64/JSON
+// token when nothing here has to survive a page reload.
+export function mockActions(
+  status: ActionStatus = "open",
+  limit = 200,
+  cursor?: string,
+): ActionsResponse {
+  const sorted = sortAgendaOrder(ACTIONS.filter((a) => a.status === status));
+  const start = cursor ? Number(cursor) : 0;
+  const page = sorted.slice(start, start + limit);
+  // Same rule as the real route (D4): a cursor shows up iff the page came
+  // back full, regardless of whether the walk has actually run out of rows.
+  const next_cursor = page.length === limit ? String(start + page.length) : null;
+  return { items: page, counts: mockActionCounts(), next_cursor };
 }
 
 export function mockSetActionStatus(
@@ -895,6 +976,7 @@ const PRESET_BASE_URLS: Partial<Record<LlmProvider, string>> = {
   openrouter: "https://openrouter.ai/api/v1",
   groq: "https://api.groq.com/openai/v1",
   mistral: "https://api.mistral.ai/v1",
+  anthropic: "https://api.anthropic.com/v1",
 };
 
 // Deployment-level flags, independent of which credential (if any) is
