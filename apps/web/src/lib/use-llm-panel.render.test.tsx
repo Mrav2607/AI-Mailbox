@@ -797,6 +797,117 @@ describe("useLlmPanel rendered lifecycle", () => {
       expect(toastSuccess).toHaveBeenCalledWith('Added "B\'s key"');
     });
 
+    it("a create's post-commit reconciliation beats a refresh that claimed a newer generation but read pre-commit data", async () => {
+      const create = deferred<LlmCredentialSummary>();
+      deps.createLlmCredential = vi.fn(() => create.promise);
+
+      // deps.listLlmCredentials gets called twice: once by the interleaved
+      // refresh below (while the POST is still in flight, so it can only
+      // read the pre-commit list), and once by the create's own post-
+      // commit reconciliation. Track which call is which by order.
+      const staleList = deferred<LlmCredentialSummary[]>();
+      const freshList = deferred<LlmCredentialSummary[]>();
+      const listCalls = [staleList, freshList];
+      let listCallIndex = 0;
+      deps.listLlmCredentials = vi.fn(() => listCalls[listCallIndex++]!.promise);
+
+      const freshSettings = deferred<LlmSettings>();
+      deps.getLlmSettings = vi.fn(() => freshSettings.promise);
+
+      const oldRow = makeCredential({ id: "cred-1", name: "old" });
+      const newRow = makeCredential({ id: "cred-new", name: "Work key" });
+
+      let createPromise!: Promise<void>;
+      await act(async () => {
+        createPromise = api!.doCreateLlmCredential({
+          name: "Work key",
+          provider: "openai",
+          api_key: "sk-12345678",
+          model: "gpt-4o-mini",
+        });
+      });
+
+      // Something re-opens the ai tab while the POST above is still in
+      // flight (App's own refetch-on-tab-activation) -- this claims a
+      // NEWER generation than the create's own pre-request bump, but its
+      // GET can still only see the pre-commit list.
+      await act(async () => {
+        void api!.refreshLlmCredentials();
+      });
+
+      // The POST commits on the server.
+      await act(async () => {
+        create.resolve(newRow);
+        await create.promise;
+      });
+
+      // The create's own post-commit GETs land first, with the true new
+      // state -- the row it just added shows up.
+      await act(async () => {
+        freshList.resolve([oldRow, newRow]);
+        freshSettings.resolve(makeSettings({ provider: "openai", model: "gpt-4o-mini" }));
+        await createPromise;
+      });
+      expect(api!.llmCredentials).toEqual([oldRow, newRow]);
+
+      // The refresh's own GET, which started before the create committed,
+      // finally lands -- reading pre-commit data (just the old row). It
+      // must not win just because it claimed a higher generation number
+      // than the create's own post-commit reconciliation.
+      await act(async () => {
+        staleList.resolve([oldRow]);
+        await staleList.promise.catch(() => {});
+      });
+
+      expect(api!.llmCredentials).toEqual([oldRow, newRow]);
+    });
+
+    it("a stale create completing after an account switch does not invalidate the new account's in-flight test", async () => {
+      const userACreate = deferred<LlmCredentialSummary>();
+      deps.createLlmCredential = vi.fn(() => userACreate.promise);
+
+      let aCreatePromise!: Promise<void>;
+      await act(async () => {
+        aCreatePromise = api!.doCreateLlmCredential({
+          name: "A's key",
+          provider: "openai",
+          api_key: "sk-aaaaaaaa",
+          model: "gpt-4o-mini",
+        });
+      });
+
+      render("user-b");
+
+      const bTest = deferred<LlmTestResult>();
+      deps.testLlmSettings = vi.fn(() => bTest.promise);
+      await act(async () => {
+        void api!.doTestLlmSettings();
+      });
+      expect(api!.llmTesting).toBe(true);
+
+      // user-a's stale create finally resolves -- its own write is already
+      // discarded by the settings-generation guard, but its finally block
+      // used to bump llmCredentialGenRef unconditionally regardless of
+      // whose completion this was. That bump would land in between user-b's
+      // test capturing its own generation and this resolving, discarding
+      // user-b's in-flight test for no reason of their own.
+      await act(async () => {
+        userACreate.resolve(makeCredential({ id: "cred-a", name: "A's key" }));
+        await aCreatePromise;
+      });
+
+      await act(async () => {
+        bTest.resolve({ ok: true, latency_ms: 7, error: null });
+        await bTest.promise;
+      });
+
+      // Without the guard, this would still be null -- the stray bump above
+      // would have made doTestLlmSettings' own identity check fail, and
+      // this actually-current result would be discarded.
+      expect(api!.llmTestResult).toEqual({ ok: true, latency_ms: 7, error: null });
+      expect(api!.llmTesting).toBe(false);
+    });
+
     it("a stale activate rejection after an account switch does not toast at the new account", async () => {
       const activate = deferred<LlmCredentialSummary>();
       deps.activateLlmCredential = vi.fn(() => activate.promise);
