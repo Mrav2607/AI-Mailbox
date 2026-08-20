@@ -408,6 +408,9 @@ export function useLlmPanel({ userId, deps, openSettings }: UseLlmPanelOptions) 
         deps.toastSuccess("AI settings saved");
         saved = true;
       } catch (e) {
+        // Identity-guarded like every other mutation's catch toast: a stale
+        // save rejecting after an account switch is the old account's news.
+        if (generation !== llmSettingsGenRef.current) return;
         deps.toastError((e as Error).message || "could not save these settings");
       } finally {
         // The credential may have changed either way -- bump all three so
