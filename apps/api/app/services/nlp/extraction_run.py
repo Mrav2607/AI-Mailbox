@@ -32,6 +32,7 @@ from app.db.models import ActionItem, Classification, MailMessage, MailThread
 from app.services.nlp.extractor import ACTION_LABELS, NoAction, extract_action_with_usage
 from app.services.nlp.llm_client import WORKER_RETRIES
 from app.services.nlp.persistence import (
+    CREDENTIAL_CLASS_FAILURE_CATEGORIES,
     MAX_ATTEMPTS,
     PENDING_LEASE,
     claim_action_item,
@@ -50,23 +51,32 @@ _RESULT_BUCKETS = ("extracted", "no_action", "ineligible", "failed", "skipped")
 
 # The extraction-sweep twin of backfill.py's _CONSECUTIVE_NO_VERDICT_LIMIT
 # (plan: phase 3 of the LLM-failure work -- Phase 2 added the classification
-# side of this, this closes the same gap for run_extraction_sweep). Same
-# value, same reasoning: after this many CONSECUTIVE "failed" buckets in a
-# row, stop issuing more extraction calls for the rest of this sweep. Not
-# 1 -- a single odd message shouldn't abort an otherwise-healthy sweep --
-# and the counter resets to zero on any non-"failed" bucket, so only a
-# genuine losing streak trips it. Each attempt this stop prevents can be a
-# real BYOK-billed call very likely to fail the same way as the last few.
+# side of this, this closes the same gap for run_extraction_sweep). After
+# this many CONSECUTIVE credential-class failures (plan:
+# 2026-08-19-extraction-cost-hardening D3 --
+# CREDENTIAL_CLASS_FAILURE_CATEGORIES: the SAME credential would fail every
+# retry identically), stop issuing more extraction calls for the rest of
+# this sweep. Not 1 -- a single odd message shouldn't abort an otherwise-
+# healthy sweep. Each attempt this stop prevents can be a real BYOK-billed
+# call very likely to fail the same way as the last few.
 #
-# This streak is fed ONLY by a genuine LLM-result failure -- the "failed"
-# bucket _claim_extract_record returns itself, which always means an actual
-# extraction attempt reached (or tried to reach) a provider and came back
-# empty (see ExtractionAttempt's docstring: `result is None` iff the call or
-# its parse failed). It is deliberately NOT fed by a containment/DB failure
-# (run_extraction_sweep's own fan-out `except Exception` below) -- those
-# carry no failure_category and say nothing about the LLM provider's health,
-# so counting them here would misdiagnose a Postgres hiccup as "the user's
-# provider is rate-limited" (Codex review, phase 3 should-fix).
+# D3 refines this from the ORIGINAL "three consecutive failed BUCKETS"
+# breaker: that version missed the prod retry storm entirely, because the
+# storm's calls surfaced under the "skipped" bucket (a genuine attempt whose
+# record got fenced out by a competing reclaim), which sailed straight past
+# a bucket == "failed" check. The streak now reads the per-attempt failure
+# CATEGORY instead, threaded out of `_claim_extract_record` as this
+# function's third return value -- a credential-class category feeds the
+# streak regardless of which bucket it surfaced under, so a run of
+# skipped-but-credential-dead attempts trips it exactly like a run of
+# failed-bucket ones would. Resets to zero on anything else: a success, a
+# non-credential-class category (rate limits recover on their own), or a
+# clean skip with no category at all. It is deliberately NOT fed (and is
+# explicitly reset) by a containment/DB failure (run_extraction_sweep's own
+# fan-out `except Exception` below) -- those carry no failure_category and
+# say nothing about the LLM provider's health, so counting them here would
+# misdiagnose a Postgres hiccup as "the user's provider is dead" (Codex
+# review, phase 3 should-fix; D3 carries the same reasoning forward).
 _CONSECUTIVE_FAILURE_LIMIT = 3
 
 
@@ -89,8 +99,16 @@ def _empty_counts() -> dict:
     # e.g. {"http_429": 8}, populated by run_extraction_sweep only; other
     # callers of _empty_counts() (run_extraction_for_message, the disabled
     # shape) legitimately leave it empty, same as an old result predating
-    # this field.
-    return {"processed": 0, **{bucket: 0 for bucket in _RESULT_BUCKETS}, "failure_categories": {}}
+    # this field. `aborted` (plan: 2026-08-19-extraction-cost-hardening D3)
+    # is the same kind of additive field: how many candidates the breaker
+    # skipped by aborting the rest of a sweep -- always 0 outside
+    # run_extraction_sweep's own credential-class trip.
+    return {
+        "processed": 0,
+        **{bucket: 0 for bucket in _RESULT_BUCKETS},
+        "failure_categories": {},
+        "aborted": 0,
+    }
 
 
 def _disabled_result() -> dict:
@@ -121,12 +139,25 @@ def terminalize_expired_pending(db: Session, *, user_id: UUID | None = None) -> 
     db.commit()
 
 
-def _call_context_from_resolved(credential, source: str | None) -> CallContext:
-    """Map `ResolvedExtraction.source` onto `CallContext.payer` -- 'fallback'
-    is the operator's own key, and only a 'user' source should ever get
-    billed onto the account whose usage we're recording (plan §1, §3).
+def _call_context_from_resolved(resolved) -> CallContext:
+    """Build a `CallContext` from a `ResolvedExtraction`: maps `.source` onto
+    `CallContext.payer` -- 'fallback' is the operator's own key, and only a
+    'user' source should ever get billed onto the account whose usage we're
+    recording (plan §1, §3) -- and carries the resolved row's `credential_id`/
+    `revision` straight through (plan: 2026-08-19-extraction-cost-hardening
+    D2), so `record_extraction`'s cap-jump can tell whether a rotation raced
+    the attempt that used this context. `getattr` with a `None` default,
+    not a direct attribute read -- the real `ResolvedExtraction` always
+    carries both, but plenty of tests stand in a bare
+    ``SimpleNamespace(credential=..., source=...)`` for it, and `None` is
+    the exact fallback-credential value anyway (no per-user row to rotate).
     """
-    return CallContext(credential=credential, payer="user" if source == "user" else "operator")
+    return CallContext(
+        credential=resolved.credential,
+        payer="user" if resolved.source == "user" else "operator",
+        credential_id=getattr(resolved, "credential_id", None),
+        revision=getattr(resolved, "revision", None),
+    )
 
 
 def _fence_claim_to_failed(message_id: UUID, claim_token: UUID) -> None:
@@ -199,14 +230,23 @@ def _claim_extract_record(
     acc: UsageAccumulator | None = None,
     failure_categories: dict[str, int] | None = None,
     deadline: float | None = None,
-) -> tuple[str, UUID | None]:
+) -> tuple[str, UUID | None, str | None]:
     """One claim -> extract -> record cycle for ``message_id``.
 
-    Returns ``(bucket, user_id)`` -- ``bucket`` is one of
-    extracted/no_action/ineligible/failed/skipped/unavailable, and
+    Returns ``(bucket, user_id, failure_category)`` -- ``bucket`` is one of
+    extracted/no_action/ineligible/failed/skipped/unavailable/deadline;
     ``user_id`` is the message's owner when known (``None`` if the message
     or its thread has vanished), so callers can attach it to a task result
-    without a second query.
+    without a second query; ``failure_category`` (plan:
+    2026-08-19-extraction-cost-hardening D3) is the attempt's own
+    ``ExtractionAttempt.failure_category`` when a real wire call was made and
+    failed, ``None`` otherwise -- including on every SUCCESS bucket, and on
+    ``"skipped"`` when no attempt was even made (a lost claim race). This is
+    what lets ``run_extraction_sweep``'s breaker read the credential-class
+    signal regardless of which bucket a genuine attempt's failure surfaced
+    under (a fenced-out record from a competing reclaim still reports its
+    real category here, even though its bucket is ``"skipped"``, not
+    ``"failed"``).
 
     ``call_context`` is the already-resolved credential AND who pays for it,
     for a sweep's user (``run_extraction_sweep`` resolves it once per run,
@@ -219,16 +259,15 @@ def _claim_extract_record(
     given, otherwise a fresh one built here once the user id is known --
     that single call is a run of one.
 
-    ``failure_categories`` is an out-param, not a return value: when given, a
-    call whose attempt actually failed (``attempt.failure_category`` set)
-    increments its bucket in place. Threading it through the return tuple
-    instead would mean every existing caller (and the many tests unpacking
-    ``bucket, user_id = ...``) has to change shape for a count only
-    ``run_extraction_sweep`` needs -- ``None`` (the default) just skips it.
+    ``failure_categories`` is an out-param, not (only) the return value: when
+    given, a call whose attempt actually failed (``attempt.failure_category``
+    set) increments its bucket in place -- this is the sweep's own aggregate
+    breakdown across the whole run, distinct from the third return value's
+    per-call signal that feeds the streak.
     """
     message = db.get(MailMessage, message_id)
     if message is None:
-        return "skipped", None
+        return "skipped", None, None
 
     # Frozen lock order: MailThread -> ActionItem. This FOR UPDATE also
     # serializes against a concurrent set_thread_done -- whichever commits
@@ -238,7 +277,7 @@ def _claim_extract_record(
         select(MailThread).where(MailThread.id == message.thread_id).with_for_update()
     ).scalar_one_or_none()
     if thread is None:
-        return "skipped", None
+        return "skipped", None, None
 
     thread_done = thread.done_at is not None
     subject = thread.subject
@@ -254,8 +293,8 @@ def _claim_extract_record(
             # Nothing was claimed, so a plain commit (not a rollback) is
             # enough to release the thread lock we just took.
             db.commit()
-            return "unavailable", user_id
-        call_context = _call_context_from_resolved(resolved.credential, resolved.source)
+            return "unavailable", user_id, None
+        call_context = _call_context_from_resolved(resolved)
 
     if acc is None:
         acc = UsageAccumulator(user_id)
@@ -267,13 +306,18 @@ def _claim_extract_record(
         user_id=user_id,
         thread_done=thread_done,
         force=force,
+        model_version=f"{call_context.credential.provider}:{call_context.credential.model}",
     )
     # Release the thread lock before the (possibly slow) LLM call -- no DB
     # transaction is checked out while extract_action runs.
     db.commit()
     if claim_token is None:
-        return "skipped", user_id
+        return "skipped", user_id, None
 
+    # Set once the wire call actually returns, below -- stays None for the
+    # deadline-exhausted path (nothing was sent) so every return before that
+    # point reports "no attempt, no category" honestly.
+    category: str | None = None
     try:
         # Final verify pass: the sweep's pre-claim deadline check can't see
         # time spent WAITING on the claim's own locks -- re-check here,
@@ -299,10 +343,9 @@ def _claim_extract_record(
             policy=WORKER_RETRIES,
         )
         result = attempt.result
-        if failure_categories is not None and attempt.failure_category is not None:
-            failure_categories[attempt.failure_category] = (
-                failure_categories.get(attempt.failure_category, 0) + 1
-            )
+        category = attempt.failure_category
+        if failure_categories is not None and category is not None:
+            failure_categories[category] = failure_categories.get(category, 0) + 1
 
         # Lock the classification row BEFORE reading its label and hold it
         # through the record commit: a concurrent reclassify-back upserts
@@ -344,6 +387,11 @@ def _claim_extract_record(
             thread_done=current_done_at is not None,
             label_still_actionable=label_still_actionable,
             already_replied=already_replied,
+            model_version=f"{call_context.credential.provider}:{call_context.credential.model}",
+            user_id=user_id,
+            failure_category=category,
+            credential_id=call_context.credential_id,
+            credential_revision=call_context.revision,
         )
 
         # Only a "user" payer gets recorded -- the operator's fallback key
@@ -383,7 +431,7 @@ def _claim_extract_record(
         # reclaimable -- but report the stop distinctly so the sweep can
         # end with status "timed_out" instead of "ok" (verify pass 3).
         _rollback_discard_and_fence(db, acc, message.id, claim_token, exc)
-        return "deadline", user_id
+        return "deadline", user_id, None
     except SoftTimeLimitExceeded as exc:
         # Celery's soft time limit is a plain Exception, so the generic
         # `except Exception` below WOULD otherwise catch it -- and
@@ -397,25 +445,35 @@ def _claim_extract_record(
         _rollback_discard_and_fence(db, acc, message.id, claim_token, exc)
         raise
     except Exception as exc:
+        # `category` may already be set here -- the wire call can succeed
+        # and THEN something else in this try block (the classification
+        # lock, the usage flush) throws. Reporting it is correct: a real
+        # credential-class signal from the provider happened, even though
+        # this particular row settles via the containment fence rather than
+        # a normal record.
         _rollback_discard_and_fence(db, acc, message.id, claim_token, exc)
-        return "failed", user_id
+        return "failed", user_id, category
 
     if not recorded:
         # Our lease expired and someone else reclaimed the row before this
-        # write landed -- a stale, harmless no-op, not a bug.
+        # write landed -- a stale, harmless no-op, not a bug. `category`
+        # still reports honestly here: the wire call genuinely happened and
+        # (if it failed) genuinely failed -- this is the D1 stale-lease/
+        # competing-reclaim combination the plan's own repro test drives:
+        # bucket "skipped" with a real failure_category attached.
         logger.warning(
             "action extraction record fenced out (stale claim_token) for message %s",
             message.id,
         )
-        return "skipped", user_id
+        return "skipped", user_id, category
 
     if not label_still_actionable:
-        return "ineligible", user_id
+        return "ineligible", user_id, category
     if isinstance(result, NoAction):
-        return "no_action", user_id
+        return "no_action", user_id, category
     if result is None:
-        return "failed", user_id
-    return "extracted", user_id
+        return "failed", user_id, category
+    return "extracted", user_id, category
 
 
 def run_extraction_for_message(db: Session, message_id: UUID) -> dict:
@@ -433,7 +491,7 @@ def run_extraction_for_message(db: Session, message_id: UUID) -> dict:
     if not extraction_feature_enabled():
         return _disabled_result()
 
-    bucket, user_id = _claim_extract_record(db, message_id)
+    bucket, user_id, _category = _claim_extract_record(db, message_id)
     if bucket == "unavailable":
         return _disabled_result()
 
@@ -447,13 +505,27 @@ def run_extraction_for_message(db: Session, message_id: UUID) -> dict:
 
 
 def _message_driven_candidates(
-    db: Session, user_id: UUID, *, since_days: int, limit: int, force: bool
+    db: Session,
+    user_id: UUID,
+    *,
+    since_days: int,
+    limit: int,
+    force: bool,
+    model_version: str | None = None,
 ) -> list[UUID]:
     """Never-claimed or currently-claimable messages: the user's messages
     whose classification label is actionable, thread not done, within
     ``since_days``, newest first. An existing row must also be claimable
     (``force``-widened) -- otherwise a settled/live-pending message would
     burn a selection slot for nothing.
+
+    ``model_version`` (plan: 2026-08-19-extraction-cost-hardening D5) is the
+    CURRENT ``f"{provider}:{model}"``, threaded straight to
+    ``claimable_predicate`` -- only meaningful when ``force`` is set, since
+    that's the only case a settled ``extracted``/``no_action`` row can ever
+    become claimable again (comparing against a stale/None model_version
+    when ``force`` is off is harmless: that branch of the predicate never
+    fires without ``force`` regardless).
 
     Messages with a NULL ``sent_at`` are possible by design (see
     ``backfill.py``'s ``latest_message_ordering``) -- coalescing to
@@ -473,7 +545,10 @@ def _message_driven_candidates(
                 MailThread.done_at.is_(None),
                 Classification.label.in_(ACTION_LABELS),
                 sent_at >= cutoff,
-                or_(ActionItem.id.is_(None), claimable_predicate(force=force)),
+                or_(
+                    ActionItem.id.is_(None),
+                    claimable_predicate(force=force, model_version=model_version),
+                ),
             )
             .order_by(sent_at.desc().nullslast())
             .limit(limit)
@@ -587,8 +662,13 @@ def run_extraction_sweep(
     if resolved.credential is None:
         return _disabled_result()
 
-    call_context = _call_context_from_resolved(resolved.credential, resolved.source)
+    call_context = _call_context_from_resolved(resolved)
     acc = UsageAccumulator(user_id)
+    # D5: what "the current model" means for this run, for
+    # claimable_predicate(force=True)'s IS DISTINCT FROM comparison -- the
+    # sweep's OWN candidate query is the only claimable_predicate call site
+    # that ever runs under force, so this is threaded exactly once, here.
+    current_model_version = f"{call_context.credential.provider}:{call_context.credential.model}"
 
     terminalize_expired_pending(db, user_id=user_id)
 
@@ -596,32 +676,35 @@ def run_extraction_sweep(
         message_ids = _recovery_candidates(db, user_id, limit=limit)
     else:
         message_ids = _message_driven_candidates(
-            db, user_id, since_days=since_days, limit=limit, force=force
+            db,
+            user_id,
+            since_days=since_days,
+            limit=limit,
+            force=force,
+            model_version=current_model_version,
         )
 
     counts = _empty_counts()
     # _CONSECUTIVE_FAILURE_LIMIT's early stop (plan: phase 3 of the
-    # LLM-failure work, mirroring Phase 2's run_backfill treatment) -- reset
-    # on any bucket other than "failed", tripped after 3 in a row. Fed ONLY
-    # by _claim_extract_record's own "failed" return (a genuine LLM-result
-    # failure) -- see this module's _CONSECUTIVE_FAILURE_LIMIT comment for
-    # why a containment/DB failure (the `except Exception` branch below)
-    # must never touch this counter.
-    consecutive_failures = 0
-    # Distinct from consecutive_failures: which early-stop tripped, if any,
+    # LLM-failure work, mirroring Phase 2's run_backfill treatment; refined
+    # by D3 -- see this module's _CONSECUTIVE_FAILURE_LIMIT comment for the
+    # full "why category, not bucket" reasoning). Reset on anything that
+    # isn't a credential-class category, tripped after 3 in a row.
+    consecutive_credential_class_failures = 0
+    # Distinct from the streak counter: which early-stop tripped, if any,
     # decides the reported status. "llm_unavailable" is a diagnosis about
-    # the provider and must only ever come from a genuine LLM failure
+    # the provider and must only ever come from a genuine credential-class
     # streak; "timed_out" is a neutral, no-diagnosis stop for the deadline
     # backstop and for Celery's own soft time limit (mirrors
     # extraction_recovery_tick's existing status name for the same signal).
     stop_reason: str | None = None
-    for message_id in message_ids:
+    for index, message_id in enumerate(message_ids):
         if deadline is not None and time.monotonic() >= deadline:
             stop_reason = "timed_out"
             break
         counts["processed"] += 1
         try:
-            bucket, _user_id = _claim_extract_record(
+            bucket, _user_id, category = _claim_extract_record(
                 db, message_id, force=force, call_context=call_context, acc=acc,
                 failure_categories=counts["failure_categories"], deadline=deadline,
             )
@@ -646,15 +729,18 @@ def run_extraction_sweep(
             # This is a CONTAINMENT failure -- a DB error, or anything
             # _claim_extract_record itself couldn't recover from -- not an
             # LLM result: it carries no failure_category and must NOT feed
-            # consecutive_failures/llm_unavailable below, or a single
-            # Postgres hiccup would misreport as "the user's LLM provider
-            # is rate-limited, try again later" (Codex review, phase 3
-            # should-fix).
+            # the credential-class streak below, or a single Postgres
+            # hiccup would misreport as "the user's LLM provider is dead"
+            # (Codex review, phase 3 should-fix). Explicitly reset rather
+            # than left alone: an unrelated DB blip between two genuine
+            # provider failures must not silently bridge them into one
+            # continuous trip either.
             db.rollback()
             logger.exception(
                 "action extraction sweep failed for message %s", message_id
             )
             counts["failed"] += 1
+            consecutive_credential_class_failures = 0
             continue
 
         if bucket == "deadline":
@@ -669,17 +755,25 @@ def run_extraction_sweep(
             break
 
         counts[bucket] += 1
-        if bucket == "failed":
-            consecutive_failures += 1
-            if consecutive_failures >= _CONSECUTIVE_FAILURE_LIMIT:
+        if category in CREDENTIAL_CLASS_FAILURE_CATEGORIES:
+            consecutive_credential_class_failures += 1
+            if consecutive_credential_class_failures >= _CONSECUTIVE_FAILURE_LIMIT:
                 # Every remaining candidate is very likely to fail the same
                 # way -- stop spending BYOK-billed attempts on it. The
                 # counts collected so far are still exactly right; the loop
-                # just never reaches the rest of message_ids.
+                # just never reaches the rest of message_ids -- report how
+                # many of them this abort skipped.
+                logger.warning(
+                    "action extraction sweep for user %s aborting after %d "
+                    "consecutive %r failures -- credential looks dead for "
+                    "this run",
+                    user_id, _CONSECUTIVE_FAILURE_LIMIT, category,
+                )
                 stop_reason = "llm_unavailable"
+                counts["aborted"] = len(message_ids) - (index + 1)
                 break
         else:
-            consecutive_failures = 0
+            consecutive_credential_class_failures = 0
     # Reporting "ok" for a run that quit early would be the same lie this
     # whole plan exists to remove: the counts would be truthful about what was
     # attempted and silent about the candidates never reached. Mirrors

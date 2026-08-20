@@ -58,6 +58,7 @@ from app.db.schemas.llm_settings import (
     LlmTestResultOut,
     LlmUsageOut,
 )
+from app.services.nlp import persistence
 from app.services.nlp.extractor import test_credential
 from app.services.nlp.providers import (
     PROVIDER_PRESETS,
@@ -121,8 +122,13 @@ def _lock_guard_user(db: Session, user_id: UUID) -> None:
     REPLACES the old single-row `with_for_update()` PUT used to take on the
     credential row itself -- no route below takes a separate credential-row
     lock of its own; this is THE lock.
+
+    Delegates to `persistence.lock_guard_user` -- the same implementation
+    `record_extraction`'s D2 credential-identity check takes, so there's one
+    SQL statement for this lock, not two copies that could drift (plan:
+    2026-08-19-extraction-cost-hardening D2).
     """
-    db.execute(select(AppUser.id).where(AppUser.id == user_id).with_for_update())
+    persistence.lock_guard_user(db, user_id)
 
 
 def _credential_rows(db: Session, user_id: UUID) -> list[UserLlmCredential]:
@@ -725,12 +731,15 @@ async def put_llm_settings(
     def _apply_update(target: UserLlmCredential) -> None:
         # Read BEFORE mutating -- both flag resolvers and `material_changed`
         # need `target`'s state as it stood before this write. A flag-only
-        # edit (no new key, same provider/base_url/model)
-        # must NOT clear last_verified_at -- that'd be a confusing "your
-        # verified key just went unverified" regression for a save that
-        # didn't touch the credential itself.
+        # edit, OR a re-send of the exact same key with the same
+        # provider/base_url/model, must NOT clear last_verified_at, bump
+        # revision, or reset extraction attempts -- none of those changed
+        # what credential is stored, so treating it as material would reopen
+        # rows that are still capped under the SAME dead credential.
+        # `target.api_key` is an EncryptedText column that reads back as
+        # plaintext, so this `!=` is a correct plaintext comparison.
         material_changed = (
-            api_key_provided
+            (api_key_provided and effective_api_key != target.api_key)
             or target.provider != provider
             or target.base_url != base_url
             or target.model != model
@@ -745,9 +754,17 @@ async def put_llm_settings(
         target.base_url = base_url
         target.api_key = effective_api_key
         target.model = model
-        target.revision += 1
         if material_changed:
+            target.revision += 1
             target.last_verified_at = None
+            # D2 recovery: a material rewrite is exactly the fix a
+            # credential-class cap-jump was waiting for -- reset this
+            # caller's terminally-capped rows so they're claimable again
+            # under whatever now-different credential this write leaves
+            # active. A flag-only edit changes nothing about the credential
+            # itself, so it deliberately does NOT reset (the row is still
+            # capped under the SAME dead credential).
+            persistence.reset_failed_extraction_attempts(db, current_user.id)
         target.updated_at = now
 
     if row is None:
@@ -771,6 +788,11 @@ async def put_llm_settings(
         )
         row.updated_at = now
         db.add(row)
+        # D2 recovery: this caller's first-ever credential always lands
+        # active -- same "the credential just changed" reasoning as a
+        # material PUT above, for whatever failed rows predate having any
+        # credential at all (e.g. rows capped under the server fallback).
+        persistence.reset_failed_extraction_attempts(db, current_user.id)
         try:
             db.commit()
         except IntegrityError:
@@ -904,6 +926,12 @@ def delete_llm_settings(
 
     Guard-locked (D6) like every other structural mutation, so a concurrent
     create/activate for this user can't interleave with the wipe.
+
+    Deliberately does NOT reset D2's terminally-capped ``failed`` rows
+    (unlike PUT/create/activate) -- there's no credential left to retry
+    under, so resetting here would just leave them capped-at-zero with
+    nothing to claim them until a NEW credential shows up, at which point
+    that credential's own mutation resets them anyway.
     """
     _lock_guard_user(db, current_user.id)
     rows = _credential_rows(db, current_user.id)
@@ -1005,6 +1033,12 @@ async def create_llm_credential(
     )
     row.updated_at = now
     db.add(row)
+    if not rows:
+        # D2 recovery: landing active because it's the caller's first
+        # credential is the same "the active credential just changed" event
+        # as a material PUT -- reset. An inactive spare (rows non-empty)
+        # changes nothing about which credential is active, so it does not.
+        persistence.reset_failed_extraction_attempts(db, current_user.id)
     db.commit()
     return _credential_summary(row)
 
@@ -1053,6 +1087,11 @@ def activate_llm_credential(
             old_active.is_active = False
             db.flush()
         target.is_active = True
+        # D2 recovery: a genuine switch changes which credential is active,
+        # so any of the caller's rows capped under the old one deserve a
+        # fresh claimable life. A call that targets the already-active
+        # credential (this branch doesn't run) changes nothing.
+        persistence.reset_failed_extraction_attempts(db, current_user.id)
     db.commit()
     return _credential_summary(target)
 
@@ -1067,6 +1106,10 @@ def delete_llm_credential(
     (switch to another with ``/activate`` first, or use the singular
     ``DELETE /settings/llm`` kill switch to remove everything at once).
     404s if ``credential_id`` isn't the caller's.
+
+    Always removes an INACTIVE spare, so the active credential (whatever
+    D2's cap-jumped rows are capped under) never changes here -- no
+    `persistence.reset_failed_extraction_attempts` call, same reasoning as the kill switch.
     """
     _lock_guard_user(db, current_user.id)
     rows = _credential_rows(db, current_user.id)

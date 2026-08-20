@@ -80,9 +80,10 @@ class UserLlmCredential(Base):
     model: Mapped[str] = mapped_column(Text, nullable=False)
     # Stamped by a successful /test only, via the revision-conditioned UPDATE.
     last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    # Incremented on every PUT; the /test success stamp conditions on it so a
-    # credential replaced mid-test can never be marked verified by the old
-    # credential's test call.
+    # Incremented when a PUT changes the credential's contents (key/provider/
+    # base_url/model) -- not on flag-only edits; the /test success stamp
+    # conditions on it so a credential replaced mid-test can never be marked
+    # verified by the old credential's test call.
     revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
     # Separate from having a credential at all: extraction runs on a settled
     # verdict subset, classification runs on every ingested message, so a
