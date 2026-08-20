@@ -126,6 +126,10 @@ export interface ActionCounts {
 export interface ActionsResponse {
   items: ActionItem[];
   counts: ActionCounts;
+  // Opaque bookmark for the next cursor page — set iff this page came back
+  // full, null on a short/empty final page. Treat it as a token, never parse
+  // it (docs/plans/2026-08-19-agenda-cursor-pagination-plan.md D3/D4).
+  next_cursor: string | null;
 }
 
 // Classifier backends an operator can pick per run. "local" = fine-tuned
